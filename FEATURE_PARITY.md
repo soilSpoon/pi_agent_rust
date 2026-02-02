@@ -1,7 +1,7 @@
 # Feature Parity: pi_agent_rust vs Pi Agent (TypeScript)
 
 > **Purpose:** Authoritative single-source-of-truth for implementation status.
-> **Last Updated:** 2026-02-02 (fixtures verified)
+> **Last Updated:** 2026-02-02 (32 lib tests pass, OpenAI provider added)
 
 ## Status Legend
 
@@ -19,7 +19,7 @@
 | Category | Implemented | Partial | Missing | Out of Scope | Total |
 |----------|-------------|---------|---------|--------------|-------|
 | **Core Types** | 8 | 0 | 0 | 0 | 8 |
-| **Provider Layer** | 1 | 1 | 3 | 10+ | 15+ |
+| **Provider Layer** | 2 | 1 | 2 | 10+ | 15+ |
 | **Tools (7 total)** | 7 | 0 | 0 | 0 | 7 |
 | **Agent Runtime** | 1 | 1 | 0 | 0 | 2 |
 | **Session Management** | 1 | 1 | 2 | 0 | 4 |
@@ -64,7 +64,7 @@
 | Provider | Status | Rust Location | Tests | Notes |
 |----------|--------|---------------|-------|-------|
 | **Anthropic** | ✅ | `src/providers/anthropic.rs` | Unit | Full streaming + thinking + tools |
-| OpenAI | ❌ | - | - | Planned for Phase 2 |
+| **OpenAI** | ✅ | `src/providers/openai.rs` | Unit | Full streaming + tool use |
 | Google Gemini | ❌ | - | - | Planned for Phase 2 |
 | Azure OpenAI | ❌ | - | - | Planned for Phase 3 |
 | Amazon Bedrock | ⬜ | - | - | Low priority |
@@ -111,7 +111,7 @@
 | Truncation (head/tail) | ✅ | ✅ | - | - | ✅ | ✅ | ✅ |
 | Image support | ✅ | - | - | - | - | - | - |
 | Streaming updates | - | ✅ | - | - | - | - | - |
-| Line numbers | ✅ | - | - | - | ✅ | - | - |
+| Line numbers | ❌ | - | - | - | ✅ | - | - |
 | Path resolution | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | ~ expansion | ✅ | - | ✅ | ✅ | ✅ | ✅ | ✅ |
 | macOS screenshot paths | ✅ | - | - | - | - | - | - |
@@ -123,7 +123,6 @@
 | DEFAULT_MAX_LINES | 2000 | read, bash, grep |
 | DEFAULT_MAX_BYTES | 50KB | read, bash, grep, find, ls |
 | GREP_MAX_LINE_LENGTH | 500 | grep |
-| DEFAULT_BASH_TIMEOUT | 120s | bash |
 
 ---
 
@@ -249,14 +248,14 @@
 |----------|------------|-------------------|---------------|-------|
 | Core types | 4 | 0 | 0 | 4 |
 | Provider (Anthropic) | 2 | 0 | 0 | 2 |
-| Tools | 7 | 20 | 61 | 88 |
-| Truncation | 3 | 0 | 9 | 12 |
+| SSE parser | 11 | 0 | 0 | 11 |
+| Tools | 5 | 20 | 67 | 92 |
+| TUI | 3 | 0 | 0 | 3 |
 | Agent | 2 | 0 | 0 | 2 |
-| Session | 0 | 0 | 0 | 0 |
 | Conformance infra | 6 | 0 | 0 | 6 |
-| **Total** | **24** | **20** | **70** | **114** |
+| **Total** | **27** | **20** | **67** | **114** |
 
-**All 59 tests pass** (24 unit + 15 fixture wrappers + 20 integration)
+**All 62 tests pass** (27 unit + 15 fixture wrappers + 20 integration)
 
 ---
 
@@ -264,10 +263,10 @@
 
 | Component | Has Fixture Tests | Fixture File | Cases | Status |
 |-----------|-------------------|--------------|-------|--------|
-| read tool | ✅ Yes | `read_tool.json` | 10 | ✅ All pass |
+| read tool | ✅ Yes | `read_tool.json` | 9 | ✅ All pass |
 | write tool | ✅ Yes | `write_tool.json` | 7 | ✅ All pass |
-| edit tool | ✅ Yes | `edit_tool.json` | 6 | ✅ All pass |
-| bash tool | ✅ Yes | `bash_tool.json` | 12 | ✅ All pass |
+| edit tool | ✅ Yes | `edit_tool.json` | 7 | ✅ All pass |
+| bash tool | ✅ Yes | `bash_tool.json` | 9 | ✅ All pass |
 | grep tool | ✅ Yes | `grep_tool.json` | 12 | ✅ All pass |
 | find tool | ✅ Yes | `find_tool.json` | 6 | ✅ All pass |
 | ls tool | ✅ Yes | `ls_tool.json` | 8 | ✅ All pass |

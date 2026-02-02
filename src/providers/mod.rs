@@ -4,3 +4,4 @@
 //! for various LLM APIs.
 
 pub mod anthropic;
+pub mod openai;
