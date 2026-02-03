@@ -212,6 +212,135 @@ schema exactly. One log entry per line.
 
 ---
 
+### 3.2 Hostcall ABI (`host_call` / `host_result`)
+
+`host_call` is the **only** way an extension requests privileged I/O from core.
+Every call is explicit, capability-gated, and logged.
+
+**`host_call.payload` fields (v1):**
+- `call_id` (string, required): correlates request ↔ response(s).
+- `capability` (string, required): the capability key evaluated by policy. **MUST**
+  match the capability core derives from `method` + `params` (prevents spoofing).
+- `method` (string, required): connector method name (e.g. `tool`, `exec`, `http`,
+  `session`, `ui`, `log`).
+- `params` (object, required): method-specific parameters.
+- `timeout_ms` (int, optional): wall-clock timeout for the host operation.
+- `cancel_token` (string, optional): idempotent cancellation handle (future).
+- `context` (object, optional): free-form metadata (never used for policy decisions).
+
+Example (`tool` call):
+```json
+{
+  "call_id": "host-1",
+  "capability": "read",
+  "method": "tool",
+  "params": { "name": "grep", "input": { "pattern": "TODO", "path": "src/" } },
+  "timeout_ms": 2500
+}
+```
+
+**Capability derivation (core-defined, v1):**
+- For `method="tool"`, required capability is derived from `params.name`:
+  - `read|grep|find|ls` → `read`
+  - `write|edit` → `write`
+  - `bash` → `exec`
+  - unknown tool → `tool` (forces prompt/deny depending on policy)
+- For other methods, required capability is the method itself (`http`, `exec`, etc).
+
+**`host_result.payload` fields (v1):**
+- `call_id` (string, required)
+- `output` (object, required): method-specific result object (may be empty on error)
+- `is_error` (bool, required)
+- `error` (object, optional): required when `is_error=true`, forbidden otherwise
+- `chunk` (object, optional): streaming metadata (when results are chunked)
+
+Error example:
+```json
+{
+  "call_id": "host-1",
+  "output": {},
+  "is_error": true,
+  "error": {
+    "code": "denied",
+    "message": "capability denied by policy",
+    "retryable": false,
+    "details": { "capability": "exec" }
+  }
+}
+```
+
+**Error taxonomy (v1):**
+- `timeout`: deadline reached.
+- `denied`: capability not granted or out of scope.
+- `io`: connector I/O failure (fs/network/process).
+- `invalid_request`: malformed method/params/capability mismatch.
+- `internal`: bug or invariant violation in the host.
+
+**Streaming contract (v1):**
+- Core may emit multiple `host_result` messages with the same `call_id`.
+- When streaming, each message includes `chunk.index` starting at 0 and increasing
+  by 1, and `chunk.is_last=true` marks the final chunk.
+- `chunk.backpressure` is reserved for future flow-control hints.
+
+---
+
+### 3.3 Capability Manifest (`pi.ext.cap.v1`)
+
+`register.payload.capability_manifest` optionally declares the extension’s
+required capabilities up front so policy can prompt/deny deterministically and
+the harness can validate conformance.
+
+Schema (v1):
+```json
+{
+  "schema": "pi.ext.cap.v1",
+  "capabilities": [
+    { "capability": "read", "methods": ["tool"], "scope": { "paths": ["src/**"] } },
+    { "capability": "http", "methods": ["http"], "scope": { "hosts": ["api.github.com"] } }
+  ]
+}
+```
+
+Fields:
+- `capabilities[].capability`: capability key (the same string used by policy and
+  `host_call.payload.capability`).
+- `capabilities[].methods` (optional): restrict to a set of connector methods
+  that may be used with this capability (defense-in-depth).
+- `capabilities[].scope` (optional):
+  - `paths`: glob-like patterns relative to the project root/cwd.
+  - `hosts`: allow-list of hostnames/domains for network calls.
+  - `env`: allow-list of env var names (future connector).
+
+Notes:
+- `register.payload.capabilities` remains the legacy, flat list; it will be
+  treated as a coarse capability set until all extensions emit a manifest.
+
+---
+
+### 3.4 Hostcall Evidence Ledger (per-call log contract)
+
+For every hostcall the runtime emits an append-only evidence ledger using
+`pi.ext.log.v1`:
+- `host_call.start`: emitted immediately before dispatch
+- `host_call.end`: emitted once on completion (success, error, or timeout)
+
+**Required ledger fields (in `log.data`):**
+- `capability` / `method`
+- `params_hash` (sha256 hex)
+- `timeout_ms` (if present)
+- `duration_ms` (end event)
+- `is_error` + `error.code` (end event, if error)
+
+**`params_hash` canonicalization (v1):**
+- Hash the canonical JSON serialization of:
+  `{ "method": <method>, "params": <params> }`
+- Canonical JSON rules: UTF-8, no whitespace, object keys sorted
+  lexicographically, arrays preserve order.
+- Never write raw `params` to logs (hash-only) unless explicitly allowed by a
+  fixture or debug mode.
+
+---
+
 ## 4. Capability Policy (Configurable Modes)
 
 `extensions.policy.mode` supports:

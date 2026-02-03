@@ -1,6 +1,6 @@
 use pi::Error;
 use pi::extensions::{
-    ExtensionMessage, ExtensionPolicy, ExtensionPolicyMode, PolicyDecision,
+    ExtensionMessage, ExtensionPolicy, ExtensionPolicyMode, HostCallPayload, PolicyDecision,
     required_capability_for_host_call,
 };
 use serde_json::json;
@@ -30,6 +30,18 @@ fn register_message_json(overrides: serde_json::Value) -> String {
     }
 
     base.to_string()
+}
+
+fn host_call(method: &str, params: serde_json::Value) -> HostCallPayload {
+    HostCallPayload {
+        call_id: "call-1".to_string(),
+        capability: "declared".to_string(),
+        method: method.to_string(),
+        params,
+        timeout_ms: None,
+        cancel_token: None,
+        context: None,
+    }
 }
 
 #[test]
@@ -180,54 +192,59 @@ fn policy_evaluate_covers_modes_and_deny_list() {
 #[test]
 fn required_capability_for_host_call_maps_tool_to_capability() {
     assert_eq!(
-        required_capability_for_host_call("exec", &json!({})).as_deref(),
+        required_capability_for_host_call(&host_call("exec", json!({}))).as_deref(),
         Some("exec")
     );
     assert_eq!(
-        required_capability_for_host_call("http", &json!({})).as_deref(),
+        required_capability_for_host_call(&host_call("http", json!({}))).as_deref(),
         Some("http")
     );
     assert_eq!(
-        required_capability_for_host_call("session", &json!({})).as_deref(),
+        required_capability_for_host_call(&host_call("session", json!({}))).as_deref(),
         Some("session")
     );
     assert_eq!(
-        required_capability_for_host_call("ui", &json!({})).as_deref(),
+        required_capability_for_host_call(&host_call("ui", json!({}))).as_deref(),
         Some("ui")
     );
     assert_eq!(
-        required_capability_for_host_call("log", &json!({})).as_deref(),
+        required_capability_for_host_call(&host_call("log", json!({}))).as_deref(),
         Some("log")
     );
 
     assert_eq!(
-        required_capability_for_host_call("tool", &json!({ "name": "read" })).as_deref(),
+        required_capability_for_host_call(&host_call("tool", json!({ "name": "read" }))).as_deref(),
         Some("read")
     );
     assert_eq!(
-        required_capability_for_host_call(" TOOL ", &json!({ "name": " READ " })).as_deref(),
+        required_capability_for_host_call(&host_call(" TOOL ", json!({ "name": " READ " })))
+            .as_deref(),
         Some("read")
     );
     assert_eq!(
-        required_capability_for_host_call("tool", &json!({ "name": "grep" })).as_deref(),
+        required_capability_for_host_call(&host_call("tool", json!({ "name": "grep" }))).as_deref(),
         Some("read")
     );
     assert_eq!(
-        required_capability_for_host_call("tool", &json!({ "name": "edit" })).as_deref(),
+        required_capability_for_host_call(&host_call("tool", json!({ "name": "edit" }))).as_deref(),
         Some("write")
     );
     assert_eq!(
-        required_capability_for_host_call("tool", &json!({ "name": "bash" })).as_deref(),
+        required_capability_for_host_call(&host_call("tool", json!({ "name": "bash" }))).as_deref(),
         Some("exec")
     );
     assert_eq!(
-        required_capability_for_host_call("tool", &json!({ "name": "unknown-tool" })).as_deref(),
+        required_capability_for_host_call(&host_call("tool", json!({ "name": "unknown-tool" })))
+            .as_deref(),
         Some("tool")
     );
 
-    assert_eq!(required_capability_for_host_call("tool", &json!({})), None);
     assert_eq!(
-        required_capability_for_host_call("unknown", &json!({})),
+        required_capability_for_host_call(&host_call("tool", json!({}))),
+        None
+    );
+    assert_eq!(
+        required_capability_for_host_call(&host_call("unknown", json!({}))),
         None
     );
 }

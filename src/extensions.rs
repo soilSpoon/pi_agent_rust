@@ -133,27 +133,35 @@ impl ExtensionPolicy {
     }
 }
 
-pub fn required_capability_for_host_call(name: &str, input: &Value) -> Option<String> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "tool" => input
-            .get("name")
-            .and_then(Value::as_str)
-            .map(|tool| tool_capability(tool).to_string()),
+pub fn required_capability_for_host_call(call: &HostCallPayload) -> Option<String> {
+    let method = call.method.trim().to_ascii_lowercase();
+    if method.is_empty() {
+        return None;
+    }
+
+    match method.as_str() {
+        "tool" => {
+            let tool_name = call
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| name.trim().to_ascii_lowercase())?;
+            if tool_name.is_empty() {
+                return None;
+            }
+            match tool_name.as_str() {
+                "read" | "grep" | "find" | "ls" => Some("read".to_string()),
+                "write" | "edit" => Some("write".to_string()),
+                "bash" => Some("exec".to_string()),
+                _ => Some("tool".to_string()),
+            }
+        }
         "exec" => Some("exec".to_string()),
         "http" => Some("http".to_string()),
         "session" => Some("session".to_string()),
         "ui" => Some("ui".to_string()),
         "log" => Some("log".to_string()),
         _ => None,
-    }
-}
-
-fn tool_capability(tool_name: &str) -> &'static str {
-    match tool_name.trim().to_ascii_lowercase().as_str() {
-        "read" | "grep" | "find" | "ls" => "read",
-        "write" | "edit" => "write",
-        "bash" => "exec",
-        _ => "tool",
     }
 }
 
@@ -191,12 +199,39 @@ pub struct RegisterPayload {
     pub api_version: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_manifest: Option<CapabilityManifest>,
     #[serde(default)]
     pub tools: Vec<Value>,
     #[serde(default)]
     pub slash_commands: Vec<Value>,
     #[serde(default)]
     pub event_hooks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityManifest {
+    pub schema: String,
+    pub capabilities: Vec<CapabilityRequirement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityRequirement {
+    pub capability: String,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CapabilityScope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,12 +253,51 @@ pub struct ToolResultPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostCallPayload {
     pub call_id: String,
-    pub name: String,
-    pub input: Value,
+    pub capability: String,
+    pub method: String,
+    pub params: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCallErrorCode {
+    Timeout,
+    Denied,
+    Io,
+    InvalidRequest,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostCallError {
+    pub code: HostCallErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostStreamChunk {
+    pub index: u64,
+    pub is_last: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backpressure: Option<HostStreamBackpressure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostStreamBackpressure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +305,10 @@ pub struct HostResultPayload {
     pub call_id: String,
     pub output: Value,
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<HostCallError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk: Option<HostStreamChunk>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,6 +529,23 @@ fn validate_register(payload: &RegisterPayload) -> Result<()> {
     if payload.api_version.trim().is_empty() {
         return Err(Error::validation("Extension api_version is empty"));
     }
+
+    if let Some(manifest) = &payload.capability_manifest {
+        if manifest.schema != "pi.ext.cap.v1" {
+            return Err(Error::validation(format!(
+                "Unsupported capability manifest schema: {}",
+                manifest.schema
+            )));
+        }
+
+        for req in &manifest.capabilities {
+            if req.capability.trim().is_empty() {
+                return Err(Error::validation(
+                    "Capability manifest includes empty capability",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -475,8 +570,31 @@ fn validate_host_call(payload: &HostCallPayload) -> Result<()> {
     if payload.call_id.trim().is_empty() {
         return Err(Error::validation("Host call_id is empty"));
     }
-    if payload.name.trim().is_empty() {
-        return Err(Error::validation("Host call name is empty"));
+
+    if !payload.params.is_object() {
+        return Err(Error::validation("Host call params must be an object"));
+    }
+
+    let declared_capability = payload.capability.trim().to_ascii_lowercase();
+    if declared_capability.is_empty() {
+        return Err(Error::validation("Host call capability is empty"));
+    }
+
+    if payload.method.trim().is_empty() {
+        return Err(Error::validation("Host call method is empty"));
+    }
+
+    let required = required_capability_for_host_call(payload).ok_or_else(|| {
+        Error::validation(format!(
+            "Unknown or invalid host call method: {}",
+            payload.method
+        ))
+    })?;
+
+    if declared_capability != required {
+        return Err(Error::validation(format!(
+            "Host call capability mismatch: declared {declared_capability}, required {required}"
+        )));
     }
     Ok(())
 }
@@ -484,6 +602,20 @@ fn validate_host_call(payload: &HostCallPayload) -> Result<()> {
 fn validate_host_result(payload: &HostResultPayload) -> Result<()> {
     if payload.call_id.trim().is_empty() {
         return Err(Error::validation("Host result call_id is empty"));
+    }
+    if !payload.output.is_object() {
+        return Err(Error::validation("Host result output must be an object"));
+    }
+    if payload.is_error {
+        if payload.error.is_none() {
+            return Err(Error::validation(
+                "Host result marked is_error=true but error payload is missing",
+            ));
+        }
+    } else if payload.error.is_some() {
+        return Err(Error::validation(
+            "Host result includes error payload but is_error=false",
+        ));
     }
     Ok(())
 }
@@ -830,28 +962,33 @@ mod tests {
     fn compiled_extension_protocol_schema() -> Validator {
         let schema_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("docs/schema/extension_protocol.json");
-        let raw = std::fs::read_to_string(&schema_path).unwrap_or_else(|err| {
-            panic!(
-                "Failed to read extension protocol schema {}: {err}",
-                schema_path.display()
-            )
-        });
-        let schema: Value = serde_json::from_str(&raw).unwrap_or_else(|err| {
-            panic!(
-                "Failed to parse extension protocol schema {}: {err}",
-                schema_path.display()
-            )
-        });
+        let raw = std::fs::read_to_string(&schema_path)
+            .map_err(|err| {
+                format!(
+                    "Failed to read extension protocol schema {}: {err}",
+                    schema_path.display()
+                )
+            })
+            .unwrap();
+        let schema: Value = serde_json::from_str(&raw)
+            .map_err(|err| {
+                format!(
+                    "Failed to parse extension protocol schema {}: {err}",
+                    schema_path.display()
+                )
+            })
+            .unwrap();
 
         jsonschema::draft202012::options()
             .should_validate_formats(true)
             .build(&schema)
-            .unwrap_or_else(|err| {
-                panic!(
+            .map_err(|err| {
+                format!(
                     "Failed to compile JSON schema {}: {err}",
                     schema_path.display()
                 )
             })
+            .unwrap()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -867,6 +1004,7 @@ mod tests {
                         version: "0.1.0".to_string(),
                         api_version: "1.0".to_string(),
                         capabilities: vec!["read".to_string()],
+                        capability_manifest: None,
                         tools: Vec::new(),
                         slash_commands: Vec::new(),
                         event_hooks: Vec::new(),
@@ -939,9 +1077,11 @@ mod tests {
                     version: PROTOCOL_VERSION.to_string(),
                     body: ExtensionBody::HostCall(HostCallPayload {
                         call_id: "host-1".to_string(),
-                        name: "tool".to_string(),
-                        input: json!({ "name": "read", "input": { "path": "README.md" } }),
+                        capability: "read".to_string(),
+                        method: "tool".to_string(),
+                        params: json!({ "name": "read", "input": { "path": "README.md" } }),
                         timeout_ms: Some(2500),
+                        cancel_token: None,
                         context: None,
                     }),
                 },
@@ -955,6 +1095,8 @@ mod tests {
                         call_id: "host-1".to_string(),
                         output: json!({ "content": [] }),
                         is_error: false,
+                        error: None,
+                        chunk: None,
                     }),
                 },
             ),
@@ -1056,8 +1198,9 @@ mod tests {
           "type": "host_call",
           "payload": {
             "call_id": "call-1",
-            "name": "tool",
-            "input": { "name": "read", "input": { "path": "README.md" } },
+            "capability": "read",
+            "method": "tool",
+            "params": { "name": "read", "input": { "path": "README.md" } },
             "timeout_ms": 1000
           }
         }
@@ -1139,24 +1282,29 @@ mod tests {
     fn extension_protocol_schema_accepts_all_variants() {
         let schema = compiled_extension_protocol_schema();
         for (label, message) in sample_protocol_messages() {
-            let instance =
-                serde_json::to_value(&message).unwrap_or_else(|err| panic!("{label}: {err}"));
+            let instance = serde_json::to_value(&message)
+                .map_err(|err| format!("{label}: {err}"))
+                .unwrap();
 
-            if !schema.is_valid(&instance) {
-                let errs = schema
-                    .iter_errors(&instance)
-                    .map(|err| err.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                panic!("{label}: schema validation failed:\n{errs}");
-            }
+            let errors = schema
+                .iter_errors(&instance)
+                .map(|err| err.to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                errors.is_empty(),
+                "{label}: schema validation failed:\n{}",
+                errors.join("\n")
+            );
 
-            let json =
-                serde_json::to_string(&message).unwrap_or_else(|err| panic!("{label}: {err}"));
+            let json = serde_json::to_string(&message)
+                .map_err(|err| format!("{label}: {err}"))
+                .unwrap();
             let parsed = ExtensionMessage::parse_and_validate(&json)
-                .unwrap_or_else(|err| panic!("{label}: parse_and_validate failed: {err}"));
-            let parsed_json =
-                serde_json::to_value(&parsed).unwrap_or_else(|err| panic!("{label}: {err}"));
+                .map_err(|err| format!("{label}: parse_and_validate failed: {err}"))
+                .unwrap();
+            let parsed_json = serde_json::to_value(&parsed)
+                .map_err(|err| format!("{label}: {err}"))
+                .unwrap();
             assert_eq!(
                 instance, parsed_json,
                 "{label}: JSON changed after roundtrip"

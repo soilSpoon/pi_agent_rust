@@ -97,23 +97,88 @@ fn bench_required_capability_for_host_call(c: &mut Criterion) {
     };
     let empty = json!({});
 
-    let cases: Vec<(&str, &str, &Value)> = vec![
-        ("tool_read_small", "tool", &tool_read_small),
-        ("tool_read_large", "tool", &tool_read_large),
-        ("tool_bash", "tool", &tool_bash),
-        ("exec", "exec", &empty),
-        ("http", "http", &empty),
-        ("unknown", "unknown", &empty),
+    let cases: Vec<(&str, pi::extensions::HostCallPayload)> = vec![
+        (
+            "tool_read_small",
+            pi::extensions::HostCallPayload {
+                call_id: "call-1".to_string(),
+                capability: "read".to_string(),
+                method: "tool".to_string(),
+                params: tool_read_small,
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "tool_read_large",
+            pi::extensions::HostCallPayload {
+                call_id: "call-1".to_string(),
+                capability: "read".to_string(),
+                method: "tool".to_string(),
+                params: tool_read_large,
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "tool_bash",
+            pi::extensions::HostCallPayload {
+                call_id: "call-1".to_string(),
+                capability: "exec".to_string(),
+                method: "tool".to_string(),
+                params: tool_bash,
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "exec",
+            pi::extensions::HostCallPayload {
+                call_id: "call-1".to_string(),
+                capability: "exec".to_string(),
+                method: "exec".to_string(),
+                params: empty.clone(),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "http",
+            pi::extensions::HostCallPayload {
+                call_id: "call-1".to_string(),
+                capability: "http".to_string(),
+                method: "http".to_string(),
+                params: empty.clone(),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "unknown",
+            pi::extensions::HostCallPayload {
+                call_id: "call-1".to_string(),
+                capability: "unknown".to_string(),
+                method: "unknown".to_string(),
+                params: empty,
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
     ];
 
     let mut group = c.benchmark_group("ext_required_capability");
     group.throughput(Throughput::Elements(1));
-    for (case, name, input) in cases {
-        group.bench_function(BenchmarkId::new("host_call", case), |b| {
+    for (case, call) in cases {
+        group.bench_function(BenchmarkId::new("host_call", case), move |b| {
             b.iter(|| {
                 black_box(pi::extensions::required_capability_for_host_call(
-                    black_box(name),
-                    black_box(input),
+                    black_box(&call),
                 ))
             });
         });
@@ -124,30 +189,39 @@ fn bench_required_capability_for_host_call(c: &mut Criterion) {
 fn bench_dispatch_decision(c: &mut Criterion) {
     let policy = pi::extensions::ExtensionPolicy::default();
 
-    let warm_input = json!({"name": "read"});
-    let warm_name = "tool";
+    let warm_call = pi::extensions::HostCallPayload {
+        call_id: "call-1".to_string(),
+        capability: "read".to_string(),
+        method: "tool".to_string(),
+        params: json!({"name": "read"}),
+        timeout_ms: None,
+        cancel_token: None,
+        context: None,
+    };
     let mut group = c.benchmark_group("ext_dispatch");
 
     group.bench_function("decision_warm", |b| {
         b.iter(|| {
-            let cap = pi::extensions::required_capability_for_host_call(
-                black_box(warm_name),
-                black_box(&warm_input),
-            )
-            .unwrap_or_else(|| "unknown".to_string());
+            let cap = pi::extensions::required_capability_for_host_call(black_box(&warm_call))
+                .unwrap_or_else(|| "unknown".to_string());
             black_box(policy.evaluate(&cap))
         });
     });
 
     group.bench_function("decision_cold", |b| {
         b.iter_batched(
-            || json!({"name": "read"}),
-            |input| {
-                let cap = pi::extensions::required_capability_for_host_call(
-                    black_box("tool"),
-                    black_box(&input),
-                )
-                .unwrap_or_else(|| "unknown".to_string());
+            || pi::extensions::HostCallPayload {
+                call_id: "call-1".to_string(),
+                capability: "read".to_string(),
+                method: "tool".to_string(),
+                params: json!({"name": "read"}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+            |call| {
+                let cap = pi::extensions::required_capability_for_host_call(black_box(&call))
+                    .unwrap_or_else(|| "unknown".to_string());
                 black_box(policy.evaluate(&cap))
             },
             BatchSize::SmallInput,
@@ -159,7 +233,7 @@ fn bench_dispatch_decision(c: &mut Criterion) {
 
 fn bench_protocol_parse_and_validate(c: &mut Criterion) {
     let host_call_small = format!(
-        r#"{{"id":"msg-1","version":"{}","type":"host_call","payload":{{"call_id":"call-1","name":"tool","input":{{"name":"read"}}}}}}"#,
+        r#"{{"id":"msg-1","version":"{}","type":"host_call","payload":{{"call_id":"call-1","capability":"read","method":"tool","params":{{"name":"read"}}}}}}"#,
         pi::extensions::PROTOCOL_VERSION
     );
 

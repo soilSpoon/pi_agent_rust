@@ -74,9 +74,38 @@
         "version": { "type": "string" },
         "api_version": { "type": "string" },
         "capabilities": { "type": "array", "items": { "type": "string" } },
+        "capability_manifest": { "$ref": "#/$defs/capability_manifest" },
         "tools": { "type": "array", "items": { "type": "object" } },
         "slash_commands": { "type": "array", "items": { "type": "object" } },
         "event_hooks": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "capability_manifest": {
+      "type": "object",
+      "required": ["schema", "capabilities"],
+      "properties": {
+        "schema": { "type": "string", "enum": ["pi.ext.cap.v1"] },
+        "capabilities": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/capability_requirement" }
+        }
+      }
+    },
+    "capability_requirement": {
+      "type": "object",
+      "required": ["capability"],
+      "properties": {
+        "capability": { "type": "string" },
+        "methods": { "type": "array", "items": { "type": "string" } },
+        "scope": { "$ref": "#/$defs/capability_scope" }
+      }
+    },
+    "capability_scope": {
+      "type": "object",
+      "properties": {
+        "paths": { "type": "array", "items": { "type": "string" } },
+        "hosts": { "type": "array", "items": { "type": "string" } },
+        "env": { "type": "array", "items": { "type": "string" } }
       }
     },
     "tool_call": {
@@ -100,12 +129,14 @@
     },
     "host_call": {
       "type": "object",
-      "required": ["call_id", "name", "input"],
+      "required": ["call_id", "capability", "method", "params"],
       "properties": {
         "call_id": { "type": "string" },
-        "name": { "type": "string", "description": "Connector call name (e.g., tool, exec, http, session, ui)" },
-        "input": { "type": "object" },
+        "capability": { "type": "string", "description": "Capability key to evaluate and audit (must match core-derived requirement)" },
+        "method": { "type": "string", "description": "Connector method name (e.g., tool, exec, http, session, ui)" },
+        "params": { "type": "object" },
         "timeout_ms": { "type": "integer", "minimum": 0 },
+        "cancel_token": { "type": "string" },
         "context": { "type": "object" }
       }
     },
@@ -115,7 +146,49 @@
       "properties": {
         "call_id": { "type": "string" },
         "output": { "type": "object" },
-        "is_error": { "type": "boolean" }
+        "is_error": { "type": "boolean" },
+        "error": { "$ref": "#/$defs/host_call_error" },
+        "chunk": { "$ref": "#/$defs/host_stream_chunk" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "is_error": { "const": true } } },
+          "then": { "required": ["error"] }
+        },
+        {
+          "if": { "properties": { "is_error": { "const": false } } },
+          "then": { "not": { "required": ["error"] } }
+        }
+      ]
+    },
+    "host_call_error_code": {
+      "type": "string",
+      "enum": ["timeout", "denied", "io", "invalid_request", "internal"]
+    },
+    "host_call_error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "$ref": "#/$defs/host_call_error_code" },
+        "message": { "type": "string" },
+        "details": { "type": "object" },
+        "retryable": { "type": "boolean" }
+      }
+    },
+    "host_stream_backpressure": {
+      "type": "object",
+      "properties": {
+        "credits": { "type": "integer", "minimum": 0 },
+        "delay_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "host_stream_chunk": {
+      "type": "object",
+      "required": ["index", "is_last"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "is_last": { "type": "boolean" },
+        "backpressure": { "$ref": "#/$defs/host_stream_backpressure" }
       }
     },
     "slash_command": {
