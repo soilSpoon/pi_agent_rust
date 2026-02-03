@@ -12,6 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use pi::extensions::{LogComponent, LogCorrelation, LogLevel, LogPayload, LogSource};
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -714,6 +716,148 @@ fn scenario_is_supported_headless(scenario: &ScenarioSuiteScenario) -> bool {
     }
 }
 
+// ============================================================================
+// Normalization (bd-1oz)
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct NormalizationContext {
+    project_root: String,
+    pi_mono_root: String,
+}
+
+impl NormalizationContext {
+    fn from_args(args: &Args) -> Self {
+        let project_root = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cwd.canonicalize().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .display()
+            .to_string();
+        let pi_mono_root = args
+            .pi_mono_root
+            .canonicalize()
+            .unwrap_or_else(|_| args.pi_mono_root.clone())
+            .display()
+            .to_string();
+        Self {
+            project_root,
+            pi_mono_root,
+        }
+    }
+}
+
+fn normalize_string(value: &str, ctx: &NormalizationContext) -> String {
+    static RUN_ID_RE: OnceLock<Regex> = OnceLock::new();
+    static UUID_RE: OnceLock<Regex> = OnceLock::new();
+    static MOCK_OPENAI_BASE_RE: OnceLock<Regex> = OnceLock::new();
+
+    let run_id_re =
+        RUN_ID_RE.get_or_init(|| Regex::new(r"\brun-[0-9a-fA-F-]{36}\b").expect("run id regex"));
+    let uuid_re = UUID_RE.get_or_init(|| {
+        Regex::new(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        )
+        .expect("uuid regex")
+    });
+    let openai_base_re = MOCK_OPENAI_BASE_RE
+        .get_or_init(|| Regex::new(r"http://127\.0\.0\.1:\d+/v1").expect("openai base url regex"));
+
+    let mut out = value.to_string();
+
+    // Replace the pinned legacy root first (it includes the project_root prefix).
+    if !ctx.pi_mono_root.is_empty() {
+        out = out.replace(&ctx.pi_mono_root, "<PI_MONO_ROOT>");
+    }
+    if !ctx.project_root.is_empty() {
+        out = out.replace(&ctx.project_root, "<PROJECT_ROOT>");
+    }
+
+    out = run_id_re.replace_all(&out, "<RUN_ID>").into_owned();
+    out = openai_base_re
+        .replace_all(&out, "http://127.0.0.1:<PORT>/v1")
+        .into_owned();
+    out = uuid_re.replace_all(&out, "<UUID>").into_owned();
+    out
+}
+
+fn normalize_json_value(value: &mut Value, key: Option<&str>, ctx: &NormalizationContext) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                normalize_json_value(v, Some(k.as_str()), ctx);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_json_value(item, None, ctx);
+            }
+        }
+        Value::String(s) => {
+            if matches!(
+                key,
+                Some("timestamp" | "started_at" | "finished_at" | "created_at" | "createdAt")
+            ) {
+                *s = "<TIMESTAMP>".to_string();
+            } else if matches!(key, Some("cwd")) {
+                *s = "<PI_MONO_ROOT>".to_string();
+            } else {
+                *s = normalize_string(s, ctx);
+            }
+        }
+        Value::Number(_) => {
+            if matches!(
+                key,
+                Some("timestamp" | "started_at" | "finished_at" | "created_at" | "createdAt")
+            ) {
+                *value = Value::Number(serde_json::Number::from(0));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_text_line(line: &str, ctx: &NormalizationContext) -> String {
+    static TOTAL_OUTPUT_LINES_RE: OnceLock<Regex> = OnceLock::new();
+    let total_lines_re = TOTAL_OUTPUT_LINES_RE
+        .get_or_init(|| Regex::new(r"^Total output lines: \d+$").expect("total lines regex"));
+
+    if total_lines_re.is_match(line) {
+        return "Total output lines: <N>".to_string();
+    }
+    normalize_string(line, ctx)
+}
+
+fn normalize_jsonl_file(input: &Path, output: &Path, ctx: &NormalizationContext) -> Result<()> {
+    let reader =
+        BufReader::new(File::open(input).with_context(|| format!("open {}", input.display()))?);
+    let mut out = File::create(output).with_context(|| format!("create {}", output.display()))?;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("read {}", input.display()))?;
+        if line.trim_start().starts_with('{') {
+            if let Ok(mut value) = serde_json::from_str::<Value>(&line) {
+                normalize_json_value(&mut value, None, ctx);
+                let normalized = serde_json::to_string(&value)?;
+                writeln!(out, "{normalized}")?;
+                continue;
+            }
+        }
+        writeln!(out, "{}", normalize_text_line(&line, ctx))?;
+    }
+    Ok(())
+}
+
+fn normalize_json_file(input: &Path, output: &Path, ctx: &NormalizationContext) -> Result<()> {
+    let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    let mut value = serde_json::from_slice::<Value>(&bytes)
+        .with_context(|| format!("parse {}", input.display()))?;
+    normalize_json_value(&mut value, None, ctx);
+    let normalized = serde_json::to_string_pretty(&value)?;
+    std::fs::write(output, format!("{normalized}\n"))
+        .with_context(|| format!("write {}", output.display()))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -844,7 +988,7 @@ fn main() -> Result<()> {
         let exit_status = run_pi_mono_to_completion(child, &stdout_rx, &mut writer, timeout)?;
 
         let finished_at = now_rfc3339_millis_z();
-        writer.write_meta_json(&json!({
+        let meta_value = json!({
             "schema": "pi.legacy_capture.v1",
             "run_id": ids.run_id.clone(),
             "extension_id": item.id.clone(),
@@ -874,12 +1018,99 @@ fn main() -> Result<()> {
                 "TZ": "UTC",
                 "no_env": args.no_env,
             },
-        }))?;
+        });
+        writer.write_meta_json(&meta_value)?;
 
         let mut end = log_payload(&ids, &item.id, &scenario.id);
         end.message = "capture.finish".to_string();
         writer.write_capture_log(&end)?;
+
+        drop(writer);
+
+        let norm_ctx = NormalizationContext::from_args(&args);
+        normalize_jsonl_file(
+            &scenario_dir.join("stdout.jsonl"),
+            &scenario_dir.join("stdout.normalized.jsonl"),
+            &norm_ctx,
+        )?;
+        normalize_json_file(
+            &scenario_dir.join("meta.json"),
+            &scenario_dir.join("meta.normalized.json"),
+            &norm_ctx,
+        )?;
+        normalize_jsonl_file(
+            &scenario_dir.join("capture.log.jsonl"),
+            &scenario_dir.join("capture.normalized.log.jsonl"),
+            &norm_ctx,
+        )?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_string_rewrites_run_ids_and_ports_and_paths() {
+        let ctx = NormalizationContext {
+            project_root: "/repo".to_string(),
+            pi_mono_root: "/repo/legacy_pi_mono_code/pi-mono".to_string(),
+        };
+
+        let input = "run-123e4567-e89b-12d3-a456-426614174000 http://127.0.0.1:4887/v1 /repo/legacy_pi_mono_code/pi-mono";
+        let out = normalize_string(input, &ctx);
+        assert!(out.contains("<RUN_ID>"), "{out}");
+        assert!(out.contains("http://127.0.0.1:<PORT>/v1"), "{out}");
+        assert!(out.contains("<PI_MONO_ROOT>"), "{out}");
+    }
+
+    #[test]
+    fn normalize_json_value_masks_timestamps_and_cwd() {
+        let ctx = NormalizationContext {
+            project_root: "/repo".to_string(),
+            pi_mono_root: "/repo/legacy_pi_mono_code/pi-mono".to_string(),
+        };
+
+        let mut value = serde_json::json!({
+            "type": "session",
+            "id": "6f48c50c-eb30-407c-a207-78beef805fc5",
+            "timestamp": "2026-02-03T09:34:26.827Z",
+            "cwd": "/repo/legacy_pi_mono_code/pi-mono"
+        });
+        normalize_json_value(&mut value, None, &ctx);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "session",
+                "id": "<UUID>",
+                "timestamp": "<TIMESTAMP>",
+                "cwd": "<PI_MONO_ROOT>"
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_json_value_does_not_touch_tool_call_ids() {
+        let ctx = NormalizationContext {
+            project_root: "/repo".to_string(),
+            pi_mono_root: "/repo/legacy_pi_mono_code/pi-mono".to_string(),
+        };
+
+        let mut value = serde_json::json!({
+            "type": "tool_execution_start",
+            "toolCallId": "call_1|fc_1",
+            "timestamp": 1_770_111_266_912_u64
+        });
+        normalize_json_value(&mut value, None, &ctx);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_1|fc_1",
+                "timestamp": 0
+            })
+        );
+    }
 }

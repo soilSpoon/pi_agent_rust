@@ -75,3 +75,17 @@ To make conformance reproducible offline, we vendor the extension sources for th
 1. Define per-extension capture scenarios (bd-2qd) in `docs/extension-sample.json` (`scenario_suite`).
 2. Implement the legacy capture pipeline to run scenarios and record outputs (bd-3on), then normalize paths/time/randomness (bd-1oz).
 3. Use this list + artifacts as the canonical sample for conformance and benchmark runs.
+
+### Legacy Capture Normalization (bd-1oz)
+
+`pi_legacy_capture` writes normalized artifacts alongside the raw capture outputs:
+- `stdout.normalized.jsonl`
+- `meta.normalized.json`
+- `capture.normalized.log.jsonl`
+
+Normalization rules (remove non-determinism, preserve semantics):
+- Replace RFC3339 timestamp strings with `<TIMESTAMP>` and numeric `timestamp` fields with `0`.
+- Rewrite absolute paths under the repo to `<PROJECT_ROOT>` and the legacy repo root to `<PI_MONO_ROOT>`.
+- Rewrite `run-<uuid>` to `<RUN_ID>` and bare UUIDs to `<UUID>`.
+- Rewrite mock OpenAI base URLs to `http://127.0.0.1:<PORT>/v1`.
+- Rewrite `Total output lines: N` to `Total output lines: <N>`.
