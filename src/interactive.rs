@@ -1616,7 +1616,7 @@ impl PiApp {
                     content: SlashCommand::help_text().to_string(),
                     thinking: None,
                 });
-                self.scroll_to_bottom();
+                self.scroll_to_last_match("Available commands:");
             }
             SlashCommand::Login => {
                 if self.agent_state != AgentState::Idle {
@@ -2928,6 +2928,22 @@ impl PiApp {
         self.conversation_viewport.set_content(&content);
         self.conversation_viewport.goto_bottom();
         let _ = line_count; // Avoid unused warning
+    }
+
+    fn scroll_to_last_match(&mut self, needle: &str) {
+        let content = self.build_conversation_content();
+        self.conversation_viewport.set_content(&content);
+        let mut last_index = None;
+        for (idx, line) in content.lines().enumerate() {
+            if line.contains(needle) {
+                last_index = Some(idx);
+            }
+        }
+        if let Some(idx) = last_index {
+            self.conversation_viewport.set_y_offset(idx);
+        } else {
+            self.conversation_viewport.goto_bottom();
+        }
     }
 
     pub fn set_terminal_size(&mut self, width: usize, height: usize) {

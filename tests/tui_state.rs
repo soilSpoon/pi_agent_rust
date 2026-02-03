@@ -954,8 +954,8 @@ fn tui_state_slash_help_adds_help_text() {
 
     type_text(&harness, &mut app, "/help");
     let step = press_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "Tips:");
-    assert_after_contains(&harness, &step, "/skill:name");
+    assert_after_contains(&harness, &step, "Available commands:");
+    assert_after_contains(&harness, &step, "/help, /h, /?");
 }
 
 #[test]
