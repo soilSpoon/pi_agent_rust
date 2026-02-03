@@ -573,7 +573,15 @@ fn build_openai_tool_call_responses(
     let item_id = "fc_1";
     let response_id = "resp_1";
     let arguments = serde_json::to_string(tool_input)?;
-    let tool_item = json!({
+    let tool_item_added = json!({
+        "type": "function_call",
+        "id": item_id,
+        "call_id": call_id,
+        "name": tool_name,
+        "arguments": "",
+        "status": "in_progress"
+    });
+    let tool_item_done = json!({
         "type": "function_call",
         "id": item_id,
         "call_id": call_id,
@@ -583,15 +591,16 @@ fn build_openai_tool_call_responses(
     });
 
     let first = build_sse_body(&[
-        json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":tool_item}),
-        json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":tool_item}),
-        json!({"type":"response.completed","sequence_number":3,"response": {
+        json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":tool_item_added}),
+        json!({"type":"response.function_call_arguments.done","sequence_number":2,"output_index":0,"item_id": item_id,"name": tool_name, "arguments": arguments}),
+        json!({"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":tool_item_done}),
+        json!({"type":"response.completed","sequence_number":4,"response": {
             "id": response_id,
             "object": "response",
             "created_at": 0,
             "model": model,
             "status": "completed",
-            "output": [tool_item],
+            "output": [tool_item_done],
             "output_text": "",
             "error": null,
             "incomplete_details": null,
