@@ -387,9 +387,8 @@ fn js_to_json<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<serde_
     if let Some(arr) = value.as_array() {
         let mut result = Vec::new();
         for i in 0..arr.len() {
-            if let Some(v) = arr.get::<Value<'js>>(i)? {
-                result.push(js_to_json(ctx, v)?);
-            }
+            let v: Value<'js> = arr.get(i)?;
+            result.push(js_to_json(ctx, v)?);
         }
         return Ok(serde_json::Value::Array(result));
     }
