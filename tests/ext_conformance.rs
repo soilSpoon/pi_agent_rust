@@ -15,8 +15,11 @@ use serde_json::{Value, json};
 use similar::ChangeTag;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::OnceLock;
+use tempfile::NamedTempFile;
 
 const PLACEHOLDER_TS: &str = "<ts>";
 const PLACEHOLDER_HOST: &str = "<host>";
@@ -322,4 +325,60 @@ fn diff_normalized_jsonl_treats_dynamic_fields_as_equal() {
 "#;
 
     diff_normalized_jsonl(expected, actual, cwd).unwrap();
+}
+
+#[test]
+fn trace_viewer_renders_pretty_and_exports_jsonl() {
+    let mut log_file = NamedTempFile::new().expect("temp log file");
+
+    let line1 = r#"{"schema":"pi.ext.log.v1","ts":"2026-02-03T03:01:02.123Z","level":"info","event":"capture","message":"capture.start","correlation":{"extension_id":"ext.demo","scenario_id":"scn-001","run_id":"run-123"},"source":{"component":"capture","pid":42},"data":{"started_at":"2026-02-03T03:01:02.123Z","provider":"openai","model":"gpt-4o-mini"}}"#;
+    let line2 = r#"{"schema":"pi.ext.log.v1","ts":"2026-02-03T03:01:02.456Z","level":"debug","event":"tool_call.start","message":"read.start","correlation":{"extension_id":"ext.demo","scenario_id":"scn-001","tool_call_id":"tool-42"},"source":{"component":"runtime","pid":4242},"data":{"tool":"read","path":"/repo/README.md"}}"#;
+    let line3 = r#"{"schema":"pi.ext.log.v1","ts":"2026-02-03T03:01:02.999Z","level":"error","event":"hostcall.error","message":"capability denied","correlation":{"extension_id":"ext.demo","scenario_id":"scn-001","host_call_id":"host-7","trace_id":"trace-xyz"},"source":{"component":"runtime","pid":4242},"data":{"capability":"fs.read","scope":"repo","hint":"Add fs.read capability to manifest."}}"#;
+
+    writeln!(log_file, "{line1}").expect("write log line1");
+    writeln!(log_file, "{line2}").expect("write log line2");
+    writeln!(log_file, "{line3}").expect("write log line3");
+
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_pi_legacy_capture"));
+
+    let pretty = Command::new(&binary_path)
+        .args([
+            "--view-log",
+            log_file.path().to_str().expect("utf8 path"),
+            "--view-mode",
+            "pretty",
+            "--view-min-level",
+            "debug",
+        ])
+        .output()
+        .expect("run trace viewer (pretty)");
+    assert!(
+        pretty.status.success(),
+        "trace viewer (pretty) exit={:?}, stderr={}",
+        pretty.status.code(),
+        String::from_utf8_lossy(&pretty.stderr)
+    );
+    let pretty_stdout = String::from_utf8_lossy(&pretty.stdout);
+    insta::assert_snapshot!(pretty_stdout);
+
+    let jsonl = Command::new(&binary_path)
+        .args([
+            "--view-log",
+            log_file.path().to_str().expect("utf8 path"),
+            "--view-mode",
+            "jsonl",
+            "--view-min-level",
+            "debug",
+        ])
+        .output()
+        .expect("run trace viewer (jsonl)");
+    assert!(
+        jsonl.status.success(),
+        "trace viewer (jsonl) exit={:?}, stderr={}",
+        jsonl.status.code(),
+        String::from_utf8_lossy(&jsonl.stderr)
+    );
+    let jsonl_stdout = String::from_utf8_lossy(&jsonl.stdout);
+    let expected_jsonl = format!("{line1}\n{line2}\n{line3}\n");
+    assert_eq!(jsonl_stdout.as_ref(), expected_jsonl);
 }
