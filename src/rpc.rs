@@ -1736,7 +1736,7 @@ async fn run_bash_rpc(
         "sh"
     };
 
-    let mut child = tokio::process::Command::new(shell)
+    let child = tokio::process::Command::new(shell)
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -1754,7 +1754,8 @@ async fn run_bash_rpc(
             (true, output_fut.await)
         }
     };
-    let output = output.map_err(|e| Error::tool("bash", format!("Failed to wait for process: {e}")))?;
+    let output =
+        output.map_err(|e| Error::tool("bash", format!("Failed to wait for process: {e}")))?;
 
     let mut combined = Vec::new();
     combined.extend_from_slice(&output.stdout);
