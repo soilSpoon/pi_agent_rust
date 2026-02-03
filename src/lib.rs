@@ -20,12 +20,14 @@
 )]
 
 pub mod agent;
+pub mod app;
 pub mod auth;
 pub mod cli;
 pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod extensions;
+pub mod http;
 pub mod interactive;
 pub mod model;
 pub mod models;

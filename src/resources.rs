@@ -187,16 +187,15 @@ impl ResourceLoader {
         let enable_skill_commands = config.enable_skill_commands();
 
         // Resolve configured resources (settings + auto-discovery + packages) and CLI `-e` sources.
-        let resolved = manager.resolve().await?;
-        let cli_extensions = manager
-            .resolve_extension_sources(
-                &cli.extension_paths,
-                ResolveExtensionSourcesOptions {
-                    local: false,
-                    temporary: true,
-                },
-            )
-            .await?;
+        let resolved = Box::pin(manager.resolve()).await?;
+        let cli_extensions = Box::pin(manager.resolve_extension_sources(
+            &cli.extension_paths,
+            ResolveExtensionSourcesOptions {
+                local: false,
+                temporary: true,
+            },
+        ))
+        .await?;
 
         let resolved_skill_paths = resolved
             .skills

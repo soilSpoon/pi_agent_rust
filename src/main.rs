@@ -14,6 +14,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use asupersync::runtime::reactor::create_reactor;
+use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use chrono::{Datelike, Local};
 use clap::Parser;
 use glob::Pattern;
@@ -22,14 +24,14 @@ use pi::auth::AuthStorage;
 use pi::cli;
 use pi::config::Config;
 use pi::model;
-use pi::model::{AssistantMessage, ContentBlock, ImageContent, StopReason, TextContent};
+use pi::model::{AssistantMessage, ContentBlock, StopReason};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::package_manager::{PackageEntry, PackageManager, PackageScope};
 use pi::provider::{InputType, StreamOptions, ThinkingBudgets};
 use pi::providers;
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
-use pi::tools::{ToolRegistry, process_file_arguments};
+use pi::tools::ToolRegistry;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
@@ -43,14 +45,20 @@ fn main() -> Result<()> {
     let cli = cli::Cli::parse();
 
     // Run the application
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run(cli))
+    let reactor = create_reactor()?;
+    let runtime = RuntimeBuilder::multi_thread()
+        .blocking_threads(1, 8)
+        .with_reactor(reactor)
+        .build()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let handle = runtime.handle();
+    let runtime_handle = handle.clone();
+    let join = handle.spawn(async move { run(cli, runtime_handle).await });
+    runtime.block_on(join)
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run(mut cli: cli::Cli) -> Result<()> {
+async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     if cli.version {
         print_version();
         return Ok(());
@@ -85,7 +93,8 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
     };
     let mut auth = AuthStorage::load(Config::auth_path())?;
     auth.refresh_expired_oauth_tokens().await?;
-    let models_path = default_models_path(&Config::global_dir());
+    let global_dir = Config::global_dir();
+    let models_path = default_models_path(&global_dir);
     let model_registry = ModelRegistry::load(&auth, Some(models_path));
     if let Some(error) = model_registry.error() {
         eprintln!("Warning: models.json error: {error}");
@@ -139,7 +148,7 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
     let scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
     } else {
-        resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
+        pi::app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
     };
 
     if cli.api_key.is_some()
@@ -152,8 +161,14 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
 
     let mut session = Session::new(&cli, &config).await?;
 
-    let selection =
-        select_model_and_thinking(&cli, &config, &session, &model_registry, &scoped_models)?;
+    let selection = pi::app::select_model_and_thinking(
+        &cli,
+        &config,
+        &session,
+        &model_registry,
+        &scoped_models,
+        &global_dir,
+    )?;
 
     update_session_for_selection(&mut session, &selection);
 
@@ -161,7 +176,7 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
         eprintln!("Warning: {message}");
     }
 
-    let api_key = resolve_api_key(&auth, &cli, &selection.model_entry)?;
+    let api_key = pi::app::resolve_api_key(&auth, &cli, &selection.model_entry)?;
 
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()
@@ -216,6 +231,7 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
             available_models,
             rpc_scoped_models,
             auth.clone(),
+            runtime_handle.clone(),
         )
         .await;
     }
@@ -240,6 +256,7 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
             resources,
             resource_cli,
             cwd.clone(),
+            runtime_handle.clone(),
         )
         .await;
     }
@@ -542,6 +559,7 @@ async fn run_rpc_mode(
     available_models: Vec<ModelEntry>,
     scoped_models: Vec<pi::rpc::RpcScopedModel>,
     auth: AuthStorage,
+    runtime_handle: RuntimeHandle,
 ) -> Result<()> {
     pi::rpc::run_stdio(
         session,
@@ -551,6 +569,7 @@ async fn run_rpc_mode(
             available_models,
             scoped_models,
             auth,
+            runtime_handle,
         },
     )
     .await
@@ -586,10 +605,11 @@ async fn run_print_mode(
     };
     let (abort_handle, abort_signal) = AbortHandle::new();
     let abort_listener = abort_handle.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+    if let Err(err) = ctrlc::set_handler(move || {
         abort_listener.abort();
-    });
+    }) {
+        eprintln!("Warning: Failed to install Ctrl+C handler: {err}");
+    }
 
     let mut initial = initial;
     if let Some(ref mut initial) = initial {
@@ -653,6 +673,7 @@ async fn run_interactive_mode(
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
     cwd: PathBuf,
+    runtime_handle: RuntimeHandle,
 ) -> Result<()> {
     let mut pending = Vec::new();
     if let Some(initial) = initial {
@@ -677,22 +698,14 @@ async fn run_interactive_mode(
         resources,
         resource_cli,
         cwd,
+        runtime_handle,
     )
     .await?;
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct InitialMessage {
-    text: String,
-    images: Vec<ImageContent>,
-}
-
-#[derive(Debug, Clone)]
-struct ScopedModel {
-    model: ModelEntry,
-    thinking_level: Option<model::ThinkingLevel>,
-}
+type InitialMessage = pi::app::InitialMessage;
+type ScopedModel = pi::app::ScopedModel;
 
 #[derive(Debug, Clone)]
 struct ParsedModelResult {
@@ -701,13 +714,7 @@ struct ParsedModelResult {
     warning: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct ModelSelection {
-    model_entry: ModelEntry,
-    thinking_level: model::ThinkingLevel,
-    scoped_models: Vec<ScopedModel>,
-    fallback_message: Option<String>,
-}
+type ModelSelection = pi::app::ModelSelection;
 
 #[derive(Debug, Clone)]
 struct ContextFile {
@@ -740,34 +747,11 @@ fn prepare_initial_message(
     messages: &mut Vec<String>,
     auto_resize_images: bool,
 ) -> Result<Option<InitialMessage>> {
-    if file_args.is_empty() {
-        return Ok(None);
-    }
-
-    let processed = process_file_arguments(file_args, cwd, auto_resize_images)?;
-    let mut initial_message = processed.text;
-    let has_message = !messages.is_empty();
-    if has_message {
-        initial_message.push_str(&messages.remove(0));
-    }
-
-    if initial_message.is_empty() && processed.images.is_empty() && !has_message {
-        return Ok(None);
-    }
-
-    Ok(Some(InitialMessage {
-        text: initial_message,
-        images: processed.images,
-    }))
+    pi::app::prepare_initial_message(cwd, file_args, messages, auto_resize_images)
 }
 
 fn build_initial_content(initial: &InitialMessage) -> Vec<ContentBlock> {
-    let mut content = Vec::new();
-    content.push(ContentBlock::Text(TextContent::new(initial.text.clone())));
-    for image in &initial.images {
-        content.push(ContentBlock::Image(image.clone()));
-    }
-    content
+    pi::app::build_initial_content(initial)
 }
 
 fn build_system_prompt(
@@ -776,37 +760,16 @@ fn build_system_prompt(
     enabled_tools: &[&str],
     skills_prompt: Option<&str>,
 ) -> String {
-    use std::fmt::Write as _;
-
-    let custom_prompt = resolve_prompt_input(cli.system_prompt.as_deref(), "system prompt");
-    let append_prompt =
-        resolve_prompt_input(cli.append_system_prompt.as_deref(), "append system prompt");
-    let context_files = load_project_context_files(cwd);
-
-    let mut prompt = custom_prompt.unwrap_or_else(|| default_system_prompt(enabled_tools));
-
-    if let Some(append_prompt) = append_prompt {
-        prompt.push_str("\n\n");
-        prompt.push_str(&append_prompt);
-    }
-
-    if !context_files.is_empty() {
-        prompt.push_str("\n\n# Project Context\n\n");
-        prompt.push_str("Project-specific instructions and guidelines:\n\n");
-        for file in &context_files {
-            let _ = write!(prompt, "## {}\n\n{}\n\n", file.path, file.content);
-        }
-    }
-
-    if let Some(skills_prompt) = skills_prompt {
-        prompt.push_str(skills_prompt);
-    }
-
-    let date_time = format_current_datetime();
-    let _ = write!(prompt, "\nCurrent date and time: {date_time}");
-    let _ = write!(prompt, "\nCurrent working directory: {}", cwd.display());
-
-    prompt
+    let global_dir = Config::global_dir();
+    let package_dir = Config::package_dir();
+    pi::app::build_system_prompt(
+        cli,
+        cwd,
+        enabled_tools,
+        skills_prompt,
+        &global_dir,
+        &package_dir,
+    )
 }
 
 fn resolve_prompt_input(input: Option<&str>, description: &str) -> Option<String> {
@@ -1009,12 +972,7 @@ fn fuzzy_match(pattern: &str, value: &str) -> bool {
 }
 
 fn parse_models_arg(models: &str) -> Vec<String> {
-    models
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect()
+    pi::app::parse_models_arg(models)
 }
 
 fn resolve_model_scope(
