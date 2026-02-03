@@ -24,7 +24,7 @@
 | **Agent Runtime** | 7 | 0 | 0 | 0 | 7 |
 | **Session Management** | 10 | 0 | 0 | 0 | 10 |
 | **CLI** | 10 | 0 | 0 | 0 | 10 |
-| **Resources & Customization** | 6 | 0 | 2 | 0 | 8 |
+| **Resources & Customization** | 6 | 1 | 1 | 0 | 8 |
 | **Extensions Runtime** | 0 | 4 | 8 | 0 | 12 |
 | **TUI** | 18 | 0 | 0 | 2 | 20 |
 | **Configuration** | 2 | 0 | 0 | 0 | 2 |
@@ -83,7 +83,7 @@
 
 | Feature | Status | Location | Notes |
 |---------|--------|----------|-------|
-| SSE parsing (Anthropic) | ✅ | `anthropic.rs` | `reqwest` bytes stream + `src/sse.rs` |
+| SSE parsing (Anthropic) | ✅ | `anthropic.rs` | `asupersync` HTTP stream (`src/http/client.rs`) + `src/sse.rs` |
 | SSE parser module | ✅ | `src/sse.rs` | Custom parser for asupersync migration |
 | Text delta streaming | ✅ | `anthropic.rs:339-352` | Real-time text |
 | Thinking delta streaming | ✅ | `anthropic.rs:354-367` | Extended thinking |
@@ -187,25 +187,25 @@
 | Prompt template loader | ✅ | `src/resources.rs` | Unit | Global/project + explicit paths |
 | Prompt template expansion (`/name args`) | ✅ | `src/resources.rs`, `src/interactive.rs` | Unit | `$1`, `$@`, `$ARGUMENTS`, `${@:N}` |
 | Package resource discovery | ✅ | `src/resources.rs` | Unit | Reads `package.json` `pi` field or defaults |
-| Themes discovery | ❌ | - | - | Not yet implemented (bd-3ev) |
-| Themes hot reload | ❌ | - | - | Blocked by themes discovery |
+| Themes discovery | 🔶 | `src/theme.rs` | - | Loader + global/project discovery implemented; apply/switch tracked in `bd-22p` |
+| Themes hot reload | ❌ | - | - | Defer until theme switching is wired (`bd-22p`) |
 
 ## 6B. Extensions Runtime
 
 | Feature | Status | Rust Location | Tests | Notes |
 |---------|--------|---------------|-------|-------|
-| Extension discovery | 🔶 | `src/extensions.rs` | 2 | Protocol scaffold only |
-| PiJS runtime (QuickJS) | ❌ | - | - | See `EXTENSIONS.md` connector model (bd-1ii) |
-| registerTool API | ❌ | - | - | Blocked by PiJS runtime |
-| registerCommand API | ❌ | - | - | Blocked by PiJS runtime |
-| Event handlers (onXxx) | ❌ | - | - | Blocked by PiJS runtime |
-| ctx.ui dialogs (select/confirm/input/editor) | 🔶 | `src/rpc.rs` | - | RPC protocol exists; runtime missing |
-| ctx.ui updates (notify/setStatus/setWidget) | 🔶 | `src/rpc.rs` | - | RPC protocol exists; runtime missing |
-| ctx.session access | ❌ | - | - | Blocked by PiJS runtime |
-| Extension logging | ❌ | - | - | Blocked by PiJS runtime |
-| Hostcall ABI (host_call/host_result) | ❌ | - | - | See `EXTENSIONS.md` connector model |
-| Capability manifest + policy | 🔶 | `src/extensions.rs` | 2 | Parsing + policy eval implemented |
-| MCP server support (Tier C) | ❌ | - | - | Lower priority than PiJS |
+| Extension discovery | 🔶 | `src/extensions.rs` | 2 | Protocol scaffold only (`bd-1e0`) |
+| PiJS runtime (QuickJS) | ❌ | - | - | Runtime tracked in `bd-btq` (see `EXTENSIONS.md`) |
+| registerTool API | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
+| registerCommand API | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
+| Event handlers (onXxx) | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
+| ctx.ui dialogs (select/confirm/input/editor) | 🔶 | `src/rpc.rs` | - | RPC protocol exists; runtime missing (`bd-btq`) |
+| ctx.ui updates (notify/setStatus/setWidget) | 🔶 | `src/rpc.rs` | - | RPC protocol exists; runtime missing (`bd-btq`) |
+| ctx.session access | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
+| Extension logging | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
+| Hostcall ABI (host_call/host_result) | ❌ | - | - | Spec in `EXTENSIONS.md` (`bd-37z`); impl blocked by PiJS runtime (`bd-btq`) |
+| Capability manifest + policy | 🔶 | `src/extensions.rs` | 2 | Parsing + policy eval implemented; modes/audit logging tracked in `bd-34f` |
+| MCP server support (Tier C) | ❌ | - | - | Deferred; prioritize PiJS runtime (`bd-btq`) |
 
 ---
 
@@ -268,21 +268,21 @@
 | `/history` | ✅ | `src/interactive.rs` | Show input history |
 | `/export` | ✅ | `src/interactive.rs` | Export session to HTML |
 | `/exit` / `/quit` | ✅ | `src/interactive.rs` | Exit Pi |
-| `/login` | 🔶 | `src/interactive.rs`, `src/auth.rs` | OAuth login (Anthropic supported; others pending) |
+| `/login` | 🔶 | `src/interactive.rs`, `src/auth.rs` | Anthropic OAuth supported; other providers deferred (refresh tests `bd-3pn`) |
 | `/logout` | ✅ | `src/interactive.rs`, `src/auth.rs` | Remove stored credentials |
 | `/session` | ✅ | `src/interactive.rs` | Show session info (path/tokens/cost) |
-| `/resume` | 🔶 | `src/interactive.rs` | Shows hint to use --resume flag |
-| `/new` | 🔶 | `src/interactive.rs` | Shows hint to restart Pi |
+| `/resume` | 🔶 | `src/interactive.rs` | In-app resume UX tracked in `bd-14cc` |
+| `/new` | 🔶 | `src/interactive.rs` | In-app new-session UX tracked in `bd-14cc` |
 | `/name <name>` | ✅ | `src/interactive.rs` | Set session display name |
-| `/copy` | 🔶 | `src/interactive.rs` | Clipboard feature not enabled (placeholder) |
+| `/copy` | 🔶 | `src/interactive.rs` | Clipboard parity tracked in `bd-28uy` (workstream `bd-1u0c`) |
 | `/hotkeys` | ✅ | `src/interactive.rs` | Show keybindings |
-| `/scoped-models` | 🔶 | `src/interactive.rs` | Scoped list stored; cycling keybind pending |
-| `/settings` | 🔶 | `src/interactive.rs` | Shows merged settings JSON (no editor UI) |
+| `/scoped-models` | 🔶 | `src/interactive.rs` | UI + persistence tracked in `bd-27a8` (cycling `bd-21gp`) |
+| `/settings` | 🔶 | `src/interactive.rs` | UI parity + persistence tracked in `bd-axuu` |
 | `/tree` | ✅ | `src/interactive.rs` | List leaves and switch branch by id/index |
 | `/fork` | ✅ | `src/interactive.rs` | Forks new session file from user message |
 | `/compact [prompt]` | ✅ | `src/interactive.rs`, `src/compaction.rs` | Manual compaction |
-| `/share` | 🔶 | `src/interactive.rs` | Saves HTML to temp file (no remote share) |
-| `/reload` | 🔶 | `src/interactive.rs`, `src/resources.rs` | Reloads skills/prompts (themes/extensions pending) |
+| `/share` | 🔶 | `src/interactive.rs` | Gist upload parity tracked in `bd-1kza` (workstream `bd-1u0c`) |
+| `/reload` | 🔶 | `src/interactive.rs`, `src/resources.rs` | Autocomplete + diagnostics tracked in `bd-3nix` (themes `bd-22p`, extensions `bd-btq`) |
 | `/changelog` | ✅ | `src/interactive.rs` | Display changelog entries |
 
 ---
@@ -297,8 +297,8 @@
 | File locking | ✅ | `src/auth.rs` | - | Exclusive lock with timeout |
 | Key resolution | ✅ | `src/auth.rs` | - | override > auth.json > env |
 | Multi-provider keys | ✅ | `src/auth.rs` | - | 12 providers supported |
-| OAuth flow | 🔶 | `src/auth.rs`, `src/interactive.rs` | - | `/login` supports Anthropic OAuth (others pending) |
-| Token refresh | 🔶 | `src/auth.rs`, `src/main.rs` | - | Auto-refresh expired Anthropic OAuth tokens at startup |
+| OAuth flow | 🔶 | `src/auth.rs`, `src/interactive.rs` | - | Anthropic OAuth supported; other providers deferred (tests `bd-3pn`) |
+| Token refresh | 🔶 | `src/auth.rs`, `src/main.rs` | - | Refresh tests tracked in `bd-3pn` |
 
 ---
 
@@ -328,6 +328,7 @@
 | Provider (Azure) | 4 | 0 | 0 | 4 |
 | SSE parser | 11 | 0 | 0 | 11 |
 | Tools | 5 | 20 | 122 | 147 |
+| CLI flags (fixtures) | 0 | 0 | 17 | 17 |
 | TUI (rich_rust) | 3 | 0 | 0 | 3 |
 | TUI (interactive) | 2 | 0 | 0 | 2 |
 | TUI (session picker) | 3 | 0 | 0 | 3 |
@@ -335,9 +336,9 @@
 | Agent | 2 | 0 | 0 | 2 |
 | Conformance infra | 6 | 0 | 0 | 6 |
 | Extensions | 2 | 0 | 0 | 2 |
-| **Total** | **56** | **20** | **122** | **198** |
+| **Total** | **56** | **20** | **139** | **215** |
 
-**All tests pass** (56 unit + 15 fixture wrappers + 20 integration)
+**All tests pass** (unit + integration + fixture-based conformance)
 
 ---
 
@@ -353,10 +354,10 @@
 | find tool | ✅ Yes | `find_tool.json` | 6 | ✅ All pass |
 | ls tool | ✅ Yes | `ls_tool.json` | 8 | ✅ All pass |
 | truncation | ✅ Yes | `truncation.json` | 9 | ✅ All pass |
-| Session format | ❌ No | - | - | - |
-| Provider responses | ❌ No | - | - | - |
-| CLI flags | ❌ No | - | - | - |
-| **Total** | **8/11** | - | **122** | ✅ |
+| Session format | ❌ No | - | - | Covered by integration tests (`tests/session_conformance.rs`); fixtures out-of-scope |
+| Provider responses | ❌ No | - | - | Covered by VCR-backed streaming tests (`bd-h7r`, `bd-gd1`) |
+| CLI flags | ✅ Yes | `cli_flags.json` | 17 | ✅ All pass |
+| **Total** | **9/11** | - | **139** | ✅ |
 
 ### Fixture Schema
 
