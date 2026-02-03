@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pi Extension Manifest",
+  "type": "object",
+  "required": ["schema", "extension_id", "name", "version", "api_version", "runtime", "entrypoint"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "enum": ["pi.ext.manifest.v1"],
+      "description": "Manifest schema identifier"
+    },
+    "extension_id": {
+      "type": "string",
+      "description": "Stable identifier used in logs and harness fixtures"
+    },
+    "name": { "type": "string" },
+    "version": { "type": "string" },
+    "api_version": {
+      "type": "string",
+      "description": "Extension protocol version (e.g., 1.0)"
+    },
+    "runtime": {
+      "type": "string",
+      "enum": ["js", "wasm"],
+      "description": "Extension runtime tier"
+    },
+    "entrypoint": {
+      "type": "string",
+      "description": "Entrypoint path relative to extension root"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Legacy flat capability list (coarse)"
+    },
+    "capability_manifest": { "$ref": "#/$defs/capability_manifest" },
+    "metadata": {
+      "type": "object",
+      "description": "Arbitrary non-policy metadata",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "capability_manifest": {
+      "type": "object",
+      "required": ["schema", "capabilities"],
+      "properties": {
+        "schema": { "type": "string", "enum": ["pi.ext.cap.v1"] },
+        "capabilities": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/capability_requirement" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "capability_requirement": {
+      "type": "object",
+      "required": ["capability"],
+      "properties": {
+        "capability": { "type": "string" },
+        "methods": { "type": "array", "items": { "type": "string" } },
+        "scope": { "$ref": "#/$defs/capability_scope" }
+      },
+      "additionalProperties": false
+    },
+    "capability_scope": {
+      "type": "object",
+      "properties": {
+        "paths": { "type": "array", "items": { "type": "string" } },
+        "hosts": { "type": "array", "items": { "type": "string" } },
+        "env": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    }
+  }
+}

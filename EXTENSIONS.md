@@ -301,6 +301,122 @@ Then:
 - `extension.json` (manifest)
 - Source files (TS/JS or Rust/WASM)
 
+### 2.1 Extension Manifest (`extension.json`) (Normative)
+
+`extension.json` is the **canonical manifest** used by extc and the runtime to
+understand entrypoint and capability requirements. If it is absent, extc MAY
+read equivalent fields from `package.json` under the `pi` key.
+
+Schema (v1):
+```json
+{
+  "schema": "pi.ext.manifest.v1",
+  "name": "acme.tools",
+  "version": "1.2.3",
+  "entrypoint": "src/index.ts",
+  "runtime": "pijs",
+  "capabilities": [
+    { "capability": "read", "scope": { "paths": ["src/**"] } },
+    { "capability": "http", "scope": { "hosts": ["api.github.com"] } }
+  ]
+}
+```
+
+Required fields:
+- `schema`: must be `pi.ext.manifest.v1`.
+- `name`: extension identifier (string).
+- `version`: semver (string).
+- `entrypoint`: path **inside** the extension root.
+
+Optional fields:
+- `runtime`: `pijs` (default) or `wasm`. If `wasm`, `entrypoint` MUST end in
+  `.wasm` and be a component/wasm artifact.
+- `capabilities`: recommended. Each entry uses the **same shape** as
+  `pi.ext.cap.v1` (§3.3).
+
+`package.json` embedding (if no `extension.json`):
+```json
+{
+  "name": "acme.tools",
+  "version": "1.2.3",
+  "pi": {
+    "schema": "pi.ext.manifest.v1",
+    "entrypoint": "src/index.ts",
+    "runtime": "pijs",
+    "capabilities": [{ "capability": "read" }]
+  }
+}
+```
+
+Rules:
+- If both `extension.json` and `package.json#pi` exist, `extension.json` wins.
+- Parsing the manifest is **static only**: no code execution, no dynamic imports.
+- Invalid `capabilities` entries (unknown capability or malformed scope) MUST
+  fail validation.
+
+### 2.2 Capability Inference + Merge Policy (Normative)
+
+Capability resolution is a **deterministic** merge of declared + inferred
+requirements, with explicit user overrides.
+
+**Inputs**
+- **Declared**: from manifest (`extension.json` or `package.json#pi`).
+- **Inferred**: from static analysis (imports, call sites, literals).
+- **Overrides**: `extensions.policy.default_caps` (add) and
+  `extensions.policy.deny_caps` (remove).
+
+#### Inference rules (v1)
+
+1) **Pi APIs (preferred, exact):**
+   - `pi.tool(read/grep/find/ls)` → `read`
+   - `pi.tool(write/edit)` → `write`
+   - `pi.tool(bash)` or `pi.exec(...)` → `exec`
+   - `pi.http(...)` → `http`
+   - `pi.session.*` → `session`
+   - `pi.ui.*` → `ui`
+   - `pi.log(...)` → `log`
+   - `pi.tool(<non-core>)` → `tool`
+
+2) **Node/Bun builtins or shims (conservative):**
+   - `fs`, `fs/promises`, `node:fs*` → `read` + `write`
+   - `child_process`, `node:child_process` → `exec`
+   - `http`, `https`, `undici`, `fetch` → `http`
+   - `process.env`, `node:os` → `env`
+
+3) **Literal scope extraction (best-effort, deterministic):**
+   - Literal URL passed to `fetch`/`http.request` adds `hosts` scope.
+   - Literal file paths passed to fs APIs add `paths` scope.
+   - If a scope cannot be proven, omit it (policy will prompt/deny).
+
+**Normalization (required):**
+- De‑duplicate by `(capability, methods, scope)`.
+- Sort by `capability`, then `methods`, then `scope` values (lexicographic).
+
+#### Merge policy
+
+1) `resolved = declared ∪ inferred ∪ default_caps`
+2) Remove any `deny_caps`
+3) If policy denies a **declared** capability:
+   - `strict` → registration fails
+   - `prompt` → user decision required
+   - `permissive` → allow but log
+
+The resolved set is emitted as `capabilities_required` in `artifact.json` and
+used as the default for policy prompts.
+
+#### Capability resolution log (required)
+
+At registration time, emit a `pi.ext.log.v1` entry with:
+```json
+{
+  "event": "capability_resolution",
+  "declared": [{ "capability": "read", "scope": { "paths": ["src/**"] } }],
+  "inferred": [{ "capability": "http", "evidence": [{ "file": "index.ts", "line": 12 }] }],
+  "merged": [{ "capability": "read" }, { "capability": "http" }],
+  "policy": { "mode": "prompt", "default_caps": ["read"], "deny_caps": ["exec"] }
+}
+```
+
 **Pipeline**
 1. **SWC build**: TS/JS → bundle (tree‑shaken/minified).
 2. **Compatibility scan**: static analysis for forbidden APIs.
@@ -465,6 +581,9 @@ Risky constructs that require evidence logging but don't block compilation:
   }
   ```
 
+- `capabilities_required` MUST be computed per §2.2 (declared ∪ inferred) with
+  deterministic ordering.
+
 #### Side-Effect Policy
 
 - Extc MUST NOT execute extension code during compilation.
@@ -536,6 +655,167 @@ Extc MUST produce sourcemaps that:
 - **Negative tests**: forbidden APIs MUST produce exact error messages.
 - **E2E harness**: verify rewritten bundles run 16/16 sample extensions with
   actionable failure diagnostics.
+
+---
+
+## 2B. Extension Manifest + Capability Inference (Normative)
+
+This section defines:
+- the **on‑disk extension manifest** (`extension.json`), and
+- how tooling derives **required capabilities** deterministically from a bundle
+  (capability inference) and merges them with the manifest.
+
+This is the contract used by:
+- **extc** (compiler + compatibility scanner) during artifact build (§2A), and
+- **runtime + harness** when deciding prompt/deny and validating conformance.
+
+### 2B.1 Extension Manifest (`extension.json`, `pi.ext.manifest.v1`)
+
+**Location:** `<extension_root>/extension.json`
+
+**Canonicalization (v1):**
+- Manifest hashing MUST use **canonical JSON** (UTF‑8, no whitespace, object keys
+  sorted lexicographically, arrays preserve order).
+- The pipeline hash (§2) is computed over canonical manifest bytes.
+
+**Machine schema:** `docs/schema/extension_manifest.json`
+
+**Schema (v1) — human‑readable form:**
+```json
+{
+  "schema": "pi.ext.manifest.v1",
+  "extension_id": "ext.todo",
+  "name": "Todo",
+  "version": "0.1.0",
+  "api_version": "1.0",
+  "runtime": "js",
+  "entrypoint": "src/index.ts",
+
+  "capabilities": ["read"],
+  "capability_manifest": {
+    "schema": "pi.ext.cap.v1",
+    "capabilities": [
+      { "capability": "read", "methods": ["tool"], "scope": { "paths": ["src/**"] } }
+    ]
+  }
+}
+```
+
+Fields:
+- `schema` (required): must be `pi.ext.manifest.v1`.
+- `extension_id` (required): stable identifier used in logs (`ext.log.v1`) and
+  harness fixtures.
+- `name` / `version` / `api_version` (required): must match the protocol
+  `register` payload (§3).
+- `runtime` (required): `js` or `wasm`.
+- `entrypoint` (required): path relative to extension root:
+  - JS: source entrypoint (pre‑bundle), e.g. `src/index.ts`.
+  - WASM: component artifact path, e.g. `dist/extension.wasm`.
+- `capabilities` (optional, legacy): flat list used as a coarse capability set
+  until all extensions emit a scoped manifest.
+- `capability_manifest` (optional, recommended): scoped requirements using the
+  schema in §3.3 (`pi.ext.cap.v1`).
+
+### 2B.2 Capability Inference (`pi.ext.infer.v1`)
+
+**Goal:** deterministically derive the minimum known set of capabilities that an
+artifact *appears* to require, with auditable evidence.
+
+**Output:** an inferred `pi.ext.cap.v1`‑shaped requirement set plus evidence
+records. The inferred set is written into `artifact.json` as:
+- `capabilities_required`: a stable, sorted list of capability keys (`read`,
+  `write`, `exec`, `http`, ...), and optionally
+- `capability_scope_inferred`: a scoped manifest when inference can extract
+  stable scopes (paths/hosts).
+
+**Evidence sources (v1, ordered):**
+1) **Import specifiers** (post‑rewrite):
+   - `pi:node/fs` / `pi:node/fs_promises` → infer `read` and/or `write` based on
+     used APIs (see rules below).
+   - `pi:node/child_process` → `exec`.
+   - `pi:polyfills/fetch` or `fetch(` usage → `http`.
+2) **PiJS primitives**:
+   - `pi.tool("read"|"grep"|"find"|"ls", ...)` → `read`
+   - `pi.tool("write"|"edit", ...)` → `write`
+   - `pi.tool("bash", ...)` or `pi.exec(...)` → `exec`
+   - `pi.http(...)` → `http`
+3) **Literal scope hints** (best‑effort):
+   - `read`/`write` paths: string literals that look like relative paths.
+   - `http` hosts: string literals parsed as URLs; host extracted.
+
+**Inference rules (v1):**
+- Determinism: inference MUST be stable across platforms; ordering is:
+  `capability` ascending, then `method` ascending, then scopes sorted.
+- Soundness target: inference MUST be **conservative** (over‑approx is allowed),
+  but MUST NOT invent scopes from non‑literal sources. Dynamic values produce
+  an **unspecified scope** (forces prompt/deny depending on policy).
+- JS vs WASM: the capability names and scope semantics are identical (§3.2A).
+  WASM inference MAY be based on:
+  - static analysis of the component (if available), or
+  - observed `host_call` traces in capture mode (preferred for correctness).
+
+### 2B.3 Merge Policy (Declared ∪ Inferred + User Overrides)
+
+Define:
+- `declared`: from `extension.json.capability_manifest` if present, otherwise
+  from legacy `extension.json.capabilities` (coarse).
+- `inferred`: from the inference engine (§2B.2).
+- `overrides`: user policy overrides (allow/deny/narrow scope) from config.
+
+**Effective requirements (v1):**
+1) Start with `declared ∪ inferred` (union by capability key).
+2) Apply user **deny** overrides:
+   - Removing a capability is allowed; runtime hostcalls will return `denied`.
+   - Narrowing scope is allowed; apply scope intersection.
+3) Apply user **allow** overrides (add capability / widen scope).
+4) Emit a `capability.resolve` log (see §2B.5) with the full breakdown.
+
+### 2B.4 Validation (Hard Errors)
+
+The runtime/harness MUST reject an extension manifest when:
+- `schema` is unknown.
+- `name`/`version`/`api_version` are empty.
+- A declared capability key is unknown to the taxonomy (§3.2A).
+- A declared scope contains invalid shapes (non‑string items) or non‑normalized
+patterns (implementation-defined, but MUST be deterministic).
+
+### 2B.5 Capability Resolution Logs (ext.log.v1)
+
+At extension load (artifact or dev), the host MUST emit one log entry:
+- `event`: `capability.resolve`
+- `data`: declared/inferred/overrides/effective, plus evidence hashes.
+
+Example:
+```json
+{
+  "schema": "pi.ext.log.v1",
+  "ts": "2026-02-03T00:00:00Z",
+  "level": "info",
+  "event": "capability.resolve",
+  "message": "Resolved effective capabilities",
+  "correlation": { "extension_id": "ext.todo", "scenario_id": "scn-local" },
+  "data": {
+    "declared": ["read"],
+    "inferred": ["read", "http"],
+    "effective": ["read", "http"],
+    "evidence": [
+      { "capability": "http", "kind": "literal_url", "value_hash": "sha256:..." }
+    ]
+  }
+}
+```
+
+Notes:
+- Evidence values SHOULD be hashed (and optionally include a redacted preview)
+  to avoid leaking secrets; follow the redaction rules in §3.1.
+
+### 2B.6 Test Requirements
+
+- Unit fixtures for inference with deterministic ordering (same input → same
+  inferred output).
+- Negative fixtures for invalid manifests (unknown capability, invalid scope).
+- Harness fixtures asserting `capability.resolve` logs are stable after
+  normalization.
 
 ---
 
@@ -781,6 +1061,8 @@ Notes:
   treated as a coarse capability set until all extensions emit a manifest.
 - The manifest applies **equally to JS and WASM** runtimes; capability names and
   scope semantics are identical across both.
+- Extensions SHOULD mirror the resolved set (declared ∪ inferred, §2.2) in
+  `capability_manifest`; hosts MUST log any drift.
 
 ---
 
