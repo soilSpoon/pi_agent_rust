@@ -1674,6 +1674,11 @@ fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
         .collect()
 }
 
+fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
+    left.model.provider.eq_ignore_ascii_case(&right.model.provider)
+        && left.model.id.eq_ignore_ascii_case(&right.model.id)
+}
+
 fn resolve_scoped_model_entries(
     patterns: &[String],
     available_models: &[ModelEntry],
@@ -1694,16 +1699,10 @@ fn resolve_scoped_model_entries(
                 let full_id_lower = full_id.to_lowercase();
                 let id_lower = entry.model.id.to_lowercase();
 
-                if glob.matches(&full_id_lower) || glob.matches(&id_lower) {
-                    if !resolved.iter().any(|existing: &ModelEntry| {
-                        existing
-                            .model
-                            .provider
-                            .eq_ignore_ascii_case(&entry.model.provider)
-                            && existing.model.id.eq_ignore_ascii_case(&entry.model.id)
-                    }) {
-                        resolved.push(entry.clone());
-                    }
+                if (glob.matches(&full_id_lower) || glob.matches(&id_lower))
+                    && !resolved.iter().any(|existing| model_entry_matches(existing, entry))
+                {
+                    resolved.push(entry.clone());
                 }
             }
             continue;
@@ -1714,13 +1713,7 @@ fn resolve_scoped_model_entries(
             if raw_pattern.eq_ignore_ascii_case(&full_id)
                 || raw_pattern.eq_ignore_ascii_case(&entry.model.id)
             {
-                if !resolved.iter().any(|existing: &ModelEntry| {
-                    existing
-                        .model
-                        .provider
-                        .eq_ignore_ascii_case(&entry.model.provider)
-                        && existing.model.id.eq_ignore_ascii_case(&entry.model.id)
-                }) {
+                if !resolved.iter().any(|existing| model_entry_matches(existing, entry)) {
                     resolved.push(entry.clone());
                 }
                 break;
