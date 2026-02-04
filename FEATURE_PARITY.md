@@ -187,8 +187,8 @@
 | Prompt template loader | ✅ | `src/resources.rs` | Unit | Global/project + explicit paths |
 | Prompt template expansion (`/name args`) | ✅ | `src/resources.rs`, `src/interactive.rs` | Unit | `$1`, `$@`, `$ARGUMENTS`, `${@:N}` |
 | Package resource discovery | ✅ | `src/resources.rs` | Unit | Reads `package.json` `pi` field or defaults |
-| Themes discovery | 🔶 | `src/theme.rs` | - | Loader + global/project discovery implemented; apply/switch tracked in `bd-22p` |
-| Themes hot reload | ❌ | - | - | Defer until theme switching is wired (`bd-22p`) |
+| Themes discovery | ✅ | `src/theme.rs`, `src/interactive.rs` | Unit + `tests/tui_state.rs` | Loader + /theme switching |
+| Themes hot reload | ✅ | `src/interactive.rs` | `tests/tui_state.rs` | `/reload` re-resolves and reapplies current theme |
 
 ## 6B. Extensions Runtime
 
@@ -255,7 +255,7 @@
 | Slash command system | ✅ | `src/interactive.rs` | - | /help, /login, /logout, /clear, /model, /thinking, /exit, /history, /export, /session, /resume, /new, /copy, /name, /hotkeys |
 | Viewport scrolling | ✅ | `src/interactive.rs` | - | Viewport with scroll_to_bottom() |
 | Image display | ⬜ | - | - | Terminal dependent |
-| Autocomplete | ⬜ | - | - | Defer |
+| Autocomplete | ✅ | `src/autocomplete.rs`, `src/interactive.rs` | `tests/tui_state.rs` | Tab-triggered dropdown + path completion |
 
 ### 8.3 Interactive Commands (Slash)
 
@@ -271,18 +271,18 @@
 | `/login` | 🔶 | `src/interactive.rs`, `src/auth.rs` | Anthropic OAuth supported; other providers deferred (refresh tests `bd-3pn`) |
 | `/logout` | ✅ | `src/interactive.rs`, `src/auth.rs` | Remove stored credentials |
 | `/session` | ✅ | `src/interactive.rs` | Show session info (path/tokens/cost) |
-| `/resume` | 🔶 | `src/interactive.rs` | In-app resume UX tracked in `bd-14cc` |
-| `/new` | 🔶 | `src/interactive.rs` | In-app new-session UX tracked in `bd-14cc` |
+| `/resume` | ✅ | `src/interactive.rs` | Session picker overlay (deletion disabled) |
+| `/new` | ✅ | `src/interactive.rs` | Start new in-memory session |
 | `/name <name>` | ✅ | `src/interactive.rs` | Set session display name |
-| `/copy` | 🔶 | `src/interactive.rs` | Clipboard parity tracked in `bd-28uy` (workstream `bd-1u0c`) |
+| `/copy` | ✅ | `src/interactive.rs` | Clipboard support is feature-gated (`--features clipboard`) |
 | `/hotkeys` | ✅ | `src/interactive.rs` | Show keybindings |
 | `/scoped-models` | 🔶 | `src/interactive.rs` | UI + persistence tracked in `bd-27a8` (cycling `bd-21gp`) |
-| `/settings` | 🔶 | `src/interactive.rs` | UI parity + persistence tracked in `bd-axuu` |
+| `/settings` | ✅ | `src/interactive.rs` | Shows effective settings + resource counts |
 | `/tree` | ✅ | `src/interactive.rs` | List leaves and switch branch by id/index |
 | `/fork` | ✅ | `src/interactive.rs` | Forks new session file from user message |
 | `/compact [prompt]` | ✅ | `src/interactive.rs`, `src/compaction.rs` | Manual compaction |
-| `/share` | 🔶 | `src/interactive.rs` | Gist upload parity tracked in `bd-1kza` (workstream `bd-1u0c`) |
-| `/reload` | 🔶 | `src/interactive.rs`, `src/resources.rs` | Autocomplete + diagnostics tracked in `bd-3nix` (themes `bd-22p`, extensions `bd-btq`) |
+| `/share` | 🔶 | `src/interactive.rs` | Exports temp HTML; Gist upload deferred |
+| `/reload` | ✅ | `src/interactive.rs`, `src/resources.rs` | Reloads skills/prompts/themes + refreshes autocomplete |
 | `/changelog` | ✅ | `src/interactive.rs` | Display changelog entries |
 
 ---
@@ -354,10 +354,10 @@
 | find tool | ✅ Yes | `find_tool.json` | 6 | ✅ All pass |
 | ls tool | ✅ Yes | `ls_tool.json` | 8 | ✅ All pass |
 | truncation | ✅ Yes | `truncation.json` | 9 | ✅ All pass |
-| Session format | ❌ No | - | - | - |
-| Provider responses | ❌ No | - | - | - |
+| Session format | ✅ Yes | `tests/session_conformance.rs` | 28 | ✅ All pass |
+| Provider responses | ✅ Yes | `tests/provider_streaming.rs` | 4 | ✅ All pass (VCR) |
 | CLI flags | ✅ Yes | `cli_flags.json` | 17 | ✅ All pass |
-| **Total** | **9/11** | - | **139** | ✅ |
+| **Total** | **11/11** | - | **171** | ✅ |
 
 ### Fixture Schema
 
