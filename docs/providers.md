@@ -29,6 +29,16 @@ Pi supports multiple LLM providers. You can configure them via environment varia
 
 ## Configuration
 
+### Selecting Provider/Model
+
+You can pick a provider/model in a few ways:
+
+- **CLI flags:** `pi --provider openai --model gpt-4o "Hello"`
+- **Env vars:** `PI_PROVIDER`, `PI_MODEL`
+- **Settings:** `default_provider`, `default_model` in `~/.pi/agent/settings.json` (and/or `.pi/settings.json`)
+
+For custom endpoints (Azure, OpenAI-compatible providers, etc.), configure models in `models.json`. See [models.md](models.md).
+
 ### Environment Variables
 
 Set these in your shell profile (e.g. `~/.bashrc` or `~/.zshrc`):

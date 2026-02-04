@@ -36,11 +36,12 @@ pub fn create_provider(entry: &ModelEntry) -> Result<Arc<dyn Provider>> {
 }
 
 pub fn normalize_openai_base(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
     if base_url.ends_with("/chat/completions") || base_url.ends_with("/responses") {
         return base_url.to_string();
     }
     if base_url.ends_with("/v1") {
         return format!("{base_url}/chat/completions");
     }
-    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+    format!("{base_url}/chat/completions")
 }

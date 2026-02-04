@@ -3,10 +3,9 @@
 mod common;
 
 use common::TestHarness;
-use pi::config::{Config, SettingsScope};
+use pi::config::{Config, SettingsScope, TerminalSettings};
 use serde_json::json;
 use std::env;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -30,34 +29,6 @@ impl CurrentDirGuard {
 impl Drop for CurrentDirGuard {
     fn drop(&mut self) {
         let _ = env::set_current_dir(&self.previous);
-    }
-}
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let previous = env::var_os(key);
-        env::set_var(key, value);
-        Self { key, previous }
-    }
-
-    fn remove(key: &'static str) -> Self {
-        let previous = env::var_os(key);
-        env::remove_var(key);
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => env::set_var(self.key, value),
-            None => env::remove_var(self.key),
-        }
     }
 }
 
@@ -90,10 +61,8 @@ fn config_load_pi_config_path_override_beats_project_and_global() {
     );
 
     let _cwd_guard = CurrentDirGuard::new(&cwd);
-    let _global_guard = EnvVarGuard::set("PI_CODING_AGENT_DIR", &global_dir);
-    let _override_guard = EnvVarGuard::set("PI_CONFIG_PATH", &override_path);
-
-    let config = Config::load().expect("load config");
+    let config =
+        Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
     harness.log().info_ctx("config", "Loaded config", |ctx| {
         ctx.push((
             "theme".to_string(),
@@ -131,10 +100,7 @@ fn config_load_merges_project_over_global_when_no_override() {
     );
 
     let _cwd_guard = CurrentDirGuard::new(&cwd);
-    let _global_guard = EnvVarGuard::set("PI_CODING_AGENT_DIR", &global_dir);
-    let _override_guard = EnvVarGuard::remove("PI_CONFIG_PATH");
-
-    let config = Config::load().expect("load config");
+    let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
     harness.log().info_ctx("config", "Loaded config", |ctx| {
         ctx.push((
             "theme".to_string(),
@@ -155,28 +121,21 @@ fn config_load_merges_project_over_global_when_no_override() {
 }
 
 #[test]
-fn config_dirs_respect_pi_env_overrides() {
+fn config_dirs_use_explicit_roots() {
     let _lock = config_lock();
-    let harness = TestHarness::new("config_dirs_respect_pi_env_overrides");
+    let harness = TestHarness::new("config_dirs_use_explicit_roots");
 
-    let agent_dir = harness.create_dir("agent-root");
-    let sessions_dir = harness.create_dir("sessions-custom");
-    let packages_dir = harness.create_dir("packages-custom");
+    let cwd = harness.create_dir("cwd");
+    let global_dir = harness.create_dir("global");
 
-    let _global_guard = EnvVarGuard::set("PI_CODING_AGENT_DIR", &agent_dir);
-    let _sessions_guard = EnvVarGuard::remove("PI_SESSIONS_DIR");
-    let _packages_guard = EnvVarGuard::remove("PI_PACKAGE_DIR");
-
-    assert_eq!(Config::global_dir(), agent_dir);
-    assert_eq!(Config::sessions_dir(), agent_dir.join("sessions"));
-    assert_eq!(Config::package_dir(), agent_dir.join("packages"));
-    assert_eq!(Config::auth_path(), agent_dir.join("auth.json"));
-
-    let _sessions_guard = EnvVarGuard::set("PI_SESSIONS_DIR", &sessions_dir);
-    let _packages_guard = EnvVarGuard::set("PI_PACKAGE_DIR", &packages_dir);
-
-    assert_eq!(Config::sessions_dir(), sessions_dir);
-    assert_eq!(Config::package_dir(), packages_dir);
+    assert_eq!(
+        Config::settings_path_with_roots(SettingsScope::Global, &global_dir, &cwd),
+        global_dir.join("settings.json")
+    );
+    assert_eq!(
+        Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd),
+        cwd.join(".pi/settings.json")
+    );
 }
 
 #[test]
@@ -246,10 +205,8 @@ fn config_load_pi_config_path_invalid_json_falls_back_to_defaults() {
     );
 
     let _cwd_guard = CurrentDirGuard::new(&cwd);
-    let _global_guard = EnvVarGuard::set("PI_CODING_AGENT_DIR", &global_dir);
-    let _override_guard = EnvVarGuard::set("PI_CONFIG_PATH", &override_path);
-
-    let config = Config::load().expect("load config");
+    let config =
+        Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
     harness.log().info_ctx("config", "Loaded config", |ctx| {
         ctx.push((
             "theme".to_string(),
@@ -259,4 +216,22 @@ fn config_load_pi_config_path_invalid_json_falls_back_to_defaults() {
 
     assert!(config.theme.is_none());
     assert!(config.default_provider.is_none());
+}
+
+#[test]
+fn config_terminal_defaults_and_overrides() {
+    let _lock = config_lock();
+    let config = Config::default();
+    assert!(config.terminal_show_images());
+    assert!(!config.terminal_clear_on_shrink());
+
+    let config = Config {
+        terminal: Some(TerminalSettings {
+            show_images: Some(false),
+            clear_on_shrink: Some(true),
+        }),
+        ..Config::default()
+    };
+    assert!(!config.terminal_show_images());
+    assert!(config.terminal_clear_on_shrink());
 }

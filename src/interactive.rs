@@ -20,7 +20,9 @@ use async_trait::async_trait;
 use bubbles::spinner::{SpinnerModel, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
-use bubbletea::{Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, Program, batch, quit};
+use bubbletea::{
+    Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, Program, WindowSizeMsg, batch, quit,
+};
 use chrono::Utc;
 use crossterm::{cursor, terminal};
 use futures::future::BoxFuture;
@@ -51,10 +53,10 @@ use crate::model::{
     AssistantMessageEvent, ContentBlock, Message as ModelMessage, StopReason, TextContent,
     ThinkingLevel, Usage, UserContent, UserMessage,
 };
-use crate::models::ModelEntry;
+use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::package_manager::PackageManager;
 use crate::providers;
-use crate::resources::{ResourceCliOptions, ResourceLoader};
+use crate::resources::{DiagnosticKind, ResourceCliOptions, ResourceDiagnostic, ResourceLoader};
 use crate::session::{Session, SessionEntry, SessionMessage, bash_execution_to_text};
 use crate::session_index::{SessionIndex, SessionMeta};
 use crate::session_picker::delete_session_file;
@@ -620,10 +622,22 @@ impl PiApp {
     }
 
     pub fn set_terminal_size(&mut self, width: usize, height: usize) {
+        let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
+        let previous_height = self.term_height;
         self.term_width = width.max(1);
         self.term_height = height.max(1);
         self.input
             .set_width(self.term_width.saturating_sub(4 + self.editor_padding_x));
+
+        if !test_mode
+            && self.term_height < previous_height
+            && self.config.terminal_clear_on_shrink()
+        {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                terminal::Clear(terminal::ClearType::Purge)
+            );
+        }
 
         let viewport_height = self.term_height.saturating_sub(9);
         let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
@@ -1423,8 +1437,12 @@ fn is_file_ref_boundary(text: &str, at: usize) -> bool {
     prev.is_whitespace() || matches!(prev, '(' | '[' | '{' | '<' | '"' | '\'')
 }
 
-fn format_tool_output(content: &[ContentBlock], details: Option<&Value>) -> Option<String> {
-    let mut output = content_blocks_to_text(content);
+fn format_tool_output(
+    content: &[ContentBlock],
+    details: Option<&Value>,
+    show_images: bool,
+) -> Option<String> {
+    let mut output = tool_content_blocks_to_text(content, show_images);
     if output.trim().is_empty() {
         if let Some(details) = details {
             output = pretty_json(details);
@@ -1437,8 +1455,126 @@ fn format_tool_output(content: &[ContentBlock], details: Option<&Value>) -> Opti
     }
 }
 
+fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: bool) -> String {
+    let mut output = String::new();
+    let mut hidden_images = 0usize;
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
+            ContentBlock::Image(image) => {
+                if show_images {
+                    push_line(&mut output, &format!("[image: {}]", image.mime_type));
+                } else {
+                    hidden_images = hidden_images.saturating_add(1);
+                }
+            }
+            ContentBlock::Thinking(thinking_block) => {
+                push_line(&mut output, &thinking_block.thinking);
+            }
+            ContentBlock::ToolCall(call) => {
+                push_line(&mut output, &format!("[tool call: {}]", call.name));
+            }
+        }
+    }
+
+    if !show_images && hidden_images > 0 {
+        push_line(&mut output, &format!("[{hidden_images} image(s) hidden]"));
+    }
+
+    output
+}
+
 fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+const fn kind_rank(kind: &DiagnosticKind) -> u8 {
+    match kind {
+        DiagnosticKind::Warning => 0,
+        DiagnosticKind::Collision => 1,
+    }
+}
+
+fn format_resource_diagnostics(label: &str, diagnostics: &[ResourceDiagnostic]) -> (String, usize) {
+    let mut ordered: Vec<&ResourceDiagnostic> = diagnostics.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| kind_rank(&a.kind).cmp(&kind_rank(&b.kind)))
+            .then_with(|| a.message.cmp(&b.message))
+    });
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{label}:");
+    for diag in ordered {
+        let kind = match diag.kind {
+            DiagnosticKind::Warning => "warning",
+            DiagnosticKind::Collision => "collision",
+        };
+        let _ = write!(out, "- {kind}: {} ({})", diag.message, diag.path.display());
+        if let Some(collision) = &diag.collision {
+            let _ = write!(
+                out,
+                " [winner: {} loser: {}]",
+                collision.winner_path.display(),
+                collision.loser_path.display()
+            );
+        }
+        out.push('\n');
+    }
+    (out, diagnostics.len())
+}
+
+fn build_reload_diagnostics(
+    models_error: Option<String>,
+    resources: &ResourceLoader,
+) -> (Option<String>, usize) {
+    let mut sections = Vec::new();
+    let mut count = 0usize;
+
+    if let Some(err) = models_error {
+        count = count.saturating_add(1);
+        sections.push(format!("models.json:\n{err}"));
+    }
+
+    let mut resource_sections = Vec::new();
+    let (skills_text, skills_count) =
+        format_resource_diagnostics("Skills", resources.skill_diagnostics());
+    if skills_count > 0 {
+        resource_sections.push(skills_text);
+        count = count.saturating_add(skills_count);
+    }
+
+    let (prompts_text, prompts_count) =
+        format_resource_diagnostics("Prompts", resources.prompt_diagnostics());
+    if prompts_count > 0 {
+        resource_sections.push(prompts_text);
+        count = count.saturating_add(prompts_count);
+    }
+
+    let (themes_text, themes_count) =
+        format_resource_diagnostics("Themes", resources.theme_diagnostics());
+    if themes_count > 0 {
+        resource_sections.push(themes_text);
+        count = count.saturating_add(themes_count);
+    }
+
+    if !resource_sections.is_empty() {
+        sections.push(format!(
+            "Resource diagnostics:\n{}",
+            resource_sections.join("\n")
+        ));
+    }
+
+    if sections.is_empty() {
+        (None, 0)
+    } else {
+        (
+            Some(format!("Reload diagnostics:\n\n{}", sections.join("\n\n"))),
+            count,
+        )
+    }
 }
 
 fn push_line(out: &mut String, line: &str) {
@@ -1993,6 +2129,7 @@ pub enum PiMsg {
     ResourcesReloaded {
         resources: ResourceLoader,
         status: String,
+        diagnostics: Option<String>,
     },
     /// Extension UI request (select/confirm/input/editor/notify).
     ExtensionUiRequest(ExtensionUiRequest),
@@ -3377,6 +3514,11 @@ impl PiApp {
             return self.handle_pi_message(pi_msg.clone());
         }
 
+        if let Some(size) = msg.downcast_ref::<WindowSizeMsg>() {
+            self.set_terminal_size(size.width as usize, size.height as usize);
+            return None;
+        }
+
         // Handle keyboard input via keybindings layer
         if let Some(key) = msg.downcast_ref::<KeyMsg>() {
             // Clear status message on any key press
@@ -4352,7 +4494,11 @@ impl PiApp {
                 details,
                 ..
             } => {
-                if let Some(output) = format_tool_output(&content, details.as_ref()) {
+                if let Some(output) = format_tool_output(
+                    &content,
+                    details.as_ref(),
+                    self.config.terminal_show_images(),
+                ) {
                     self.pending_tool_output = Some(format!("Tool {name} output:\n{output}"));
                 }
             }
@@ -4425,9 +4571,14 @@ impl PiApp {
             PiMsg::AgentError(error) => {
                 self.current_response.clear();
                 self.current_thinking.clear();
+                let content = if error.contains('\n') || error.starts_with("Error:") {
+                    error
+                } else {
+                    format!("Error: {error}")
+                };
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
-                    content: format!("Error: {error}"),
+                    content,
                     thinking: None,
                 });
                 self.agent_state = AgentState::Idle;
@@ -4502,7 +4653,11 @@ impl PiApp {
                 self.input.set_value(&text);
                 self.input.focus();
             }
-            PiMsg::ResourcesReloaded { resources, status } => {
+            PiMsg::ResourcesReloaded {
+                resources,
+                status,
+                diagnostics,
+            } => {
                 let autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
                 self.autocomplete.provider.set_catalog(autocomplete_catalog);
                 self.autocomplete.close();
@@ -4512,6 +4667,14 @@ impl PiApp {
                 self.current_tool = None;
                 self.abort_handle = None;
                 self.status_message = Some(status);
+                if let Some(message) = diagnostics {
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: message,
+                        thinking: None,
+                    });
+                    self.scroll_to_bottom();
+                }
                 self.input.focus();
             }
             PiMsg::ExtensionUiRequest(request) => {
@@ -4914,7 +5077,8 @@ impl PiApp {
             }
 
             if let Err(err) = result {
-                let _ = event_tx.try_send(PiMsg::AgentError(err.to_string()));
+                let formatted = crate::error_hints::format_error_with_hints(&err);
+                let _ = event_tx.try_send(PiMsg::AgentError(formatted));
             }
         });
 
@@ -5515,6 +5679,108 @@ impl PiApp {
         }
     }
 
+    fn cycle_model(&mut self, delta: i32) {
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some("Cannot switch models while processing".to_string());
+            return;
+        }
+
+        let mut candidates = if self.model_scope.is_empty() {
+            self.available_models.clone()
+        } else {
+            self.model_scope.clone()
+        };
+
+        candidates.sort_by(|a, b| {
+            let left = format!("{}/{}", a.model.provider, a.model.id);
+            let right = format!("{}/{}", b.model.provider, b.model.id);
+            left.cmp(&right)
+        });
+        candidates.dedup_by(|a, b| {
+            a.model.provider.eq_ignore_ascii_case(&b.model.provider)
+                && a.model.id.eq_ignore_ascii_case(&b.model.id)
+        });
+
+        if candidates.is_empty() {
+            self.status_message = Some("No models available".to_string());
+            return;
+        }
+
+        let current_index = candidates.iter().position(|entry| {
+            entry
+                .model
+                .provider
+                .eq_ignore_ascii_case(&self.model_entry.model.provider)
+                && entry
+                    .model
+                    .id
+                    .eq_ignore_ascii_case(&self.model_entry.model.id)
+        });
+
+        let next_index = current_index.map_or_else(
+            || {
+                if delta >= 0 { 0 } else { candidates.len() - 1 }
+            },
+            |idx| {
+                if delta >= 0 {
+                    (idx + 1) % candidates.len()
+                } else {
+                    idx.checked_sub(1).unwrap_or(candidates.len() - 1)
+                }
+            },
+        );
+
+        let next = candidates[next_index].clone();
+
+        if next
+            .model
+            .provider
+            .eq_ignore_ascii_case(&self.model_entry.model.provider)
+            && next
+                .model
+                .id
+                .eq_ignore_ascii_case(&self.model_entry.model.id)
+        {
+            self.status_message = Some(format!("Current model: {}", self.model));
+            return;
+        }
+
+        let provider_impl = match providers::create_provider(&next) {
+            Ok(provider_impl) => provider_impl,
+            Err(err) => {
+                self.status_message = Some(err.to_string());
+                return;
+            }
+        };
+
+        let Ok(mut agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return;
+        };
+        agent_guard.set_provider(provider_impl);
+        drop(agent_guard);
+
+        let Ok(mut session_guard) = self.session.try_lock() else {
+            self.status_message = Some("Session busy; try again".to_string());
+            return;
+        };
+        session_guard.header.provider = Some(next.model.provider.clone());
+        session_guard.header.model_id = Some(next.model.id.clone());
+        session_guard.append_model_change(next.model.provider.clone(), next.model.id.clone());
+        drop(session_guard);
+        self.spawn_save_session();
+
+        self.model_entry = next.clone();
+        if let Ok(mut guard) = self.model_entry_shared.lock() {
+            *guard = next;
+        }
+        self.model = format!(
+            "{}/{}",
+            self.model_entry.model.provider, self.model_entry.model.id
+        );
+        self.status_message = Some(format!("Switched model: {}", self.model));
+    }
+
     /// Handle an action dispatched from the keybindings layer.
     ///
     /// Returns `Some(Cmd)` if a command should be executed,
@@ -5630,6 +5896,18 @@ impl PiApp {
                         self.status_message = Some(format!("Editor error: {e}"));
                     }
                 }
+                None
+            }
+
+            // =========================================================
+            // Models & thinking
+            // =========================================================
+            AppAction::CycleModelForward => {
+                self.cycle_model(1);
+                None
+            }
+            AppAction::CycleModelBackward => {
+                self.cycle_model(-1);
                 None
             }
 
@@ -5817,6 +6095,8 @@ impl PiApp {
             // Tab is consumed (autocomplete).
             AppAction::PageUp
             | AppAction::PageDown
+            | AppAction::CycleModelForward
+            | AppAction::CycleModelBackward
             | AppAction::ToggleThinking
             | AppAction::FollowUp
             | AppAction::NewLine
@@ -6856,14 +7136,38 @@ impl PiApp {
                     let manager = PackageManager::new(cwd.clone());
                     match ResourceLoader::load(&manager, &cwd, &config, &cli).await {
                         Ok(resources) => {
-                            let status = format!(
+                            let models_error =
+                                match crate::auth::AuthStorage::load_async(Config::auth_path())
+                                    .await
+                                {
+                                    Ok(auth) => {
+                                        let models_path =
+                                            default_models_path(&Config::global_dir());
+                                        let registry =
+                                            ModelRegistry::load(&auth, Some(models_path));
+                                        registry.error().map(ToString::to_string)
+                                    }
+                                    Err(err) => Some(format!("Failed to load auth.json: {err}")),
+                                };
+
+                            let (diagnostics, diag_count) =
+                                build_reload_diagnostics(models_error, &resources);
+
+                            let mut status = format!(
                                 "Reloaded resources: {} skills, {} prompts, {} themes",
                                 resources.skills().len(),
                                 resources.prompts().len(),
                                 resources.themes().len()
                             );
-                            let _ =
-                                event_tx.try_send(PiMsg::ResourcesReloaded { resources, status });
+                            if diag_count > 0 {
+                                let _ = write!(status, " ({diag_count} diagnostics)");
+                            }
+
+                            let _ = event_tx.try_send(PiMsg::ResourcesReloaded {
+                                resources,
+                                status,
+                                diagnostics,
+                            });
                         }
                         Err(err) => {
                             let _ = event_tx.try_send(PiMsg::AgentError(format!(

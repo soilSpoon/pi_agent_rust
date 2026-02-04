@@ -5,9 +5,19 @@
 //! - Performance: Sub-100ms startup, smooth TUI at 60fps
 //! - Reliability: No panics in normal operation
 //! - Efficiency: Single binary, minimal dependencies
+//!
+//! ## Public API policy
+//!
+//! The `pi` crate is primarily the implementation crate for the `pi` CLI binary.
+//! Until we intentionally stabilize a library API, external consumers should treat
+//! all modules/types as **unstable** and subject to change.
+//!
+//! Currently intended stable exports:
+//! - [`Error`](crate::Error)
+//! - [`PiResult`](crate::PiResult)
 
 #![forbid(unsafe_code)]
-#![allow(dead_code, clippy::unused_async)]
+#![allow(dead_code, clippy::unused_async, unused_attributes)]
 // Allow pedantic lints during early development - can tighten later
 #![allow(
     clippy::must_use_candidate,
@@ -35,6 +45,7 @@ pub mod http;
 pub mod interactive;
 pub mod keybindings;
 pub mod model;
+pub mod model_selector;
 pub mod models;
 pub mod package_manager;
 pub mod provider;

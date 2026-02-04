@@ -432,6 +432,7 @@ fn tui_snapshot_status_message() {
         PiMsg::ResourcesReloaded {
             resources: ResourceLoader::empty(true),
             status: "Reloaded resources".to_string(),
+            diagnostics: None,
         },
     );
     let context = vec![

@@ -34,7 +34,14 @@ use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
 use tracing_subscriber::EnvFilter;
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = main_impl() {
+        print_error_with_hints(&err);
+        std::process::exit(1);
+    }
+}
+
+fn main_impl() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -56,6 +63,17 @@ fn main() -> Result<()> {
     let runtime_handle = handle.clone();
     let join = handle.spawn(Box::pin(run(cli, runtime_handle)));
     runtime.block_on(join)
+}
+
+fn print_error_with_hints(err: &anyhow::Error) {
+    for cause in err.chain() {
+        if let Some(pi_error) = cause.downcast_ref::<pi::error::Error>() {
+            eprint!("{}", pi::error_hints::format_error_with_hints(pi_error));
+            return;
+        }
+    }
+
+    eprintln!("{err}");
 }
 
 #[allow(clippy::too_many_lines)]

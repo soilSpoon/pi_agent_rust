@@ -18,6 +18,7 @@ use crate::compaction::{
 };
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::error_hints;
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
@@ -324,7 +325,7 @@ pub async fn run(
                 let images = match parse_prompt_images(parsed.get("images")) {
                     Ok(images) => images,
                     Err(err) => {
-                        let resp = response_error(id, "prompt", err.to_string());
+                        let resp = response_error_with_hints(id, "prompt", &err);
                         let _ = out_tx.send(resp);
                         continue;
                     }
@@ -334,7 +335,7 @@ pub async fn run(
                     match parse_streaming_behavior(parsed.get("streamingBehavior")) {
                         Ok(value) => value,
                         Err(err) => {
-                            let resp = response_error(id, "prompt", err.to_string());
+                            let resp = response_error_with_hints(id, "prompt", &err);
                             let _ = out_tx.send(resp);
                             continue;
                         }
@@ -667,7 +668,7 @@ pub async fn run(
                 let api_key = match api_key {
                     Ok(key) => key,
                     Err(err) => {
-                        let _ = out_tx.send(response_error(id, "set_model", err.to_string()));
+                        let _ = out_tx.send(response_error_with_hints(id, "set_model", &err));
                         continue;
                     }
                 };
@@ -745,7 +746,7 @@ pub async fn run(
                     Ok(level) => level,
                     Err(err) => {
                         let _ =
-                            out_tx.send(response_error(id, "set_thinking_level", err.to_string()));
+                            out_tx.send(response_error_with_hints(id, "set_thinking_level", &err));
                         continue;
                     }
                 };
@@ -758,10 +759,10 @@ pub async fn run(
                     let level = current_model_entry(&guard.session, &options)
                         .map_or(level, |entry| clamp_thinking_level(level, entry));
                     if let Err(err) = apply_thinking_level(&mut guard, level).await {
-                        let _ = out_tx.send(response_error(
+                        let _ = out_tx.send(response_error_with_hints(
                             id.clone(),
                             "set_thinking_level",
-                            err.to_string(),
+                            &err,
                         ));
                         continue;
                     }
@@ -1016,7 +1017,7 @@ pub async fn run(
                                 })),
                             )
                         }
-                        Err(err) => response_error(id_clone, "bash", err.to_string()),
+                        Err(err) => response_error_with_hints(id_clone, "bash", &err),
                     };
 
                     let _ = out_tx.send(response);
@@ -1192,7 +1193,7 @@ pub async fn run(
                         state.follow_up.clear();
                     }
                     Err(err) => {
-                        let _ = out_tx.send(response_error(id, "switch_session", err.to_string()));
+                        let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
                     }
                 }
             }
@@ -1293,6 +1294,7 @@ async fn run_prompt_with_retry(
     let mut retry_count: u32 = 0;
     let mut success = false;
     let mut final_error: Option<String> = None;
+    let mut final_error_hints: Option<Value> = None;
 
     loop {
         let (abort_handle, abort_signal) = AbortHandle::new();
@@ -1328,6 +1330,7 @@ async fn run_prompt_with_retry(
                 Ok(guard) => guard,
                 Err(err) => {
                     final_error = Some(format!("session lock failed: {err}"));
+                    final_error_hints = None;
                     break;
                 }
             };
@@ -1357,6 +1360,7 @@ async fn run_prompt_with_retry(
                         .error_message
                         .clone()
                         .or_else(|| Some("Request error".to_string()));
+                    final_error_hints = None;
                     if message.stop_reason == StopReason::Aborted {
                         break;
                     }
@@ -1367,6 +1371,7 @@ async fn run_prompt_with_retry(
             }
             Err(err) => {
                 final_error = Some(err.to_string());
+                final_error_hints = Some(error_hints_value(&err));
             }
         }
 
@@ -1419,11 +1424,15 @@ async fn run_prompt_with_retry(
 
     if !success {
         if let Some(err) = final_error {
-            let _ = out_tx.send(event(&json!({
+            let mut payload = json!({
                 "type": "agent_end",
                 "messages": [],
                 "error": err
-            })));
+            });
+            if let Some(hints) = final_error_hints {
+                payload["errorHints"] = hints;
+            }
+            let _ = out_tx.send(event(&payload));
         }
         return;
     }
@@ -1469,8 +1478,31 @@ fn response_error(id: Option<String>, command: &str, error: impl Into<String>) -
     resp.to_string()
 }
 
+fn response_error_with_hints(id: Option<String>, command: &str, error: &Error) -> String {
+    let mut resp = json!({
+        "type": "response",
+        "command": command,
+        "success": false,
+        "error": error.to_string(),
+        "errorHints": error_hints_value(error),
+    });
+    if let Some(id) = id {
+        resp["id"] = Value::String(id);
+    }
+    resp.to_string()
+}
+
 fn event(value: &Value) -> String {
     value.to_string()
+}
+
+fn error_hints_value(error: &Error) -> Value {
+    let hint = error_hints::hints_for_error(error);
+    json!({
+        "summary": hint.summary,
+        "hints": hint.hints,
+        "contextFields": hint.context_fields,
+    })
 }
 
 fn rpc_session_message_value(message: SessionMessage) -> Value {

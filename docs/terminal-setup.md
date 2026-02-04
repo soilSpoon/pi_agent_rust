@@ -87,7 +87,7 @@ To block images entirely, set:
 }
 ```
 
-There is also a planned terminal toggle:
+You can also hide image blocks in terminal output:
 
 ```json
 {
@@ -97,7 +97,9 @@ There is also a planned terminal toggle:
 }
 ```
 
-`terminal.show_images` and `terminal.clear_on_shrink` are tracked by `bd-xk3g` and not wired yet.
+`terminal.show_images` controls whether Pi includes image blocks in terminal tool output (defaults to `true`).
+
+`terminal.clear_on_shrink` (defaults to `false`) purges scrollback when the terminal height shrinks, which helps avoid stale rows reappearing after a resize.
 
 ## Keybindings
 

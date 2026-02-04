@@ -4,11 +4,19 @@
 //! validation utilities plus a minimal WASM host scaffold.
 
 use crate::agent::AgentEvent;
+use crate::connectors::Connector;
+use crate::connectors::http::HttpConnector;
 use crate::error::{Error, Result};
+use crate::extensions_js::{
+    HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig, js_to_json, json_to_js,
+};
+use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
+use crate::tools::ToolRegistry;
 use asupersync::Cx;
 use asupersync::channel::{mpsc, oneshot};
-use asupersync::time::{timeout, wall_now};
+use asupersync::runtime::RuntimeBuilder;
+use asupersync::time::{sleep, timeout, wall_now};
 use async_trait::async_trait;
 use base64::Engine as _;
 use regex::Regex;
@@ -18,10 +26,12 @@ use sha2::Digest as _;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: &str = "1.0";
@@ -1959,19 +1969,435 @@ fn validate_error(payload: &ErrorPayload) -> Result<()> {
 // WASM Host Scaffold (minimal)
 // ============================================================================
 
+#[cfg(feature = "wasm-host")]
 #[derive(Debug, Clone)]
 pub struct WasmExtension {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
-pub struct WasmExtensionHost {
-    policy: ExtensionPolicy,
+#[cfg(feature = "wasm-host")]
+#[allow(clippy::trait_duplication_in_bounds)]
+mod wasm_host {
+    use super::*;
+
+    use crate::connectors::Connector as _;
+    use crate::connectors::http::HttpConnector;
+    use wasmtime::component::{Component, Linker};
+
+    wasmtime::component::bindgen!({
+        path: "docs/wit/extension.wit",
+        world: "pi-extension",
+        async: true,
+    });
+
+    use self::pi::extension::host;
+
+    pub struct HostState {
+        pub policy: ExtensionPolicy,
+        pub cwd: PathBuf,
+        pub tools: crate::tools::ToolRegistry,
+        pub http: HttpConnector,
+    }
+
+    impl HostState {
+        pub fn new(policy: ExtensionPolicy, cwd: PathBuf) -> Self {
+            let tools = crate::tools::ToolRegistry::new(
+                &["read", "bash", "edit", "write", "grep", "find", "ls"],
+                &cwd,
+                None,
+            );
+            Self {
+                policy,
+                cwd,
+                tools,
+                http: HttpConnector::with_defaults(),
+            }
+        }
+
+        fn host_error_json(
+            code: HostCallErrorCode,
+            message: impl Into<String>,
+            details: Option<Value>,
+            retryable: Option<bool>,
+        ) -> String {
+            let payload = HostCallError {
+                code,
+                message: message.into(),
+                details,
+                retryable,
+            };
+            serde_json::to_string(&payload).unwrap_or_else(|_| {
+                format!(
+                    "{{\"code\":\"internal\",\"message\":\"failed to serialize error: {}\"}}",
+                    payload.message
+                )
+            })
+        }
+
+        async fn dispatch_tool(
+            &self,
+            call: &HostCallPayload,
+        ) -> std::result::Result<String, String> {
+            let params = &call.params;
+            let tool_name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .ok_or_else(|| {
+                    Self::host_error_json(
+                        HostCallErrorCode::InvalidRequest,
+                        "Missing tool name",
+                        None,
+                        None,
+                    )
+                })?;
+            let input = params
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
+
+            let tool = self.tools.get(tool_name).ok_or_else(|| {
+                Self::host_error_json(
+                    HostCallErrorCode::InvalidRequest,
+                    format!("Unknown tool: {tool_name}"),
+                    Some(json!({ "tool": tool_name })),
+                    None,
+                )
+            })?;
+
+            let output =
+                tool.execute(&call.call_id, input, None)
+                    .await
+                    .map_err(|err| match &err {
+                        Error::Validation(_) => Self::host_error_json(
+                            HostCallErrorCode::InvalidRequest,
+                            err.to_string(),
+                            Some(json!({ "tool": tool_name })),
+                            None,
+                        ),
+                        Error::Tool { .. } | Error::Io(_) => Self::host_error_json(
+                            HostCallErrorCode::Io,
+                            err.to_string(),
+                            Some(json!({ "tool": tool_name })),
+                            None,
+                        ),
+                        Error::Aborted => Self::host_error_json(
+                            HostCallErrorCode::Timeout,
+                            "Tool execution aborted",
+                            Some(json!({ "tool": tool_name })),
+                            Some(true),
+                        ),
+                        _ => Self::host_error_json(
+                            HostCallErrorCode::Internal,
+                            err.to_string(),
+                            Some(json!({ "tool": tool_name })),
+                            None,
+                        ),
+                    })?;
+
+            serde_json::to_string(&output).map_err(|err| {
+                Self::host_error_json(
+                    HostCallErrorCode::Internal,
+                    format!("Failed to serialize tool output: {err}"),
+                    Some(json!({ "tool": tool_name })),
+                    None,
+                )
+            })
+        }
+
+        async fn dispatch_http(
+            &self,
+            call: &HostCallPayload,
+        ) -> std::result::Result<String, String> {
+            let connector_call = crate::connectors::HostCallPayload {
+                call_id: call.call_id.clone(),
+                capability: call.capability.clone(),
+                method: call.method.clone(),
+                params: call.params.clone(),
+                timeout_ms: call.timeout_ms,
+                cancel_token: call.cancel_token.clone(),
+                context: call.context.clone(),
+            };
+
+            let result = self.http.dispatch(&connector_call).await.map_err(|err| {
+                Self::host_error_json(HostCallErrorCode::Internal, err.to_string(), None, None)
+            })?;
+
+            if result.is_error {
+                let error = result.error.as_ref().map_or_else(
+                    || {
+                        Self::host_error_json(
+                            HostCallErrorCode::Internal,
+                            "HTTP connector returned is_error=true but no error payload",
+                            None,
+                            None,
+                        )
+                    },
+                    |payload| {
+                        let code = match payload.code {
+                            crate::connectors::HostCallErrorCode::Timeout => {
+                                HostCallErrorCode::Timeout
+                            }
+                            crate::connectors::HostCallErrorCode::Denied => {
+                                HostCallErrorCode::Denied
+                            }
+                            crate::connectors::HostCallErrorCode::Io => HostCallErrorCode::Io,
+                            crate::connectors::HostCallErrorCode::InvalidRequest => {
+                                HostCallErrorCode::InvalidRequest
+                            }
+                            crate::connectors::HostCallErrorCode::Internal => {
+                                HostCallErrorCode::Internal
+                            }
+                        };
+
+                        Self::host_error_json(
+                            code,
+                            payload.message.clone(),
+                            payload.details.clone(),
+                            payload.retryable,
+                        )
+                    },
+                );
+                return Err(error);
+            }
+
+            serde_json::to_string(&result.output).map_err(|err| {
+                Self::host_error_json(
+                    HostCallErrorCode::Internal,
+                    format!("Failed to serialize HTTP output: {err}"),
+                    None,
+                    None,
+                )
+            })
+        }
+
+        async fn dispatch_exec(
+            &self,
+            call: &HostCallPayload,
+        ) -> std::result::Result<String, String> {
+            // Minimal: map exec -> bash tool (same sandbox semantics).
+            let mut params = call.params.clone();
+            if params.get("command").is_none() {
+                if let (Some(cmd), Some(args)) = (
+                    params.get("cmd").and_then(Value::as_str),
+                    params.get("args").and_then(Value::as_array),
+                ) {
+                    let args_str = args
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    params = json!({ "command": format!("{cmd} {args_str}") });
+                }
+            }
+
+            let bash_call = HostCallPayload {
+                call_id: call.call_id.clone(),
+                capability: call.capability.clone(),
+                method: "tool".to_string(),
+                params: json!({ "name": "bash", "input": params }),
+                timeout_ms: call.timeout_ms,
+                cancel_token: call.cancel_token.clone(),
+                context: call.context.clone(),
+            };
+
+            self.dispatch_tool(&bash_call).await
+        }
+    }
+
+    impl host::Host for HostState {
+        async fn call(
+            &mut self,
+            name: String,
+            input_json: String,
+        ) -> std::result::Result<String, String> {
+            let payload: HostCallPayload = match serde_json::from_str(&input_json) {
+                Ok(value) => value,
+                Err(err) => {
+                    return Err(Self::host_error_json(
+                        HostCallErrorCode::InvalidRequest,
+                        format!("Invalid host_call JSON: {err}"),
+                        None,
+                        None,
+                    ));
+                }
+            };
+
+            if !name.trim().is_empty() && !payload.method.eq_ignore_ascii_case(name.trim()) {
+                return Err(Self::host_error_json(
+                    HostCallErrorCode::InvalidRequest,
+                    "host.call name must match host_call.method",
+                    Some(json!({ "name": name, "method": payload.method })),
+                    None,
+                ));
+            }
+
+            let Some(required) = required_capability_for_host_call(&payload) else {
+                return Err(Self::host_error_json(
+                    HostCallErrorCode::InvalidRequest,
+                    format!("Unknown host_call method: {}", payload.method),
+                    Some(json!({ "method": payload.method })),
+                    None,
+                ));
+            };
+
+            if !payload.capability.trim().eq_ignore_ascii_case(&required) {
+                return Err(Self::host_error_json(
+                    HostCallErrorCode::InvalidRequest,
+                    "Capability mismatch: declared capability does not match derived capability",
+                    Some(json!({
+                        "declared": payload.capability,
+                        "required": required,
+                        "method": payload.method,
+                    })),
+                    None,
+                ));
+            }
+
+            let policy_check = self.policy.evaluate(&required);
+            if policy_check.decision != PolicyDecision::Allow {
+                return Err(Self::host_error_json(
+                    HostCallErrorCode::Denied,
+                    "Capability denied by policy",
+                    Some(json!({
+                        "capability": policy_check.capability,
+                        "decision": format!("{:?}", policy_check.decision),
+                        "reason": policy_check.reason,
+                    })),
+                    None,
+                ));
+            }
+
+            let method = payload.method.trim().to_ascii_lowercase();
+            match method.as_str() {
+                "tool" => self.dispatch_tool(&payload).await,
+                "http" => self.dispatch_http(&payload).await,
+                "exec" => self.dispatch_exec(&payload).await,
+                _ => Err(Self::host_error_json(
+                    HostCallErrorCode::InvalidRequest,
+                    format!("Unsupported host_call method: {method}"),
+                    Some(json!({ "method": method })),
+                    None,
+                )),
+            }
+        }
+    }
+
+    pub struct Instance {
+        store: wasmtime::Store<HostState>,
+        bindings: PiExtension,
+    }
+
+    impl Instance {
+        pub async fn instantiate(
+            engine: &wasmtime::Engine,
+            path: &Path,
+            state: HostState,
+        ) -> Result<Self> {
+            let component = Component::from_file(engine, path).map_err(|err| {
+                Error::extension(format!(
+                    "Failed to load WASM component {}: {err}",
+                    path.display()
+                ))
+            })?;
+
+            let mut linker = Linker::<HostState>::new(engine);
+            host::add_to_linker(&mut linker, |data| data).map_err(|err| {
+                Error::extension(format!("Failed to link WASM host imports: {err}"))
+            })?;
+
+            let mut store = wasmtime::Store::new(engine, state);
+            let bindings = PiExtension::instantiate_async(&mut store, &component, &linker)
+                .await
+                .map_err(|err| {
+                    Error::extension(format!("Failed to instantiate WASM extension: {err}"))
+                })?;
+
+            Ok(Self { store, bindings })
+        }
+
+        pub async fn init(&mut self, manifest_json: &str) -> Result<String> {
+            let result = self
+                .bindings
+                .interface0
+                .call_init(&mut self.store, manifest_json)
+                .await
+                .map_err(|err| Error::extension(format!("WASM init failed: {err}")))?;
+
+            result.map_err(Error::extension)
+        }
+
+        pub async fn handle_tool(&mut self, name: &str, input_json: &str) -> Result<String> {
+            let result = self
+                .bindings
+                .interface0
+                .call_handle_tool(&mut self.store, name, input_json)
+                .await
+                .map_err(|err| Error::extension(format!("WASM handle-tool failed: {err}")))?;
+
+            result.map_err(Error::extension)
+        }
+
+        pub async fn handle_slash(
+            &mut self,
+            command: &str,
+            args: &[String],
+            input_json: &str,
+        ) -> Result<String> {
+            let result = self
+                .bindings
+                .interface0
+                .call_handle_slash(&mut self.store, command, args, input_json)
+                .await
+                .map_err(|err| Error::extension(format!("WASM handle-slash failed: {err}")))?;
+
+            result.map_err(Error::extension)
+        }
+
+        pub async fn handle_event(&mut self, event_json: &str) -> Result<String> {
+            let result = self
+                .bindings
+                .interface0
+                .call_handle_event(&mut self.store, event_json)
+                .await
+                .map_err(|err| Error::extension(format!("WASM handle-event failed: {err}")))?;
+
+            result.map_err(Error::extension)
+        }
+
+        pub async fn shutdown(&mut self) -> Result<()> {
+            self.bindings
+                .interface0
+                .call_shutdown(&mut self.store)
+                .await
+                .map_err(|err| Error::extension(format!("WASM shutdown failed: {err}")))?;
+            Ok(())
+        }
+    }
 }
 
+#[cfg(feature = "wasm-host")]
+pub struct WasmExtensionHost {
+    policy: ExtensionPolicy,
+    cwd: PathBuf,
+    engine: wasmtime::Engine,
+}
+
+#[cfg(feature = "wasm-host")]
 impl WasmExtensionHost {
-    pub const fn new(policy: ExtensionPolicy) -> Self {
-        Self { policy }
+    pub fn new(cwd: &Path, policy: ExtensionPolicy) -> Result<Self> {
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        config.async_support(true);
+
+        let engine = wasmtime::Engine::new(&config)
+            .map_err(|err| Error::extension(format!("Failed to create WASM engine: {err}")))?;
+
+        Ok(Self {
+            policy,
+            cwd: cwd.to_path_buf(),
+            engine,
+        })
     }
 
     pub const fn policy(&self) -> &ExtensionPolicy {
@@ -1990,10 +2416,13 @@ impl WasmExtensionHost {
         })
     }
 
-    pub fn instantiate(&self, _extension: &WasmExtension) -> Result<()> {
-        Err(Error::validation(
-            "WASM host not enabled yet. Scaffold only.",
-        ))
+    pub async fn instantiate(&self, extension: &WasmExtension) -> Result<wasm_host::Instance> {
+        wasm_host::Instance::instantiate(
+            &self.engine,
+            &extension.path,
+            wasm_host::HostState::new(self.policy.clone(), self.cwd.clone()),
+        )
+        .await
     }
 }
 
@@ -2047,6 +2476,842 @@ impl std::fmt::Display for ExtensionEventName {
     }
 }
 
+// ============================================================================
+// JS Extension Runtime (QuickJS via PiJsRuntime)
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct JsExtensionLoadSpec {
+    pub extension_id: String,
+    pub entry_path: PathBuf,
+    pub name: String,
+    pub version: String,
+    pub api_version: String,
+}
+
+impl JsExtensionLoadSpec {
+    pub fn from_entry_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(Error::validation(format!(
+                "Extension entry does not exist: {}",
+                path.display()
+            )));
+        }
+
+        let entry_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+        let file_stem = entry_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if file_stem.is_empty() {
+            return Err(Error::validation(format!(
+                "Extension entry has no filename: {}",
+                entry_path.display()
+            )));
+        }
+
+        let extension_id = if file_stem == "index" {
+            entry_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        } else {
+            file_stem
+        };
+
+        if extension_id.is_empty() {
+            return Err(Error::validation(format!(
+                "Could not derive extension id from entry path: {}",
+                entry_path.display()
+            )));
+        }
+
+        let mut name = extension_id.clone();
+        let mut version = "0.0.0".to_string();
+
+        if let Some(parent) = entry_path.parent() {
+            let manifest_path = parent.join("package.json");
+            if manifest_path.exists() {
+                if let Ok(raw) = fs::read_to_string(&manifest_path) {
+                    if let Ok(json) = serde_json::from_str::<Value>(&raw) {
+                        if let Some(manifest_name) = json.get("name").and_then(Value::as_str) {
+                            if !manifest_name.trim().is_empty() {
+                                name = manifest_name.trim().to_string();
+                            }
+                        }
+                        if let Some(manifest_version) = json.get("version").and_then(Value::as_str)
+                        {
+                            if !manifest_version.trim().is_empty() {
+                                version = manifest_version.trim().to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            extension_id,
+            entry_path,
+            name,
+            version,
+            api_version: PROTOCOL_VERSION.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JsExtensionSnapshot {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    api_version: String,
+    #[serde(default)]
+    tools: Vec<Value>,
+    #[serde(default)]
+    slash_commands: Vec<Value>,
+    #[serde(default)]
+    providers: Vec<Value>,
+    #[serde(default)]
+    event_hooks: Vec<String>,
+    #[serde(default)]
+    active_tools: Option<Vec<String>>,
+}
+
+#[derive(Clone)]
+struct JsRuntimeHost {
+    tools: Arc<ToolRegistry>,
+    manager: ExtensionManager,
+    http: Arc<HttpConnector>,
+}
+
+#[derive(Debug)]
+enum JsRuntimeCommand {
+    LoadExtensions {
+        specs: Vec<JsExtensionLoadSpec>,
+        reply: oneshot::Sender<Result<Vec<JsExtensionSnapshot>>>,
+    },
+    DispatchEvent {
+        event_name: String,
+        event_payload: Value,
+        ctx_payload: Value,
+        timeout_ms: u64,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    ExecuteTool {
+        tool_name: String,
+        tool_call_id: String,
+        input: Value,
+        ctx_payload: Value,
+        timeout_ms: u64,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    ExecuteCommand {
+        command_name: String,
+        args: String,
+        ctx_payload: Value,
+        timeout_ms: u64,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+}
+
+#[derive(Clone)]
+pub struct JsExtensionRuntimeHandle {
+    sender: mpsc::Sender<JsRuntimeCommand>,
+}
+
+impl JsExtensionRuntimeHandle {
+    pub async fn start(
+        config: PiJsRuntimeConfig,
+        tools: Arc<ToolRegistry>,
+        manager: ExtensionManager,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::channel(32);
+        let (init_tx, init_rx) = oneshot::channel();
+        let host = JsRuntimeHost {
+            tools,
+            manager,
+            http: Arc::new(HttpConnector::with_defaults()),
+        };
+
+        thread::spawn(move || {
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("extension runtime build");
+            runtime.block_on(async move {
+                let cx = Cx::for_request();
+                let init =
+                    PiJsRuntime::with_clock_and_config(crate::scheduler::WallClock, config).await;
+                let js_runtime = match init {
+                    Ok(runtime) => {
+                        let _ = init_tx.send(&cx, Ok(()));
+                        runtime
+                    }
+                    Err(err) => {
+                        let _ = init_tx.send(&cx, Err(err));
+                        return;
+                    }
+                };
+
+                while let Ok(cmd) = rx.recv(&cx).await {
+                    match cmd {
+                        JsRuntimeCommand::LoadExtensions { specs, reply } => {
+                            let result = load_all_extensions(&js_runtime, &host, &specs).await;
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::DispatchEvent {
+                            event_name,
+                            event_payload,
+                            ctx_payload,
+                            timeout_ms,
+                            reply,
+                        } => {
+                            let result = dispatch_extension_event(
+                                &js_runtime,
+                                &host,
+                                &event_name,
+                                event_payload,
+                                ctx_payload,
+                                timeout_ms,
+                            )
+                            .await;
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::ExecuteTool {
+                            tool_name,
+                            tool_call_id,
+                            input,
+                            ctx_payload,
+                            timeout_ms,
+                            reply,
+                        } => {
+                            let result = execute_extension_tool(
+                                &js_runtime,
+                                &host,
+                                &tool_name,
+                                &tool_call_id,
+                                input,
+                                ctx_payload,
+                                timeout_ms,
+                            )
+                            .await;
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::ExecuteCommand {
+                            command_name,
+                            args,
+                            ctx_payload,
+                            timeout_ms,
+                            reply,
+                        } => {
+                            let result = execute_extension_command(
+                                &js_runtime,
+                                &host,
+                                &command_name,
+                                &args,
+                                ctx_payload,
+                                timeout_ms,
+                            )
+                            .await;
+                            let _ = reply.send(&cx, result);
+                        }
+                    }
+                }
+            });
+        });
+
+        let cx = Cx::for_request();
+        init_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime init cancelled"))??;
+
+        Ok(Self { sender: tx })
+    }
+
+    async fn load_extensions_snapshots(
+        &self,
+        specs: Vec<JsExtensionLoadSpec>,
+    ) -> Result<Vec<JsExtensionSnapshot>> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::LoadExtensions {
+                    specs,
+                    reply: reply_tx,
+                },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn load_all_extensions(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    specs: &[JsExtensionLoadSpec],
+) -> Result<Vec<JsExtensionSnapshot>> {
+    for spec in specs {
+        load_one_extension(runtime, host, spec).await?;
+    }
+    snapshot_extensions(runtime).await
+}
+
+#[allow(clippy::future_not_send)]
+async fn load_one_extension(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    spec: &JsExtensionLoadSpec,
+) -> Result<()> {
+    let entry_specifier = spec.entry_path.display().to_string();
+    let meta = json!({
+        "name": spec.name,
+        "version": spec.version,
+        "apiVersion": spec.api_version,
+    });
+    let task_id = format!("task-load-{}", Uuid::new_v4());
+
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let load_fn: rquickjs::Function<'_> = global.get("__pi_load_extension")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let meta_value = json_to_js(&ctx, &meta)?;
+            let promise: rquickjs::Value<'_> =
+                load_fn.call((spec.extension_id.clone(), entry_specifier, meta_value))?;
+            let _task: String = task_start.call((task_id.clone(), promise))?;
+            Ok(())
+        })
+        .await?;
+
+    let _ = await_js_task(runtime, host, &task_id, Duration::from_secs(10)).await?;
+    Ok(())
+}
+
+#[allow(clippy::future_not_send)]
+async fn snapshot_extensions(runtime: &PiJsRuntime) -> Result<Vec<JsExtensionSnapshot>> {
+    let json = runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let snapshot_fn: rquickjs::Function<'_> = global.get("__pi_snapshot_extensions")?;
+            let value: rquickjs::Value<'_> = snapshot_fn.call(())?;
+            js_to_json(&value)
+        })
+        .await?;
+
+    let snapshots: Vec<JsExtensionSnapshot> =
+        serde_json::from_value(json).map_err(|err| Error::extension(err.to_string()))?;
+    Ok(snapshots)
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_extension_event(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    event_name: &str,
+    event_payload: Value,
+    ctx_payload: Value,
+    timeout_ms: u64,
+) -> Result<Value> {
+    let task_id = format!("task-event-{}", Uuid::new_v4());
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let dispatch_fn: rquickjs::Function<'_> =
+                global.get("__pi_dispatch_extension_event")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let event_js = json_to_js(&ctx, &event_payload)?;
+            let ctx_js = json_to_js(&ctx, &ctx_payload)?;
+            let promise: rquickjs::Value<'_> =
+                dispatch_fn.call((event_name.to_string(), event_js, ctx_js))?;
+            let _task: String = task_start.call((task_id.clone(), promise))?;
+            Ok(())
+        })
+        .await?;
+
+    await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await
+}
+
+#[allow(clippy::future_not_send)]
+async fn execute_extension_tool(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    tool_name: &str,
+    tool_call_id: &str,
+    input: Value,
+    ctx_payload: Value,
+    timeout_ms: u64,
+) -> Result<Value> {
+    let task_id = format!("task-tool-{}", Uuid::new_v4());
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_tool")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let input_js = json_to_js(&ctx, &input)?;
+            let ctx_js = json_to_js(&ctx, &ctx_payload)?;
+            let promise: rquickjs::Value<'_> = exec_fn.call((
+                tool_name.to_string(),
+                tool_call_id.to_string(),
+                input_js,
+                ctx_js,
+            ))?;
+            let _task: String = task_start.call((task_id.clone(), promise))?;
+            Ok(())
+        })
+        .await?;
+
+    await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await
+}
+
+#[allow(clippy::future_not_send)]
+async fn execute_extension_command(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    command_name: &str,
+    args: &str,
+    ctx_payload: Value,
+    timeout_ms: u64,
+) -> Result<Value> {
+    let task_id = format!("task-cmd-{}", Uuid::new_v4());
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_command")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let ctx_js = json_to_js(&ctx, &ctx_payload)?;
+            let promise: rquickjs::Value<'_> =
+                exec_fn.call((command_name.to_string(), args.to_string(), ctx_js))?;
+            let _task: String = task_start.call((task_id.clone(), promise))?;
+            Ok(())
+        })
+        .await?;
+
+    await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await
+}
+
+#[derive(Debug, Deserialize)]
+struct JsTaskState {
+    status: String,
+    #[serde(default)]
+    value: Option<Value>,
+    #[serde(default)]
+    error: Option<JsTaskError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsTaskError {
+    #[serde(default)]
+    code: Option<String>,
+    message: String,
+    #[serde(default)]
+    stack: Option<String>,
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> HostcallOutcome {
+    match request.kind {
+        HostcallKind::Tool { name } => {
+            dispatch_hostcall_tool(&host.tools, &request.call_id, &name, request.payload).await
+        }
+        HostcallKind::Exec { cmd } => {
+            dispatch_hostcall_exec(&request.call_id, &cmd, request.payload).await
+        }
+        HostcallKind::Http => {
+            dispatch_hostcall_http(&request.call_id, &host.http, request.payload).await
+        }
+        HostcallKind::Session { op } => {
+            dispatch_hostcall_session(&request.call_id, &host.manager, &op, request.payload).await
+        }
+        HostcallKind::Ui { op } => {
+            dispatch_hostcall_ui(&request.call_id, &host.manager, &op, request.payload).await
+        }
+        HostcallKind::Events { op } => {
+            dispatch_hostcall_events(&request.call_id, &host.manager, &op, request.payload).await
+        }
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall_tool(
+    tools: &ToolRegistry,
+    call_id: &str,
+    name: &str,
+    payload: Value,
+) -> HostcallOutcome {
+    let Some(tool) = tools.get(name) else {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: format!("Unknown tool: {name}"),
+        };
+    };
+
+    match tool.execute(call_id, payload, None).await {
+        Ok(output) => match serde_json::to_value(output) {
+            Ok(value) => HostcallOutcome::Success(value),
+            Err(err) => HostcallOutcome::Error {
+                code: "internal".to_string(),
+                message: format!("Serialize tool output: {err}"),
+            },
+        },
+        Err(err) => HostcallOutcome::Error {
+            code: "tool_error".to_string(),
+            message: err.to_string(),
+        },
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall_exec(_call_id: &str, cmd: &str, payload: Value) -> HostcallOutcome {
+    let args = payload
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map_or_else(|| v.to_string(), ToString::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let options = payload.get("options").cloned().unwrap_or_else(|| json!({}));
+    let cwd = options
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let timeout_ms = options
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| options.get("timeoutMs").and_then(Value::as_u64));
+
+    let cmd = cmd.to_string();
+    let (tx, rx) = oneshot::channel();
+    thread::spawn(move || {
+        let result = Command::new(&cmd)
+            .args(&args)
+            .current_dir(cwd.unwrap_or_else(|| PathBuf::from(".")))
+            .output()
+            .map_err(|err| err.to_string())
+            .map(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let exit_code = output.status.code().unwrap_or(-1);
+                json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exitCode": exit_code,
+                })
+            });
+        let cx = Cx::for_request();
+        let _ = tx.send(&cx, result);
+    });
+
+    let cx = Cx::for_request();
+    let result = if let Some(timeout_ms) = timeout_ms {
+        match timeout(wall_now(), Duration::from_millis(timeout_ms), rx.recv(&cx)).await {
+            Ok(Ok(res)) => Ok(res),
+            Ok(Err(_)) => Err(Error::extension("exec task cancelled")),
+            Err(_) => Err(Error::extension("exec timeout")),
+        }
+    } else {
+        rx.recv(&cx)
+            .await
+            .map_err(|_| Error::extension("exec task cancelled"))
+    };
+
+    match result {
+        Ok(Ok(value)) => HostcallOutcome::Success(value),
+        Ok(Err(err)) => HostcallOutcome::Error {
+            code: "io".to_string(),
+            message: err,
+        },
+        Err(err) => HostcallOutcome::Error {
+            code: "timeout".to_string(),
+            message: err.to_string(),
+        },
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall_http(
+    call_id: &str,
+    connector: &HttpConnector,
+    payload: Value,
+) -> HostcallOutcome {
+    let call = crate::connectors::HostCallPayload {
+        call_id: call_id.to_string(),
+        capability: "http".to_string(),
+        method: "http".to_string(),
+        params: payload,
+        timeout_ms: None,
+        cancel_token: None,
+        context: None,
+    };
+
+    match connector.dispatch(&call).await {
+        Ok(result) => {
+            if result.is_error {
+                let message = result.error.as_ref().map_or_else(
+                    || "HTTP connector error".to_string(),
+                    |err| err.message.clone(),
+                );
+                let code = result
+                    .error
+                    .as_ref()
+                    .map_or("internal", |err| hostcall_code_to_str(err.code));
+                HostcallOutcome::Error {
+                    code: code.to_string(),
+                    message,
+                }
+            } else {
+                HostcallOutcome::Success(result.output)
+            }
+        }
+        Err(err) => HostcallOutcome::Error {
+            code: "internal".to_string(),
+            message: err.to_string(),
+        },
+    }
+}
+
+const fn hostcall_code_to_str(code: crate::connectors::HostCallErrorCode) -> &'static str {
+    match code {
+        crate::connectors::HostCallErrorCode::Timeout => "timeout",
+        crate::connectors::HostCallErrorCode::Denied => "denied",
+        crate::connectors::HostCallErrorCode::Io => "io",
+        crate::connectors::HostCallErrorCode::InvalidRequest => "invalid_request",
+        crate::connectors::HostCallErrorCode::Internal => "internal",
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall_session(
+    _call_id: &str,
+    manager: &ExtensionManager,
+    op: &str,
+    payload: Value,
+) -> HostcallOutcome {
+    let Some(session) = manager.session_handle() else {
+        return HostcallOutcome::Error {
+            code: "denied".to_string(),
+            message: "No session configured".to_string(),
+        };
+    };
+
+    let op_norm = op.trim().to_ascii_lowercase();
+    let result = match op_norm.as_str() {
+        "get_state" | "getstate" => Ok(session.get_state().await),
+        "get_messages" | "getmessages" => serde_json::to_value(session.get_messages().await)
+            .map_err(|err| Error::extension(format!("Serialize messages: {err}"))),
+        "get_entries" | "getentries" => serde_json::to_value(session.get_entries().await)
+            .map_err(|err| Error::extension(format!("Serialize entries: {err}"))),
+        "get_branch" | "getbranch" => serde_json::to_value(session.get_branch().await)
+            .map_err(|err| Error::extension(format!("Serialize branch: {err}"))),
+        "set_name" | "setname" => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            session.set_name(name).await.map(|()| Value::Null)
+        }
+        "append_entry" | "appendentry" => {
+            let custom_type = payload
+                .get("customType")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("custom_type").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            let data = payload.get("data").cloned();
+            session
+                .append_custom_entry(custom_type, data)
+                .await
+                .map(|()| Value::Null)
+        }
+        _ => Err(Error::extension(format!("Unknown session op: {op}"))),
+    };
+
+    match result {
+        Ok(value) => HostcallOutcome::Success(value),
+        Err(err) => HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: err.to_string(),
+        },
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall_ui(
+    call_id: &str,
+    manager: &ExtensionManager,
+    op: &str,
+    payload: Value,
+) -> HostcallOutcome {
+    let request = ExtensionUiRequest {
+        id: call_id.to_string(),
+        method: op.to_string(),
+        payload,
+        timeout_ms: None,
+    };
+
+    match manager.request_ui(request).await {
+        Ok(Some(response)) => HostcallOutcome::Success(response.value.unwrap_or(Value::Null)),
+        Ok(None) => HostcallOutcome::Success(Value::Null),
+        Err(err) => HostcallOutcome::Error {
+            code: "io".to_string(),
+            message: err.to_string(),
+        },
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall_events(
+    _call_id: &str,
+    manager: &ExtensionManager,
+    op: &str,
+    payload: Value,
+) -> HostcallOutcome {
+    let op_norm = op.trim().to_ascii_lowercase();
+    match op_norm.as_str() {
+        "setactivetools" | "set_active_tools" => {
+            let tools = payload
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            manager.set_active_tools(tools);
+            HostcallOutcome::Success(Value::Null)
+        }
+        "appendentry" | "append_entry" => {
+            let Some(session) = manager.session_handle() else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "No session configured".to_string(),
+                };
+            };
+            let custom_type = payload
+                .get("customType")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("custom_type").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            let data = payload.get("data").cloned();
+            match session.append_custom_entry(custom_type, data).await {
+                Ok(()) => HostcallOutcome::Success(Value::Null),
+                Err(err) => HostcallOutcome::Error {
+                    code: "io".to_string(),
+                    message: err.to_string(),
+                },
+            }
+        }
+        _ => HostcallOutcome::Success(Value::Null),
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn await_js_task(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    task_id: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let start = Instant::now();
+
+    loop {
+        if start.elapsed() > timeout {
+            return Err(Error::extension(format!(
+                "JS task timed out after {}ms",
+                timeout.as_millis()
+            )));
+        }
+
+        let mut pending = runtime.drain_hostcall_requests();
+        while let Some(req) = pending.pop_front() {
+            let call_id = req.call_id.clone();
+            let outcome = dispatch_hostcall(host, req).await;
+            runtime.complete_hostcall(call_id, outcome);
+        }
+
+        let _ = runtime.tick().await?;
+        let _ = runtime.drain_microtasks().await?;
+
+        let state_json = runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let take_fn: rquickjs::Function<'_> = global.get("__pi_task_take")?;
+                let value: rquickjs::Value<'_> = take_fn.call((task_id.to_string(),))?;
+                js_to_json(&value)
+            })
+            .await?;
+
+        if state_json.is_null() {
+            return Err(Error::extension("JS task state missing".to_string()));
+        }
+
+        let state: JsTaskState =
+            serde_json::from_value(state_json).map_err(|err| Error::extension(err.to_string()))?;
+
+        match state.status.as_str() {
+            "pending" => {
+                if !runtime.has_pending() {
+                    sleep(wall_now(), Duration::from_millis(1)).await;
+                }
+            }
+            "resolved" => return Ok(state.value.unwrap_or(Value::Null)),
+            "rejected" => {
+                let err = state.error.unwrap_or_else(|| JsTaskError {
+                    code: None,
+                    message: "Unknown JS task error".to_string(),
+                    stack: None,
+                });
+                let mut message = err.message;
+                if let Some(code) = err.code {
+                    message = format!("{code}: {message}");
+                }
+                if let Some(stack) = err.stack {
+                    if !stack.is_empty() {
+                        message.push('\n');
+                        message.push_str(&stack);
+                    }
+                }
+                return Err(Error::extension(message));
+            }
+            other => {
+                return Err(Error::extension(format!(
+                    "Unexpected JS task status: {other}"
+                )));
+            }
+        }
+
+        sleep(wall_now(), Duration::from_millis(0)).await;
+    }
+}
+
 /// Extension manager for handling loaded extensions.
 #[derive(Clone)]
 pub struct ExtensionManager {
@@ -2056,6 +3321,7 @@ pub struct ExtensionManager {
 #[derive(Default)]
 struct ExtensionManagerInner {
     extensions: Vec<RegisterPayload>,
+    js_runtime: Option<JsExtensionRuntimeHandle>,
     ui_sender: Option<mpsc::Sender<ExtensionUiRequest>>,
     pending_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
     session: Option<Arc<dyn ExtensionSession>>,
@@ -2087,9 +3353,78 @@ impl ExtensionManager {
         guard.ui_sender = Some(sender);
     }
 
+    pub fn set_js_runtime(&self, runtime: JsExtensionRuntimeHandle) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.js_runtime = Some(runtime);
+    }
+
+    pub fn js_runtime(&self) -> Option<JsExtensionRuntimeHandle> {
+        let guard = self.inner.lock().unwrap();
+        guard.js_runtime.clone()
+    }
+
+    pub async fn load_js_extensions(&self, specs: Vec<JsExtensionLoadSpec>) -> Result<()> {
+        let runtime = self
+            .js_runtime()
+            .ok_or_else(|| Error::extension("JS extension runtime not configured"))?;
+
+        let snapshots = runtime.load_extensions_snapshots(specs).await?;
+
+        let mut payloads = Vec::new();
+        let mut active_tools: Option<Vec<String>> = None;
+        for snapshot in snapshots {
+            let JsExtensionSnapshot {
+                id,
+                name,
+                version,
+                api_version,
+                tools,
+                slash_commands,
+                providers,
+                event_hooks,
+                active_tools: ext_active_tools,
+            } = snapshot;
+            let _ = providers;
+            if let Some(list) = ext_active_tools {
+                active_tools = Some(list);
+            }
+            payloads.push(RegisterPayload {
+                name: if name.is_empty() { id } else { name },
+                version,
+                api_version: if api_version.is_empty() {
+                    PROTOCOL_VERSION.to_string()
+                } else {
+                    api_version
+                },
+                capabilities: Vec::new(),
+                capability_manifest: None,
+                tools,
+                slash_commands,
+                event_hooks,
+            });
+        }
+
+        {
+            let mut guard = self.inner.lock().unwrap();
+            guard.extensions = payloads;
+            guard.active_tools = active_tools;
+        }
+        Ok(())
+    }
+
     pub fn set_session(&self, session: Arc<dyn ExtensionSession>) {
         let mut guard = self.inner.lock().unwrap();
         guard.session = Some(session);
+    }
+
+    pub fn session_handle(&self) -> Option<Arc<dyn ExtensionSession>> {
+        let guard = self.inner.lock().unwrap();
+        guard.session.clone()
+    }
+
+    pub fn set_active_tools(&self, tools: Vec<String>) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.active_tools = Some(tools);
     }
 
     pub fn register(&self, payload: RegisterPayload) {

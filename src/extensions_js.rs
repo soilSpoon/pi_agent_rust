@@ -1375,7 +1375,11 @@ export default { fileURLToPath };
         "node:os".to_string(),
         r#"
 export function homedir() {
-  return "/home/unknown";
+  const home =
+    globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
+      ? globalThis.pi.env.get("HOME")
+      : undefined;
+  return home || "/home/unknown";
 }
 export default { homedir };
 "#
@@ -2199,7 +2203,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let env = env.clone();
                         move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
-                            tracing::debug!(event = "pijs.env.get", key = %key, "env get");
+                            let allowed = key == "HOME"
+                                || key == "OSTYPE"
+                                || key == "OS"
+                                || key.starts_with("PI_");
+                            tracing::debug!(
+                                event = "pijs.env.get",
+                                key = %key,
+                                allowed,
+                                "env get"
+                            );
+                            if !allowed {
+                                return Ok(None);
+                            }
                             Ok(env.get(&key).cloned())
                         }
                     }),
@@ -3147,6 +3163,9 @@ pi.process = {
     args: __pi_process_args_native(),
 };
 
+try { Object.freeze(pi.process.args); } catch (_) {}
+try { Object.freeze(pi.process); } catch (_) {}
+
 pi.path = {
     join: __pi_path_join,
     basename: __pi_path_basename,
@@ -3455,6 +3474,10 @@ if (typeof globalThis.process === 'undefined') {
             throw new Error('process.exit is not available in PiJS');
         },
     };
+
+    try { Object.freeze(envProxy); } catch (_) {}
+    try { Object.freeze(globalThis.process.argv); } catch (_) {}
+    try { Object.freeze(globalThis.process); } catch (_) {}
 }
 
 if (typeof globalThis.setTimeout !== 'function') {
@@ -4111,6 +4134,10 @@ mod tests {
             let mut env = HashMap::new();
             env.insert("HOME".to_string(), "/virtual/home".to_string());
             env.insert("PI_IMAGE_SAVE_MODE".to_string(), "tmp".to_string());
+            env.insert(
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "nope-do-not-expose".to_string(),
+            );
             let config = PiJsRuntimeConfig {
                 cwd: "/virtual/cwd".to_string(),
                 args: vec!["--flag".to_string()],
@@ -4127,6 +4154,9 @@ mod tests {
                     globalThis.home = pi.env.get("HOME");
                     globalThis.mode = pi.env.get("PI_IMAGE_SAVE_MODE");
                     globalThis.missing_is_undefined = (pi.env.get("NOPE") === undefined);
+                    globalThis.secret_is_undefined = (pi.env.get("AWS_SECRET_ACCESS_KEY") === undefined);
+                    globalThis.process_secret_is_undefined = (process.env.AWS_SECRET_ACCESS_KEY === undefined);
+                    globalThis.secret_in_env = ("AWS_SECRET_ACCESS_KEY" in process.env);
                     "#,
                 )
                 .await
@@ -4143,6 +4173,18 @@ mod tests {
             assert_eq!(
                 get_global_json(&runtime, "missing_is_undefined").await,
                 serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "secret_is_undefined").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "process_secret_is_undefined").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "secret_in_env").await,
+                serde_json::json!(false)
             );
         });
     }
@@ -4166,6 +4208,12 @@ mod tests {
                     r#"
                     globalThis.cwd = pi.process.cwd;
                     globalThis.args = pi.process.args;
+                    globalThis.pi_process_is_frozen = Object.isFrozen(pi.process);
+                    globalThis.pi_args_is_frozen = Object.isFrozen(pi.process.args);
+                    try { pi.process.cwd = "/hacked"; } catch (_) {}
+                    try { pi.process.args.push("c"); } catch (_) {}
+                    globalThis.cwd_after_mut = pi.process.cwd;
+                    globalThis.args_after_mut = pi.process.args;
 
                     globalThis.joined = pi.path.join("/a", "b", "..", "c");
                     globalThis.base = pi.path.basename("/a/b/c.txt");
@@ -4188,6 +4236,22 @@ mod tests {
             );
             assert_eq!(
                 get_global_json(&runtime, "args").await,
+                serde_json::json!(["a", "b"])
+            );
+            assert_eq!(
+                get_global_json(&runtime, "pi_process_is_frozen").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "pi_args_is_frozen").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "cwd_after_mut").await,
+                serde_json::json!("/virtual/cwd")
+            );
+            assert_eq!(
+                get_global_json(&runtime, "args_after_mut").await,
                 serde_json::json!(["a", "b"])
             );
 

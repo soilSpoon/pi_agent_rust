@@ -393,6 +393,20 @@ impl Config {
             .unwrap_or(true)
     }
 
+    pub fn terminal_show_images(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .and_then(|t| t.show_images)
+            .unwrap_or(true)
+    }
+
+    pub fn terminal_clear_on_shrink(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .and_then(|t| t.clear_on_shrink)
+            .unwrap_or(false)
+    }
+
     pub fn thinking_budget(&self, level: &str) -> u32 {
         let budgets = self.thinking_budgets.as_ref();
         match level {

@@ -354,9 +354,13 @@ fn resume_with_picker_creates_new_session_when_project_dir_missing() {
     let _guard = CurrentDirGuard::new(&cwd);
 
     let session = run_async(async {
-        Session::resume_with_picker(Some(&base_dir), &Config::default(), None)
-            .await
-            .expect("resume")
+        Box::pin(Session::resume_with_picker(
+            Some(&base_dir),
+            &Config::default(),
+            None,
+        ))
+        .await
+        .expect("resume")
     });
     harness.log().info_ctx("verify", "resume result", |ctx| {
         ctx.push((
@@ -383,9 +387,13 @@ fn resume_with_picker_creates_new_session_when_sessions_empty() {
     std::fs::create_dir_all(&project_dir).expect("create project dir");
 
     let session = run_async(async {
-        Session::resume_with_picker(Some(&base_dir), &Config::default(), None)
-            .await
-            .expect("resume")
+        Box::pin(Session::resume_with_picker(
+            Some(&base_dir),
+            &Config::default(),
+            None,
+        ))
+        .await
+        .expect("resume")
     });
     harness.log().info_ctx("verify", "resume result", |ctx| {
         ctx.push((
@@ -422,9 +430,13 @@ fn resume_with_picker_selects_session_with_override_input() {
     let second_path = create_session(&harness, &base_dir, &cwd, "second");
 
     let session = run_async(async {
-        Session::resume_with_picker(Some(&base_dir), &Config::default(), Some("2".to_string()))
-            .await
-            .expect("resume")
+        Box::pin(Session::resume_with_picker(
+            Some(&base_dir),
+            &Config::default(),
+            Some("2".to_string()),
+        ))
+        .await
+        .expect("resume")
     });
 
     harness.log().info_ctx("verify", "selected session", |ctx| {

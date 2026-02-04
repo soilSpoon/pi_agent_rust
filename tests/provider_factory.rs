@@ -108,6 +108,37 @@ fn normalize_openai_base_preserves_responses() {
 }
 
 #[test]
+fn normalize_openai_base_trims_trailing_slash_for_chat_completions() {
+    let harness =
+        TestHarness::new("normalize_openai_base_trims_trailing_slash_for_chat_completions");
+    let input = "https://api.openai.com/v1/chat/completions/";
+    let expected = "https://api.openai.com/v1/chat/completions";
+    harness
+        .log()
+        .info_ctx("normalize", "chat completions trailing slash", |ctx| {
+            ctx.push(("input".to_string(), input.to_string()));
+            ctx.push(("expected".to_string(), expected.to_string()));
+        });
+    let normalized = normalize_openai_base(input);
+    assert_eq!(normalized, expected);
+}
+
+#[test]
+fn normalize_openai_base_trims_trailing_slash_for_responses() {
+    let harness = TestHarness::new("normalize_openai_base_trims_trailing_slash_for_responses");
+    let input = "https://api.openai.com/v1/responses/";
+    let expected = "https://api.openai.com/v1/responses";
+    harness
+        .log()
+        .info_ctx("normalize", "responses trailing slash", |ctx| {
+            ctx.push(("input".to_string(), input.to_string()));
+            ctx.push(("expected".to_string(), expected.to_string()));
+        });
+    let normalized = normalize_openai_base(input);
+    assert_eq!(normalized, expected);
+}
+
+#[test]
 fn create_provider_for_anthropic() {
     let harness = TestHarness::new("create_provider_for_anthropic");
     let entry = make_model_entry(

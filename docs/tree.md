@@ -1,39 +1,60 @@
-# Tree Navigation
+# Session Tree Navigation
 
-Pi sessions are trees, not just flat lists. You can branch the conversation at any point.
+Pi sessions are **trees**, not flat message lists. Every entry has an `id` and optional `parentId`, and the session tracks a current **leaf** pointer (your current position in the tree).
 
-## Concepts
+Use `/tree` to navigate the session tree and switch the leaf.
 
-- **Branching**: Occurs when you reply to a message that is not the current leaf.
-- **Tree Navigator**: The `/tree` command helps you visualize and traverse these branches.
+## `/tree` vs `/fork`
 
-## Usage
+| Feature | `/tree` | `/fork` |
+|---------|---------|---------|
+| Changes | Leaf pointer in the **same session file** | Creates a **new session file** from a chosen point |
+| Best for | Quick branch switching / exploring alternatives | Spinning off a tangent into its own session |
+| Summary | Optional branch summarization prompt | No branch summarization prompt |
 
-Run `/tree` to open the navigator.
+## Tree UI
 
-```bash
-/tree
-```
+The tree UI shows a depth-first list with indentation, and marks the current leaf with `← active`.
 
 ### Controls
 
-- **Up/Down**: Move selection.
-- **Enter**: Switch to the selected node.
-- **Escape**: Cancel.
-- **Ctrl+U**: Toggle "User Only" mode (hides assistant messages and tool calls for a cleaner view).
-- **Ctrl+O**: Toggle "Show All" (includes hidden/system entries).
+| Key | Action |
+|-----|--------|
+| ↑/↓ | Move selection |
+| Enter | Select node |
+| Escape / Ctrl+C | Cancel |
+| Ctrl+U | Toggle “user messages only” (hide assistant/tool entries for a cleaner view) |
+| Ctrl+O | Toggle “show all” (include hidden system-ish entries like labels/custom) |
 
-### Selection Behavior
+### Selection behavior
 
-- **Selecting a Leaf**: Switches context to that point in the conversation.
-- **Selecting a Non-Leaf**: Switches context to that point. If you then type a message, a new branch is created.
-- **Selecting a User Message**: Pre-fills the editor with that message text, allowing you to edit and resubmit (creating a branch).
+Pi has two distinct selection modes depending on what you select:
 
-## Forking vs Tree Switching
+1) **User message (or custom message)**
+   - Leaf is set to the **parent** of the selected node (or `null` if the selected node is the root).
+   - The selected text is placed into the editor so you can edit + re-submit, creating a new branch.
 
-- **Tree Switching** (`/tree`): Stays in the **same session file**. Useful for quick experiments or retries.
-- **Forking** (`/fork`): Creates a **new session file** starting from the current branch. Useful when a tangent becomes a substantial conversation of its own.
+2) **Non-user message (assistant/tool/compaction/etc.)**
+   - Leaf is set to the **selected node**.
+   - The editor remains unchanged/empty; you continue from that point.
 
-## Branch Summarization
+## Branch summarization
 
-When you switch branches, Pi may offer to summarize the path you are leaving. This summary is stored as a `branch_summary` entry, helping the model understand context if you ever switch back or reference that branch.
+When switching branches, Pi may offer to summarize the branch you’re leaving. The prompt offers:
+
+1) **No summary**
+2) **Summarize**
+3) **Summarize with custom prompt** (opens a small input box for extra focus instructions)
+
+### Prompt controls
+
+- **Summary choice**: ↑/↓ to choose, Enter to confirm, Escape/Ctrl+C to cancel.
+- **Custom prompt**: type instructions (Backspace to edit), Enter to start summarization, Escape/Ctrl+C to return to the choice list.
+
+### What gets summarized
+
+The summary covers the **abandoned path** from the old leaf back toward the common ancestor with your selected target. Summarization stops early if a **compaction** node is encountered.
+
+### Storage
+
+Summaries are stored as `branch_summary` session entries attached to the **new leaf**, so the model can quickly recover context if you return to that branch later.

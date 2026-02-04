@@ -7,11 +7,13 @@ use bubbletea::{Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, QuitMsg}
 use common::TestHarness;
 use futures::stream;
 use pi::agent::{Agent, AgentConfig};
-use pi::config::Config;
+use pi::config::{Config, TerminalSettings};
 use pi::extensions::ExtensionUiRequest;
 use pi::interactive::{ConversationMessage, MessageRole, PendingInput, PiApp, PiMsg};
 use pi::keybindings::KeyBindings;
-use pi::model::{ContentBlock, Cost, StopReason, StreamEvent, TextContent, Usage, UserContent};
+use pi::model::{
+    ContentBlock, Cost, ImageContent, StopReason, StreamEvent, TextContent, Usage, UserContent,
+};
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
 use pi::resources::{ResourceCliOptions, ResourceLoader};
@@ -102,6 +104,14 @@ fn dummy_model_entry() -> ModelEntry {
     }
 }
 
+fn make_model_entry(provider: &str, id: &str, base_url: &str) -> ModelEntry {
+    let mut entry = dummy_model_entry();
+    entry.model.provider = provider.to_string();
+    entry.model.id = id.to_string();
+    entry.model.base_url = base_url.to_string();
+    entry
+}
+
 fn build_app_with_session(
     harness: &TestHarness,
     pending_inputs: Vec<PendingInput>,
@@ -152,6 +162,53 @@ fn build_app_with_session_and_config(
         false,
         None,
         Some(KeyBindings::new()),
+    );
+    app.set_terminal_size(80, 24);
+    app
+}
+
+fn build_app_with_models(
+    harness: &TestHarness,
+    session: Session,
+    config: Config,
+    model_entry: ModelEntry,
+    model_scope: Vec<ModelEntry>,
+    available_models: Vec<ModelEntry>,
+    keybindings: KeyBindings,
+) -> PiApp {
+    let cwd = harness.temp_dir().to_path_buf();
+    let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+    let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
+    let agent = Agent::new(provider, tools, AgentConfig::default());
+    let resources = ResourceLoader::empty(config.enable_skill_commands());
+    let resource_cli = ResourceCliOptions {
+        no_skills: false,
+        no_prompt_templates: false,
+        no_extensions: false,
+        no_themes: false,
+        skill_paths: Vec::new(),
+        prompt_paths: Vec::new(),
+        extension_paths: Vec::new(),
+        theme_paths: Vec::new(),
+    };
+    let (event_tx, _event_rx) = mpsc::channel(1024);
+
+    let mut app = PiApp::new(
+        agent,
+        session,
+        config,
+        resources,
+        resource_cli,
+        cwd,
+        model_entry,
+        model_scope,
+        available_models,
+        Vec::new(),
+        event_tx,
+        test_runtime_handle(),
+        false,
+        None,
+        Some(keybindings),
     );
     app.set_terminal_size(80, 24);
     app
@@ -512,6 +569,14 @@ fn press_ctrld(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
 
 fn press_ctrlt(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
     apply_key(harness, app, "key:CtrlT", KeyMsg::from_type(KeyType::CtrlT))
+}
+
+fn press_ctrlp(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
+    apply_key(harness, app, "key:CtrlP", KeyMsg::from_type(KeyType::CtrlP))
+}
+
+fn press_ctrlo(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
+    apply_key(harness, app, "key:CtrlO", KeyMsg::from_type(KeyType::CtrlO))
 }
 
 fn press_up(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
@@ -1047,6 +1112,121 @@ fn tui_state_tool_end_appends_tool_output_message() {
 }
 
 #[test]
+fn tui_state_terminal_show_images_false_hides_images_in_tool_output() {
+    let harness =
+        TestHarness::new("tui_state_terminal_show_images_false_hides_images_in_tool_output");
+    let config = Config {
+        terminal: Some(TerminalSettings {
+            show_images: Some(false),
+            clear_on_shrink: None,
+        }),
+        ..Config::default()
+    };
+    let mut app =
+        build_app_with_session_and_config(&harness, Vec::new(), Session::in_memory(), config);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read)",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("file contents")),
+                ContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+            ],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "file contents");
+    assert_after_contains(&harness, &step, "1 image(s) hidden");
+    assert_after_not_contains(&harness, &step, "[image:");
+}
+
+#[test]
+fn tui_state_terminal_show_images_true_shows_image_placeholders_in_tool_output() {
+    let harness = TestHarness::new(
+        "tui_state_terminal_show_images_true_shows_image_placeholders_in_tool_output",
+    );
+    let config = Config {
+        terminal: Some(TerminalSettings {
+            show_images: Some(true),
+            clear_on_shrink: None,
+        }),
+        ..Config::default()
+    };
+    let mut app =
+        build_app_with_session_and_config(&harness, Vec::new(), Session::in_memory(), config);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read)",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("file contents")),
+                ContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+            ],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "file contents");
+    assert_after_contains(&harness, &step, "[image: image/png]");
+    assert_after_not_contains(&harness, &step, "image(s) hidden");
+}
+
+#[test]
 fn tui_state_agent_done_appends_assistant_message_and_updates_usage() {
     let harness =
         TestHarness::new("tui_state_agent_done_appends_assistant_message_and_updates_usage");
@@ -1218,6 +1398,7 @@ fn tui_state_resources_reloaded_sets_status_message() {
         PiMsg::ResourcesReloaded {
             resources,
             status: "reloaded".to_string(),
+            diagnostics: None,
         },
     );
     assert_after_contains(&harness, &step, "reloaded");
@@ -1318,6 +1499,132 @@ fn tui_state_slash_model_no_args_reports_current_model() {
 }
 
 #[test]
+fn tui_state_ctrlp_cycles_models_with_scope_and_updates_session_header() {
+    let harness =
+        TestHarness::new("tui_state_ctrlp_cycles_models_with_scope_and_updates_session_header");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    let google = make_model_entry(
+        "google",
+        "gemini-a",
+        "https://generativeai.googleapis.com/v1beta/models",
+    );
+
+    // Deliberately scrambled ordering: cycling should use a stable ordering.
+    let model_scope = vec![openai.clone(), anthropic.clone()];
+    let available_models = vec![google, openai, anthropic.clone()];
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    let step = press_ctrlp(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
+
+    let session_handle = app.session_handle();
+    let session_guard = session_handle.try_lock().expect("session lock");
+    assert_eq!(session_guard.header.provider.as_deref(), Some("openai"));
+    assert_eq!(session_guard.header.model_id.as_deref(), Some("gpt-a"));
+    drop(session_guard);
+
+    press_ctrlp(&harness, &mut app);
+    let session_guard = session_handle.try_lock().expect("session lock");
+    assert_eq!(session_guard.header.provider.as_deref(), Some("anthropic"));
+    assert_eq!(session_guard.header.model_id.as_deref(), Some("claude-a"));
+}
+
+#[test]
+fn tui_state_ctrlp_cycles_models_without_scope_uses_available_models() {
+    let harness =
+        TestHarness::new("tui_state_ctrlp_cycles_models_without_scope_uses_available_models");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    let google = make_model_entry(
+        "google",
+        "gemini-a",
+        "https://generativeai.googleapis.com/v1beta/models",
+    );
+
+    let available_models = vec![openai, google, anthropic.clone()];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    press_ctrlp(&harness, &mut app);
+    let session_handle = app.session_handle();
+    let session_guard = session_handle.try_lock().expect("session lock");
+    assert_eq!(session_guard.header.provider.as_deref(), Some("google"));
+    assert_eq!(session_guard.header.model_id.as_deref(), Some("gemini-a"));
+}
+
+#[test]
+fn tui_state_cycle_model_backward_can_be_bound_and_updates_session_header() {
+    let harness =
+        TestHarness::new("tui_state_cycle_model_backward_can_be_bound_and_updates_session_header");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    let temp = harness.temp_dir().join("keybindings.json");
+    std::fs::write(
+        &temp,
+        r#"{
+  "cycleModelBackward": ["ctrl+o"]
+}"#,
+    )
+    .expect("write keybindings");
+    let keybindings = KeyBindings::load(&temp).expect("load keybindings");
+
+    let model_entry = openai.clone();
+    let model_scope = vec![openai.clone(), anthropic.clone()];
+    let available_models = vec![anthropic, openai];
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        model_entry,
+        model_scope,
+        available_models,
+        keybindings,
+    );
+
+    press_ctrlo(&harness, &mut app);
+    let session_handle = app.session_handle();
+    let session_guard = session_handle.try_lock().expect("session lock");
+    assert_eq!(session_guard.header.provider.as_deref(), Some("anthropic"));
+    assert_eq!(session_guard.header.model_id.as_deref(), Some("claude-a"));
+}
+
+#[test]
 fn tui_state_slash_history_shows_previous_inputs() {
     let harness = TestHarness::new("tui_state_slash_history_shows_previous_inputs");
     let mut app = build_app(&harness, Vec::new());
@@ -1392,6 +1699,43 @@ fn tui_state_slash_settings_opens_selector_and_restores_editor() {
     let step = press_esc(&harness, &mut app);
     assert_after_contains(&harness, &step, "[single-line]");
     assert_after_not_contains(&harness, &step, "↑/↓/j/k: navigate");
+}
+
+#[test]
+fn tui_state_slash_settings_quiet_startup_persists_and_overrides_global() {
+    let harness =
+        TestHarness::new("tui_state_slash_settings_quiet_startup_persists_and_overrides_global");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/settings");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Settings");
+    assert_after_contains(&harness, &step, "quietStartup:");
+
+    // Navigate to quietStartup entry:
+    // Summary(0), Theme(1), SteeringMode(2), FollowUpMode(3), QuietStartup(4)
+    press_down(&harness, &mut app);
+    press_down(&harness, &mut app);
+    press_down(&harness, &mut app);
+    press_down(&harness, &mut app);
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Updated quietStartup: on");
+
+    let settings_path = harness.temp_dir().join(".pi/settings.json");
+    let content = std::fs::read_to_string(&settings_path).expect("read settings.json");
+    let value: serde_json::Value = serde_json::from_str(&content).expect("parse settings.json");
+    assert_eq!(value["quiet_startup"], json!(true));
+
+    // Ensure project settings override global on load (legacy keys accepted via serde aliases).
+    let global_dir = harness.create_dir("global");
+    std::fs::write(
+        global_dir.join("settings.json"),
+        r#"{ "quietStartup": false }"#,
+    )
+    .expect("write global settings");
+    let loaded = Config::load_with_roots(None, &global_dir, harness.temp_dir()).expect("load");
+    assert_eq!(loaded.quiet_startup, Some(true));
 }
 
 #[test]

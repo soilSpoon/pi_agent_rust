@@ -200,6 +200,104 @@ fn e2e_cli_config_subcommand_prints_paths() {
 }
 
 #[test]
+fn e2e_cli_config_paths_honor_env_overrides() {
+    let mut harness = CliTestHarness::new("e2e_cli_config_paths_honor_env_overrides");
+
+    let env_root = harness.harness.temp_path("env-overrides");
+    let agent_dir = env_root.join("agent-root");
+    let config_path = env_root.join("settings-override.json");
+    let sessions_dir = env_root.join("sessions-root");
+    let packages_dir = env_root.join("packages-root");
+
+    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+    std::fs::write(&config_path, "{}").expect("write override settings");
+
+    harness.env.insert(
+        "PI_CODING_AGENT_DIR".to_string(),
+        agent_dir.display().to_string(),
+    );
+    harness.env.insert(
+        "PI_CONFIG_PATH".to_string(),
+        config_path.display().to_string(),
+    );
+    harness.env.insert(
+        "PI_SESSIONS_DIR".to_string(),
+        sessions_dir.display().to_string(),
+    );
+    harness.env.insert(
+        "PI_PACKAGE_DIR".to_string(),
+        packages_dir.display().to_string(),
+    );
+
+    let result = harness.run(&["config"]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Global:  {}", config_path.display()),
+    );
+    let project_path = harness.harness.temp_dir().join(".pi/settings.json");
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Project: {}", project_path.display()),
+    );
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Sessions: {}", sessions_dir.display()),
+    );
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Auth:     {}", agent_dir.join("auth.json").display()),
+    );
+}
+
+#[test]
+fn e2e_cli_config_paths_fallback_to_agent_dir() {
+    let mut harness = CliTestHarness::new("e2e_cli_config_paths_fallback_to_agent_dir");
+
+    let env_root = harness.harness.temp_path("env-fallback");
+    let agent_dir = env_root.join("agent-root");
+    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+
+    harness.env.insert(
+        "PI_CODING_AGENT_DIR".to_string(),
+        agent_dir.display().to_string(),
+    );
+    harness.env.remove("PI_CONFIG_PATH");
+    harness.env.remove("PI_SESSIONS_DIR");
+    harness.env.remove("PI_PACKAGE_DIR");
+
+    let result = harness.run(&["config"]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Global:  {}", agent_dir.join("settings.json").display()),
+    );
+    let project_path = harness.harness.temp_dir().join(".pi/settings.json");
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Project: {}", project_path.display()),
+    );
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Sessions: {}", agent_dir.join("sessions").display()),
+    );
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Auth:     {}", agent_dir.join("auth.json").display()),
+    );
+}
+
+#[test]
 fn e2e_cli_list_subcommand_works_offline() {
     let harness = CliTestHarness::new("e2e_cli_list_subcommand_works_offline");
     let result = harness.run(&["list"]);

@@ -175,8 +175,8 @@ Accessor defaults:
 
 ### Terminal display
 
-- `terminal.show_images` (bool)
-- `terminal.clear_on_shrink` (bool)
+- `terminal.show_images` (bool): Default `true`. When `false`, Pi hides image blocks in terminal tool output (images are still stored in sessions/exports).
+- `terminal.clear_on_shrink` (bool): Default `false`. When `true`, Pi purges scrollback on terminal shrink to avoid stale rows reappearing after resize.
 
 ### Thinking budgets (tokens)
 
@@ -198,7 +198,6 @@ These settings are defined in `src/config.rs` but are not fully wired into behav
 
 - `quiet_startup`, `collapse_changelog` → tracked by `bd-35y0` and `bd-217r`.
 - `session_picker_input` → tracked by `bd-14cc`.
-- `terminal.show_images`, `terminal.clear_on_shrink` → tracked by `bd-xk3g`.
 
 ## Full reference
 

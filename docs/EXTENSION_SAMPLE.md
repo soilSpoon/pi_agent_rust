@@ -70,6 +70,98 @@ To make conformance reproducible offline, we vendor the extension sources for th
 | subagent | `packages/coding-agent/examples/extensions/subagent` | multi-file | tool_only, ui_integration | exec, read | large | cpu-heavy, os-heavy |
 | git-checkpoint | `packages/coding-agent/examples/extensions/git-checkpoint.ts` | legacy-js | event_hook | exec | medium | fs-heavy |
 
+## Adding a New Extension to the Sample (bd-1rm)
+
+This is the “new contributor path” for extending the frozen sample set.
+
+### 0) Before you start
+
+- Decide whether you are **adding** a new sample entry or **updating** an existing one.
+- Confirm provenance and redistribution: the current sample set vendors sources from `pi-mono` at a pinned commit (MIT licensed). If you want to pull in a gist/npm/community extension, **stop and validate license/redistribution policy first** (do not vendor artifacts you can’t redistribute).
+
+### 1) Pick a candidate (and justify it)
+
+1. Start from the raw inventory: `docs/EXTENSION_CANDIDATES.md`.
+2. Apply quotas and selection rationale: `docs/EXTENSION_SAMPLING_MATRIX.md`.
+3. Prefer candidates that add missing coverage (runtime tier, interaction tags, I/O patterns, capabilities).
+
+### 2) Update the manifest (`docs/extension-sample.json`)
+
+1. Add or modify the entry under `items[]`:
+   - `id`, `name`, `source` (repo + commit + path), plus tier/tag metadata.
+2. Add capture scenarios under `scenario_suite.items[]` for the new `extension_id`:
+   - Each scenario must have a stable `id` (`scn-<ext>-<nnn>`) and declare `kind` + the relevant selector (`tool_name`, `command_name`, or `event_name`).
+3. Keep the manifest’s rationale up to date if the sample set composition changes.
+
+### 3) Vendor the artifact (`tests/ext_conformance/artifacts/<id>/`)
+
+Vendor the extension source into a new directory under `tests/ext_conformance/artifacts/<id>/`.
+
+- For `pi-mono` examples, copy from the pinned checkout under `legacy_pi_mono_code/pi-mono/...`.
+- Preserve the original filenames (e.g. `todo.ts`, `package.json`, `index.ts`).
+
+### 4) Compute the artifact checksum and write it to the manifest
+
+The checksum is the content-only tree digest described above (file path + bytes, sorted by POSIX path).
+
+One way to compute it (from repo root):
+
+```bash
+python - <<'PY'
+import hashlib, os
+
+ext_id = "todo"  # <-- set this
+root = os.path.join("tests", "ext_conformance", "artifacts", ext_id)
+
+files = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames.sort()
+    for name in sorted(filenames):
+        path = os.path.join(dirpath, name)
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        files.append((rel, path))
+
+h = hashlib.sha256()
+for rel, path in sorted(files):
+    h.update(b"file\0")
+    h.update(rel.encode("utf-8"))
+    h.update(b"\0")
+    with open(path, "rb") as f:
+        h.update(f.read())
+    h.update(b"\0")
+
+print(h.hexdigest())
+PY
+```
+
+Write that value to `docs/extension-sample.json` at `items[].checksum.sha256`.
+
+### 5) Re-run legacy capture and regenerate fixtures
+
+1. Run the capture pipeline:
+   - Full suite: `cargo run --bin pi_legacy_capture`
+   - One scenario: `cargo run --bin pi_legacy_capture -- --scenario-id scn-<ext>-<nnn>`
+2. Confirm the fixture exists:
+   - `tests/ext_conformance/fixtures/<extension_id>.json`
+
+### 6) Verify (tests)
+
+Run these before committing:
+
+```bash
+cargo test ext_conformance_artifacts_match_manifest_checksums
+cargo test ext_conformance_pinned_sample_compat_ledger_snapshot
+```
+
+Then run the normal project quality gates:
+
+```bash
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo test
+```
+
 ## Next Steps
 
 1. Define per-extension capture scenarios (bd-2qd) in `docs/extension-sample.json` (`scenario_suite`).

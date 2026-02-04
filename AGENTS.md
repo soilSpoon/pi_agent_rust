@@ -167,7 +167,7 @@ cargo test conformance
 ### Architecture
 
 ```
-CLI (clap) → Agent Loop → Provider (Anthropic/OpenAI) → Streaming Response
+CLI (clap) → Agent Loop → Provider (Anthropic/OpenAI/Gemini) → Streaming Response
                 ↓
          Tool Execution (read/write/edit/bash/grep/find/ls)
                 ↓
@@ -182,6 +182,9 @@ CLI (clap) → Agent Loop → Provider (Anthropic/OpenAI) → Streaming Response
 | `src/agent.rs` | Agent loop with tool iteration |
 | `src/provider.rs` | Provider trait definition |
 | `src/providers/anthropic.rs` | Anthropic API implementation |
+| `src/providers/openai.rs` | OpenAI API implementation |
+| `src/providers/gemini.rs` | Gemini API implementation |
+| `src/providers/azure.rs` | Azure OpenAI API implementation |
 | `src/tools.rs` | 7 built-in tools |
 | `src/model.rs` | Message/content types |
 | `src/session.rs` | JSONL session persistence |
@@ -195,7 +198,9 @@ CLI (clap) → Agent Loop → Provider (Anthropic/OpenAI) → Streaming Response
 **Provider Layer:**
 - Abstract `Provider` trait for LLM backends
 - Anthropic implementation with streaming + extended thinking
-- OpenAI implementation (planned)
+- OpenAI implementation with streaming + tool use
+- Gemini implementation with streaming + tool use
+- Azure OpenAI implementation (requires resource/deployment config)
 - Tool definitions with JSON Schema
 
 **Built-in Tools:**

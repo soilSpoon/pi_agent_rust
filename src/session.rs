@@ -86,6 +86,40 @@ pub struct ForkPlan {
     pub selected_text: String,
 }
 
+/// Diagnostics captured while opening a session file.
+#[derive(Debug, Clone, Default)]
+pub struct SessionOpenDiagnostics {
+    pub skipped_entries: Vec<SessionOpenSkippedEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionOpenSkippedEntry {
+    /// 1-based line number in the session file.
+    pub line_number: usize,
+    pub error: String,
+}
+
+impl SessionOpenDiagnostics {
+    fn warning_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for skipped in &self.skipped_entries {
+            lines.push(format!(
+                "Warning: Skipping corrupted entry at line {} in session file: {}",
+                skipped.line_number, skipped.error
+            ));
+        }
+
+        if !self.skipped_entries.is_empty() {
+            lines.push(format!(
+                "Warning: Skipped {} corrupted entries while loading session",
+                self.skipped_entries.len()
+            ));
+        }
+
+        lines
+    }
+}
+
 impl Session {
     /// Create a new session from CLI args and config.
     pub async fn new(cli: &Cli, config: &Config) -> Result<Self> {
@@ -99,7 +133,12 @@ impl Session {
         }
 
         if cli.resume {
-            return Self::resume_with_picker(session_dir.as_deref(), config, None).await;
+            return Box::pin(Self::resume_with_picker(
+                session_dir.as_deref(),
+                config,
+                None,
+            ))
+            .await;
         }
 
         if cli.r#continue {
@@ -275,6 +314,15 @@ impl Session {
 
     /// Open an existing session.
     pub async fn open(path: &str) -> Result<Self> {
+        let (session, diagnostics) = Self::open_with_diagnostics(path).await?;
+        for warning in diagnostics.warning_lines() {
+            eprintln!("{warning}");
+        }
+        Ok(session)
+    }
+
+    /// Open an existing session and return diagnostics about any recovered corruption.
+    pub async fn open_with_diagnostics(path: &str) -> Result<(Self, SessionOpenDiagnostics)> {
         let path = PathBuf::from(path);
         if !path.exists() {
             return Err(crate::Error::SessionNotFound {
@@ -294,35 +342,33 @@ impl Session {
 
         // Parse entries
         let mut entries = Vec::new();
-        let mut skipped_entries = 0usize;
+        let mut diagnostics = SessionOpenDiagnostics::default();
         for (line_num, line) in lines.enumerate() {
             match serde_json::from_str::<SessionEntry>(line) {
                 Ok(entry) => entries.push(entry),
                 Err(e) => {
-                    // Log the error but continue - sessions may have partial corruption
-                    eprintln!(
-                        "Warning: Skipping corrupted entry at line {} in session file: {e}",
-                        line_num + 2 // +2 for 1-based indexing and header line
-                    );
-                    skipped_entries += 1;
+                    diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
+                        line_number: line_num + 2, // +2 for 1-based indexing and header line
+                        error: e.to_string(),
+                    });
                 }
             }
-        }
-        if skipped_entries > 0 {
-            eprintln!("Warning: Skipped {skipped_entries} corrupted entries while loading session");
         }
 
         ensure_entry_ids(&mut entries);
 
         let leaf_id = entries.iter().rev().find_map(|e| e.base_id().cloned());
 
-        Ok(Self {
-            header,
-            entries,
-            path: Some(path),
-            leaf_id,
-            session_dir: None,
-        })
+        Ok((
+            Self {
+                header,
+                entries,
+                path: Some(path),
+                leaf_id,
+                session_dir: None,
+            },
+            diagnostics,
+        ))
     }
 
     /// Continue the most recent session.
@@ -1791,12 +1837,21 @@ fn generate_entry_id(existing: &HashSet<String>) -> String {
 mod tests {
     use super::*;
     use crate::model::{StopReason, Usage};
+    use asupersync::runtime::RuntimeBuilder;
+    use std::future::Future;
 
     fn make_test_message(text: &str) -> SessionMessage {
         SessionMessage::User {
             content: UserContent::Text(text.to_string()),
             timestamp: Some(0),
         }
+    }
+
+    fn run_async<T>(future: impl Future<Output = T>) -> T {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(future)
     }
 
     #[test]
@@ -1944,10 +1999,6 @@ mod tests {
 
     #[test]
     fn test_session_jsonl_serialization() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
         let temp = tempfile::tempdir().unwrap();
         let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
         session.header.provider = Some("anthropic".to_string());
@@ -1972,7 +2023,7 @@ mod tests {
         session.append_branch_summary(user_id, "branch".to_string(), None, None);
         session.append_session_info(Some("my-session".to_string()));
 
-        runtime.block_on(async { session.save().await }).unwrap();
+        run_async(async { session.save().await }).unwrap();
 
         let path = session.path.clone().unwrap();
         let contents = std::fs::read_to_string(path).unwrap();
@@ -1995,6 +2046,145 @@ mod tests {
         assert!(types.contains(&"compaction".to_string()));
         assert!(types.contains(&"branch_summary".to_string()));
         assert!(types.contains(&"session_info".to_string()));
+    }
+
+    #[test]
+    fn test_open_with_diagnostics_skips_corrupted_last_entry_and_recovers_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        let first_id = session.append_message(make_test_message("Hello"));
+        let second_id = session.append_message(make_test_message("World"));
+        assert_eq!(session.leaf_id.as_deref(), Some(second_id.as_str()));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().expect("session path set");
+
+        let mut lines = std::fs::read_to_string(&path)
+            .expect("read session")
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(lines.len() >= 3, "expected header + 2 entries");
+
+        let corrupted_line_number = lines.len(); // 1-based
+        let last_index = lines.len() - 1;
+        lines[last_index] = "{ this is not json }".to_string();
+
+        let corrupted_path = temp.path().join("corrupted.jsonl");
+        std::fs::write(&corrupted_path, format!("{}\n", lines.join("\n")))
+            .expect("write corrupted session");
+
+        let (loaded, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(corrupted_path.to_string_lossy().as_ref()).await
+        })
+        .expect("open corrupted session");
+
+        assert_eq!(diagnostics.skipped_entries.len(), 1);
+        assert_eq!(
+            diagnostics.skipped_entries[0].line_number,
+            corrupted_line_number
+        );
+
+        let warnings = diagnostics.warning_lines();
+        assert_eq!(warnings.len(), 2, "expected per-line warning + summary");
+        assert!(
+            warnings[0].starts_with(&format!(
+                "Warning: Skipping corrupted entry at line {corrupted_line_number} in session file:"
+            )),
+            "unexpected warning: {}",
+            warnings[0]
+        );
+        assert_eq!(
+            warnings[1],
+            "Warning: Skipped 1 corrupted entries while loading session"
+        );
+
+        assert_eq!(
+            loaded.entries.len(),
+            session.entries.len() - 1,
+            "expected last entry to be dropped"
+        );
+        assert_eq!(loaded.leaf_id.as_deref(), Some(first_id.as_str()));
+    }
+
+    #[test]
+    fn test_save_and_open_round_trip_preserves_compaction_and_branch_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        let root_id = session.append_message(make_test_message("Hello"));
+        session.append_compaction("compacted".to_string(), root_id.clone(), 123, None, None);
+        session.append_branch_summary(root_id, "branch summary".to_string(), None, None);
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().expect("session path set");
+
+        let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await })
+            .expect("reopen session");
+
+        assert!(loaded.entries.iter().any(|entry| {
+            matches!(entry, SessionEntry::Compaction(compaction) if compaction.summary == "compacted" && compaction.tokens_before == 123)
+        }));
+        assert!(loaded.entries.iter().any(|entry| {
+            matches!(entry, SessionEntry::BranchSummary(summary) if summary.summary == "branch summary")
+        }));
+
+        let html = loaded.to_html();
+        assert!(html.contains("compacted"));
+        assert!(html.contains("branch summary"));
+    }
+
+    #[test]
+    fn test_concurrent_saves_do_not_corrupt_session_file_unit() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_dir = temp.path().join("sessions");
+
+        let mut session = Session::create_with_dir(Some(base_dir));
+        session.append_message(make_test_message("Hello"));
+
+        run_async(async { session.save().await }).expect("initial save");
+        let path = session.path.clone().expect("session path set");
+
+        let path1 = path.clone();
+        let path2 = path.clone();
+
+        let t1 = std::thread::spawn(move || {
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            runtime.block_on(async move {
+                let mut s = Session::open(path1.to_string_lossy().as_ref())
+                    .await
+                    .expect("open session");
+                s.append_message(make_test_message("From thread 1"));
+                s.save().await
+            })
+        });
+
+        let t2 = std::thread::spawn(move || {
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            runtime.block_on(async move {
+                let mut s = Session::open(path2.to_string_lossy().as_ref())
+                    .await
+                    .expect("open session");
+                s.append_message(make_test_message("From thread 2"));
+                s.save().await
+            })
+        });
+
+        let r1 = t1.join().expect("thread 1 join");
+        let r2 = t2.join().expect("thread 2 join");
+        assert!(
+            r1.is_ok() || r2.is_ok(),
+            "Expected at least one save to succeed: r1={r1:?} r2={r2:?}"
+        );
+
+        let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await })
+            .expect("open after concurrent saves");
+        assert!(!loaded.entries.is_empty());
     }
 
     #[test]

@@ -873,6 +873,48 @@ mod tests {
     }
 
     #[test]
+    fn set_catalog_updates_prompt_templates() {
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+
+        let query = "/zzz_reload_test_template";
+        let resp = provider.suggest(query, query.len());
+        assert!(
+            !resp
+                .items
+                .iter()
+                .any(|item| item.insert == query
+                    && item.kind == AutocompleteItemKind::PromptTemplate)
+        );
+
+        provider.set_catalog(AutocompleteCatalog {
+            prompt_templates: vec![NamedEntry {
+                name: "zzz_reload_test_template".to_string(),
+                description: None,
+            }],
+            skills: Vec::new(),
+            enable_skill_commands: false,
+        });
+        let resp = provider.suggest(query, query.len());
+        assert!(
+            resp.items
+                .iter()
+                .any(|item| item.insert == query
+                    && item.kind == AutocompleteItemKind::PromptTemplate)
+        );
+
+        provider.set_catalog(AutocompleteCatalog::default());
+        let resp = provider.suggest(query, query.len());
+        assert!(
+            !resp
+                .items
+                .iter()
+                .any(|item| item.insert == query
+                    && item.kind == AutocompleteItemKind::PromptTemplate)
+        );
+    }
+
+    #[test]
     fn file_ref_uses_cached_project_files() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("hello.txt"), "hi").expect("write");
