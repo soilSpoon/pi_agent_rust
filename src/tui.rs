@@ -37,7 +37,11 @@ impl PiConsole {
     /// Create a console with forced color output (for testing).
     pub fn with_color() -> Self {
         Self {
-            console: Console::builder().markup(true).emoji(true).build(),
+            console: Console::builder()
+                .markup(true)
+                .emoji(true)
+                .file(Box::new(io::sink()))
+                .build(),
             is_tty: true,
         }
     }
