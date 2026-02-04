@@ -23,6 +23,7 @@ pub struct Config {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub default_thinking_level: Option<String>,
+    #[serde(alias = "enabledModels")]
     pub enabled_models: Option<Vec<String>>,
 
     // Message Handling

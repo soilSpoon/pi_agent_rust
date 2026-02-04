@@ -27,6 +27,7 @@ use chrono::Utc;
 use crossterm::{cursor, terminal};
 use futures::future::BoxFuture;
 use glamour::{Renderer as MarkdownRenderer, StyleConfig as GlamourStyleConfig};
+use glob::Pattern;
 use serde_json::{Value, json};
 use url::Url;
 
@@ -160,6 +161,53 @@ impl PiApp {
             let _ = writeln!(output, "{marker}{name}");
         }
         output.push_str("\nUse /theme <name> to switch");
+        output
+    }
+
+    fn format_scoped_models_status(&self) -> String {
+        let patterns = self.config.enabled_models.as_deref().unwrap_or(&[]);
+        let scope_configured = !patterns.is_empty();
+
+        let mut output = String::new();
+        let current = format!(
+            "{}/{}",
+            self.model_entry.model.provider, self.model_entry.model.id
+        );
+        let _ = writeln!(output, "Current model: {current}");
+        let _ = writeln!(output);
+
+        if !scope_configured {
+            let _ = writeln!(output, "Scoped models: (all models)");
+            let _ = writeln!(output);
+            output.push_str("Use /scoped-models <patterns> to scope Ctrl+P cycling.\n");
+            output.push_str("Use /scoped-models clear to clear scope.\n");
+            return output;
+        }
+
+        output.push_str("Scoped model patterns:\n");
+        for pattern in patterns {
+            let _ = writeln!(output, "  - {pattern}");
+        }
+        let _ = writeln!(output);
+
+        output.push_str("Scoped models (matched):\n");
+        if self.model_scope.is_empty() {
+            output.push_str("  (none)\n");
+        } else {
+            let mut models = self
+                .model_scope
+                .iter()
+                .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
+                .collect::<Vec<_>>();
+            models.sort_by_key(|value| value.to_ascii_lowercase());
+            models.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+            for model in models {
+                let _ = writeln!(output, "  - {model}");
+            }
+        }
+        let _ = writeln!(output);
+
+        output.push_str("Use /scoped-models clear to cycle all models.\n");
         output
     }
 
@@ -1606,6 +1654,78 @@ fn truncate(s: &str, max_len: usize) -> String {
     out.extend(s.chars().take(take_len));
     out.push_str("...");
     out
+}
+
+fn strip_thinking_level_suffix(pattern: &str) -> &str {
+    let Some((prefix, suffix)) = pattern.rsplit_once(':') else {
+        return pattern;
+    };
+    match suffix.to_ascii_lowercase().as_str() {
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" => prefix,
+        _ => pattern,
+    }
+}
+
+fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
+    args.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn resolve_scoped_model_entries(
+    patterns: &[String],
+    available_models: &[ModelEntry],
+) -> Result<Vec<ModelEntry>, String> {
+    let mut resolved = Vec::new();
+
+    for pattern in patterns {
+        let raw_pattern = strip_thinking_level_suffix(pattern);
+        let is_glob = raw_pattern.contains('*') || raw_pattern.contains('?') || raw_pattern.contains('[');
+
+        if is_glob {
+            let glob = Pattern::new(&raw_pattern.to_lowercase())
+                .map_err(|err| format!("Invalid model pattern \"{pattern}\": {err}"))?;
+
+            for entry in available_models {
+                let full_id = format!("{}/{}", entry.model.provider, entry.model.id);
+                let full_id_lower = full_id.to_lowercase();
+                let id_lower = entry.model.id.to_lowercase();
+
+                if glob.matches(&full_id_lower) || glob.matches(&id_lower) {
+                    if !resolved.iter().any(|existing| {
+                        existing.model.provider.eq_ignore_ascii_case(&entry.model.provider)
+                            && existing.model.id.eq_ignore_ascii_case(&entry.model.id)
+                    }) {
+                        resolved.push(entry.clone());
+                    }
+                }
+            }
+            continue;
+        }
+
+        for entry in available_models {
+            let full_id = format!("{}/{}", entry.model.provider, entry.model.id);
+            if raw_pattern.eq_ignore_ascii_case(&full_id) || raw_pattern.eq_ignore_ascii_case(&entry.model.id) {
+                if !resolved.iter().any(|existing| {
+                    existing.model.provider.eq_ignore_ascii_case(&entry.model.provider)
+                        && existing.model.id.eq_ignore_ascii_case(&entry.model.id)
+                }) {
+                    resolved.push(entry.clone());
+                }
+                break;
+            }
+        }
+    }
+
+    resolved.sort_by(|a, b| {
+        let left = format!("{}/{}", a.model.provider, a.model.id);
+        let right = format!("{}/{}", b.model.provider, b.model.id);
+        left.cmp(&right)
+    });
+
+    Ok(resolved)
 }
 
 fn queued_message_preview(text: &str, max_len: usize) -> String {
@@ -5685,10 +5805,16 @@ impl PiApp {
             return;
         }
 
-        let mut candidates = if self.model_scope.is_empty() {
-            self.available_models.clone()
-        } else {
+        let scope_configured = self
+            .config
+            .enabled_models
+            .as_ref()
+            .is_some_and(|patterns| !patterns.is_empty());
+        let use_scope = scope_configured || !self.model_scope.is_empty();
+        let mut candidates = if use_scope {
             self.model_scope.clone()
+        } else {
+            self.available_models.clone()
         };
 
         candidates.sort_by(|a, b| {
@@ -5702,7 +5828,11 @@ impl PiApp {
         });
 
         if candidates.is_empty() {
-            self.status_message = Some("No models available".to_string());
+            self.status_message = Some(if use_scope {
+                "No models in scope".to_string()
+            } else {
+                "No models available".to_string()
+            });
             return;
         }
 
@@ -5741,7 +5871,11 @@ impl PiApp {
                 .id
                 .eq_ignore_ascii_case(&self.model_entry.model.id)
         {
-            self.status_message = Some(format!("Current model: {}", self.model));
+            self.status_message = Some(if use_scope {
+                "Only one model in scope".to_string()
+            } else {
+                "Only one model available".to_string()
+            });
             return;
         }
 
@@ -6385,7 +6519,73 @@ impl PiApp {
                 None
             }
             SlashCommand::ScopedModels => {
-                self.status_message = Some("Scoped models not implemented yet".to_string());
+                let value = args.trim();
+                if value.is_empty() {
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: self.format_scoped_models_status(),
+                        thinking: None,
+                    });
+                    self.scroll_to_last_match("Scoped models");
+                    return None;
+                }
+
+                if value.eq_ignore_ascii_case("clear") {
+                    self.config.enabled_models = Some(Vec::new());
+                    self.model_scope.clear();
+
+                    let global_dir = Config::global_dir();
+                    let patch = json!({ "enabled_models": [] as [String; 0] });
+                    if let Err(err) = Config::patch_settings_with_roots(
+                        SettingsScope::Project,
+                        &global_dir,
+                        &self.cwd,
+                        patch,
+                    ) {
+                        tracing::warn!("Failed to persist enabled_models: {err}");
+                        self.status_message =
+                            Some(format!("Scoped models cleared (not saved: {err})"));
+                    } else {
+                        self.status_message = Some("Scoped models cleared".to_string());
+                    }
+                    return None;
+                }
+
+                let patterns = parse_scoped_model_patterns(value);
+                if patterns.is_empty() {
+                    self.status_message =
+                        Some("Usage: /scoped-models [patterns|clear]".to_string());
+                    return None;
+                }
+
+                let resolved = match resolve_scoped_model_entries(&patterns, &self.available_models)
+                {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        self.status_message = Some(err);
+                        return None;
+                    }
+                };
+
+                self.model_scope = resolved;
+                self.config.enabled_models = Some(patterns.clone());
+
+                let match_count = self.model_scope.len();
+                let global_dir = Config::global_dir();
+                let patch = json!({ "enabled_models": patterns });
+                if let Err(err) = Config::patch_settings_with_roots(
+                    SettingsScope::Project,
+                    &global_dir,
+                    &self.cwd,
+                    patch,
+                ) {
+                    tracing::warn!("Failed to persist enabled_models: {err}");
+                    self.status_message = Some(format!(
+                        "Scoped models updated: {match_count} matched (not saved: {err})"
+                    ));
+                } else {
+                    self.status_message = Some(format!("Scoped models updated: {match_count} matched"));
+                }
                 None
             }
             SlashCommand::Exit => Some(quit()),

@@ -48,6 +48,16 @@ pub fn hints_for_error(error: &Error) -> ErrorHint {
 }
 
 fn config_hints(msg: &str) -> ErrorHint {
+    if msg.contains("cassette") {
+        return ErrorHint {
+            summary: "VCR cassette missing or invalid",
+            hints: &[
+                "If running tests, set VCR_MODE=record to create cassettes",
+                "Or ensure VCR_CASSETTE_DIR contains the expected cassette file",
+            ],
+            context_fields: &["file_path"],
+        };
+    }
     if msg.contains("settings.json") {
         return ErrorHint {
             summary: "Invalid or missing configuration file",
@@ -582,6 +592,48 @@ mod tests {
         let formatted = format_error_with_hints(&error);
         assert!(formatted.contains("Error:"));
         assert!(formatted.contains("Suggestions:"));
+    }
+
+    #[test]
+    fn test_format_error_with_hints_includes_api_key_suggestion() {
+        let error = Error::auth("API key not set");
+        let formatted = format_error_with_hints(&error);
+        assert!(formatted.contains("ANTHROPIC_API_KEY"));
+        assert!(formatted.contains("auth.json"));
+    }
+
+    #[test]
+    fn test_format_error_with_hints_includes_json_syntax_suggestions() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{ invalid }").unwrap_err();
+        let error = Error::Json(Box::new(json_err));
+        let formatted = format_error_with_hints(&error);
+        assert!(formatted.contains("Invalid JSON syntax"));
+        assert!(formatted.contains("Validate JSON"));
+    }
+
+    #[test]
+    fn test_format_error_with_hints_includes_fd_install_hint() {
+        let error = Error::tool("find", "fd command not found");
+        let formatted = format_error_with_hints(&error);
+        assert!(formatted.contains("fd"));
+        assert!(formatted.contains("apt install"));
+    }
+
+    #[test]
+    fn test_format_error_with_hints_includes_read_permission_hint() {
+        let error = Error::tool("read", "permission denied: /etc/shadow");
+        let formatted = format_error_with_hints(&error);
+        assert!(formatted.contains("Permission denied"));
+        assert!(formatted.contains("Check file permissions"));
+    }
+
+    #[test]
+    fn test_format_error_with_hints_includes_vcr_cassette_hint() {
+        let error = Error::config("Failed to read cassette /tmp/cassette.json: missing file");
+        let formatted = format_error_with_hints(&error);
+        assert!(formatted.contains("VCR cassette"));
+        assert!(formatted.contains("VCR_MODE=record"));
+        assert!(formatted.contains("VCR_CASSETTE_DIR"));
     }
 
     #[test]

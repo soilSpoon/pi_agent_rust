@@ -3888,6 +3888,22 @@ mod tests {
                 },
             ),
             (
+                "host_call_cancel",
+                ExtensionMessage {
+                    id: "msg-host-call-cancel".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::HostCall(HostCallPayload {
+                        call_id: "host-2".to_string(),
+                        capability: "http".to_string(),
+                        method: "http".to_string(),
+                        params: json!({ "url": "https://example.com", "method": "GET" }),
+                        timeout_ms: Some(1500),
+                        cancel_token: Some("cancel-1".to_string()),
+                        context: Some(json!({ "trace_id": "trace-1" })),
+                    }),
+                },
+            ),
+            (
                 "host_result",
                 ExtensionMessage {
                     id: "msg-host-result".to_string(),
@@ -3897,6 +3913,44 @@ mod tests {
                         output: json!({ "content": [] }),
                         is_error: false,
                         error: None,
+                        chunk: None,
+                    }),
+                },
+            ),
+            (
+                "host_result_timeout",
+                ExtensionMessage {
+                    id: "msg-host-result-timeout".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::HostResult(HostResultPayload {
+                        call_id: "host-2".to_string(),
+                        output: json!({}),
+                        is_error: true,
+                        error: Some(HostCallError {
+                            code: HostCallErrorCode::Timeout,
+                            message: "Timed out".to_string(),
+                            details: None,
+                            retryable: Some(true),
+                        }),
+                        chunk: None,
+                    }),
+                },
+            ),
+            (
+                "host_result_denied",
+                ExtensionMessage {
+                    id: "msg-host-result-denied".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::HostResult(HostResultPayload {
+                        call_id: "host-3".to_string(),
+                        output: json!({}),
+                        is_error: true,
+                        error: Some(HostCallError {
+                            code: HostCallErrorCode::Denied,
+                            message: "Denied".to_string(),
+                            details: Some(json!({ "capability": "exec" })),
+                            retryable: None,
+                        }),
                         chunk: None,
                     }),
                 },
@@ -4168,6 +4222,62 @@ mod tests {
     }
 
     #[test]
+    fn required_capability_for_host_call_maps_tools_and_fs_ops() {
+        let tool_read = HostCallPayload {
+            call_id: "call-tool-read".to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "read", "input": { "path": "README.md" } }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+        assert_eq!(
+            required_capability_for_host_call(&tool_read).as_deref(),
+            Some("read")
+        );
+
+        let tool_bash = HostCallPayload {
+            call_id: "call-tool-bash".to_string(),
+            capability: "exec".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "bash", "input": { "command": "echo hi" } }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+        assert_eq!(
+            required_capability_for_host_call(&tool_bash).as_deref(),
+            Some("exec")
+        );
+
+        let fs_delete = HostCallPayload {
+            call_id: "call-fs-delete".to_string(),
+            capability: "write".to_string(),
+            method: "fs".to_string(),
+            params: json!({ "op": "delete", "path": "tmp.txt" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+        assert_eq!(
+            required_capability_for_host_call(&fs_delete).as_deref(),
+            Some("write")
+        );
+
+        let unknown = HostCallPayload {
+            call_id: "call-unknown".to_string(),
+            capability: "read".to_string(),
+            method: "nope".to_string(),
+            params: json!({}),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+        assert!(required_capability_for_host_call(&unknown).is_none());
+    }
+
+    #[test]
     fn fs_connector_denies_path_traversal_outside_cwd() {
         let dir = tempdir().expect("tempdir");
         let project = dir.path().join("project");
@@ -4246,5 +4356,234 @@ mod tests {
             result.error.as_ref().expect("error").code,
             HostCallErrorCode::Denied
         );
+    }
+
+    #[test]
+    fn fs_connector_denies_when_policy_denies_capability() {
+        let dir = tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+
+        let inside = project.join("inside.txt");
+        std::fs::write(&inside, "hello").expect("write inside");
+
+        let mut policy = ExtensionPolicy::default();
+        policy.deny_caps.push("read".to_string());
+
+        let scopes = FsScopes::for_cwd(&project).expect("scopes");
+        let connector = FsConnector::new(&project, policy, scopes).expect("connector");
+
+        let call = HostCallPayload {
+            call_id: "call-policy-deny".to_string(),
+            capability: "read".to_string(),
+            method: "fs".to_string(),
+            params: json!({ "op": "read", "path": "inside.txt" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let result = connector.handle_host_call(&call);
+        assert!(result.is_error);
+        assert_eq!(
+            result.error.as_ref().expect("error").code,
+            HostCallErrorCode::Denied
+        );
+    }
+
+    #[test]
+    fn fs_connector_denies_write_when_manifest_does_not_declare_write_scope() {
+        let dir = tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+
+        let inside = project.join("inside.txt");
+        std::fs::write(&inside, "hello").expect("write inside");
+
+        let manifest = CapabilityManifest {
+            schema: "pi.ext.cap.v1".to_string(),
+            capabilities: vec![CapabilityRequirement {
+                capability: "read".to_string(),
+                methods: vec!["fs".to_string()],
+                scope: Some(CapabilityScope {
+                    paths: Some(vec![".".to_string()]),
+                    hosts: None,
+                    env: None,
+                }),
+            }],
+        };
+        let scopes = FsScopes::from_manifest(Some(&manifest), &project).expect("scopes");
+        let connector = FsConnector::new(&project, ExtensionPolicy::default(), scopes)
+            .expect("connector");
+
+        let call = HostCallPayload {
+            call_id: "call-scope-deny".to_string(),
+            capability: "write".to_string(),
+            method: "fs".to_string(),
+            params: json!({ "op": "write", "path": "inside.txt" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let result = connector.handle_host_call(&call);
+        assert!(result.is_error);
+        assert_eq!(
+            result.error.as_ref().expect("error").code,
+            HostCallErrorCode::Denied
+        );
+    }
+
+    fn canonicalize_json(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut keys = map.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for key in keys {
+                    if let Some(value) = map.get(&key) {
+                        out.insert(key, canonicalize_json(value));
+                    }
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+            other => other.clone(),
+        }
+    }
+
+    fn sha256_hex(input: &str) -> String {
+        use std::fmt::Write as _;
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(input.as_bytes());
+        let digest = hasher.finalize();
+
+        let mut out = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            write!(&mut out, "{byte:02x}").expect("write hex");
+        }
+        out
+    }
+
+    fn hostcall_params_hash(method: &str, params: &Value) -> String {
+        let canonical = canonicalize_json(&json!({ "method": method, "params": params }));
+        let json = serde_json::to_string(&canonical).expect("serialize canonical hostcall");
+        sha256_hex(&json)
+    }
+
+    fn hostcall_ledger_start_data(call: &HostCallPayload) -> Value {
+        let mut data = serde_json::Map::new();
+        data.insert("capability".to_string(), Value::String(call.capability.clone()));
+        data.insert("method".to_string(), Value::String(call.method.clone()));
+        data.insert(
+            "params_hash".to_string(),
+            Value::String(hostcall_params_hash(&call.method, &call.params)),
+        );
+        if let Some(timeout_ms) = call.timeout_ms {
+            data.insert("timeout_ms".to_string(), json!(timeout_ms));
+        }
+        Value::Object(data)
+    }
+
+    fn hostcall_ledger_end_data(call: &HostCallPayload, duration_ms: u64, result: &HostResultPayload) -> Value {
+        let mut data = serde_json::Map::new();
+        data.insert("capability".to_string(), Value::String(call.capability.clone()));
+        data.insert("method".to_string(), Value::String(call.method.clone()));
+        data.insert(
+            "params_hash".to_string(),
+            Value::String(hostcall_params_hash(&call.method, &call.params)),
+        );
+        if let Some(timeout_ms) = call.timeout_ms {
+            data.insert("timeout_ms".to_string(), json!(timeout_ms));
+        }
+        data.insert("duration_ms".to_string(), json!(duration_ms));
+        data.insert("is_error".to_string(), Value::Bool(result.is_error));
+        if result.is_error {
+            if let Some(error) = result.error.as_ref() {
+                data.insert("error".to_string(), json!({ "code": error.code }));
+            }
+        }
+        Value::Object(data)
+    }
+
+    #[test]
+    fn hostcall_params_hash_is_stable_for_key_ordering() {
+        let mut first = serde_json::Map::new();
+        first.insert("b".to_string(), json!(2));
+        first.insert("a".to_string(), json!(1));
+        let first = Value::Object(first);
+
+        let mut second = serde_json::Map::new();
+        second.insert("a".to_string(), json!(1));
+        second.insert("b".to_string(), json!(2));
+        let second = Value::Object(second);
+
+        assert_eq!(
+            hostcall_params_hash("http", &first),
+            hostcall_params_hash("http", &second)
+        );
+        assert_ne!(
+            hostcall_params_hash("http", &first),
+            hostcall_params_hash("tool", &first)
+        );
+    }
+
+    #[test]
+    fn hostcall_ledger_start_redacts_params_and_includes_hash() {
+        let call = HostCallPayload {
+            call_id: "host-ledger-1".to_string(),
+            capability: "env".to_string(),
+            method: "env".to_string(),
+            params: json!({ "name": "ANTHROPIC_API_KEY", "value": "sk-ant-SECRET" }),
+            timeout_ms: Some(1234),
+            cancel_token: None,
+            context: None,
+        };
+
+        let data = hostcall_ledger_start_data(&call);
+        let obj = data.as_object().expect("object");
+        assert!(obj.get("params_hash").is_some());
+        assert!(obj.get("params").is_none());
+
+        let encoded = serde_json::to_string(&data).expect("serialize data");
+        assert!(!encoded.contains("sk-ant-SECRET"));
+        assert!(!encoded.contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn hostcall_ledger_end_includes_error_code_when_is_error() {
+        let call = HostCallPayload {
+            call_id: "host-ledger-2".to_string(),
+            capability: "exec".to_string(),
+            method: "exec".to_string(),
+            params: json!({ "cmd": "ls", "args": ["-la"] }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let result = HostResultPayload {
+            call_id: call.call_id.clone(),
+            output: json!({}),
+            is_error: true,
+            error: Some(HostCallError {
+                code: HostCallErrorCode::Denied,
+                message: "Denied".to_string(),
+                details: None,
+                retryable: None,
+            }),
+            chunk: None,
+        };
+
+        let data = hostcall_ledger_end_data(&call, 10, &result);
+        let obj = data.as_object().expect("object");
+        assert_eq!(obj.get("is_error").and_then(Value::as_bool), Some(true));
+
+        let error = obj
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error object");
+        assert_eq!(error.get("code").and_then(Value::as_str), Some("denied"));
     }
 }
