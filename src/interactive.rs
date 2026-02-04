@@ -1675,7 +1675,9 @@ fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
 }
 
 fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
-    left.model.provider.eq_ignore_ascii_case(&right.model.provider)
+    left.model
+        .provider
+        .eq_ignore_ascii_case(&right.model.provider)
         && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
@@ -1700,7 +1702,9 @@ fn resolve_scoped_model_entries(
                 let id_lower = entry.model.id.to_lowercase();
 
                 if (glob.matches(&full_id_lower) || glob.matches(&id_lower))
-                    && !resolved.iter().any(|existing| model_entry_matches(existing, entry))
+                    && !resolved
+                        .iter()
+                        .any(|existing| model_entry_matches(existing, entry))
                 {
                     resolved.push(entry.clone());
                 }
@@ -1713,7 +1717,10 @@ fn resolve_scoped_model_entries(
             if raw_pattern.eq_ignore_ascii_case(&full_id)
                 || raw_pattern.eq_ignore_ascii_case(&entry.model.id)
             {
-                if !resolved.iter().any(|existing| model_entry_matches(existing, entry)) {
+                if !resolved
+                    .iter()
+                    .any(|existing| model_entry_matches(existing, entry))
+                {
                     resolved.push(entry.clone());
                 }
                 break;
@@ -5801,6 +5808,7 @@ impl PiApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn cycle_model(&mut self, delta: i32) {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot switch models while processing".to_string());
@@ -5824,10 +5832,7 @@ impl PiApp {
             let right = format!("{}/{}", b.model.provider, b.model.id);
             left.cmp(&right)
         });
-        candidates.dedup_by(|a, b| {
-            a.model.provider.eq_ignore_ascii_case(&b.model.provider)
-                && a.model.id.eq_ignore_ascii_case(&b.model.id)
-        });
+        candidates.dedup_by(model_entry_matches);
 
         if candidates.is_empty() {
             self.status_message = Some(if use_scope {
@@ -5838,16 +5843,9 @@ impl PiApp {
             return;
         }
 
-        let current_index = candidates.iter().position(|entry| {
-            entry
-                .model
-                .provider
-                .eq_ignore_ascii_case(&self.model_entry.model.provider)
-                && entry
-                    .model
-                    .id
-                    .eq_ignore_ascii_case(&self.model_entry.model.id)
-        });
+        let current_index = candidates
+            .iter()
+            .position(|entry| model_entry_matches(entry, &self.model_entry));
 
         let next_index = current_index.map_or_else(
             || {
@@ -5864,15 +5862,7 @@ impl PiApp {
 
         let next = candidates[next_index].clone();
 
-        if next
-            .model
-            .provider
-            .eq_ignore_ascii_case(&self.model_entry.model.provider)
-            && next
-                .model
-                .id
-                .eq_ignore_ascii_case(&self.model_entry.model.id)
-        {
+        if model_entry_matches(&next, &self.model_entry) {
             self.status_message = Some(if use_scope {
                 "Only one model in scope".to_string()
             } else {
