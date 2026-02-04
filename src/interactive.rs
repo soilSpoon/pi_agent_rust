@@ -412,7 +412,12 @@ impl PiApp {
         out.push_str("\n  ");
         out.push_str(&self.styles.muted_bold.render("Pending:"));
         out.push(' ');
-        out.push_str(&self.styles.accent_bold.render(&format!("{steering_len} steering")));
+        out.push_str(
+            &self
+                .styles
+                .accent_bold
+                .render(&format!("{steering_len} steering")),
+        );
         out.push_str(&self.styles.muted.render(", "));
         out.push_str(&self.styles.muted.render(&format!("{follow_len} follow-up")));
         out.push('\n');

@@ -714,7 +714,8 @@ fn tui_state_agent_start_enters_processing() {
 
 #[test]
 fn tui_state_pending_message_queue_shows_steering_preview_while_busy() {
-    let harness = TestHarness::new("tui_state_pending_message_queue_shows_steering_preview_while_busy");
+    let harness =
+        TestHarness::new("tui_state_pending_message_queue_shows_steering_preview_while_busy");
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
