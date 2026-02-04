@@ -393,6 +393,14 @@ fn press_pgdown(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
     )
 }
 
+fn press_left(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
+    apply_key(harness, app, "key:Left", KeyMsg::from_type(KeyType::Left))
+}
+
+fn press_tab(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
+    apply_key(harness, app, "key:Tab", KeyMsg::from_type(KeyType::Tab))
+}
+
 fn user_msg(text: &str) -> ConversationMessage {
     ConversationMessage {
         role: MessageRole::User,
@@ -454,6 +462,48 @@ fn tui_state_escape_exits_multiline_instead_of_quit() {
     assert_after_contains(&harness, &step, "[multi-line]");
     let step = press_esc(&harness, &mut app);
     assert_after_contains(&harness, &step, "[single-line]");
+}
+
+#[test]
+fn tui_state_tab_completes_path_when_cursor_in_token() {
+    let harness = TestHarness::new("tui_state_tab_completes_path_when_cursor_in_token");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    std::fs::create_dir_all(harness.temp_dir().join("src")).expect("mkdir");
+    std::fs::write(harness.temp_dir().join("src/main.rs"), "fn main() {}").expect("write");
+
+    let step = type_text(&harness, &mut app, "src/ma other");
+    assert_after_contains(&harness, &step, "src/ma other");
+
+    for _ in 0..6 {
+        let _ = press_left(&harness, &mut app);
+    }
+
+    let step = press_tab(&harness, &mut app);
+    assert_after_contains(&harness, &step, "src/main.rs other");
+    assert_after_not_contains(&harness, &step, "Enter/Tab accept");
+}
+
+#[test]
+fn tui_state_tab_opens_autocomplete_for_ambiguous_paths() {
+    let harness = TestHarness::new("tui_state_tab_opens_autocomplete_for_ambiguous_paths");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    std::fs::create_dir_all(harness.temp_dir().join("src")).expect("mkdir");
+    std::fs::write(harness.temp_dir().join("src/main.rs"), "fn main() {}").expect("write");
+    std::fs::write(harness.temp_dir().join("src/make.rs"), "pub fn make() {}").expect("write");
+
+    let step = type_text(&harness, &mut app, "src/ma");
+    assert_after_contains(&harness, &step, "src/ma");
+    assert_after_not_contains(&harness, &step, "Enter/Tab accept");
+
+    let step = press_tab(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Enter/Tab accept");
+    assert_after_contains(&harness, &step, "src/main.rs");
+    assert_after_contains(&harness, &step, "src/make.rs");
+    assert_after_contains(&harness, &step, "src/ma");
 }
 
 #[test]
@@ -660,6 +710,35 @@ fn tui_state_agent_start_enters_processing() {
 
     let step = apply_pi(&harness, &mut app, "PiMsg::AgentStart", PiMsg::AgentStart);
     assert_after_contains(&harness, &step, "Processing...");
+}
+
+#[test]
+fn tui_state_pending_message_queue_shows_steering_preview_while_busy() {
+    let harness = TestHarness::new("tui_state_pending_message_queue_shows_steering_preview_while_busy");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "queued steering");
+    apply_pi(&harness, &mut app, "PiMsg::AgentStart", PiMsg::AgentStart);
+
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Pending:");
+    assert_after_contains(&harness, &step, "queued steering");
+}
+
+#[test]
+fn tui_state_pending_message_queue_shows_follow_up_preview_while_busy() {
+    let harness =
+        TestHarness::new("tui_state_pending_message_queue_shows_follow_up_preview_while_busy");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "queued follow-up");
+    apply_pi(&harness, &mut app, "PiMsg::AgentStart", PiMsg::AgentStart);
+
+    let step = press_alt_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Pending:");
+    assert_after_contains(&harness, &step, "queued follow-up");
 }
 
 #[test]

@@ -214,10 +214,18 @@ impl PiApp {
             return;
         }
 
-        // Use end-of-buffer as cursor for now; this is good enough for tests and avoids
-        // depending on TextArea cursor internals.
-        let cursor = text.len();
+        // Autocomplete provider expects a byte offset cursor.
+        let cursor = self.input.cursor_byte_offset();
         let response = self.autocomplete.provider.suggest(&text, cursor);
+        // Path completion is Tab-triggered to avoid noisy dropdowns for URL-like tokens.
+        if response
+            .items
+            .iter()
+            .all(|item| item.kind == AutocompleteItemKind::Path)
+        {
+            self.autocomplete.close();
+            return;
+        }
         self.autocomplete.open_with(response);
     }
 
@@ -381,6 +389,53 @@ impl PiApp {
             "Tokens: {input} in / {output_tokens} out{cost_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
         );
         format!("\n  {}\n", self.styles.muted.render(&footer))
+    }
+
+    fn render_pending_message_queue(&self) -> Option<String> {
+        if self.agent_state == AgentState::Idle {
+            return None;
+        }
+
+        let Ok(queue) = self.message_queue.lock() else {
+            return None;
+        };
+
+        let steering_len = queue.steering.len();
+        let follow_len = queue.follow_up.len();
+        if steering_len == 0 && follow_len == 0 {
+            return None;
+        }
+
+        let max_preview = self.term_width.saturating_sub(24).max(20);
+
+        let mut out = String::new();
+        out.push_str("\n  ");
+        out.push_str(&self.styles.muted_bold.render("Pending:"));
+        out.push(' ');
+        out.push_str(&self.styles.accent_bold.render(&format!("{steering_len} steering")));
+        out.push_str(&self.styles.muted.render(", "));
+        out.push_str(&self.styles.muted.render(&format!("{follow_len} follow-up")));
+        out.push('\n');
+
+        if let Some(text) = queue.steering.front() {
+            let preview = queued_message_preview(text, max_preview);
+            out.push_str("  ");
+            out.push_str(&self.styles.accent_bold.render("steering →"));
+            out.push(' ');
+            out.push_str(&preview);
+            out.push('\n');
+        }
+
+        if let Some(text) = queue.follow_up.front() {
+            let preview = queued_message_preview(text, max_preview);
+            out.push_str("  ");
+            out.push_str(&self.styles.muted_bold.render("follow-up →"));
+            out.push(' ');
+            out.push_str(&self.styles.muted.render(&preview));
+            out.push('\n');
+        }
+
+        Some(out)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -735,6 +790,18 @@ fn truncate(s: &str, max_len: usize) -> String {
     out.extend(s.chars().take(take_len));
     out.push_str("...");
     out
+}
+
+fn queued_message_preview(text: &str, max_len: usize) -> String {
+    let first_line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if first_line.is_empty() {
+        return "(empty)".to_string();
+    }
+    truncate(first_line, max_len)
 }
 
 /// Run the interactive mode.
@@ -2681,6 +2748,10 @@ impl PiApp {
                 self.spinner.view(),
                 self.styles.accent.render("Processing...")
             );
+
+            if let Some(pending_queue) = self.render_pending_message_queue() {
+                output.push_str(&pending_queue);
+            }
         }
 
         // Footer with usage stats
@@ -4448,10 +4519,38 @@ impl PiApp {
             // Autocomplete
             // =========================================================
             AppAction::Tab => {
-                // Tab triggers/advances autocomplete when idle
-                if self.agent_state == AgentState::Idle {
-                    self.trigger_autocomplete();
+                if self.agent_state != AgentState::Idle || self.session_picker.is_some() {
+                    return None;
                 }
+
+                let text = self.input.value();
+                if text.trim().is_empty() {
+                    self.autocomplete.close();
+                    return None;
+                }
+
+                let cursor = self.input.cursor_byte_offset();
+                let response = self.autocomplete.provider.suggest(&text, cursor);
+
+                if response.items.is_empty() {
+                    self.autocomplete.close();
+                    return None;
+                }
+
+                if response.items.len() == 1
+                    && response
+                        .items
+                        .first()
+                        .is_some_and(|item| item.kind == AutocompleteItemKind::Path)
+                {
+                    let item = response.items[0].clone();
+                    self.autocomplete.replace_range = response.replace;
+                    self.accept_autocomplete(&item);
+                    self.autocomplete.close();
+                    return None;
+                }
+
+                self.autocomplete.open_with(response);
                 None
             }
 

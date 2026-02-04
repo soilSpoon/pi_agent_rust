@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::resources::ResourceLoader;
+use ignore::WalkBuilder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutocompleteItemKind {
@@ -291,27 +292,28 @@ impl AutocompleteProvider {
     }
 
     fn suggest_path(&self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
-        let raw = token.text;
-        let expanded = expand_tilde(raw);
+        let raw = token.text.trim();
+        let (dir_part_raw, base_part) = split_path_prefix(raw);
 
-        let (dir_part, base_part) = split_path_prefix(&expanded);
-        let dir_path = if Path::new(&dir_part).is_absolute() {
-            PathBuf::from(&dir_part)
-        } else {
-            self.cwd.join(&dir_part)
-        };
-
-        let mut items = Vec::new();
-        let Ok(read_dir) = std::fs::read_dir(&dir_path) else {
+        let Some(dir_path) = resolve_dir_path(&self.cwd, &dir_part_raw) else {
             return AutocompleteResponse {
                 replace: token.range.clone(),
                 items: Vec::new(),
             };
         };
 
-        for entry in read_dir.flatten() {
-            let file_name = entry.file_name();
-            let Some(file_name) = file_name.to_str() else {
+        let mut items = Vec::new();
+        for entry in WalkBuilder::new(&dir_path)
+            .require_git(false)
+            .max_depth(Some(1))
+            .build()
+            .filter_map(Result::ok)
+        {
+            if entry.depth() != 1 {
+                continue;
+            }
+
+            let Some(file_name) = entry.file_name().to_str() else {
                 continue;
             };
 
@@ -319,15 +321,21 @@ impl AutocompleteProvider {
                 continue;
             }
 
-            let mut insert = if dir_part == "." {
-                file_name.to_string()
-            } else if dir_part.ends_with(std::path::MAIN_SEPARATOR) || dir_part.ends_with('/') {
-                format!("{dir_part}{file_name}")
+            let mut insert = if dir_part_raw == "." {
+                if raw.starts_with("./") {
+                    format!("./{file_name}")
+                } else {
+                    file_name.to_string()
+                }
+            } else if dir_part_raw.ends_with(std::path::MAIN_SEPARATOR)
+                || dir_part_raw.ends_with('/')
+            {
+                format!("{dir_part_raw}{file_name}")
             } else {
-                format!("{dir_part}/{file_name}")
+                format!("{dir_part_raw}/{file_name}")
             };
 
-            let is_dir = entry.file_type().is_ok_and(|ty| ty.is_dir());
+            let is_dir = entry.file_type().is_some_and(|ty| ty.is_dir());
             if is_dir {
                 insert.push('/');
             }
@@ -682,6 +690,22 @@ fn expand_tilde(text: &str) -> String {
     text.to_string()
 }
 
+fn resolve_dir_path(cwd: &Path, dir_part: &str) -> Option<PathBuf> {
+    let dir_part = dir_part.trim();
+
+    if dir_part == "~" {
+        return dirs::home_dir();
+    }
+    if let Some(rest) = dir_part.strip_prefix("~/") {
+        return dirs::home_dir().map(|home| home.join(rest));
+    }
+    if Path::new(dir_part).is_absolute() {
+        return Some(PathBuf::from(dir_part));
+    }
+
+    Some(cwd.join(dir_part))
+}
+
 fn split_path_prefix(path: &str) -> (String, String) {
     let path = path.trim();
     if path.ends_with('/') {
@@ -810,5 +834,41 @@ mod tests {
         // Trigger a refresh and query.
         let resp = provider.suggest("@ma", 3);
         assert!(resp.items.iter().any(|item| item.insert == "@src/main.rs"));
+    }
+
+    #[test]
+    fn path_suggests_children_for_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("mkdir");
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}").expect("write");
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn lib() {}").expect("write");
+
+        let mut provider =
+            AutocompleteProvider::new(tmp.path().to_path_buf(), AutocompleteCatalog::default());
+        let resp = provider.suggest("src/ma", "src/ma".len());
+        assert_eq!(resp.replace, 0..6);
+        assert!(
+            resp.items.iter().any(|item| item.insert == "src/main.rs"
+                && item.kind == AutocompleteItemKind::Path)
+        );
+        assert!(!resp.items.iter().any(|item| item.insert == "src/lib.rs"));
+    }
+
+    #[test]
+    fn path_suggest_respects_gitignore_and_preserves_dot_slash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".gitignore"), "target/\n").expect("write");
+        std::fs::create_dir_all(tmp.path().join("target")).expect("mkdir");
+        std::fs::create_dir_all(tmp.path().join("tags")).expect("mkdir");
+
+        let mut provider =
+            AutocompleteProvider::new(tmp.path().to_path_buf(), AutocompleteCatalog::default());
+        let resp = provider.suggest("./ta", "./ta".len());
+        assert!(
+            resp.items
+                .iter()
+                .any(|item| item.insert == "./tags/" && item.kind == AutocompleteItemKind::Path)
+        );
+        assert!(!resp.items.iter().any(|item| item.insert == "./target/"));
     }
 }
