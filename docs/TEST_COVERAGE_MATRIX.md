@@ -42,7 +42,7 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 | `src/providers/openai.rs` | ✅ | `tests/provider_streaming.rs` | ✅ (VCR) | ❌ | Streaming is covered via VCR playback fixtures. |
 | `src/providers/mod.rs` | ❌ | ❌ | ❌ | ❌ | **Gap**: no tests. |
 | `src/resources.rs` | ✅ | ❌ | ❌ | ❌ | Unit coverage only. |
-| `src/rpc.rs` | ❌ | `tests/rpc_mode.rs` | ❌ | ❌ | Uses a deterministic `TestProvider` in RPC tests. |
+| `src/rpc.rs` | ❌ | `tests/rpc_mode.rs` | ❌ | ❌ | RPC tests run through VCR-backed OpenAI streams. |
 | `src/session.rs` | ✅ | `tests/session_conformance.rs` | ❌ | ❌ | Session JSONL conformance coverage. |
 | `src/session_index.rs` | ❌ | `tests/session_index_tests.rs` | ❌ | ❌ | Indexing + retrieval coverage. |
 | `src/sse.rs` | ✅ | ❌ | ❌ | ❌ | Unit coverage for SSE parser. |
@@ -60,7 +60,7 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 | `tests/tools_conformance.rs` | Integration | `src/tools.rs` | Direct tool execution tests. |
 | `tests/conformance_fixtures.rs` | Conformance | `src/tools.rs`, truncation | Fixture runner for tool parity. |
 | `tests/session_conformance.rs` | Conformance | `src/session.rs` | JSONL session format v3. |
-| `tests/rpc_mode.rs` | Integration | `src/rpc.rs`, `src/agent.rs`, `src/session.rs` | Uses a deterministic `TestProvider`. |
+| `tests/rpc_mode.rs` | Integration | `src/rpc.rs`, `src/agent.rs`, `src/session.rs` | VCR-backed OpenAI stream for RPC prompt path. |
 | `tests/provider_streaming.rs` | Conformance | `src/providers/*`, `src/vcr.rs` | VCR-backed streaming fixtures. |
 | `tests/e2e_cli.rs` | Integration | `src/main.rs`, `src/app.rs` | Headless CLI smoke (no interactive TUI). |
 | `tests/tui_snapshot.rs` | Integration | `src/tui.rs`, `src/interactive.rs` | insta snapshot coverage. |

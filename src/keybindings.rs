@@ -1071,9 +1071,7 @@ impl KeyBindings {
     /// Get the default user keybindings path: `~/.pi/agent/keybindings.json`
     #[must_use]
     pub fn user_config_path() -> std::path::PathBuf {
-        crate::config::Config::global_dir()
-            .join("agent")
-            .join("keybindings.json")
+        crate::config::Config::global_dir().join("keybindings.json")
     }
 
     /// Load keybindings from user config, returning defaults with diagnostics if loading fails.

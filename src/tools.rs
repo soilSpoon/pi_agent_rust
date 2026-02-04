@@ -2266,7 +2266,7 @@ impl Tool for GrepTool {
 
         for (file_path, line_number) in &matches {
             let relative_path = format_grep_path(file_path, &search_path, is_directory);
-            let lines = get_file_lines(file_path, &mut file_cache);
+            let lines = get_file_lines_async(file_path, &mut file_cache).await;
 
             if lines.is_empty() {
                 output_lines.push(format!(
@@ -2665,14 +2665,17 @@ impl Tool for LsTool {
         }
 
         let mut entries = Vec::new();
-        let read_dir = std::fs::read_dir(&dir_path)
+        let mut read_dir = asupersync::fs::read_dir(&dir_path)
+            .await
             .map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?;
 
-        for entry in read_dir {
-            let entry =
-                entry.map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?;
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(|e| Error::tool("ls", format!("Cannot read directory entry: {e}")))?
+        {
             let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(meta) = entry.metadata() else {
+            let Ok(meta) = entry.metadata().await else {
                 continue;
             };
             entries.push((name, meta.is_dir()));
@@ -2926,15 +2929,19 @@ fn format_grep_path(file_path: &Path, search_path: &Path, is_directory: bool) ->
         .to_string()
 }
 
-fn get_file_lines<'a>(path: &Path, cache: &'a mut HashMap<PathBuf, Vec<String>>) -> &'a [String] {
-    let lines = cache.entry(path.to_path_buf()).or_insert_with(|| {
+async fn get_file_lines_async<'a>(
+    path: &Path,
+    cache: &'a mut HashMap<PathBuf, Vec<String>>,
+) -> &'a [String] {
+    if !cache.contains_key(path) {
         // Match Node's `readFileSync(..., "utf-8")` behavior: decode lossily rather than failing.
-        let bytes = std::fs::read(path).unwrap_or_default();
+        let bytes = asupersync::fs::read(path).await.unwrap_or_default();
         let content = String::from_utf8_lossy(&bytes).to_string();
         let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
-        normalized.split('\n').map(str::to_string).collect()
-    });
-    lines.as_slice()
+        let lines: Vec<String> = normalized.split('\n').map(str::to_string).collect();
+        cache.insert(path.to_path_buf(), lines);
+    }
+    cache.get(path).unwrap().as_slice()
 }
 
 fn find_fd_binary() -> Option<&'static str> {

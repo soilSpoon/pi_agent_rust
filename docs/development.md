@@ -1,83 +1,74 @@
 # Development
 
-This guide summarizes the build/test workflow and the quality gates expected for
-changes in this repo.
+## Building
 
-## Prerequisites
-
-- Rust nightly (2024 edition).
-- `cargo`, `rustfmt`, `clippy`.
-- `fd` for the `find` tool (optional but recommended).
-- `rg` for faster grep (optional).
-
-## Build
+Pi requires Rust nightly (2024 edition).
 
 ```bash
+# Build dev binary
 cargo build
+
+# Build release binary (optimized)
 cargo build --release
 ```
 
-## Quality Gates (required after code changes)
+## Testing
+
+We enforce a strict "no mocks" policy for core logic. Tests use real filesystem operations (in temp dirs) and VCR-style recording for HTTP interactions.
+
+### Unit & Integration Tests
 
 ```bash
-# Formatting
-cargo fmt --check
-
-# Compiler warnings/errors
-cargo check --all-targets
-
-# Clippy (pedantic + nursery are enabled)
-cargo clippy --all-targets -- -D warnings
-```
-
-## Tests
-
-```bash
-# All tests
+# Run all tests
 cargo test
 
-# With output
-cargo test -- --nocapture
-
-# Focused modules
-cargo test sse::tests
-cargo test tools::tests
-cargo test conformance
+# Run specific module
+cargo test config
+cargo test session
 ```
 
-## Conformance Fixtures
+### Conformance Tests
 
-Conformance tests are fixture-driven and live under `tests/conformance/fixtures/`.
-Each fixture defines setup steps, tool input, and expected outputs. The runner
-loads fixtures and asserts stable, deterministic behavior.
-
-Run them with:
+Conformance tests validate that Pi behaves identically to the legacy TypeScript implementation for tools and core logic.
 
 ```bash
 cargo test conformance
 ```
 
-## Provider Streaming (VCR)
+### VCR Mode
 
-Provider streaming tests use VCR-style recorded cassettes for determinism.
-Cassettes live under `tests/fixtures/vcr/`.
+Provider tests use recorded "cassettes" to avoid network calls and ensure determinism.
+
+- **Playback (Default)**: Replays recorded responses. Fails if cassette missing.
+- **Record**: Makes real API calls and saves cassettes.
 
 ```bash
-# Record new cassettes (requires live API access)
-VCR_MODE=record cargo test provider_streaming::anthropic
+# Run in playback mode (CI default)
+VCR_MODE=playback cargo test
 
-# Playback from recorded cassettes (CI-safe)
-VCR_MODE=playback cargo test provider_streaming::anthropic
+# Record new cassettes (requires API keys)
+export ANTHROPIC_API_KEY=...
+VCR_MODE=record cargo test provider_streaming
 ```
 
-Common env vars:
+## Quality Gates
 
-- `VCR_MODE=record|playback|auto`
-- `VCR_CASSETTE_DIR=tests/fixtures/vcr`
+Before submitting a PR, ensure all gates pass:
 
-## Useful Config Paths
+```bash
+# Format check
+cargo fmt --check
 
-- Global config: `~/.pi/agent/settings.json`
-- Project config: `.pi/settings.json`
-- Sessions: `~/.pi/agent/sessions/` (override via `PI_SESSIONS_DIR`)
-- Auth: `~/.pi/agent/auth.json`
+# Lint check (deny warnings)
+cargo clippy --all-targets -- -D warnings
+
+# Tests
+cargo test --all-targets
+```
+
+## Project Structure
+
+- `src/`: Core Rust source
+- `tests/`: Integration and conformance tests
+- `docs/`: User and developer documentation
+- `legacy_pi_mono_code/`: Reference code from the original TypeScript implementation

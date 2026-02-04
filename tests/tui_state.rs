@@ -17,6 +17,7 @@ use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
 use pi::session::SessionMessage;
+use pi::session::encode_cwd;
 use pi::tools::ToolRegistry;
 use regex::Regex;
 use serde_json::json;
@@ -24,6 +25,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
     static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
@@ -96,7 +99,15 @@ fn build_app_with_session(
     pending_inputs: Vec<PendingInput>,
     session: Session,
 ) -> PiApp {
-    let config = Config::default();
+    build_app_with_session_and_config(harness, pending_inputs, session, Config::default())
+}
+
+fn build_app_with_session_and_config(
+    harness: &TestHarness,
+    pending_inputs: Vec<PendingInput>,
+    session: Session,
+    config: Config,
+) -> PiApp {
     let cwd = harness.temp_dir().to_path_buf();
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
@@ -138,6 +149,54 @@ fn build_app_with_session(
     app
 }
 
+#[allow(dead_code)]
+fn build_app_with_session_and_events(
+    harness: &TestHarness,
+    pending_inputs: Vec<PendingInput>,
+    session: Session,
+) -> (PiApp, mpsc::Receiver<PiMsg>) {
+    let config = Config::default();
+    let cwd = harness.temp_dir().to_path_buf();
+    let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+    let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
+    let agent = Agent::new(provider, tools, AgentConfig::default());
+    let resources = ResourceLoader::empty(config.enable_skill_commands());
+    let resource_cli = ResourceCliOptions {
+        no_skills: false,
+        no_prompt_templates: false,
+        no_extensions: false,
+        no_themes: false,
+        skill_paths: Vec::new(),
+        prompt_paths: Vec::new(),
+        extension_paths: Vec::new(),
+        theme_paths: Vec::new(),
+    };
+    let model_entry = dummy_model_entry();
+    let model_scope = vec![model_entry.clone()];
+    let available_models = vec![model_entry.clone()];
+    let (event_tx, event_rx) = mpsc::channel(1024);
+
+    let mut app = PiApp::new(
+        agent,
+        session,
+        config,
+        resources,
+        resource_cli,
+        cwd,
+        model_entry,
+        model_scope,
+        available_models,
+        pending_inputs,
+        event_tx,
+        test_runtime_handle(),
+        false,
+        None,
+        Some(KeyBindings::new()),
+    );
+    app.set_terminal_size(80, 24);
+    (app, event_rx)
+}
+
 fn build_app(harness: &TestHarness, pending_inputs: Vec<PendingInput>) -> PiApp {
     build_app_with_session(harness, pending_inputs, Session::in_memory())
 }
@@ -155,6 +214,59 @@ fn normalize_view(input: &str) -> String {
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[allow(dead_code)]
+fn create_session_on_disk(
+    base_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    name: &str,
+    user_text: &str,
+) -> std::path::PathBuf {
+    let project_dir = base_dir.join(encode_cwd(cwd));
+    std::fs::create_dir_all(&project_dir).expect("create sessions dir");
+
+    let mut session = Session::create_with_dir(Some(base_dir.to_path_buf()));
+    session.header.cwd = cwd.display().to_string();
+    session.set_name(name);
+    session.append_message(SessionMessage::User {
+        content: UserContent::Text(user_text.to_string()),
+        timestamp: Some(0),
+    });
+    let path = project_dir.join(format!("{name}.jsonl"));
+    session.path = Some(path.clone());
+    common::run_async(async move {
+        session.save().await.expect("save session");
+    });
+    path
+}
+
+#[allow(dead_code)]
+fn wait_for_pi_msgs(
+    event_rx: &mpsc::Receiver<PiMsg>,
+    timeout: Duration,
+    predicate: impl Fn(&[PiMsg]) -> bool,
+) -> Vec<PiMsg> {
+    let start = Instant::now();
+    let mut events = Vec::new();
+    loop {
+        match event_rx.try_recv() {
+            Ok(msg) => {
+                events.push(msg);
+                if predicate(&events) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvError::Empty) => {
+                if start.elapsed() >= timeout {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    }
+    events
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +482,14 @@ fn press_esc(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
 
 fn press_ctrlc(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
     apply_key(harness, app, "key:CtrlC", KeyMsg::from_type(KeyType::CtrlC))
+}
+
+fn press_ctrld(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
+    apply_key(harness, app, "key:CtrlD", KeyMsg::from_type(KeyType::CtrlD))
+}
+
+fn press_ctrlt(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
+    apply_key(harness, app, "key:CtrlT", KeyMsg::from_type(KeyType::CtrlT))
 }
 
 fn press_up(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
@@ -787,6 +907,32 @@ fn tui_state_thinking_delta_renders_while_processing() {
         "PiMsg::ThinkingDelta",
         PiMsg::ThinkingDelta("hmm".to_string()),
     );
+    assert_after_contains(&harness, &step, "Thinking:");
+    assert_after_contains(&harness, &step, "hmm");
+}
+
+#[test]
+fn tui_state_hide_thinking_block_hides_thinking_until_toggled() {
+    let harness = TestHarness::new("tui_state_hide_thinking_block_hides_thinking_until_toggled");
+    let config = Config {
+        hide_thinking_block: Some(true),
+        ..Config::default()
+    };
+    let mut app =
+        build_app_with_session_and_config(&harness, Vec::new(), Session::in_memory(), config);
+    log_initial_state(&harness, &app);
+
+    apply_pi(&harness, &mut app, "PiMsg::AgentStart", PiMsg::AgentStart);
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ThinkingDelta(hidden)",
+        PiMsg::ThinkingDelta("hmm".to_string()),
+    );
+    assert_after_not_contains(&harness, &step, "Thinking:");
+    assert_after_not_contains(&harness, &step, "hmm");
+
+    let step = press_ctrlt(&harness, &mut app);
     assert_after_contains(&harness, &step, "Thinking:");
     assert_after_contains(&harness, &step, "hmm");
 }
@@ -1231,6 +1377,69 @@ fn tui_state_slash_resume_without_sessions_sets_status() {
 }
 
 #[test]
+fn tui_state_slash_resume_selects_latest_session_and_loads_messages() {
+    let harness =
+        TestHarness::new("tui_state_slash_resume_selects_latest_session_and_loads_messages");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_dir().to_path_buf();
+
+    create_session_on_disk(&base_dir, &cwd, "older", "Older session message");
+    thread::sleep(Duration::from_millis(10));
+    create_session_on_disk(&base_dir, &cwd, "newer", "Newer session message");
+
+    let mut session = Session::create_with_dir(Some(base_dir));
+    session.header.cwd = cwd.display().to_string();
+    let (mut app, event_rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/resume");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Select a session to resume");
+    assert_after_contains(&harness, &step, "newer");
+    assert_after_contains(&harness, &step, "older");
+
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Loading session...");
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_millis(500), |msgs| {
+        msgs.iter()
+            .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
+    });
+    let reset = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
+        .expect("expected ConversationReset after resume");
+    let step = apply_pi(&harness, &mut app, "PiMsg::ConversationReset", reset);
+    assert_after_contains(&harness, &step, "Session resumed");
+    assert_after_contains(&harness, &step, "Newer session message");
+}
+
+#[test]
+fn tui_state_session_picker_ctrl_d_reports_disabled() {
+    let harness = TestHarness::new("tui_state_session_picker_ctrl_d_reports_disabled");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_dir().to_path_buf();
+
+    create_session_on_disk(&base_dir, &cwd, "session-a", "Message A");
+    let mut session = Session::create_with_dir(Some(base_dir));
+    session.header.cwd = cwd.display().to_string();
+    let (mut app, _event_rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/resume");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Select a session to resume");
+
+    let step = press_ctrld(&harness, &mut app);
+    assert_after_contains(
+        &harness,
+        &step,
+        "Session deletion is disabled (requires explicit permission).",
+    );
+    assert_after_contains(&harness, &step, "Select a session to resume");
+}
+
+#[test]
 fn tui_state_slash_copy_reports_clipboard_unavailable_or_success() {
     let harness = TestHarness::new("tui_state_slash_copy_reports_clipboard_unavailable_or_success");
     let mut app = build_app(&harness, Vec::new());
@@ -1372,6 +1581,75 @@ fn tui_state_slash_tree_select_root_user_message_prefills_editor_and_resets_leaf
     assert_after_contains(&harness, &step, "Root");
     // Conversation should be empty after resetting leaf.
     assert_after_not_contains(&harness, &step, "You: Root");
+}
+
+#[test]
+fn tui_state_slash_fork_creates_session_and_prefills_editor() {
+    let harness = TestHarness::new("tui_state_slash_fork_creates_session_and_prefills_editor");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_dir().to_path_buf();
+
+    let mut session = Session::create_with_dir(Some(base_dir.clone()));
+    session.header.cwd = cwd.display().to_string();
+    session.append_message(SessionMessage::User {
+        content: UserContent::Text("Root message".to_string()),
+        timestamp: Some(0),
+    });
+    session.append_message(SessionMessage::User {
+        content: UserContent::Text("Child message".to_string()),
+        timestamp: Some(0),
+    });
+
+    let (mut app, event_rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/fork");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Forking session...");
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_millis(700), |msgs| {
+        let has_reset = msgs
+            .iter()
+            .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }));
+        let has_editor = msgs
+            .iter()
+            .any(|msg| matches!(msg, PiMsg::SetEditorText(_)));
+        has_reset && has_editor
+    });
+
+    let mut reset_msg = None;
+    let mut editor_msg = None;
+    for msg in events {
+        match msg {
+            PiMsg::ConversationReset { .. } => reset_msg = Some(msg),
+            PiMsg::SetEditorText(_) => editor_msg = Some(msg),
+            PiMsg::AgentError(err) => {
+                panic!("Unexpected fork error: {err}");
+            }
+            _ => {}
+        }
+    }
+
+    let reset = reset_msg.expect("expected ConversationReset after fork");
+    let step = apply_pi(&harness, &mut app, "PiMsg::ConversationReset", reset);
+    assert_after_contains(&harness, &step, "Forked new session from Child message");
+
+    let editor = editor_msg.expect("expected SetEditorText after fork");
+    let step = apply_pi(&harness, &mut app, "PiMsg::SetEditorText", editor);
+    assert_after_contains(&harness, &step, "Child message");
+
+    let repo_cwd = std::env::current_dir().expect("cwd");
+    let fork_dir = base_dir.join(encode_cwd(&repo_cwd));
+    let mut has_jsonl = false;
+    if let Ok(entries) = std::fs::read_dir(&fork_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+                has_jsonl = true;
+                break;
+            }
+        }
+    }
+    assert!(has_jsonl, "expected fork to create a session file");
 }
 
 #[test]

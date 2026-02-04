@@ -2260,6 +2260,7 @@ pub struct PiApp {
     messages: Vec<ConversationMessage>,
     current_response: String,
     current_thinking: String,
+    thinking_visible: bool,
     current_tool: Option<String>,
     pending_tool_output: Option<String>,
 
@@ -2608,6 +2609,7 @@ impl PiApp {
         let editor_padding_x = config.editor_padding_x.unwrap_or(0).min(3) as usize;
         let autocomplete_max_visible =
             config.autocomplete_max_visible.unwrap_or(5).clamp(3, 20) as usize;
+        let thinking_visible = !config.hide_thinking_block.unwrap_or(false);
 
         // Configure text area for input
         let mut input = TextArea::new();
@@ -2719,6 +2721,7 @@ impl PiApp {
             messages,
             current_response: String::new(),
             current_thinking: String::new(),
+            thinking_visible,
             current_tool: None,
             pending_tool_output: None,
             session: Arc::new(Mutex::new(session)),
@@ -3606,15 +3609,17 @@ impl PiApp {
                     );
 
                     // Render thinking if present
-                    if let Some(thinking) = &msg.thinking {
-                        let truncated = truncate(thinking, 100);
-                        let _ = writeln!(
-                            output,
-                            "  {}",
-                            self.styles
-                                .muted_italic
-                                .render(&format!("Thinking: {truncated}"))
-                        );
+                    if self.thinking_visible {
+                        if let Some(thinking) = &msg.thinking {
+                            let truncated = truncate(thinking, 100);
+                            let _ = writeln!(
+                                output,
+                                "  {}",
+                                self.styles
+                                    .muted_italic
+                                    .render(&format!("Thinking: {truncated}"))
+                            );
+                        }
                     }
 
                     // Render markdown content
@@ -3641,7 +3646,7 @@ impl PiApp {
             );
 
             // Show thinking if present
-            if !self.current_thinking.is_empty() {
+            if self.thinking_visible && !self.current_thinking.is_empty() {
                 let truncated = truncate(&self.current_thinking, 100);
                 let _ = writeln!(
                     output,
@@ -3818,6 +3823,10 @@ impl PiApp {
                 });
                 self.scroll_to_bottom();
                 self.input.focus();
+
+                if !self.pending_inputs.is_empty() {
+                    return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
+                }
             }
             PiMsg::ConversationReset {
                 messages,
@@ -3961,13 +3970,20 @@ impl PiApp {
     }
 
     fn run_next_pending(&mut self) -> Option<Cmd> {
-        if self.agent_state != AgentState::Idle {
-            return None;
-        }
-        let next = self.pending_inputs.pop_front()?;
-        match next {
-            PendingInput::Text(text) => self.submit_message(&text),
-            PendingInput::Content(content) => self.submit_content(content),
+        loop {
+            if self.agent_state != AgentState::Idle {
+                return None;
+            }
+            let next = self.pending_inputs.pop_front()?;
+
+            let cmd = match next {
+                PendingInput::Text(text) => self.submit_message(&text),
+                PendingInput::Content(content) => self.submit_content(content),
+            };
+
+            if cmd.is_some() {
+                return cmd;
+            }
         }
     }
 
@@ -5097,6 +5113,21 @@ impl PiApp {
             }
 
             // =========================================================
+            // Display actions
+            // =========================================================
+            AppAction::ToggleThinking => {
+                self.thinking_visible = !self.thinking_visible;
+                let content = self.build_conversation_content();
+                self.conversation_viewport.set_content(&content);
+                self.status_message = Some(if self.thinking_visible {
+                    "Thinking shown".to_string()
+                } else {
+                    "Thinking hidden".to_string()
+                });
+                None
+            }
+
+            // =========================================================
             // Actions not yet implemented - let through to component
             // =========================================================
             _ => {
@@ -5132,6 +5163,7 @@ impl PiApp {
             // Tab is consumed (autocomplete).
             AppAction::PageUp
             | AppAction::PageDown
+            | AppAction::ToggleThinking
             | AppAction::FollowUp
             | AppAction::NewLine
             | AppAction::Submit

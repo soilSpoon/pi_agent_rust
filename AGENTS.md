@@ -231,7 +231,8 @@ This port uses two key libraries from sibling projects:
 
 **Current Status:**
 - asupersync is the async runtime (HTTP/TLS/SQLite); SSE parser implemented
-- rich_rust added, TUI integration pending
+- rich_rust added
+- TUI integration complete (interactive mode)
 
 ### Performance Targets
 

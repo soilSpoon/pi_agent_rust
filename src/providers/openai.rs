@@ -127,11 +127,22 @@ impl Provider for OpenAIProvider {
         context: &Context,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let auth_value = options
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-            .ok_or_else(|| Error::config("Missing OpenAI API key"))?;
+        let has_authorization_header = options
+            .headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("authorization"));
+
+        let auth_value = if has_authorization_header {
+            None
+        } else {
+            Some(
+                options
+                    .api_key
+                    .clone()
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                    .ok_or_else(|| Error::config("Missing OpenAI API key"))?,
+            )
+        };
 
         let request_body = self.build_request(context, options);
 
@@ -140,8 +151,11 @@ impl Provider for OpenAIProvider {
             .client
             .post(&self.base_url)
             .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .header("Authorization", format!("Bearer {auth_value}"));
+            .header("Accept", "text/event-stream");
+
+        if let Some(auth_value) = auth_value {
+            request = request.header("Authorization", format!("Bearer {auth_value}"));
+        }
 
         for (key, value) in &options.headers {
             request = request.header(key, value);

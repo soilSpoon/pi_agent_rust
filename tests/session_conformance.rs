@@ -10,6 +10,7 @@ use pi::session::{
     CustomEntry, EntryBase, Session, SessionEntry, SessionHeader, SessionMessage, encode_cwd,
 };
 use pi::session_index::SessionIndex;
+use proptest::prelude::*;
 use serde_json::json;
 use std::future::Future;
 use std::path::Path;
@@ -68,6 +69,167 @@ fn assert_contains_entry<'a>(
         entries.iter().any(predicate),
         "Expected session entries to contain {description}"
     );
+}
+
+fn proptest_session_header() -> impl Strategy<Value = SessionHeader> {
+    let provider = prop_oneof![
+        Just(None),
+        Just(Some("anthropic".to_string())),
+        Just(Some("openai".to_string())),
+        Just(Some("gemini".to_string())),
+        Just(Some("azure".to_string())),
+    ];
+    let model_id = prop_oneof![
+        Just(None),
+        Just(Some("claude-test".to_string())),
+        Just(Some("gpt-test".to_string())),
+        Just(Some("gemini-test".to_string())),
+    ];
+    let thinking_level = prop_oneof![
+        Just(None),
+        Just(Some("off".to_string())),
+        Just(Some("low".to_string())),
+        Just(Some("medium".to_string())),
+        Just(Some("high".to_string())),
+    ];
+    let parent_session = prop_oneof![
+        Just(None),
+        Just(Some("/tmp/parent.jsonl".to_string())),
+        Just(Some("parent-session-id".to_string())),
+    ];
+
+    (
+        0u32..1_000_000,
+        provider,
+        model_id,
+        thinking_level,
+        parent_session,
+    )
+        .prop_map(
+            |(seed, provider, model_id, thinking_level, parent_session)| SessionHeader {
+                r#type: "session".to_string(),
+                version: Some(pi::session::SESSION_VERSION),
+                id: format!("sess-{seed}"),
+                timestamp: "2026-02-03T00:00:00.000Z".to_string(),
+                cwd: "/tmp/project".to_string(),
+                provider,
+                model_id,
+                thinking_level,
+                parent_session,
+            },
+        )
+}
+
+fn proptest_message_entries() -> impl Strategy<Value = Vec<SessionEntry>> {
+    proptest::collection::btree_set(0u32..1_000_000, 0..16)
+        .prop_flat_map(|id_set| {
+            let ids = id_set
+                .into_iter()
+                .map(|value| format!("{value:08x}"))
+                .collect::<Vec<_>>();
+            let len = ids.len();
+            (
+                Just(ids),
+                proptest::collection::vec(any::<u8>(), len),
+                proptest::collection::vec(any::<u8>(), len),
+            )
+        })
+        .prop_map(|(ids, parent_bytes, msg_bytes)| {
+            let mut entries = Vec::with_capacity(ids.len());
+            for i in 0..ids.len() {
+                let parent_choice = parent_bytes[i] % u8::try_from(i + 1).unwrap_or(u8::MAX);
+                let parent_id = if parent_choice == 0 {
+                    Some("root".to_string())
+                } else {
+                    let parent_idx = usize::from(parent_choice - 1);
+                    Some(ids[parent_idx].clone())
+                };
+
+                let base = EntryBase {
+                    id: Some(ids[i].clone()),
+                    parent_id,
+                    timestamp: "2026-02-03T00:00:01.000Z".to_string(),
+                };
+                let message = SessionMessage::User {
+                    content: UserContent::Text(format!("msg-{i}-{}", msg_bytes[i])),
+                    timestamp: Some(0),
+                };
+                entries.push(SessionEntry::Message(pi::session::MessageEntry {
+                    base,
+                    message,
+                }));
+            }
+            entries
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+
+    #[test]
+    fn proptest_session_header_json_roundtrip(header in proptest_session_header()) {
+        let encoded = serde_json::to_string(&header).expect("serialize header");
+        let decoded: SessionHeader = serde_json::from_str(&encoded).expect("parse header");
+        prop_assert_eq!(
+            serde_json::to_value(&decoded).expect("to value"),
+            serde_json::to_value(&header).expect("to value"),
+        );
+    }
+
+    #[test]
+    fn proptest_session_entry_json_roundtrip_and_tree_invariants(entries in proptest_message_entries()) {
+        let mut decoded_entries = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let encoded = serde_json::to_string(entry).expect("serialize entry");
+            let decoded: SessionEntry = serde_json::from_str(&encoded).expect("parse entry");
+            prop_assert_eq!(
+                serde_json::to_value(&decoded).expect("to value"),
+                serde_json::to_value(entry).expect("to value"),
+            );
+            decoded_entries.push(decoded);
+        }
+
+        let ids = decoded_entries
+            .iter()
+            .filter_map(|entry| entry.base().id.as_deref())
+            .collect::<std::collections::HashSet<_>>();
+        for entry in &decoded_entries {
+            let base = entry.base();
+            prop_assert!(base.id.as_deref().is_some_and(|id| ids.contains(id)));
+            if let Some(parent_id) = base.parent_id.as_deref() {
+                prop_assert!(parent_id == "root" || ids.contains(parent_id));
+            }
+        }
+
+        let leaf_id = decoded_entries.last().and_then(SessionEntry::base_id).cloned();
+        if let Some(ref leaf_id) = leaf_id {
+            prop_assert!(ids.contains(leaf_id.as_str()));
+        }
+
+        let mut session = Session::create();
+        session.header = SessionHeader {
+            r#type: "session".to_string(),
+            version: Some(pi::session::SESSION_VERSION),
+            id: "sess-proptest".to_string(),
+            timestamp: "2026-02-03T00:00:00.000Z".to_string(),
+            cwd: "/tmp/project".to_string(),
+            provider: None,
+            model_id: None,
+            thinking_level: None,
+            parent_session: None,
+        };
+        session.entries = decoded_entries;
+        session.leaf_id = leaf_id;
+
+        if let Some(leaf_id) = session.leaf_id.clone() {
+            // Path should always end at the requested entry.
+            let path = session.get_path_to_entry(&leaf_id);
+            prop_assert_eq!(path.last().map(String::as_str), Some(leaf_id.as_str()));
+        }
+
+        let _ = session.entries_for_current_path();
+        let _ = session.list_leaves();
+    }
 }
 
 #[test]

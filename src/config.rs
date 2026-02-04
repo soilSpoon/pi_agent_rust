@@ -1,9 +1,12 @@
 //! Configuration loading and management.
 
 use crate::agent::QueueMode;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde_json::Value;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 /// Main configuration structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -125,6 +128,12 @@ pub enum PackageSource {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsScope {
+    Global,
+    Project,
+}
+
 impl Config {
     /// Load configuration from global and project settings.
     pub fn load() -> Result<Self> {
@@ -213,6 +222,28 @@ impl Config {
         Ok(merged)
     }
 
+    pub fn settings_path_with_roots(
+        scope: SettingsScope,
+        global_dir: &Path,
+        cwd: &Path,
+    ) -> PathBuf {
+        match scope {
+            SettingsScope::Global => global_dir.join("settings.json"),
+            SettingsScope::Project => cwd.join(Self::project_dir()).join("settings.json"),
+        }
+    }
+
+    pub fn patch_settings_with_roots(
+        scope: SettingsScope,
+        global_dir: &Path,
+        cwd: &Path,
+        patch: Value,
+    ) -> Result<PathBuf> {
+        let path = Self::settings_path_with_roots(scope, global_dir, cwd);
+        patch_settings_file(&path, patch)?;
+        Ok(path)
+    }
+
     /// Merge two configurations, with `other` taking precedence.
     fn merge(base: Self, other: Self) -> Self {
         Self {
@@ -241,26 +272,26 @@ impl Config {
                 .or(base.autocomplete_max_visible),
 
             // Compaction
-            compaction: other.compaction.or(base.compaction),
+            compaction: merge_compaction(base.compaction, other.compaction),
 
             // Branch Summarization
-            branch_summary: other.branch_summary.or(base.branch_summary),
+            branch_summary: merge_branch_summary(base.branch_summary, other.branch_summary),
 
             // Retry Configuration
-            retry: other.retry.or(base.retry),
+            retry: merge_retry(base.retry, other.retry),
 
             // Shell
             shell_path: other.shell_path.or(base.shell_path),
             shell_command_prefix: other.shell_command_prefix.or(base.shell_command_prefix),
 
             // Images
-            images: other.images.or(base.images),
+            images: merge_images(base.images, other.images),
 
             // Terminal Display
-            terminal: other.terminal.or(base.terminal),
+            terminal: merge_terminal(base.terminal, other.terminal),
 
             // Thinking Budgets
-            thinking_budgets: other.thinking_budgets.or(base.thinking_budgets),
+            thinking_budgets: merge_thinking_budgets(base.thinking_budgets, other.thinking_budgets),
 
             // Extensions/Skills/etc.
             packages: other.packages.or(base.packages),
@@ -390,10 +421,188 @@ fn emit_queue_mode_diagnostic(setting: &'static str, mode: Option<&str>) {
     );
 }
 
+fn merge_compaction(
+    base: Option<CompactionSettings>,
+    other: Option<CompactionSettings>,
+) -> Option<CompactionSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(CompactionSettings {
+            enabled: other.enabled.or(base.enabled),
+            reserve_tokens: other.reserve_tokens.or(base.reserve_tokens),
+            keep_recent_tokens: other.keep_recent_tokens.or(base.keep_recent_tokens),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_branch_summary(
+    base: Option<BranchSummarySettings>,
+    other: Option<BranchSummarySettings>,
+) -> Option<BranchSummarySettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(BranchSummarySettings {
+            reserve_tokens: other.reserve_tokens.or(base.reserve_tokens),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_retry(base: Option<RetrySettings>, other: Option<RetrySettings>) -> Option<RetrySettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(RetrySettings {
+            enabled: other.enabled.or(base.enabled),
+            max_retries: other.max_retries.or(base.max_retries),
+            base_delay_ms: other.base_delay_ms.or(base.base_delay_ms),
+            max_delay_ms: other.max_delay_ms.or(base.max_delay_ms),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_images(
+    base: Option<ImageSettings>,
+    other: Option<ImageSettings>,
+) -> Option<ImageSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ImageSettings {
+            auto_resize: other.auto_resize.or(base.auto_resize),
+            block_images: other.block_images.or(base.block_images),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_terminal(
+    base: Option<TerminalSettings>,
+    other: Option<TerminalSettings>,
+) -> Option<TerminalSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(TerminalSettings {
+            show_images: other.show_images.or(base.show_images),
+            clear_on_shrink: other.clear_on_shrink.or(base.clear_on_shrink),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_thinking_budgets(
+    base: Option<ThinkingBudgets>,
+    other: Option<ThinkingBudgets>,
+) -> Option<ThinkingBudgets> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ThinkingBudgets {
+            minimal: other.minimal.or(base.minimal),
+            low: other.low.or(base.low),
+            medium: other.medium.or(base.medium),
+            high: other.high.or(base.high),
+            xhigh: other.xhigh.or(base.xhigh),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn load_settings_json_object(path: &Path) -> Result<Value> {
+    if !path.exists() {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    let value: Value = serde_json::from_str(&content)?;
+    if !value.is_object() {
+        return Err(Error::config(format!(
+            "Settings file is not a JSON object: {}",
+            path.display()
+        )));
+    }
+    Ok(value)
+}
+
+fn deep_merge_settings_value(dst: &mut Value, patch: Value) -> Result<()> {
+    let Value::Object(patch) = patch else {
+        return Err(Error::validation("Settings patch must be a JSON object"));
+    };
+
+    let dst_obj = dst.as_object_mut().ok_or_else(|| {
+        Error::config("Internal error: settings root unexpectedly not a JSON object")
+    })?;
+
+    for (key, value) in patch {
+        if value.is_null() {
+            dst_obj.remove(&key);
+            continue;
+        }
+
+        match (dst_obj.get_mut(&key), value) {
+            (Some(Value::Object(dst_child)), Value::Object(patch_child)) => {
+                let mut child = Value::Object(std::mem::take(dst_child));
+                deep_merge_settings_value(&mut child, Value::Object(patch_child))?;
+                dst_obj.insert(key, child);
+            }
+            (_, other) => {
+                dst_obj.insert(key, other);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_settings_json_atomic(path: &Path, value: &Value) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut contents = serde_json::to_string_pretty(value)?;
+    contents.push('\n');
+
+    let mut tmp = NamedTempFile::new_in(parent)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        tmp.as_file().set_permissions(perms)?;
+    }
+
+    tmp.write_all(contents.as_bytes())?;
+    tmp.as_file().sync_all()?;
+
+    tmp.persist(path).map_err(|err| {
+        Error::config(format!(
+            "Failed to persist settings file to {}: {}",
+            path.display(),
+            err.error
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn patch_settings_file(path: &Path, patch: Value) -> Result<Value> {
+    let mut settings = load_settings_json_object(path)?;
+    deep_merge_settings_value(&mut settings, patch)?;
+    write_settings_json_atomic(path, &settings)?;
+    Ok(settings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use super::SettingsScope;
     use crate::agent::QueueMode;
+    use serde_json::json;
     use tempfile::TempDir;
 
     fn write_file(path: &std::path::Path, contents: &str) {
@@ -459,6 +668,85 @@ mod tests {
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
         assert_eq!(config.default_model.as_deref(), Some("project"));
         assert_eq!(config.theme.as_deref(), Some("global"));
+    }
+
+    #[test]
+    fn load_merges_nested_structs_instead_of_overriding() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "compaction": { "enabled": true, "reserve_tokens": 1234, "keep_recent_tokens": 5678 } }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{ "compaction": { "enabled": false } }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        assert!(!config.compaction_enabled());
+        assert_eq!(config.compaction_reserve_tokens(), 1234);
+        assert_eq!(config.compaction_keep_recent_tokens(), 5678);
+    }
+
+    #[test]
+    fn patch_settings_deep_merges_and_preserves_other_fields() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let settings_path =
+            Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd);
+
+        write_file(
+            &settings_path,
+            r#"{ "theme": "dark", "compaction": { "reserve_tokens": 111 } }"#,
+        );
+
+        let updated = Config::patch_settings_with_roots(
+            SettingsScope::Project,
+            &global_dir,
+            &cwd,
+            json!({ "compaction": { "enabled": false } }),
+        )
+        .expect("patch settings");
+
+        assert_eq!(updated, settings_path);
+
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        assert_eq!(stored["theme"], json!("dark"));
+        assert_eq!(stored["compaction"]["reserve_tokens"], json!(111));
+        assert_eq!(stored["compaction"]["enabled"], json!(false));
+    }
+
+    #[test]
+    fn patch_settings_writes_with_restrictive_permissions() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let settings_path =
+            Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd);
+
+        Config::patch_settings_with_roots(
+            SettingsScope::Project,
+            &global_dir,
+            &cwd,
+            json!({ "default_provider": "anthropic" }),
+        )
+        .expect("patch settings");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&settings_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
