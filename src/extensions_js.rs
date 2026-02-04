@@ -702,8 +702,31 @@ pub struct PiJsTickStats {
     pub microtask_drains: usize,
     /// Number of pending QuickJS jobs drained.
     pub jobs_drained: usize,
-    /// Number of pending hostcalls.
+    /// Number of pending hostcalls (in-flight Promises).
     pub pending_hostcalls: usize,
+    /// Total hostcalls issued by this runtime.
+    pub hostcalls_total: u64,
+    /// Total hostcalls timed out by this runtime.
+    pub hostcalls_timed_out: u64,
+    /// Last observed QuickJS `memory_used_size` in bytes.
+    pub memory_used_bytes: u64,
+    /// Peak observed QuickJS `memory_used_size` in bytes.
+    pub peak_memory_used_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PiJsRuntimeLimits {
+    /// Limit runtime heap usage (QuickJS allocator). `None` means unlimited.
+    pub memory_limit_bytes: Option<usize>,
+    /// Limit runtime stack usage. `None` uses QuickJS default.
+    pub max_stack_bytes: Option<usize>,
+    /// Interrupt budget to bound JS execution. `None` disables budget enforcement.
+    ///
+    /// This is implemented via QuickJS's interrupt hook. For deterministic unit tests,
+    /// setting this to `Some(0)` forces an immediate abort.
+    pub interrupt_budget: Option<u64>,
+    /// Default timeout (ms) for hostcalls issued via `pi.*`.
+    pub hostcall_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -711,6 +734,7 @@ pub struct PiJsRuntimeConfig {
     pub cwd: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    pub limits: PiJsRuntimeLimits,
 }
 
 impl Default for PiJsRuntimeConfig {
@@ -719,7 +743,101 @@ impl Default for PiJsRuntimeConfig {
             cwd: ".".to_string(),
             args: Vec::new(),
             env: HashMap::new(),
+            limits: PiJsRuntimeLimits::default(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct InterruptBudget {
+    configured: Option<u64>,
+    remaining: std::cell::Cell<Option<u64>>,
+    tripped: std::cell::Cell<bool>,
+}
+
+impl InterruptBudget {
+    fn new(configured: Option<u64>) -> Self {
+        Self {
+            configured,
+            remaining: std::cell::Cell::new(configured),
+            tripped: std::cell::Cell::new(false),
+        }
+    }
+
+    fn reset(&self) {
+        self.remaining.set(self.configured);
+        self.tripped.set(false);
+    }
+
+    fn on_interrupt(&self) -> bool {
+        let Some(remaining) = self.remaining.get() else {
+            return false;
+        };
+        if remaining == 0 {
+            self.tripped.set(true);
+            return true;
+        }
+        self.remaining.set(Some(remaining - 1));
+        false
+    }
+
+    fn did_trip(&self) -> bool {
+        self.tripped.get()
+    }
+
+    fn clear_trip(&self) {
+        self.tripped.set(false);
+    }
+}
+
+#[derive(Debug, Default)]
+struct HostcallTracker {
+    pending: HashSet<String>,
+    call_to_timer: HashMap<String, u64>,
+    timer_to_call: HashMap<u64, String>,
+}
+
+enum HostcallCompletion {
+    Delivered {
+        #[allow(dead_code)]
+        timer_id: Option<u64>,
+    },
+    Unknown,
+}
+
+impl HostcallTracker {
+    fn register(&mut self, call_id: String, timer_id: Option<u64>) {
+        self.pending.insert(call_id.clone());
+        if let Some(timer_id) = timer_id {
+            self.call_to_timer.insert(call_id.clone(), timer_id);
+            self.timer_to_call.insert(timer_id, call_id);
+        }
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn on_complete(&mut self, call_id: &str) -> HostcallCompletion {
+        if !self.pending.remove(call_id) {
+            return HostcallCompletion::Unknown;
+        }
+
+        let timer_id = self.call_to_timer.remove(call_id);
+        if let Some(timer_id) = timer_id {
+            self.timer_to_call.remove(&timer_id);
+        }
+
+        HostcallCompletion::Delivered { timer_id }
+    }
+
+    fn take_timed_out_call(&mut self, timer_id: u64) -> Option<String> {
+        let call_id = self.timer_to_call.remove(&timer_id)?;
+        self.call_to_timer.remove(&call_id);
+        if !self.pending.remove(&call_id) {
+            return None;
+        }
+        Some(call_id)
     }
 }
 
@@ -762,7 +880,12 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     context: AsyncContext,
     scheduler: Rc<RefCell<Scheduler<C>>>,
     hostcall_queue: HostcallQueue,
-    trace_seq: AtomicU64,
+    trace_seq: Arc<AtomicU64>,
+    hostcall_tracker: Rc<RefCell<HostcallTracker>>,
+    hostcalls_total: Arc<AtomicU64>,
+    hostcalls_timed_out: Arc<AtomicU64>,
+    peak_memory_used_bytes: Arc<AtomicU64>,
+    interrupt_budget: Rc<InterruptBudget>,
     config: PiJsRuntimeConfig,
 }
 
@@ -787,19 +910,44 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     #[allow(clippy::future_not_send)]
     pub async fn with_clock_and_config(clock: C, config: PiJsRuntimeConfig) -> Result<Self> {
         let runtime = AsyncRuntime::new().map_err(|err| map_js_error(&err))?;
+        if let Some(limit) = config.limits.memory_limit_bytes {
+            runtime.set_memory_limit(limit).await;
+        }
+        if let Some(limit) = config.limits.max_stack_bytes {
+            runtime.set_max_stack_size(limit).await;
+        }
+
+        let interrupt_budget = Rc::new(InterruptBudget::new(config.limits.interrupt_budget));
+        if config.limits.interrupt_budget.is_some() {
+            let budget = Rc::clone(&interrupt_budget);
+            runtime
+                .set_interrupt_handler(Some(Box::new(move || budget.on_interrupt())))
+                .await;
+        }
+
         let context = AsyncContext::full(&runtime)
             .await
             .map_err(|err| map_js_error(&err))?;
 
         let scheduler = Rc::new(RefCell::new(Scheduler::with_clock(clock)));
         let hostcall_queue: HostcallQueue = Rc::new(RefCell::new(VecDeque::new()));
+        let hostcall_tracker = Rc::new(RefCell::new(HostcallTracker::default()));
+        let hostcalls_total = Arc::new(AtomicU64::new(0));
+        let hostcalls_timed_out = Arc::new(AtomicU64::new(0));
+        let peak_memory_used_bytes = Arc::new(AtomicU64::new(0));
+        let trace_seq = Arc::new(AtomicU64::new(1));
 
         let instance = Self {
             runtime,
             context,
             scheduler,
             hostcall_queue,
-            trace_seq: AtomicU64::new(1),
+            trace_seq,
+            hostcall_tracker,
+            hostcalls_total,
+            hostcalls_timed_out,
+            peak_memory_used_bytes,
+            interrupt_budget,
             config,
         };
 
@@ -807,12 +955,29 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         Ok(instance)
     }
 
+    fn map_quickjs_error(&self, err: rquickjs::Error) -> Error {
+        if self.interrupt_budget.did_trip() {
+            self.interrupt_budget.clear_trip();
+            return Error::extension("PiJS execution budget exceeded".to_string());
+        }
+        map_js_error(&err)
+    }
+
+    fn map_quickjs_job_error(&self, err: rquickjs::Error) -> Error {
+        if self.interrupt_budget.did_trip() {
+            self.interrupt_budget.clear_trip();
+            return Error::extension("PiJS execution budget exceeded".to_string());
+        }
+        Error::extension(format!("QuickJS job: {err}"))
+    }
+
     /// Evaluate JavaScript source code.
     pub async fn eval(&self, source: &str) -> Result<()> {
-        self.context
-            .with(|ctx| ctx.eval::<(), _>(source))
-            .await
-            .map_err(|err| map_js_error(&err))?;
+        self.interrupt_budget.reset();
+        match self.context.with(|ctx| ctx.eval::<(), _>(source)).await {
+            Ok(()) => {}
+            Err(err) => return Err(self.map_quickjs_error(err)),
+        }
         // Drain any immediate jobs (Promise.resolve chains, etc.)
         self.drain_jobs().await?;
         Ok(())
@@ -820,10 +985,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Evaluate a JavaScript file.
     pub async fn eval_file(&self, path: &std::path::Path) -> Result<()> {
-        self.context
-            .with(|ctx| ctx.eval_file::<(), _>(path))
-            .await
-            .map_err(|err| map_js_error(&err))?;
+        self.interrupt_budget.reset();
+        match self.context.with(|ctx| ctx.eval_file::<(), _>(path)).await {
+            Ok(()) => {}
+            Err(err) => return Err(self.map_quickjs_error(err)),
+        }
         self.drain_jobs().await?;
         Ok(())
     }
@@ -838,7 +1004,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Peek at pending hostcall requests without draining.
     pub fn pending_hostcall_count(&self) -> usize {
-        self.hostcall_queue.borrow().len()
+        self.hostcall_tracker.borrow().pending_count()
     }
 
     /// Enqueue a hostcall completion to be delivered on next tick.
@@ -874,7 +1040,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Check if there are pending tasks (macrotasks or timers).
     pub fn has_pending(&self) -> bool {
-        self.scheduler.borrow().has_pending() || !self.hostcall_queue.borrow().is_empty()
+        self.scheduler.borrow().has_pending() || self.pending_hostcall_count() > 0
     }
 
     /// Execute one tick of the event loop.
@@ -890,24 +1056,57 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let macrotask = self.scheduler.borrow_mut().tick();
 
         let mut stats = PiJsTickStats::default();
+        stats.hostcalls_total = self
+            .hostcalls_total
+            .load(std::sync::atomic::Ordering::SeqCst);
+        stats.hostcalls_timed_out = self
+            .hostcalls_timed_out
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         if let Some(task) = macrotask {
             stats.ran_macrotask = true;
+            self.interrupt_budget.reset();
 
             // Handle the macrotask inside the JS context
-            self.context
+            let result = self
+                .context
                 .with(|ctx| {
-                    Self::handle_macrotask(&ctx, &task)?;
+                    self.handle_macrotask(&ctx, &task)?;
                     Ok::<_, rquickjs::Error>(())
                 })
-                .await
-                .map_err(|err| map_js_error(&err))?;
+                .await;
+            if let Err(err) = result {
+                return Err(self.map_quickjs_error(err));
+            }
 
             // Drain microtasks until fixpoint
             stats.jobs_drained = self.drain_jobs().await?;
         }
 
-        stats.pending_hostcalls = self.hostcall_queue.borrow().len();
+        stats.pending_hostcalls = self.hostcall_tracker.borrow().pending_count();
+
+        let usage = self.runtime.memory_usage().await;
+        stats.memory_used_bytes = u64::try_from(usage.memory_used_size).unwrap_or(0);
+        let mut peak = self
+            .peak_memory_used_bytes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if stats.memory_used_bytes > peak {
+            peak = stats.memory_used_bytes;
+            self.peak_memory_used_bytes
+                .store(peak, std::sync::atomic::Ordering::SeqCst);
+        }
+        stats.peak_memory_used_bytes = peak;
+
+        if let Some(limit) = self.config.limits.memory_limit_bytes {
+            let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+            if stats.memory_used_bytes > limit {
+                return Err(Error::extension(format!(
+                    "PiJS memory budget exceeded (used {} bytes, limit {} bytes)",
+                    stats.memory_used_bytes, limit
+                )));
+            }
+        }
+
         Ok(stats)
     }
 
@@ -915,11 +1114,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     async fn drain_jobs(&self) -> Result<usize> {
         let mut count = 0;
         loop {
-            let ran = self
-                .runtime
-                .execute_pending_job()
-                .await
-                .map_err(|err| Error::extension(format!("QuickJS job: {err}")))?;
+            let ran = match self.runtime.execute_pending_job().await {
+                Ok(ran) => ran,
+                Err(err) => return Err(self.map_quickjs_job_error(err)),
+            };
             if !ran {
                 break;
             }
@@ -929,11 +1127,32 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     }
 
     /// Handle a macrotask by resolving/rejecting Promises or dispatching events.
-    fn handle_macrotask(ctx: &Ctx<'_>, task: &crate::scheduler::Macrotask) -> rquickjs::Result<()> {
+    fn handle_macrotask(
+        &self,
+        ctx: &Ctx<'_>,
+        task: &crate::scheduler::Macrotask,
+    ) -> rquickjs::Result<()> {
         use crate::scheduler::MacrotaskKind as SMK;
 
         match &task.kind {
             SMK::HostcallComplete { call_id, outcome } => {
+                let completion = self.hostcall_tracker.borrow_mut().on_complete(call_id);
+                let timer_id = match completion {
+                    HostcallCompletion::Delivered { timer_id } => timer_id,
+                    HostcallCompletion::Unknown => {
+                        tracing::debug!(
+                            event = "pijs.macrotask.hostcall_complete.ignored",
+                            call_id = %call_id,
+                            "Ignoring hostcall completion (not pending)"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                if let Some(timer_id) = timer_id {
+                    let _ = self.scheduler.borrow_mut().clear_timeout(timer_id);
+                }
+
                 tracing::debug!(
                     event = "pijs.macrotask.hostcall_complete",
                     call_id = %call_id,
@@ -945,6 +1164,28 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 Self::deliver_hostcall_completion(ctx, call_id, outcome)?;
             }
             SMK::TimerFired { timer_id } => {
+                if let Some(call_id) = self
+                    .hostcall_tracker
+                    .borrow_mut()
+                    .take_timed_out_call(*timer_id)
+                {
+                    self.hostcalls_timed_out
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tracing::warn!(
+                        event = "pijs.hostcall.timeout",
+                        call_id = %call_id,
+                        timer_id = timer_id,
+                        "Hostcall timed out"
+                    );
+
+                    let outcome = HostcallOutcome::Error {
+                        code: "timeout".to_string(),
+                        message: "Hostcall timed out".to_string(),
+                    };
+                    Self::deliver_hostcall_completion(ctx, &call_id, &outcome)?;
+                    return Ok(());
+                }
+
                 tracing::debug!(
                     event = "pijs.macrotask.timer_fired",
                     timer_id = timer_id,
@@ -1961,6 +2202,7 @@ mod tests {
                 cwd: "/virtual/cwd".to_string(),
                 args: vec!["--flag".to_string()],
                 env,
+                limits: PiJsRuntimeLimits::default(),
             };
             let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
                 .await
@@ -2000,6 +2242,7 @@ mod tests {
                 cwd: "/virtual/cwd".to_string(),
                 args: vec!["a".to_string(), "b".to_string()],
                 env: HashMap::new(),
+                limits: PiJsRuntimeLimits::default(),
             };
             let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
                 .await

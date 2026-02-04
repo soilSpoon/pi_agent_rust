@@ -1465,6 +1465,200 @@ fn retry_delay_ms(config: &Config, attempt: u32) -> u32 {
     u32::try_from(delay).unwrap_or(u32::MAX)
 }
 
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::agent::{Agent, AgentConfig, AgentSession};
+    use crate::model::{AssistantMessage, Usage};
+    use crate::provider::Provider;
+    use crate::resources::ResourceLoader;
+    use crate::session::Session;
+    use crate::tools::ToolRegistry;
+    use async_trait::async_trait;
+    use futures::stream;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct FlakyProvider {
+        calls: AtomicUsize,
+    }
+
+    impl FlakyProvider {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for FlakyProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+
+            let mut partial = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+
+            let events = if call == 0 {
+                // First call fails with an explicit error event.
+                partial.stop_reason = StopReason::Error;
+                partial.error_message = Some("boom".to_string());
+                vec![
+                    Ok(crate::model::StreamEvent::Start {
+                        partial: partial.clone(),
+                    }),
+                    Ok(crate::model::StreamEvent::Error {
+                        reason: StopReason::Error,
+                        error: partial,
+                    }),
+                ]
+            } else {
+                // Second call succeeds.
+                vec![
+                    Ok(crate::model::StreamEvent::Start {
+                        partial: partial.clone(),
+                    }),
+                    Ok(crate::model::StreamEvent::Done {
+                        reason: StopReason::Stop,
+                        message: partial,
+                    }),
+                ]
+            };
+
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    #[test]
+    fn rpc_auto_retry_retries_then_succeeds() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let provider = Arc::new(FlakyProvider::new());
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Session::in_memory();
+            let agent_session = AgentSession::new(agent, session, false);
+
+            let session = Arc::new(Mutex::new(agent_session));
+
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(1),
+                base_delay_ms: Some(1),
+                max_delay_ms: Some(1),
+            });
+
+            let mut shared = RpcSharedState::new(&config);
+            shared.auto_compaction_enabled = false;
+            let shared_state = Arc::new(Mutex::new(shared));
+
+            let is_streaming = Arc::new(AtomicBool::new(false));
+            let is_compacting = Arc::new(AtomicBool::new(false));
+            let abort_handle_slot: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
+            let retry_abort = Arc::new(AtomicBool::new(false));
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+
+            let auth_path = tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .join("auth.json");
+            let auth = AuthStorage::load(auth_path).expect("auth load");
+
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: Vec::new(),
+                scoped_models: Vec::new(),
+                auth,
+                runtime_handle,
+            };
+
+            run_prompt_with_retry(
+                session,
+                shared_state,
+                is_streaming,
+                is_compacting,
+                abort_handle_slot,
+                out_tx,
+                retry_abort,
+                options,
+                "hello".to_string(),
+                Vec::new(),
+                Cx::for_request(),
+            )
+            .await;
+
+            let mut saw_retry_start = false;
+            let mut saw_retry_end_success = false;
+
+            for line in out_rx.try_iter() {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let Some(kind) = value.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+                match kind {
+                    "auto_retry_start" => {
+                        saw_retry_start = true;
+                    }
+                    "auto_retry_end" => {
+                        if value.get("success").and_then(Value::as_bool) == Some(true) {
+                            saw_retry_end_success = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            assert!(saw_retry_start, "missing auto_retry_start event");
+            assert!(
+                saw_retry_end_success,
+                "missing successful auto_retry_end event"
+            );
+        });
+    }
+}
+
 fn should_auto_compact(tokens_before: u64, context_window: u32, reserve_tokens: u32) -> bool {
     let reserve = u64::from(reserve_tokens);
     let window = u64::from(context_window);

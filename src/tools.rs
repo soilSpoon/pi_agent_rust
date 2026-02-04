@@ -1095,6 +1095,207 @@ pub struct BashTool {
     command_prefix: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BashRunResult {
+    pub output: String,
+    pub exit_code: i32,
+    pub cancelled: bool,
+    pub truncated: bool,
+    pub full_output_path: Option<String>,
+    pub truncation: Option<TruncationResult>,
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_bash_command(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+) -> Result<BashRunResult> {
+    let timeout_secs = timeout_secs.filter(|t| *t > 0);
+    let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
+        || command.to_string(),
+        |prefix| format!("{prefix}\n{command}"),
+    );
+
+    if !cwd.exists() {
+        return Err(Error::tool(
+            "bash",
+            format!(
+                "Working directory does not exist: {}\nCannot execute bash commands.",
+                cwd.display()
+            ),
+        ));
+    }
+
+    let shell = shell_path.unwrap_or_else(|| {
+        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
+            if Path::new(path).exists() {
+                return path;
+            }
+        }
+        "sh"
+    });
+
+    let mut child = Command::new(shell)
+        .arg("-c")
+        .arg(&command)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::tool("bash", "Missing stdout".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let tx_stdout = tx.clone();
+    thread::spawn(move || pump_stream(stdout, &tx_stdout));
+    thread::spawn(move || pump_stream(stderr, &tx));
+
+    let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
+    let mut bash_output = BashOutputState::new(max_chunks_bytes);
+
+    let mut timed_out = false;
+    let mut exit_code: Option<i32> = None;
+    let child_pid = Some(child.id());
+    let start = Instant::now();
+    let timeout = timeout_secs.map(Duration::from_secs);
+
+    let tick = Duration::from_millis(10);
+    loop {
+        while let Ok(chunk) = rx.try_recv() {
+            process_bash_chunk(&chunk, &mut bash_output, on_update).await?;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = status.code();
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => return Err(Error::tool("bash", err.to_string())),
+        }
+
+        if let Some(timeout) = timeout {
+            if start.elapsed() >= timeout {
+                timed_out = true;
+                kill_process_tree(child_pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+
+        sleep(wall_now(), tick).await;
+    }
+
+    loop {
+        match rx.try_recv() {
+            Ok(chunk) => process_bash_chunk(&chunk, &mut bash_output, None).await?,
+            Err(mpsc::TryRecvError::Empty) => {
+                sleep(wall_now(), tick).await;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    drop(bash_output.temp_file.take());
+
+    let full_output = String::from_utf8_lossy(&concat_chunks(&bash_output.chunks)).to_string();
+
+    let mut truncation = truncate_tail(&full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    if bash_output.total_bytes > bash_output.chunks_bytes {
+        truncation.truncated = true;
+        truncation.truncated_by = Some(TruncatedBy::Bytes);
+        truncation.total_bytes = bash_output.total_bytes;
+    }
+
+    let mut output_text = if truncation.content.is_empty() {
+        "(no output)".to_string()
+    } else {
+        truncation.content.clone()
+    };
+
+    let mut full_output_path = None;
+    if truncation.truncated {
+        if let Some(path) = bash_output.temp_file_path.as_ref() {
+            full_output_path = Some(path.display().to_string());
+        }
+
+        let start_line = truncation
+            .total_lines
+            .saturating_sub(truncation.output_lines)
+            .saturating_add(1);
+        let end_line = truncation.total_lines;
+
+        let display_path = full_output_path.as_deref().unwrap_or("undefined");
+
+        if truncation.last_line_partial {
+            let last_line = full_output.split('\n').next_back().unwrap_or("");
+            let last_line_size = format_size(last_line.len());
+            let _ = write!(
+                output_text,
+                "\n\n[Showing last {} of line {end_line} (line is {last_line_size}). Full output: {display_path}]",
+                format_size(truncation.output_bytes)
+            );
+        } else if truncation.truncated_by == Some(TruncatedBy::Lines) {
+            let _ = write!(
+                output_text,
+                "\n\n[Showing lines {start_line}-{end_line} of {}. Full output: {display_path}]",
+                truncation.total_lines
+            );
+        } else {
+            let _ = write!(
+                output_text,
+                "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit). Full output: {display_path}]",
+                truncation.total_lines,
+                format_size(DEFAULT_MAX_BYTES)
+            );
+        }
+    }
+
+    let mut cancelled = false;
+    if timed_out {
+        cancelled = true;
+        if !output_text.is_empty() {
+            output_text.push_str("\n\n");
+        }
+        let timeout_display = timeout_secs.unwrap_or(0);
+        let _ = write!(
+            output_text,
+            "Command timed out after {timeout_display} seconds"
+        );
+    }
+
+    let exit_code = exit_code.unwrap_or(if cancelled { -1 } else { 0 });
+    if !cancelled && exit_code != 0 {
+        let _ = write!(output_text, "\n\nCommand exited with code {exit_code}");
+    }
+
+    Ok(BashRunResult {
+        output: output_text,
+        exit_code,
+        cancelled,
+        truncated: truncation.truncated,
+        full_output_path,
+        truncation: if truncation.truncated {
+            Some(truncation)
+        } else {
+            None
+        },
+    })
+}
+
 impl BashTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
@@ -1156,189 +1357,25 @@ impl Tool for BashTool {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
-        let timeout_secs = input.timeout.filter(|t| *t > 0);
-        let command = if let Some(prefix) = self
-            .command_prefix
-            .as_ref()
-            .filter(|p| !p.trim().is_empty())
-        {
-            format!("{prefix}\n{}", input.command)
-        } else {
-            input.command.clone()
-        };
-
-        if !self.cwd.exists() {
-            return Err(Error::tool(
-                "bash",
-                format!(
-                    "Working directory does not exist: {}\nCannot execute bash commands.",
-                    self.cwd.display()
-                ),
-            ));
-        }
-
-        let shell = self.shell_path.as_deref().unwrap_or_else(|| {
-            // Check common bash locations (varies by platform)
-            for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-                if Path::new(path).exists() {
-                    return path;
-                }
-            }
-            "sh"
-        });
-
-        // Spawn the bash process
-        let mut child = Command::new(shell)
-            .arg("-c")
-            .arg(&command)
-            .current_dir(&self.cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::tool("bash", "Missing stdout".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
-
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let tx_stdout = tx.clone();
-        thread::spawn(move || pump_stream(stdout, &tx_stdout));
-        thread::spawn(move || pump_stream(stderr, &tx));
-
-        let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
-        let mut bash_output = BashOutputState::new(max_chunks_bytes);
-
-        let mut timed_out = false;
-        let mut exit_code: Option<i32> = None;
-        let child_pid = Some(child.id());
-        let start = Instant::now();
-        let timeout = timeout_secs.map(Duration::from_secs);
-
-        let tick = Duration::from_millis(10);
-        loop {
-            while let Ok(chunk) = rx.try_recv() {
-                process_bash_chunk(&chunk, &mut bash_output, on_update.as_deref()).await?;
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    exit_code = status.code();
-                    break;
-                }
-                Ok(None) => {}
-                Err(err) => return Err(Error::tool("bash", err.to_string())),
-            }
-
-            if let Some(timeout) = timeout {
-                if start.elapsed() >= timeout {
-                    timed_out = true;
-                    kill_process_tree(child_pid);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-            }
-
-            sleep(wall_now(), tick).await;
-        }
-
-        // Drain any remaining output (including anything still queued after the senders drop).
-        loop {
-            match rx.try_recv() {
-                Ok(chunk) => process_bash_chunk(&chunk, &mut bash_output, None).await?,
-                Err(mpsc::TryRecvError::Empty) => {
-                    sleep(wall_now(), tick).await;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        drop(bash_output.temp_file.take());
-
-        let full_output = String::from_utf8_lossy(&concat_chunks(&bash_output.chunks)).to_string();
-
-        if timed_out {
-            let mut output = full_output;
-            if !output.is_empty() {
-                output.push_str("\n\n");
-            }
-            let timeout_display = timeout_secs.unwrap_or(0);
-            let _ = write!(output, "Command timed out after {timeout_display} seconds");
-            return Err(Error::tool("bash", output));
-        }
-
-        let mut truncation = truncate_tail(&full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-        // Correct truncation metadata if we dropped data from the in-memory buffer.
-        // bash_output.chunks only holds the last ~100KB, so if total_bytes is larger,
-        // we have definitely truncated the head of the output.
-        if bash_output.total_bytes > bash_output.chunks_bytes {
-            truncation.truncated = true;
-            truncation.truncated_by = Some(TruncatedBy::Bytes);
-            truncation.total_bytes = bash_output.total_bytes;
-        }
-
-        let mut output_text = if truncation.content.is_empty() {
-            "(no output)".to_string()
-        } else {
-            truncation.content.clone()
-        };
+        let result = run_bash_command(
+            &self.cwd,
+            self.shell_path.as_deref(),
+            self.command_prefix.as_deref(),
+            &input.command,
+            input.timeout,
+            on_update.as_deref(),
+        )
+        .await?;
 
         let mut details_map = serde_json::Map::new();
-        if truncation.truncated {
-            details_map.insert("truncation".to_string(), serde_json::to_value(&truncation)?);
-            if let Some(path) = bash_output.temp_file_path.as_ref() {
-                details_map.insert(
-                    "fullOutputPath".to_string(),
-                    serde_json::Value::String(path.display().to_string()),
-                );
-            }
-
-            let start_line = truncation
-                .total_lines
-                .saturating_sub(truncation.output_lines)
-                .saturating_add(1);
-            let end_line = truncation.total_lines;
-
-            let full_output_path = bash_output
-                .temp_file_path
-                .as_ref()
-                .map_or_else(|| "undefined".to_string(), |p| p.display().to_string());
-
-            if truncation.last_line_partial {
-                let last_line = full_output.split('\n').next_back().unwrap_or("");
-                let last_line_size = format_size(last_line.len());
-                let _ = write!(
-                    output_text,
-                    "\n\n[Showing last {} of line {end_line} (line is {last_line_size}). Full output: {full_output_path}]",
-                    format_size(truncation.output_bytes)
-                );
-            } else if truncation.truncated_by == Some(TruncatedBy::Lines) {
-                let _ = write!(
-                    output_text,
-                    "\n\n[Showing lines {start_line}-{end_line} of {}. Full output: {full_output_path}]",
-                    truncation.total_lines
-                );
-            } else {
-                let _ = write!(
-                    output_text,
-                    "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit). Full output: {full_output_path}]",
-                    truncation.total_lines,
-                    format_size(DEFAULT_MAX_BYTES)
-                );
-            }
+        if let Some(truncation) = result.truncation.as_ref() {
+            details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
         }
-
-        if let Some(code) = exit_code {
-            if code != 0 {
-                let _ = write!(output_text, "\n\nCommand exited with code {code}");
-                return Err(Error::tool("bash", output_text));
-            }
+        if let Some(path) = result.full_output_path.as_ref() {
+            details_map.insert(
+                "fullOutputPath".to_string(),
+                serde_json::Value::String(path.clone()),
+            );
         }
 
         let details = if details_map.is_empty() {
@@ -1347,8 +1384,12 @@ impl Tool for BashTool {
             Some(serde_json::Value::Object(details_map))
         };
 
+        if result.cancelled || result.exit_code != 0 {
+            return Err(Error::tool("bash", result.output));
+        }
+
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(output_text))],
+            content: vec![ContentBlock::Text(TextContent::new(result.output))],
             details,
         })
     }

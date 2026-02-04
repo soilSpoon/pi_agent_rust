@@ -750,6 +750,7 @@ mod tests {
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
+    use serde_json::json;
     use std::path::PathBuf;
 
     #[test]
@@ -804,6 +805,25 @@ mod tests {
             let events = collect_events(&case.events);
             let summaries: Vec<EventSummary> = events.iter().map(summarize_event).collect();
             assert_eq!(summaries, case.expected, "case {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_stream_error_event_maps_to_stop_reason_error() {
+        let events = vec![json!({
+            "type": "error",
+            "error": { "message": "nope" }
+        })];
+
+        let out = collect_events(&events);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            StreamEvent::Error { reason, error } => {
+                assert_eq!(*reason, StopReason::Error);
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert_eq!(error.error_message.as_deref(), Some("nope"));
+            }
+            other => panic!("expected StreamEvent::Error, got {other:?}"),
         }
     }
 

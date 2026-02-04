@@ -1460,7 +1460,7 @@ const BRANCH_SUMMARY_PREFIX: &str =
     "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
 const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 
-fn bash_execution_to_text(
+pub(crate) fn bash_execution_to_text(
     command: &str,
     output: &str,
     exit_code: i32,

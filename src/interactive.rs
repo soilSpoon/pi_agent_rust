@@ -45,14 +45,18 @@ use crate::extensions::{
 };
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::model::{
-    AssistantMessageEvent, ContentBlock, Message as ModelMessage, StopReason, ThinkingLevel, Usage,
-    UserContent, UserMessage,
+    AssistantMessageEvent, ContentBlock, Message as ModelMessage, StopReason, TextContent,
+    ThinkingLevel, Usage, UserContent, UserMessage,
 };
 use crate::models::ModelEntry;
 use crate::resources::{ResourceCliOptions, ResourceLoader};
-use crate::session::{Session, SessionEntry, SessionMessage};
+use crate::session::{Session, SessionEntry, SessionMessage, bash_execution_to_text};
 use crate::session_index::SessionMeta;
 use crate::theme::{Theme, TuiStyles};
+use crate::tools::{process_file_arguments, resolve_read_path};
+
+#[cfg(feature = "clipboard")]
+use clipboard::{ClipboardContext, ClipboardProvider};
 
 // ============================================================================
 // Slash Commands
@@ -175,6 +179,146 @@ impl PiApp {
         Ok(())
     }
 
+    fn format_input_history(&self) -> String {
+        if self.input_history.is_empty() {
+            return "No input history yet.".to_string();
+        }
+
+        let mut output = String::from("Input history (most recent first):\n");
+        for (idx, entry) in self.input_history.iter().rev().take(50).enumerate() {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let preview = trimmed.replace('\n', "\\n");
+            let preview = preview.chars().take(120).collect::<String>();
+            let _ = writeln!(output, "  {}. {preview}", idx + 1);
+        }
+        output
+    }
+
+    fn format_session_info(&self, session: &Session) -> String {
+        let file = session
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(not saved yet)".to_string());
+        let name = session.get_name().unwrap_or_else(|| "-".to_string());
+        let thinking = session
+            .header
+            .thinking_level
+            .as_deref()
+            .unwrap_or("off")
+            .to_string();
+
+        let message_count = session
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+            .count();
+
+        let total_tokens = self.total_usage.total_tokens;
+        let total_cost = self.total_usage.cost.total;
+        let cost_str = if total_cost > 0.0 {
+            format!("${total_cost:.4}")
+        } else {
+            "$0.0000".to_string()
+        };
+
+        format!(
+            "Session info:\n  file: {file}\n  id: {id}\n  name: {name}\n  model: {model}\n  thinking: {thinking}\n  messageCount: {message_count}\n  tokens: {total_tokens}\n  cost: {cost_str}",
+            id = session.header.id,
+            model = self.model,
+        )
+    }
+
+    fn format_settings_summary(&self) -> String {
+        let theme_setting = self
+            .config
+            .theme
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let theme_setting = if theme_setting.is_empty() {
+            "(default)".to_string()
+        } else {
+            theme_setting
+        };
+
+        let compaction_enabled = self.config.compaction_enabled();
+        let reserve_tokens = self.config.compaction_reserve_tokens();
+        let keep_recent = self.config.compaction_keep_recent_tokens();
+        let steering = self.config.steering_queue_mode();
+        let follow_up = self.config.follow_up_queue_mode();
+
+        let mut output = String::new();
+        let _ = writeln!(output, "Settings:");
+        let _ = writeln!(
+            output,
+            "  theme: {} (config: {})",
+            self.theme.name, theme_setting
+        );
+        let _ = writeln!(output, "  model: {}", self.model);
+        let _ = writeln!(
+            output,
+            "  compaction: {compaction_enabled} (reserve={reserve_tokens}, keepRecent={keep_recent})"
+        );
+        let _ = writeln!(output, "  steeringMode: {}", steering.as_str());
+        let _ = writeln!(output, "  followUpMode: {}", follow_up.as_str());
+        let _ = writeln!(
+            output,
+            "  skillCommands: {}",
+            if self.config.enable_skill_commands() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+
+        let _ = writeln!(output, "\nResources:");
+        let _ = writeln!(output, "  skills: {}", self.resources.skills().len());
+        let _ = writeln!(output, "  prompts: {}", self.resources.prompts().len());
+        let _ = writeln!(output, "  themes: {}", self.resources.themes().len());
+
+        let skill_diags = self.resources.skill_diagnostics().len();
+        let prompt_diags = self.resources.prompt_diagnostics().len();
+        let theme_diags = self.resources.theme_diagnostics().len();
+        if skill_diags + prompt_diags + theme_diags > 0 {
+            let _ = writeln!(output, "\nDiagnostics:");
+            let _ = writeln!(output, "  skills: {skill_diags}");
+            let _ = writeln!(output, "  prompts: {prompt_diags}");
+            let _ = writeln!(output, "  themes: {theme_diags}");
+        }
+
+        output
+    }
+
+    fn default_export_path(&self, session: &Session) -> PathBuf {
+        if let Some(path) = session.path.as_ref() {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("session");
+            return self.cwd.join(format!("pi-session-{stem}.html"));
+        }
+        let id = session.header.id.chars().take(8).collect::<String>();
+        self.cwd.join(format!("pi-session-unsaved-{id}.html"))
+    }
+
+    fn resolve_output_path(&self, raw: &str) -> PathBuf {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return self.cwd.join("pi-session.html");
+        }
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            self.cwd.join(path)
+        }
+    }
+
     fn spawn_save_session(&self) {
         if !self.save_enabled {
             return;
@@ -258,6 +402,49 @@ impl PiApp {
 
         self.input.set_value(&new_text);
         self.input.cursor_end();
+    }
+
+    fn extract_file_references(&mut self, message: &str) -> (String, Vec<String>) {
+        let mut cleaned = String::with_capacity(message.len());
+        let mut file_args = Vec::new();
+        let mut idx = 0usize;
+
+        while idx < message.len() {
+            let ch = message[idx..].chars().next().unwrap_or(' ');
+            if ch == '@' && is_file_ref_boundary(message, idx) {
+                let token_start = idx + ch.len_utf8();
+                let (token, token_end) = next_non_whitespace_token(message, token_start);
+                let (path, trailing) = split_trailing_punct(token);
+
+                if !path.is_empty() {
+                    let resolved =
+                        self.autocomplete
+                            .provider
+                            .resolve_file_ref(path)
+                            .or_else(|| {
+                                let resolved_path = resolve_read_path(path, &self.cwd);
+                                resolved_path.exists().then(|| path.to_string())
+                            });
+
+                    if let Some(resolved) = resolved {
+                        file_args.push(resolved);
+                        if !trailing.is_empty()
+                            && cleaned.chars().last().is_some_and(char::is_whitespace)
+                        {
+                            cleaned.pop();
+                        }
+                        cleaned.push_str(trailing);
+                        idx = token_end;
+                        continue;
+                    }
+                }
+            }
+
+            cleaned.push(ch);
+            idx += ch.len_utf8();
+        }
+
+        (cleaned, file_args)
     }
 
     fn load_session_from_path(&mut self, path: &str) -> Option<Cmd> {
@@ -694,6 +881,27 @@ fn parse_extension_command(input: &str) -> Option<(String, Vec<String>)> {
     Some((cmd.to_string(), args))
 }
 
+fn parse_bash_command(input: &str) -> Option<(String, bool)> {
+    let trimmed = input.trim_start();
+    if trimmed.starts_with("!!") {
+        let command = trimmed.trim_start_matches("!!").trim();
+        if command.is_empty() {
+            None
+        } else {
+            Some((command.to_string(), true))
+        }
+    } else if trimmed.starts_with('!') {
+        let command = trimmed.trim_start_matches('!').trim();
+        if command.is_empty() {
+            None
+        } else {
+            Some((command.to_string(), false))
+        }
+    } else {
+        None
+    }
+}
+
 fn user_content_to_text(content: &UserContent) -> String {
     match content {
         UserContent::Text(text) => text.clone(),
@@ -746,6 +954,47 @@ fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
         }
     }
     output
+}
+
+fn next_non_whitespace_token(text: &str, start: usize) -> (&str, usize) {
+    if start >= text.len() {
+        return ("", text.len());
+    }
+    let mut end = text.len();
+    for (offset, ch) in text[start..].char_indices() {
+        if ch.is_whitespace() {
+            end = start + offset;
+            break;
+        }
+    }
+    (&text[start..end], end)
+}
+
+fn split_trailing_punct(token: &str) -> (&str, &str) {
+    let mut split = token.len();
+    for (idx, ch) in token.char_indices().rev() {
+        if is_trailing_punct(ch) {
+            split = idx;
+        } else {
+            break;
+        }
+    }
+    token.split_at(split)
+}
+
+const fn is_trailing_punct(ch: char) -> bool {
+    matches!(
+        ch,
+        ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+    )
+}
+
+fn is_file_ref_boundary(text: &str, at: usize) -> bool {
+    if at == 0 {
+        return true;
+    }
+    let prev = text[..at].chars().last().unwrap_or(' ');
+    prev.is_whitespace() || matches!(prev, '(' | '[' | '{' | '<' | '"' | '\'')
 }
 
 fn format_tool_output(content: &[ContentBlock], details: Option<&Value>) -> Option<String> {
@@ -921,6 +1170,37 @@ fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage
                 messages.push(ConversationMessage {
                     role: MessageRole::System,
                     content: format!("{prefix} ({tool_name}): {text}"),
+                    thinking: None,
+                });
+            }
+            SessionMessage::BashExecution {
+                command,
+                output,
+                exit_code,
+                cancelled,
+                truncated,
+                full_output_path,
+                extra,
+                ..
+            } => {
+                let mut text = bash_execution_to_text(
+                    command,
+                    output,
+                    *exit_code,
+                    cancelled.unwrap_or(false),
+                    truncated.unwrap_or(false),
+                    full_output_path.as_deref(),
+                );
+                if extra
+                    .get("excludeFromContext")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|v| v)
+                {
+                    text.push_str("\n\n[Output excluded from model context]");
+                }
+                messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: text,
                     thinking: None,
                 });
             }
@@ -1266,6 +1546,8 @@ pub enum PiMsg {
     AgentError(String),
     /// Non-error system message.
     System(String),
+    /// Bash command result (non-agent).
+    BashResult { display: String },
     /// Replace conversation state from session (compaction/fork).
     ConversationReset {
         messages: Vec<ConversationMessage>,
@@ -1988,6 +2270,7 @@ pub struct PiApp {
     agent: Arc<Mutex<Agent>>,
     save_enabled: bool,
     abort_handle: Option<AbortHandle>,
+    bash_running: bool,
 
     // Token tracking
     total_usage: Usage,
@@ -2445,6 +2728,7 @@ impl PiApp {
             status_message: None,
             save_enabled,
             abort_handle: None,
+            bash_running: false,
             pending_oauth: None,
             extensions,
             keybindings,
@@ -3490,6 +3774,15 @@ impl PiApp {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
+            PiMsg::BashResult { display } => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: display,
+                    thinking: None,
+                });
+                self.bash_running = false;
+                self.scroll_to_bottom();
+            }
             PiMsg::ConversationReset {
                 messages,
                 usage,
@@ -3515,6 +3808,7 @@ impl PiApp {
                 self.autocomplete.provider.set_catalog(autocomplete_catalog);
                 self.autocomplete.close();
                 self.resources = resources;
+                self.apply_theme(Theme::resolve(&self.config, &self.cwd));
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
                 self.abort_handle = None;
@@ -3728,15 +4022,26 @@ impl PiApp {
 
     #[allow(clippy::too_many_lines)]
     fn submit_content(&mut self, content: Vec<ContentBlock>) -> Option<Cmd> {
+        let display = content_blocks_to_text(&content);
+        self.submit_content_with_display(content, &display, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn submit_content_with_display(
+        &mut self,
+        content: Vec<ContentBlock>,
+        display: &str,
+        input_text_override: Option<String>,
+    ) -> Option<Cmd> {
         if content.is_empty() {
             return None;
         }
 
-        let display = content_blocks_to_text(&content);
-        if !display.trim().is_empty() {
+        let display_owned = display.to_string();
+        if !display_owned.trim().is_empty() {
             self.messages.push(ConversationMessage {
                 role: MessageRole::User,
-                content: display.clone(),
+                content: display_owned.clone(),
                 thinking: None,
             });
         }
@@ -3752,6 +4057,7 @@ impl PiApp {
         // Auto-scroll to bottom when new message is added
         self.scroll_to_bottom();
 
+        let input_text = input_text_override.unwrap_or_else(|| display_owned.clone());
         let content_for_agent = content;
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
@@ -3763,7 +4069,7 @@ impl PiApp {
         self.abort_handle = Some(abort_handle);
 
         if let Some(manager) = extensions.clone() {
-            let message = display;
+            let message = input_text;
             runtime_handle.spawn(async move {
                 let _ = manager
                     .dispatch_event(ExtensionEventName::Input, Some(json!({ "text": message })))
@@ -3909,6 +4215,104 @@ impl PiApp {
         None
     }
 
+    fn submit_bash_command(
+        &mut self,
+        raw_message: &str,
+        command: String,
+        exclude_from_context: bool,
+    ) -> Option<Cmd> {
+        if self.bash_running {
+            self.status_message = Some("A bash command is already running.".to_string());
+            return None;
+        }
+
+        self.bash_running = true;
+        self.input_history.push(raw_message.to_string());
+        self.history_index = None;
+
+        self.input.reset();
+        self.input_mode = InputMode::SingleLine;
+        self.input.set_height(3);
+
+        let event_tx = self.event_tx.clone();
+        let session = Arc::clone(&self.session);
+        let agent = Arc::clone(&self.agent);
+        let save_enabled = self.save_enabled;
+        let cwd = self.cwd.clone();
+        let shell_path = self.config.shell_path.clone();
+        let command_prefix = self.config.shell_command_prefix.clone();
+        let runtime_handle = self.runtime_handle.clone();
+
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let result = crate::tools::run_bash_command(
+                &cwd,
+                shell_path.as_deref(),
+                command_prefix.as_deref(),
+                &command,
+                None,
+                None,
+            )
+            .await;
+
+            match result {
+                Ok(result) => {
+                    let mut extra = HashMap::new();
+                    if exclude_from_context {
+                        extra.insert("excludeFromContext".to_string(), Value::Bool(true));
+                    }
+
+                    let bash_message = SessionMessage::BashExecution {
+                        command: command.clone(),
+                        output: result.output.clone(),
+                        exit_code: result.exit_code,
+                        cancelled: Some(result.cancelled),
+                        truncated: Some(result.truncated),
+                        full_output_path: result.full_output_path.clone(),
+                        timestamp: Some(Utc::now().timestamp_millis()),
+                        extra,
+                    };
+
+                    if let Ok(mut agent_guard) = agent.lock(&cx).await {
+                        if let Some(model_message) =
+                            crate::session::session_message_to_model(&bash_message)
+                        {
+                            agent_guard.add_message(model_message);
+                        }
+                    }
+
+                    if let Ok(mut session_guard) = session.lock(&cx).await {
+                        session_guard.append_message(bash_message);
+                        if save_enabled {
+                            let _ = session_guard.save().await;
+                        }
+                    }
+
+                    let mut display = bash_execution_to_text(
+                        &command,
+                        &result.output,
+                        result.exit_code,
+                        result.cancelled,
+                        result.truncated,
+                        result.full_output_path.as_deref(),
+                    );
+                    if exclude_from_context {
+                        display.push_str("\n\n[Output excluded from model context]");
+                    }
+
+                    let _ = event_tx.try_send(PiMsg::BashResult { display });
+                }
+                Err(err) => {
+                    let _ = event_tx.try_send(PiMsg::BashResult {
+                        display: format!("Bash command failed: {err}"),
+                    });
+                }
+            }
+        });
+
+        None
+    }
+
     /// Submit a message to the agent.
     #[allow(clippy::too_many_lines)]
     fn submit_message(&mut self, message: &str) -> Option<Cmd> {
@@ -3937,6 +4341,10 @@ impl PiApp {
             return self.submit_oauth_code(message, pending);
         }
 
+        if let Some((command, exclude_from_context)) = parse_bash_command(message) {
+            return self.submit_bash_command(message, command, exclude_from_context);
+        }
+
         // Check for slash commands
         if let Some((cmd, args)) = SlashCommand::parse(message) {
             return self.handle_slash_command(cmd, args);
@@ -3951,7 +4359,48 @@ impl PiApp {
         }
 
         let message_owned = message.to_string();
-        let message_for_agent = self.resources.expand_input(&message_owned);
+        let (message_without_refs, file_refs) = self.extract_file_references(&message_owned);
+        let message_for_agent = if file_refs.is_empty() {
+            self.resources.expand_input(&message_owned)
+        } else {
+            self.resources.expand_input(message_without_refs.trim())
+        };
+
+        if !file_refs.is_empty() {
+            let auto_resize = self
+                .config
+                .images
+                .as_ref()
+                .and_then(|images| images.auto_resize)
+                .unwrap_or(true);
+
+            let processed = match process_file_arguments(&file_refs, &self.cwd, auto_resize) {
+                Ok(processed) => processed,
+                Err(err) => {
+                    self.status_message = Some(err.to_string());
+                    return None;
+                }
+            };
+
+            let mut text = processed.text;
+            if !message_for_agent.trim().is_empty() {
+                text.push_str(&message_for_agent);
+            }
+
+            let mut content = Vec::new();
+            if !text.trim().is_empty() {
+                content.push(ContentBlock::Text(TextContent::new(text)));
+            }
+            for image in processed.images {
+                content.push(ContentBlock::Image(image));
+            }
+
+            self.input_history.push(message_owned.clone());
+            self.history_index = None;
+
+            let display = content_blocks_to_text(&content);
+            return self.submit_content_with_display(content, &display, Some(message_owned));
+        }
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
@@ -4747,9 +5196,118 @@ impl PiApp {
             SlashCommand::Model => {
                 if args.trim().is_empty() {
                     self.status_message = Some(format!("Current model: {}", self.model));
-                } else {
-                    self.status_message = Some("Model switching not implemented yet".to_string());
+                    return None;
                 }
+
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot switch models while processing".to_string());
+                    return None;
+                }
+
+                let pattern = args.trim();
+                let pattern_lower = pattern.to_ascii_lowercase();
+
+                let mut exact_matches = Vec::new();
+                for entry in &self.available_models {
+                    let full = format!("{}/{}", entry.model.provider, entry.model.id);
+                    if full.eq_ignore_ascii_case(pattern) || entry.model.id.eq_ignore_ascii_case(pattern)
+                    {
+                        exact_matches.push(entry.clone());
+                    }
+                }
+
+                let mut matches = if exact_matches.is_empty() {
+                    let mut fuzzy = Vec::new();
+                    for entry in &self.available_models {
+                        let full = format!("{}/{}", entry.model.provider, entry.model.id);
+                        let full_lower = full.to_ascii_lowercase();
+                        if full_lower.contains(&pattern_lower)
+                            || entry.model.id.to_ascii_lowercase().contains(&pattern_lower)
+                        {
+                            fuzzy.push(entry.clone());
+                        }
+                    }
+                    fuzzy
+                } else {
+                    exact_matches
+                };
+
+                matches.sort_by(|a, b| {
+                    let left = format!("{}/{}", a.model.provider, a.model.id);
+                    let right = format!("{}/{}", b.model.provider, b.model.id);
+                    left.cmp(&right)
+                });
+                matches.dedup_by(|a, b| {
+                    a.model.provider.eq_ignore_ascii_case(&b.model.provider)
+                        && a.model.id.eq_ignore_ascii_case(&b.model.id)
+                });
+
+                if matches.is_empty() {
+                    self.status_message = Some(format!("Model not found: {pattern}"));
+                    return None;
+                }
+                if matches.len() > 1 {
+                    let preview = matches
+                        .iter()
+                        .take(8)
+                        .map(|m| format!("  - {}/{}", m.model.provider, m.model.id))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: format!(
+                            "Ambiguous model pattern \"{pattern}\". Matches:\n{preview}\n\nUse /model provider/id for an exact match."
+                        ),
+                        thinking: None,
+                    });
+                    self.scroll_to_bottom();
+                    return None;
+                }
+
+                let next = matches
+                    .into_iter()
+                    .next()
+                    .expect("matches is non-empty");
+
+                if next.model.provider == self.model_entry.model.provider
+                    && next.model.id == self.model_entry.model.id
+                {
+                    self.status_message = Some(format!("Current model: {}", self.model));
+                    return None;
+                }
+
+                let provider_impl = match providers::create_provider(&next) {
+                    Ok(provider_impl) => provider_impl,
+                    Err(err) => {
+                        self.status_message = Some(err.to_string());
+                        return None;
+                    }
+                };
+
+                let Ok(mut agent_guard) = self.agent.try_lock() else {
+                    self.status_message = Some("Agent busy; try again".to_string());
+                    return None;
+                };
+                agent_guard.set_provider(provider_impl);
+                drop(agent_guard);
+
+                let Ok(mut session_guard) = self.session.try_lock() else {
+                    self.status_message = Some("Session busy; try again".to_string());
+                    return None;
+                };
+                session_guard.header.provider = Some(next.model.provider.clone());
+                session_guard.header.model_id = Some(next.model.id.clone());
+                session_guard.append_model_change(next.model.provider.clone(), next.model.id.clone());
+                drop(session_guard);
+                self.spawn_save_session();
+
+                self.model_entry = next.clone();
+                if let Ok(mut guard) = self.model_entry_shared.lock() {
+                    *guard = next.clone();
+                }
+                self.model = format!("{}/{}", next.model.provider, next.model.id);
+
+                self.status_message = Some(format!("Switched model: {}", self.model));
                 None
             }
             SlashCommand::Thinking => {
@@ -4795,19 +5353,78 @@ impl PiApp {
             }
             SlashCommand::Exit => Some(quit()),
             SlashCommand::History => {
-                self.status_message = Some("History not implemented yet".to_string());
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: self.format_input_history(),
+                    thinking: None,
+                });
+                self.scroll_to_last_match("Input history");
                 None
             }
             SlashCommand::Export => {
-                self.status_message = Some("Export not implemented yet".to_string());
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot export while processing".to_string());
+                    return None;
+                }
+
+                let (output_path, html) = {
+                    let Ok(session_guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    let output_path = if args.trim().is_empty() {
+                        self.default_export_path(&session_guard)
+                    } else {
+                        self.resolve_output_path(args)
+                    };
+                    let html = session_guard.to_html();
+                    (output_path, html)
+                };
+
+                if let Some(parent) = output_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(err) = std::fs::create_dir_all(parent) {
+                            self.status_message = Some(format!("Failed to create dir: {err}"));
+                            return None;
+                        }
+                    }
+                }
+                if let Err(err) = std::fs::write(&output_path, html) {
+                    self.status_message = Some(format!("Failed to write export: {err}"));
+                    return None;
+                }
+
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!("Exported HTML: {}", output_path.display()),
+                    thinking: None,
+                });
+                self.scroll_to_bottom();
+                self.status_message = Some(format!("Exported: {}", output_path.display()));
                 None
             }
             SlashCommand::Session => {
-                self.status_message = Some("Session info not implemented yet".to_string());
+                let Ok(session_guard) = self.session.try_lock() else {
+                    self.status_message = Some("Session busy; try again".to_string());
+                    return None;
+                };
+                let info = self.format_session_info(&session_guard);
+                drop(session_guard);
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: info,
+                    thinking: None,
+                });
+                self.scroll_to_bottom();
                 None
             }
             SlashCommand::Settings => {
-                self.status_message = Some("Settings summary not implemented yet".to_string());
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: self.format_settings_summary(),
+                    thinking: None,
+                });
+                self.scroll_to_bottom();
                 None
             }
             SlashCommand::Theme => {
@@ -4852,7 +5469,25 @@ impl PiApp {
                 None
             }
             SlashCommand::Resume => {
-                self.status_message = Some("Resume not implemented yet".to_string());
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot resume while processing".to_string());
+                    return None;
+                }
+
+                let override_dir = self
+                    .session
+                    .try_lock()
+                    .ok()
+                    .and_then(|guard| guard.session_dir.clone());
+                let sessions =
+                    crate::session_picker::list_sessions_for_project(&self.cwd, override_dir.as_deref());
+                if sessions.is_empty() {
+                    self.status_message = Some("No sessions found for this project".to_string());
+                    return None;
+                }
+
+                self.session_picker = Some(SessionPickerOverlay::new(sessions));
+                self.autocomplete.close();
                 None
             }
             SlashCommand::New => {
@@ -4899,8 +5534,43 @@ impl PiApp {
                 None
             }
             SlashCommand::Copy => {
-                self.status_message = Some("Copy not implemented yet".to_string());
-                None
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot copy while processing".to_string());
+                    return None;
+                }
+
+                let text = self
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::Assistant && !m.content.trim().is_empty())
+                    .map(|m| m.content.clone());
+
+                let Some(text) = text else {
+                    self.status_message = Some("No assistant message to copy".to_string());
+                    return None;
+                };
+
+                #[cfg(feature = "clipboard")]
+                {
+                    match ClipboardProvider::new()
+                        .and_then(|mut ctx: ClipboardContext| ctx.set_contents(text))
+                    {
+                        Ok(()) => self.status_message = Some("Copied to clipboard".to_string()),
+                        Err(err) => self.status_message = Some(format!("Clipboard error: {err}")),
+                    }
+                    return None;
+                }
+
+                #[cfg(not(feature = "clipboard"))]
+                {
+                    let _ = text;
+                    self.status_message = Some(
+                        "Clipboard support is disabled. Build with: cargo build --features clipboard"
+                            .to_string(),
+                    );
+                    return None;
+                }
             }
             SlashCommand::Name => {
                 let name = args.trim();
@@ -4930,7 +5600,21 @@ impl PiApp {
                 None
             }
             SlashCommand::Changelog => {
-                self.status_message = Some("Changelog not implemented yet".to_string());
+                let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("CHANGELOG.md");
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        self.messages.push(ConversationMessage {
+                            role: MessageRole::System,
+                            content,
+                            thinking: None,
+                        });
+                        self.scroll_to_last_match("# ");
+                    }
+                    Err(err) => {
+                        self.status_message =
+                            Some(format!("Failed to read changelog {}: {err}", path.display()));
+                    }
+                }
                 None
             }
             SlashCommand::Tree => {

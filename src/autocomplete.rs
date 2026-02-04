@@ -153,6 +153,25 @@ impl AutocompleteProvider {
         }
     }
 
+    pub(crate) fn resolve_file_ref(&mut self, candidate: &str) -> Option<String> {
+        let normalized = normalize_file_ref_candidate(candidate);
+        if normalized.is_empty() {
+            return None;
+        }
+
+        if is_absolute_like(&normalized) {
+            return Some(normalized);
+        }
+
+        self.file_cache.refresh_if_needed(&self.cwd);
+        let stripped = normalized.strip_prefix("./").unwrap_or(&normalized);
+        if self.file_cache.files.iter().any(|path| path == stripped) {
+            return Some(stripped.to_string());
+        }
+
+        None
+    }
+
     fn suggest_slash(&self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
         let query = token.text.trim_start_matches('/');
 
@@ -413,6 +432,26 @@ fn collect_project_files(cwd: &Path) -> Vec<String> {
     }
 
     walk_project_files(cwd)
+}
+
+fn normalize_file_ref_candidate(candidate: &str) -> String {
+    candidate.trim().replace('\\', "/")
+}
+
+fn is_absolute_like(candidate: &str) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    if candidate.starts_with('~') {
+        return true;
+    }
+    if candidate.starts_with("//") {
+        return true;
+    }
+    if Path::new(candidate).is_absolute() {
+        return true;
+    }
+    candidate.as_bytes().get(1) == Some(&b':')
 }
 
 /// Cached result of fd binary detection.

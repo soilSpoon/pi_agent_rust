@@ -1227,6 +1227,122 @@ mod message_queue_tests {
     }
 }
 
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use crate::session::Session;
+    use crate::tools::ToolRegistry;
+    use asupersync::runtime::RuntimeBuilder;
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+
+    struct StartThenPending {
+        start: Option<StreamEvent>,
+    }
+
+    impl Stream for StartThenPending {
+        type Item = crate::error::Result<StreamEvent>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if let Some(event) = self.start.take() {
+                return Poll::Ready(Some(Ok(event)));
+            }
+            Poll::Pending
+        }
+    }
+
+    #[derive(Debug)]
+    struct HangingProvider;
+
+    #[async_trait]
+    impl Provider for HangingProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let partial = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+
+            Ok(Box::pin(StartThenPending {
+                start: Some(StreamEvent::Start { partial }),
+            }))
+        }
+    }
+
+    #[test]
+    fn abort_interrupts_in_flight_stream() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        let started = Arc::new(Notify::new());
+        let started_wait = started.notified();
+
+        let (abort_handle, abort_signal) = AbortHandle::new();
+
+        let provider = Arc::new(HangingProvider);
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Session::in_memory();
+        let mut agent_session = AgentSession::new(agent, session, false);
+
+        let started_tx = Arc::clone(&started);
+        let join = handle.spawn(async move {
+            agent_session
+                .run_text_with_abort("hello".to_string(), Some(abort_signal), move |event| {
+                    if matches!(
+                        event,
+                        AgentEvent::MessageStart {
+                            message: Message::Assistant(_)
+                        }
+                    ) {
+                        started_tx.notify_waiters();
+                    }
+                })
+                .await
+        });
+
+        runtime.block_on(async move {
+            started_wait.await;
+            abort_handle.abort();
+
+            let message = join.await.expect("join");
+            assert_eq!(message.stop_reason, StopReason::Aborted);
+            assert_eq!(message.error_message.as_deref(), Some("Aborted"));
+        });
+    }
+}
+
 impl AgentSession {
     pub const fn new(agent: Agent, session: Session, save_enabled: bool) -> Self {
         Self {

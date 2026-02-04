@@ -39,6 +39,8 @@ pub struct AzureOpenAIProvider {
     resource: String,
     /// API version string
     api_version: String,
+    /// Optional override for the full endpoint URL (primarily for deterministic tests).
+    endpoint_url_override: Option<String>,
 }
 
 impl AzureOpenAIProvider {
@@ -53,6 +55,7 @@ impl AzureOpenAIProvider {
             deployment: deployment.into(),
             resource: resource.into(),
             api_version: DEFAULT_API_VERSION.to_string(),
+            endpoint_url_override: None,
         }
     }
 
@@ -60,6 +63,16 @@ impl AzureOpenAIProvider {
     #[must_use]
     pub fn with_api_version(mut self, version: impl Into<String>) -> Self {
         self.api_version = version.into();
+        self
+    }
+
+    /// Override the full endpoint URL.
+    ///
+    /// This is intended for deterministic, offline tests (e.g. mock servers). Production
+    /// code should rely on the standard Azure endpoint URL format.
+    #[must_use]
+    pub fn with_endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
+        self.endpoint_url_override = Some(endpoint_url.into());
         self
     }
 
@@ -72,6 +85,9 @@ impl AzureOpenAIProvider {
 
     /// Get the full endpoint URL.
     fn endpoint_url(&self) -> String {
+        if let Some(url) = &self.endpoint_url_override {
+            return url.clone();
+        }
         format!(
             "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
             self.resource, self.deployment, self.api_version
@@ -268,10 +284,8 @@ where
 
     #[allow(clippy::unnecessary_wraps)]
     fn process_event(&mut self, data: &str) -> Result<Option<StreamEvent>> {
-        let chunk: AzureStreamChunk = match serde_json::from_str(data) {
-            Ok(c) => c,
-            Err(_) => return Ok(None), // Skip malformed chunks
-        };
+        let chunk: AzureStreamChunk =
+            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
 
         // Process usage if present
         if let Some(usage) = chunk.usage {
