@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use asupersync::channel::oneshot;
 use async_trait::async_trait;
+use serde_json::Value;
 
-use crate::connectors::http::HttpConnector;
+use crate::connectors::{Connector, HostCallPayload, http::HttpConnector};
 use crate::error::Result;
 use crate::extensions::{ExtensionSession, ExtensionUiRequest, ExtensionUiResponse};
 use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime};
@@ -77,6 +78,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         let outcome = match kind {
             HostcallKind::Tool { name } => self.dispatch_tool(&call_id, &name, payload).await,
             HostcallKind::Exec { cmd } => self.dispatch_exec(&call_id, &cmd, payload).await,
+            HostcallKind::Http => self.dispatch_http(&call_id, payload).await,
+            HostcallKind::Session { op } => self.dispatch_session(&call_id, &op, payload).await,
             other => HostcallOutcome::Error {
                 code: "invalid_request".to_string(),
                 message: format!("Unsupported hostcall kind: {other:?}"),
@@ -259,6 +262,135 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             },
         }
     }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_http(&self, call_id: &str, payload: serde_json::Value) -> HostcallOutcome {
+        let call = HostCallPayload {
+            call_id: call_id.to_string(),
+            capability: "http".to_string(),
+            method: "http".to_string(),
+            params: payload,
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        match self.http_connector.dispatch(&call).await {
+            Ok(result) => {
+                if result.is_error {
+                    let message = result.error.as_ref().map_or_else(
+                        || "HTTP connector error".to_string(),
+                        |err| err.message.clone(),
+                    );
+                    let code = result
+                        .error
+                        .as_ref()
+                        .map_or("internal", |err| hostcall_code_to_str(err.code));
+                    HostcallOutcome::Error {
+                        code: code.to_string(),
+                        message,
+                    }
+                } else {
+                    HostcallOutcome::Success(result.output)
+                }
+            }
+            Err(err) => HostcallOutcome::Error {
+                code: "internal".to_string(),
+                message: err.to_string(),
+            },
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_session(&self, _call_id: &str, op: &str, payload: Value) -> HostcallOutcome {
+        let op_norm = op.trim().to_ascii_lowercase();
+        let result: std::result::Result<Value, String> = match op_norm.as_str() {
+            "get_state" | "getstate" => Ok(self.session.get_state().await),
+            "get_messages" | "getmessages" => {
+                serde_json::to_value(self.session.get_messages().await)
+                    .map_err(|err| format!("Serialize messages: {err}"))
+            }
+            "get_entries" | "getentries" => serde_json::to_value(self.session.get_entries().await)
+                .map_err(|err| format!("Serialize entries: {err}")),
+            "get_branch" | "getbranch" => serde_json::to_value(self.session.get_branch().await)
+                .map_err(|err| format!("Serialize branch: {err}")),
+            "get_file" | "getfile" => {
+                let state = self.session.get_state().await;
+                let file = state
+                    .get("sessionFile")
+                    .or_else(|| state.get("session_file"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                Ok(file)
+            }
+            "get_name" | "getname" => {
+                let state = self.session.get_state().await;
+                let name = state
+                    .get("sessionName")
+                    .or_else(|| state.get("session_name"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                Ok(name)
+            }
+            "set_name" | "setname" => {
+                let name = payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.session
+                    .set_name(name)
+                    .await
+                    .map(|()| Value::Null)
+                    .map_err(|err| err.to_string())
+            }
+            "append_entry" | "appendentry" => {
+                let custom_type = payload
+                    .get("customType")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("custom_type").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                let data = payload.get("data").cloned();
+                self.session
+                    .append_custom_entry(custom_type, data)
+                    .await
+                    .map(|()| Value::Null)
+                    .map_err(|err| err.to_string())
+            }
+            "append_message" | "appendmessage" => {
+                let message_value = payload.get("message").cloned().unwrap_or(payload);
+                match serde_json::from_value(message_value) {
+                    Ok(message) => self
+                        .session
+                        .append_message(message)
+                        .await
+                        .map(|()| Value::Null)
+                        .map_err(|err| err.to_string()),
+                    Err(err) => Err(format!("Parse message: {err}")),
+                }
+            }
+            _ => Err(format!("Unknown session op: {op}")),
+        };
+
+        match result {
+            Ok(value) => HostcallOutcome::Success(value),
+            Err(message) => HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message,
+            },
+        }
+    }
+}
+
+const fn hostcall_code_to_str(code: crate::connectors::HostCallErrorCode) -> &'static str {
+    match code {
+        crate::connectors::HostCallErrorCode::Timeout => "timeout",
+        crate::connectors::HostCallErrorCode::Denied => "denied",
+        crate::connectors::HostCallErrorCode::Io => "io",
+        crate::connectors::HostCallErrorCode::InvalidRequest => "invalid_request",
+        crate::connectors::HostCallErrorCode::Internal => "internal",
+    }
 }
 
 /// Trait for handling individual hostcall types.
@@ -282,10 +414,14 @@ pub trait ExtensionUiHandler: Send + Sync {
 mod tests {
     use super::*;
 
+    use crate::connectors::http::HttpConnectorConfig;
     use crate::scheduler::DeterministicClock;
     use crate::session::SessionMessage;
     use serde_json::Value;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::Path;
+    use std::sync::Mutex;
 
     struct NullSession;
 
@@ -336,6 +472,49 @@ mod tests {
         }
     }
 
+    struct TestSession {
+        state: Value,
+        name: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl ExtensionSession for TestSession {
+        async fn get_state(&self) -> Value {
+            self.state.clone()
+        }
+
+        async fn get_messages(&self) -> Vec<SessionMessage> {
+            Vec::new()
+        }
+
+        async fn get_entries(&self) -> Vec<Value> {
+            Vec::new()
+        }
+
+        async fn get_branch(&self) -> Vec<Value> {
+            Vec::new()
+        }
+
+        async fn set_name(&self, name: String) -> Result<()> {
+            let mut guard = self.name.lock().unwrap();
+            *guard = Some(name);
+            drop(guard);
+            Ok(())
+        }
+
+        async fn append_message(&self, _message: SessionMessage) -> Result<()> {
+            Ok(())
+        }
+
+        async fn append_custom_entry(
+            &self,
+            _custom_type: String,
+            _data: Option<Value>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
     fn build_dispatcher(
         runtime: Rc<PiJsRuntime<DeterministicClock>>,
     ) -> ExtensionDispatcher<DeterministicClock> {
@@ -347,6 +526,24 @@ mod tests {
             Arc::new(NullUiHandler),
             PathBuf::from("."),
         )
+    }
+
+    fn spawn_http_server(body: &'static str) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind http server");
+        let addr = listener.local_addr().expect("server addr");
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        addr
     }
 
     #[test]
@@ -476,7 +673,10 @@ mod tests {
                 dispatcher.dispatch_and_complete(request).await;
             }
 
-            runtime.tick().await.expect("tick");
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
 
             runtime
                 .eval(
@@ -489,6 +689,82 @@ mod tests {
                 )
                 .await
                 .expect("verify error");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_hostcall_resolves_state_and_set_name() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.state = null;
+                    globalThis.file = null;
+                    globalThis.nameValue = null;
+                    globalThis.nameSet = false;
+                    pi.session("get_state", {}).then((r) => { globalThis.state = r; });
+                    pi.session("get_file", {}).then((r) => { globalThis.file = r; });
+                    pi.session("get_name", {}).then((r) => { globalThis.nameValue = r; });
+                    pi.session("set_name", { name: "hello" }).then(() => { globalThis.nameSet = true; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 4);
+
+            let name = Arc::new(Mutex::new(None));
+            let session = Arc::new(TestSession {
+                state: serde_json::json!({
+                    "sessionFile": "/tmp/session.jsonl",
+                    "sessionName": "demo",
+                }),
+                name: Arc::clone(&name),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.state) throw new Error("State not resolved");
+                    if (globalThis.state.sessionFile !== "/tmp/session.jsonl") {
+                        throw new Error("Wrong sessionFile: " + JSON.stringify(globalThis.state));
+                    }
+                    if (globalThis.file !== "/tmp/session.jsonl") {
+                        throw new Error("Wrong get_file: " + JSON.stringify(globalThis.file));
+                    }
+                    if (globalThis.nameValue !== "demo") {
+                        throw new Error("Wrong get_name: " + JSON.stringify(globalThis.nameValue));
+                    }
+                    if (!globalThis.nameSet) throw new Error("set_name not resolved");
+                "#,
+                )
+                .await
+                .expect("verify state");
+
+            let name_value = name.lock().unwrap().clone();
+            assert_eq!(name_value.as_deref(), Some("hello"));
         });
     }
 
@@ -579,6 +855,122 @@ mod tests {
                     r#"
                     if (globalThis.err === null) throw new Error("Promise not rejected");
                     if (globalThis.err !== "io") {
+                        throw new Error("Wrong error code: " + globalThis.err);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify error");
+        });
+    }
+
+    #[test]
+    fn dispatcher_http_hostcall_executes_and_resolves_promise() {
+        futures::executor::block_on(async {
+            let addr = spawn_http_server("hello");
+            let url = format!("http://{addr}/test");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            let script = format!(
+                r#"
+                globalThis.result = null;
+                pi.http({{ url: "{url}", method: "GET" }})
+                    .then((r) => {{ globalThis.result = r; }});
+            "#
+            );
+            runtime.eval(&script).await.expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let http_connector = HttpConnector::new(HttpConnectorConfig {
+                require_tls: false,
+                ..Default::default()
+            });
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(http_connector),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === null) throw new Error("Promise not resolved");
+                    if (globalThis.result.status !== 200) {
+                        throw new Error("Wrong status: " + globalThis.result.status);
+                    }
+                    if (globalThis.result.body !== "hello") {
+                        throw new Error("Wrong body: " + globalThis.result.body);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify result");
+        });
+    }
+
+    #[test]
+    fn dispatcher_http_hostcall_invalid_method_rejects_promise() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.http({ url: "https://example.com", method: "PUT" })
+                        .catch((e) => { globalThis.err = e.code; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let http_connector = HttpConnector::new(HttpConnectorConfig {
+                require_tls: false,
+                ..Default::default()
+            });
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(http_connector),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.err === null) throw new Error("Promise not rejected");
+                    if (globalThis.err !== "invalid_request") {
                         throw new Error("Wrong error code: " + globalThis.err);
                     }
                 "#,
