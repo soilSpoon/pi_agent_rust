@@ -1216,6 +1216,26 @@ fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage
                     });
                 }
             }
+            SessionMessage::BashExecution {
+                command,
+                output,
+                extra,
+                ..
+            } => {
+                let mut text = bash_execution_to_text(command, output, 0, false, false, None);
+                if extra
+                    .get("excludeFromContext")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|v| v)
+                {
+                    text.push_str("\n\n[Output excluded from model context]");
+                }
+                messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: text,
+                    thinking: None,
+                });
+            }
             _ => {}
         }
     }
@@ -3723,6 +3743,7 @@ impl PiApp {
                 self.current_tool = None;
                 self.abort_handle = None;
                 self.extension_streaming.store(false, Ordering::SeqCst);
+                self.extension_compacting.store(false, Ordering::SeqCst);
 
                 if stop_reason == StopReason::Aborted {
                     self.status_message = Some("Request aborted".to_string());
@@ -3757,6 +3778,7 @@ impl PiApp {
                 self.current_tool = None;
                 self.abort_handle = None;
                 self.extension_streaming.store(false, Ordering::SeqCst);
+                self.extension_compacting.store(false, Ordering::SeqCst);
                 self.input.focus();
 
                 if !self.pending_inputs.is_empty() {
@@ -3772,6 +3794,7 @@ impl PiApp {
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
                 self.abort_handle = None;
+                self.extension_compacting.store(false, Ordering::SeqCst);
                 self.input.focus();
 
                 if !self.pending_inputs.is_empty() {
