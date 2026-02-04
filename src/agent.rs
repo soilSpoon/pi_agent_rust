@@ -1588,7 +1588,7 @@ mod turn_event_tests {
                     assert!(matches!(message, Message::Assistant(_)));
                     assert!(tool_results.is_empty());
                 }
-                other => assert!(false, "Expected TurnEnd event, got {other:?}"),
+                other => panic!("Expected TurnEnd event, got {other:?}"),
             }
         });
     }
@@ -1721,7 +1721,7 @@ mod tests {
                 content: UserContent::Text(text),
                 ..
             }) => assert_eq!(text, expected),
-            other => assert!(false, "expected user text message, got {other:?}"),
+            other => panic!("expected user text message, got {other:?}"),
         }
     }
 

@@ -292,7 +292,7 @@ mod tests {
             if let Some(result) = tool_result {
                 match result.content.as_slice() {
                     [ContentBlock::Text(text)] => assert_eq!(text.text, "hello pi"),
-                    other => assert!(false, "Expected single text content block, got: {other:?}"),
+                    other => panic!("Expected single text content block, got: {other:?}"),
                 }
 
                 let events = vec![
@@ -408,7 +408,7 @@ mod tests {
 
             match message.content.as_slice() {
                 [ContentBlock::Text(text)] => assert_eq!(text.text, "done"),
-                other => assert!(false, "Expected single text content block, got: {other:?}"),
+                other => panic!("Expected single text content block, got: {other:?}"),
             }
         });
     }

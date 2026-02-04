@@ -804,11 +804,8 @@ mod tests {
             1,
             "expected a single Text chunk, got {chunks:?}"
         );
-        let text = if let MarkdownChunk::Text(text) = &chunks[0] {
-            text
-        } else {
-            assert!(false, "expected text fallback, got {chunks:?}");
-            return;
+        let MarkdownChunk::Text(text) = &chunks[0] else {
+            panic!("expected text fallback, got {chunks:?}");
         };
         assert!(text.contains("```rust"));
         assert!(text.contains("fn main"));
