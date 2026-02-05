@@ -2719,7 +2719,6 @@ impl Tool for FindTool {
             });
         }
 
-        let search_path_str = search_path.display().to_string();
         let mut relativized: Vec<String> = Vec::new();
         for raw_line in stdout.lines() {
             let line = raw_line.trim_end_matches('\r').trim();
@@ -2727,17 +2726,17 @@ impl Tool for FindTool {
                 continue;
             }
 
-            let mut rel = if Path::new(line).is_absolute() {
-                if let Ok(stripped) = Path::new(line).strip_prefix(&search_path) {
-                    stripped.to_string_lossy().to_string()
-                } else {
-                    line.to_string()
-                }
+            let line_path = Path::new(line);
+            let mut rel = if line_path.is_absolute() {
+                line_path.strip_prefix(&search_path).map_or_else(
+                    |_| line.to_string(),
+                    |stripped| stripped.to_string_lossy().to_string(),
+                )
             } else {
                 line.to_string()
             };
 
-            let full_path = if Path::new(line).is_absolute() {
+            let full_path = if line_path.is_absolute() {
                 PathBuf::from(line)
             } else {
                 search_path.join(line)

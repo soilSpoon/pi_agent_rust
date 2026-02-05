@@ -19,7 +19,7 @@ use crate::compaction::{
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::error_hints;
-use crate::extensions::{ExtensionEventName, extension_event_from_agent};
+use crate::extensions::extension_event_from_agent;
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
@@ -969,19 +969,20 @@ pub async fn run(
                     .get("outputPath")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let path = {
+                let inner_session = {
                     let guard = session
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let session_snapshot = {
-                        let inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.clone()
-                    };
-                    export_html(&session_snapshot, output_path.as_deref()).await?
+                    Arc::clone(&guard.session)
                 };
+                let session_snapshot = {
+                    let inner_session = inner_session.lock(&cx).await.map_err(|err| {
+                        Error::session(format!("inner session lock failed: {err}"))
+                    })?;
+                    inner_session.clone()
+                };
+                let path = export_html(&session_snapshot, output_path.as_deref()).await?;
                 let _ = out_tx.send(response_ok(
                     id,
                     "export_html",
@@ -1410,21 +1411,6 @@ async fn run_prompt_with_retry(
                 }
             };
 
-            if let Some(manager) = extensions.clone() {
-                let message_text = message.clone();
-                let runtime_handle = runtime_for_events.clone();
-                runtime_handle.spawn(async move {
-                    let _ = manager
-                        .dispatch_event(
-                            ExtensionEventName::Input,
-                            Some(json!({ "text": message_text })),
-                        )
-                        .await;
-                    let _ = manager
-                        .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
-                        .await;
-                });
-            }
             if images.is_empty() {
                 guard
                     .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)

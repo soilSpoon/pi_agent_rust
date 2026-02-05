@@ -16,9 +16,11 @@ use crate::error::{Error, Result};
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, JsExtensionLoadSpec,
-    JsExtensionRuntimeHandle,
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionLoadSpec, ExtensionManager,
+    JsExtensionRuntimeHandle, resolve_extension_load_spec,
 };
+#[cfg(feature = "wasm-host")]
+use crate::extensions::{ExtensionPolicy, WasmExtensionHost, WasmExtensionLoadSpec};
 use crate::extensions_js::PiJsRuntimeConfig;
 use crate::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ImageContent, Message, StopReason,
@@ -2564,12 +2566,28 @@ impl AgentSession {
         .await?;
         manager.set_js_runtime(js_runtime.clone());
 
-        let mut specs = Vec::new();
+        let mut js_specs = Vec::new();
+        #[cfg(feature = "wasm-host")]
+        let mut wasm_specs: Vec<WasmExtensionLoadSpec> = Vec::new();
+
         for entry in extension_entries {
-            specs.push(JsExtensionLoadSpec::from_entry_path(entry)?);
+            match resolve_extension_load_spec(entry)? {
+                ExtensionLoadSpec::Js(spec) => js_specs.push(spec),
+                #[cfg(feature = "wasm-host")]
+                ExtensionLoadSpec::Wasm(spec) => wasm_specs.push(spec),
+            }
         }
-        if !specs.is_empty() {
-            manager.load_js_extensions(specs).await?;
+
+        if !js_specs.is_empty() {
+            manager.load_js_extensions(js_specs).await?;
+        }
+
+        #[cfg(feature = "wasm-host")]
+        if !wasm_specs.is_empty() {
+            let host = WasmExtensionHost::new(cwd, ExtensionPolicy::default())?;
+            manager
+                .load_wasm_extensions(&host, wasm_specs, Arc::clone(&tools))
+                .await?;
         }
 
         // Fire the `startup` lifecycle hook once extensions are loaded.
@@ -2584,16 +2602,13 @@ impl AgentSession {
             session.path.as_ref().map(|p| p.display().to_string())
         };
 
-        if let Err(err) = js_runtime
+        if let Err(err) = manager
             .dispatch_event(
-                "startup".to_string(),
-                serde_json::json!({
-                    "type": "startup",
+                ExtensionEventName::Startup,
+                Some(serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "sessionFile": session_path,
-                }),
-                serde_json::json!({ "cwd": cwd.display().to_string() }),
-                EXTENSION_EVENT_TIMEOUT_MS,
+                })),
             )
             .await
         {
@@ -2658,6 +2673,8 @@ impl AgentSession {
             }
         };
 
+        self.dispatch_before_agent_start().await;
+
         if images.is_empty() {
             self.run_agent_with_text(text, abort, on_event).await
         } else {
@@ -2691,6 +2708,8 @@ impl AgentSession {
             }
         };
 
+        self.dispatch_before_agent_start().await;
+
         let content_for_agent = Self::build_content_blocks_for_input(&text, &images);
         self.run_agent_with_content(content_for_agent, abort, on_event)
             .await
@@ -2721,6 +2740,17 @@ impl AgentSession {
             .await?;
 
         Ok(apply_input_event_response(response, text, images))
+    }
+
+    async fn dispatch_before_agent_start(&self) {
+        if let Some(extensions) = &self.extensions {
+            if let Err(err) = extensions
+                .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
+                .await
+            {
+                tracing::warn!("before_agent_start extension hook failed (fail-open): {err}");
+            }
+        }
     }
 
     fn split_content_blocks_for_input(blocks: &[ContentBlock]) -> (String, Vec<ImageContent>) {

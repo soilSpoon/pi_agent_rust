@@ -24,7 +24,7 @@ use pi::app::StartupError;
 use pi::auth::{AuthCredential, AuthStorage};
 use pi::cli;
 use pi::config::Config;
-use pi::extensions::{ExtensionEventName, extension_event_from_agent};
+use pi::extensions::extension_event_from_agent;
 use pi::model::{AssistantMessage, ContentBlock, StopReason};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::package_manager::{PackageEntry, PackageManager, PackageScope};
@@ -35,7 +35,6 @@ use pi::session::Session;
 use pi::session_index::SessionIndex;
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
-use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -913,18 +912,6 @@ async fn run_print_mode(
         .collect::<Vec<_>>();
 
     if let Some(initial) = initial {
-        if let Some(manager) = session.extensions.clone() {
-            let message = initial.text.clone();
-            let runtime_handle = runtime_handle.clone();
-            runtime_handle.spawn(async move {
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::Input, Some(json!({ "text": message })))
-                    .await;
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
-                    .await;
-            });
-        }
         let content = pi::app::build_initial_content(&initial);
         last_message = Some(
             session
@@ -938,21 +925,6 @@ async fn run_print_mode(
     }
 
     for message in messages {
-        if let Some(manager) = session.extensions.clone() {
-            let message_text = message.clone();
-            let runtime_handle = runtime_handle.clone();
-            runtime_handle.spawn(async move {
-                let _ = manager
-                    .dispatch_event(
-                        ExtensionEventName::Input,
-                        Some(json!({ "text": message_text })),
-                    )
-                    .await;
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
-                    .await;
-            });
-        }
         last_message = Some(
             session
                 .run_text_with_abort(message, Some(abort_signal.clone()), make_event_handler())

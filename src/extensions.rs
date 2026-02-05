@@ -32,9 +32,10 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::OnceLock;
+#[cfg(feature = "wasm-host")]
+use std::sync::Weak;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -893,6 +894,7 @@ pub fn required_capability_for_host_call(call: &HostCallPayload) -> Option<Strin
         "http" => Some("http".to_string()),
         "session" => Some("session".to_string()),
         "ui" => Some("ui".to_string()),
+        "events" => Some("events".to_string()),
         "log" => Some("log".to_string()),
         _ => None,
     }
@@ -2049,6 +2051,7 @@ mod wasm_host {
         pub policy: ExtensionPolicy,
         pub cwd: PathBuf,
         pub tools: Arc<crate::tools::ToolRegistry>,
+        pub manager: Option<ExtensionManagerHandle>,
         pub http: HttpConnector,
         pub fs: FsConnector,
         pub env_allowlist: BTreeSet<String>,
@@ -2062,13 +2065,14 @@ mod wasm_host {
                 &cwd,
                 None,
             ));
-            Self::new_with_tools(policy, cwd, tools)
+            Self::new_with_tools(policy, cwd, tools, None)
         }
 
         pub fn new_with_tools(
             policy: ExtensionPolicy,
             cwd: PathBuf,
             tools: Arc<crate::tools::ToolRegistry>,
+            manager: Option<ExtensionManagerHandle>,
         ) -> Result<Self> {
             let scopes = FsScopes::for_cwd(&cwd)?;
             let fs = FsConnector::new(&cwd, policy.clone(), scopes)?;
@@ -2076,6 +2080,7 @@ mod wasm_host {
                 policy,
                 cwd,
                 tools,
+                manager,
                 http: HttpConnector::with_defaults(),
                 fs,
                 env_allowlist: BTreeSet::new(),
@@ -2156,6 +2161,22 @@ mod wasm_host {
             Ok(())
         }
 
+        fn manager(&self) -> Option<ExtensionManager> {
+            self.manager
+                .as_ref()
+                .and_then(ExtensionManagerHandle::upgrade)
+        }
+
+        fn hostcall_op(params: &Value) -> Option<String> {
+            params
+                .get("op")
+                .or_else(|| params.get("method"))
+                .or_else(|| params.get("name"))
+                .and_then(Value::as_str)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        }
+
         fn host_error_json(
             code: HostCallErrorCode,
             message: impl Into<String>,
@@ -2174,6 +2195,97 @@ mod wasm_host {
                     payload.message
                 )
             })
+        }
+
+        fn hostcall_outcome_code(code: &str) -> HostCallErrorCode {
+            match code {
+                "timeout" => HostCallErrorCode::Timeout,
+                "denied" => HostCallErrorCode::Denied,
+                "io" => HostCallErrorCode::Io,
+                "invalid_request" => HostCallErrorCode::InvalidRequest,
+                "internal" => HostCallErrorCode::Internal,
+                _ => HostCallErrorCode::Internal,
+            }
+        }
+
+        fn hostcall_outcome_to_result(
+            outcome: HostcallOutcome,
+        ) -> std::result::Result<String, String> {
+            match outcome {
+                HostcallOutcome::Success(value) => serde_json::to_string(&value).map_err(|err| {
+                    Self::host_error_json(
+                        HostCallErrorCode::Internal,
+                        format!("Failed to serialize hostcall output: {err}"),
+                        None,
+                        None,
+                    )
+                }),
+                HostcallOutcome::Error { code, message } => Err(Self::host_error_json(
+                    Self::hostcall_outcome_code(&code),
+                    message,
+                    None,
+                    None,
+                )),
+            }
+        }
+
+        async fn resolve_policy_decision(
+            &self,
+            required: &str,
+        ) -> (PolicyDecision, String, String) {
+            const UNKNOWN_EXTENSION_ID: &str = "<unknown>";
+            let PolicyCheck {
+                decision,
+                capability,
+                reason,
+            } = self.policy.evaluate(required);
+
+            if decision != PolicyDecision::Prompt {
+                return (decision, reason, capability);
+            }
+
+            let Some(manager) = self.manager() else {
+                return (
+                    PolicyDecision::Deny,
+                    "prompt_required_no_manager".to_string(),
+                    capability,
+                );
+            };
+
+            if let Some(extension_id) = self.extension_id.as_deref() {
+                if let Some(allow) =
+                    manager.cached_policy_prompt_decision(extension_id, &capability)
+                {
+                    let decision = if allow {
+                        PolicyDecision::Allow
+                    } else {
+                        PolicyDecision::Deny
+                    };
+                    let reason = if allow {
+                        "prompt_cache_allow".to_string()
+                    } else {
+                        "prompt_cache_deny".to_string()
+                    };
+                    return (decision, reason, capability);
+                }
+            }
+
+            let prompt_extension_id = self.extension_id.as_deref().unwrap_or(UNKNOWN_EXTENSION_ID);
+            let allow = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
+            if let Some(extension_id) = self.extension_id.as_deref() {
+                manager.cache_policy_prompt_decision(extension_id, &capability, allow);
+            }
+            let decision = if allow {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::Deny
+            };
+            let reason = if allow {
+                "prompt_user_allow".to_string()
+            } else {
+                "prompt_user_deny".to_string()
+            };
+            (decision, reason, capability)
         }
 
         async fn dispatch_tool(
@@ -2610,16 +2722,16 @@ mod wasm_host {
                 "Hostcall start"
             );
 
-            let policy_check = self.policy.evaluate(&required);
-            if policy_check.decision == PolicyDecision::Allow {
+            let (decision, reason, capability) = self.resolve_policy_decision(&required).await;
+            if decision == PolicyDecision::Allow {
                 tracing::info!(
                     event = "policy.decision",
                     runtime = "wasm",
                     call_id = %payload.call_id,
                     extension_id = ?self.extension_id.as_deref(),
-                    capability = %policy_check.capability,
-                    decision = ?policy_check.decision,
-                    reason = %policy_check.reason,
+                    capability = %capability,
+                    decision = ?decision,
+                    reason = %reason,
                     params_hash = %params_hash,
                     "Hostcall allowed by policy"
                 );
@@ -2629,16 +2741,16 @@ mod wasm_host {
                     runtime = "wasm",
                     call_id = %payload.call_id,
                     extension_id = ?self.extension_id.as_deref(),
-                    capability = %policy_check.capability,
-                    decision = ?policy_check.decision,
-                    reason = %policy_check.reason,
+                    capability = %capability,
+                    decision = ?decision,
+                    reason = %reason,
                     params_hash = %params_hash,
                     "Hostcall denied by policy"
                 );
             }
 
             let method = payload.method.trim().to_ascii_lowercase();
-            let outcome = if policy_check.decision == PolicyDecision::Allow {
+            let outcome = if decision == PolicyDecision::Allow {
                 let dispatch = async {
                     match method.as_str() {
                         "tool" => self.dispatch_tool(&payload).await,
@@ -2646,6 +2758,58 @@ mod wasm_host {
                         "exec" => self.dispatch_exec(&payload).await,
                         "fs" => self.dispatch_fs(&payload).await,
                         "env" => self.dispatch_env(&payload).await,
+                        "session" | "ui" | "events" => {
+                            let op = Self::hostcall_op(&payload.params).ok_or_else(|| {
+                                Self::host_error_json(
+                                    HostCallErrorCode::InvalidRequest,
+                                    format!("Missing host_call op for {method}"),
+                                    Some(json!({ "method": method })),
+                                    None,
+                                )
+                            })?;
+                            let manager = self.manager().ok_or_else(|| {
+                                Self::host_error_json(
+                                    HostCallErrorCode::Denied,
+                                    "No extension manager configured for host_call",
+                                    Some(json!({ "method": method })),
+                                    None,
+                                )
+                            })?;
+                            let outcome = match method.as_str() {
+                                "session" => {
+                                    dispatch_hostcall_session(
+                                        &payload.call_id,
+                                        &manager,
+                                        &op,
+                                        payload.params.clone(),
+                                    )
+                                    .await
+                                }
+                                "ui" => {
+                                    dispatch_hostcall_ui(
+                                        &payload.call_id,
+                                        &manager,
+                                        &op,
+                                        payload.params.clone(),
+                                    )
+                                    .await
+                                }
+                                "events" => {
+                                    dispatch_hostcall_events(
+                                        &payload.call_id,
+                                        &manager,
+                                        &op,
+                                        payload.params.clone(),
+                                    )
+                                    .await
+                                }
+                                _ => HostcallOutcome::Error {
+                                    code: "invalid_request".to_string(),
+                                    message: format!("Unsupported host_call method: {method}"),
+                                },
+                            };
+                            return Self::hostcall_outcome_to_result(outcome);
+                        }
                         _ => Err(Self::host_error_json(
                             HostCallErrorCode::InvalidRequest,
                             format!("Unsupported host_call method: {method}"),
@@ -2675,11 +2839,11 @@ mod wasm_host {
             } else {
                 Err(Self::host_error_json(
                     HostCallErrorCode::Denied,
-                    "Capability denied by policy",
+                    format!("Capability '{capability}' denied by policy ({reason})"),
                     Some(json!({
-                        "capability": policy_check.capability,
-                        "decision": format!("{:?}", policy_check.decision),
-                        "reason": policy_check.reason,
+                        "capability": capability,
+                        "decision": format!("{:?}", decision),
+                        "reason": reason,
                     })),
                     None,
                 ))
@@ -3487,12 +3651,17 @@ impl WasmExtensionHost {
         &self,
         extension: &WasmExtension,
         tools: Arc<ToolRegistry>,
-        _manager: Option<ExtensionManager>,
+        manager: Option<ExtensionManagerHandle>,
     ) -> Result<wasm_host::Instance> {
         wasm_host::Instance::instantiate(
             &self.engine,
             &extension.path,
-            wasm_host::HostState::new_with_tools(self.policy.clone(), self.cwd.clone(), tools)?,
+            wasm_host::HostState::new_with_tools(
+                self.policy.clone(),
+                self.cwd.clone(),
+                tools,
+                manager,
+            )?,
         )
         .await
     }
@@ -3508,6 +3677,8 @@ pub const EXTENSION_EVENT_TIMEOUT_MS: u64 = 5000;
 /// Event names for the extension lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionEventName {
+    /// Agent startup (once per session).
+    Startup,
     /// Input from the user.
     Input,
     /// Before the agent starts processing.
@@ -3553,6 +3724,7 @@ pub enum ExtensionEventName {
 impl std::fmt::Display for ExtensionEventName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
+            Self::Startup => "startup",
             Self::Input => "input",
             Self::BeforeAgentStart => "before_agent_start",
             Self::AgentStart => "agent_start",
@@ -3702,6 +3874,20 @@ fn validate_extension_manifest(manifest: &ExtensionManifest) -> Result<()> {
     }
     if manifest.entrypoint.trim().is_empty() {
         return Err(Error::validation("Extension manifest entrypoint is empty"));
+    }
+    let entry_path = Path::new(manifest.entrypoint.trim());
+    if entry_path.is_absolute()
+        || entry_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(Error::validation(format!(
+            "Extension manifest entrypoint must be a relative path inside the extension root: {}",
+            manifest.entrypoint
+        )));
     }
 
     if let Some(capability_manifest) = &manifest.capability_manifest {
@@ -4084,7 +4270,7 @@ impl WasmExtensionHandle {
         &self.registration.event_hooks
     }
 
-    pub fn registration(&self) -> &RegisterPayload {
+    pub const fn registration(&self) -> &RegisterPayload {
         &self.registration
     }
 
@@ -5499,6 +5685,25 @@ pub struct ExtensionManager {
     inner: Arc<Mutex<ExtensionManagerInner>>,
 }
 
+#[cfg(feature = "wasm-host")]
+#[derive(Clone, Default)]
+struct ExtensionManagerHandle {
+    inner: Weak<Mutex<ExtensionManagerInner>>,
+}
+
+#[cfg(feature = "wasm-host")]
+impl ExtensionManagerHandle {
+    fn new(manager: &ExtensionManager) -> Self {
+        Self {
+            inner: Arc::downgrade(&manager.inner),
+        }
+    }
+
+    fn upgrade(&self) -> Option<ExtensionManager> {
+        self.inner.upgrade().map(|inner| ExtensionManager { inner })
+    }
+}
+
 #[derive(Default)]
 struct ExtensionManagerInner {
     extensions: Vec<RegisterPayload>,
@@ -5559,6 +5764,11 @@ impl ExtensionManager {
     pub fn set_model_registry_values(&self, values: HashMap<String, String>) {
         let mut guard = self.inner.lock().unwrap();
         guard.model_registry_values = values;
+    }
+
+    #[cfg(feature = "wasm-host")]
+    fn handle(&self) -> ExtensionManagerHandle {
+        ExtensionManagerHandle::new(self)
     }
 
     pub fn set_host_actions(&self, actions: Arc<dyn ExtensionHostActions>) {
@@ -5661,7 +5871,7 @@ impl ExtensionManager {
         for spec in specs {
             let extension = host.load_from_path(&spec.entry_path)?;
             let mut instance = host
-                .instantiate_with(&extension, Arc::clone(&tools), Some(self.clone()))
+                .instantiate_with(&extension, Arc::clone(&tools), Some(self.handle()))
                 .await?;
 
             let registration_json = instance.init(&spec.manifest_json).await?;
@@ -5672,7 +5882,9 @@ impl ExtensionManager {
                     ))
                 })?;
             if registration.capability_manifest.is_none() {
-                registration.capability_manifest = spec.manifest.capability_manifest.clone();
+                registration
+                    .capability_manifest
+                    .clone_from(&spec.manifest.capability_manifest);
             }
             validate_register(&registration)?;
 
@@ -5680,9 +5892,11 @@ impl ExtensionManager {
             registrations.push(registration);
         }
 
-        let mut guard = self.inner.lock().unwrap();
-        guard.extensions.extend(registrations);
-        guard.wasm_extensions.extend(wasm_handles);
+        {
+            let mut guard = self.inner.lock().unwrap();
+            guard.extensions.extend(registrations);
+            guard.wasm_extensions.extend(wasm_handles);
+        }
         Ok(())
     }
 
@@ -6003,23 +6217,21 @@ impl ExtensionManager {
 
     /// Dispatch a `tool_call` event to registered extensions and return the first
     /// blocking response (if any).
+    #[allow(clippy::too_many_lines)]
     pub async fn dispatch_tool_call(
         &self,
         tool_call: &crate::model::ToolCall,
         timeout_ms: u64,
     ) -> Result<Option<ToolCallEventResult>> {
         let event_name = "tool_call".to_string();
-        let Some(runtime) = self.js_runtime() else {
-            return Ok(None);
-        };
-
-        let (has_ui, session, cwd_override, model_registry_values, has_hook) = {
+        let (runtime, has_ui, session, cwd_override, model_registry_values, has_hook_js) = {
             let guard = self.inner.lock().unwrap();
             let has_hook = guard
                 .extensions
                 .iter()
                 .any(|ext| ext.event_hooks.iter().any(|hook| hook == &event_name));
             (
+                guard.js_runtime.clone(),
                 guard.ui_sender.is_some(),
                 guard.session.clone(),
                 guard.cwd.clone(),
@@ -6028,7 +6240,28 @@ impl ExtensionManager {
             )
         };
 
-        if !has_hook {
+        #[cfg(feature = "wasm-host")]
+        let (wasm_extensions, has_hook_wasm) = {
+            let guard = self.inner.lock().unwrap();
+            let has_hook_wasm = guard
+                .wasm_extensions
+                .iter()
+                .any(|ext| ext.event_hooks().iter().any(|hook| hook == &event_name));
+            (guard.wasm_extensions.clone(), has_hook_wasm)
+        };
+
+        let has_any_hook = {
+            #[cfg(feature = "wasm-host")]
+            {
+                has_hook_js || has_hook_wasm
+            }
+            #[cfg(not(feature = "wasm-host"))]
+            {
+                has_hook_js
+            }
+        };
+
+        if !has_any_hook {
             return Ok(None);
         }
 
@@ -6061,6 +6294,7 @@ impl ExtensionManager {
             ctx.insert("sessionLeafEntry".to_string(), leaf_entry);
         }
 
+        let ctx_payload = Value::Object(ctx);
         let event_payload = json!({
             "type": "tool_call",
             "toolName": tool_call.name.clone(),
@@ -6068,22 +6302,58 @@ impl ExtensionManager {
             "input": tool_call.arguments.clone()
         });
 
-        let response = runtime
-            .dispatch_event(event_name, event_payload, Value::Object(ctx), timeout_ms)
-            .await?;
+        let mut response: Option<ToolCallEventResult> = None;
 
-        if response.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(
-                serde_json::from_value(response)
-                    .map_err(|err| Error::extension(err.to_string()))?,
-            ))
+        if let Some(runtime) = runtime {
+            if has_hook_js {
+                let js_response = runtime
+                    .dispatch_event(
+                        event_name.clone(),
+                        event_payload.clone(),
+                        ctx_payload.clone(),
+                        timeout_ms,
+                    )
+                    .await?;
+                if !js_response.is_null() {
+                    let parsed: ToolCallEventResult = serde_json::from_value(js_response)
+                        .map_err(|err| Error::extension(err.to_string()))?;
+                    if parsed.block {
+                        return Ok(Some(parsed));
+                    }
+                    response = Some(parsed);
+                }
+            }
         }
+
+        #[cfg(feature = "wasm-host")]
+        if has_hook_wasm {
+            let mut wasm_payload = event_payload;
+            if let Value::Object(map) = &mut wasm_payload {
+                map.insert("ctx".to_string(), ctx_payload);
+            }
+            if let Some(value) = Self::dispatch_wasm_event_value(
+                &wasm_extensions,
+                &event_name,
+                &wasm_payload,
+                timeout_ms,
+            )
+            .await?
+            {
+                let parsed: ToolCallEventResult = serde_json::from_value(value)
+                    .map_err(|err| Error::extension(err.to_string()))?;
+                if parsed.block {
+                    return Ok(Some(parsed));
+                }
+                response = response.or(Some(parsed));
+            }
+        }
+
+        Ok(response)
     }
 
     /// Dispatch a `tool_result` event to registered extensions and return the
     /// last handler response (if any).
+    #[allow(clippy::too_many_lines)]
     pub async fn dispatch_tool_result(
         &self,
         tool_call: &crate::model::ToolCall,
@@ -6092,17 +6362,14 @@ impl ExtensionManager {
         timeout_ms: u64,
     ) -> Result<Option<ToolResultEventResult>> {
         let event_name = "tool_result".to_string();
-        let Some(runtime) = self.js_runtime() else {
-            return Ok(None);
-        };
-
-        let (has_ui, session, cwd_override, model_registry_values, has_hook) = {
+        let (runtime, has_ui, session, cwd_override, model_registry_values, has_hook_js) = {
             let guard = self.inner.lock().unwrap();
             let has_hook = guard
                 .extensions
                 .iter()
                 .any(|ext| ext.event_hooks.iter().any(|hook| hook == &event_name));
             (
+                guard.js_runtime.clone(),
                 guard.ui_sender.is_some(),
                 guard.session.clone(),
                 guard.cwd.clone(),
@@ -6111,7 +6378,28 @@ impl ExtensionManager {
             )
         };
 
-        if !has_hook {
+        #[cfg(feature = "wasm-host")]
+        let (wasm_extensions, has_hook_wasm) = {
+            let guard = self.inner.lock().unwrap();
+            let has_hook_wasm = guard
+                .wasm_extensions
+                .iter()
+                .any(|ext| ext.event_hooks().iter().any(|hook| hook == &event_name));
+            (guard.wasm_extensions.clone(), has_hook_wasm)
+        };
+
+        let has_any_hook = {
+            #[cfg(feature = "wasm-host")]
+            {
+                has_hook_js || has_hook_wasm
+            }
+            #[cfg(not(feature = "wasm-host"))]
+            {
+                has_hook_js
+            }
+        };
+
+        if !has_any_hook {
             return Ok(None);
         }
 
@@ -6144,6 +6432,7 @@ impl ExtensionManager {
             ctx.insert("sessionLeafEntry".to_string(), leaf_entry);
         }
 
+        let ctx_payload = Value::Object(ctx);
         let event_payload = json!({
             "type": "tool_result",
             "toolName": tool_call.name.clone(),
@@ -6154,18 +6443,49 @@ impl ExtensionManager {
             "isError": is_error
         });
 
-        let response = runtime
-            .dispatch_event(event_name, event_payload, Value::Object(ctx), timeout_ms)
-            .await?;
+        let mut response: Option<ToolResultEventResult> = None;
 
-        if response.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(
-                serde_json::from_value(response)
-                    .map_err(|err| Error::extension(err.to_string()))?,
-            ))
+        if let Some(runtime) = runtime {
+            if has_hook_js {
+                let js_response = runtime
+                    .dispatch_event(
+                        event_name.clone(),
+                        event_payload.clone(),
+                        ctx_payload.clone(),
+                        timeout_ms,
+                    )
+                    .await?;
+                if !js_response.is_null() {
+                    response = Some(
+                        serde_json::from_value(js_response)
+                            .map_err(|err| Error::extension(err.to_string()))?,
+                    );
+                }
+            }
         }
+
+        #[cfg(feature = "wasm-host")]
+        if has_hook_wasm {
+            let mut wasm_payload = event_payload;
+            if let Value::Object(map) = &mut wasm_payload {
+                map.insert("ctx".to_string(), ctx_payload);
+            }
+            if let Some(value) = Self::dispatch_wasm_event_value(
+                &wasm_extensions,
+                &event_name,
+                &wasm_payload,
+                timeout_ms,
+            )
+            .await?
+            {
+                response = Some(
+                    serde_json::from_value(value)
+                        .map_err(|err| Error::extension(err.to_string()))?,
+                );
+            }
+        }
+
+        Ok(response)
     }
 }
 
