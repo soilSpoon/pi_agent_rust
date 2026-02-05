@@ -110,7 +110,7 @@ Location: `tests/ext_conformance_diff.rs` + `tests/ext_conformance/`
 | Official | 60 | 60 | 100% | All pass, test runs in CI |
 | Community | 53 | 58 | 91.4% | 53/53 testable pass; 5 TS oracle env failures |
 | npm | 47 | 63 | 74.6% | 16 failures: 13 missing npm deps, 3 env issues |
-| Third-party | 18 | 23 | 78.3% | 5 failures: 2 missing files, 2 missing npm deps, 1 config error |
+| Third-party | 19 | 23 | 82.6% | 19/19 testable pass; 4 known-unfixable skipped |
 
 **Community TS oracle failures (environment issues, not Rust bugs):**
 - `nicobailon-interactive-shell`: requires native `pty.node` module
@@ -119,11 +119,19 @@ Location: `tests/ext_conformance_diff.rs` + `tests/ext_conformance/`
 - `qualisero-pi-agent-scip`: missing `./dist/extension.js`
 - `qualisero-safe-git`: missing `../../shared` module
 
+**Third-party known-unfixable failures (external dependencies, not Rust bugs):**
+- `kcosr`: readFileSync adjacent `.md` file (VFS is in-memory only)
+- `marckrenn`: imports `@marckrenn/pi-sub-shared` (private npm package)
+- `ogulcancelik`: readFileSync adjacent `.html` file (VFS is in-memory only)
+- `qualisero`: imports `@sourcegraph/scip-typescript` (external npm package)
+
 **Key runtime features enabling conformance:**
 - In-memory virtual filesystem (`__pi_vfs`) for `node:fs`
 - CJS-to-ESM transformation shim for CommonJS extensions
 - `createRequire` resolves actual builtin modules
-- Virtual module stubs: `shell-quote`, `vscode-languageserver-protocol`, `@modelcontextprotocol/sdk`
+- Virtual module stubs: `shell-quote`, `vscode-languageserver-protocol`, `@modelcontextprotocol/sdk`, `glob`, `uuid`, `diff`, `just-bash`, `bunfig`, `dotenv`
+- `registerCommand` accepts both `spec.handler` and `spec.fn` (PiCommand compat)
+- Global `URL` polyfill for QuickJS
 - Comprehensive node polyfills: `fs`, `path`, `os`, `crypto`, `url`, `process`, `buffer`, `child_process`
 
 Current building blocks:
