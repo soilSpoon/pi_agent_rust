@@ -1220,6 +1220,7 @@ impl PiApp {
 
             let kind_icon = match item.kind {
                 AutocompleteItemKind::SlashCommand => "⚡",
+                AutocompleteItemKind::ExtensionCommand => "🧩",
                 AutocompleteItemKind::PromptTemplate => "📄",
                 AutocompleteItemKind::Skill => "🔧",
                 AutocompleteItemKind::File => "📁",
