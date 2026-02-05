@@ -189,6 +189,7 @@ fn normalize_mock_error_cassette(cassette_path: &Path, harness: &TestHarness) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_scenario(scenario: Scenario) {
     let harness = TestHarness::new(format!("anthropic_{}", scenario.name));
     let cassette_dir = cassette_root();
@@ -211,7 +212,7 @@ async fn run_scenario(scenario: Scenario) {
         mode == VcrMode::Record || (mode == VcrMode::Auto && !cassette_path.exists());
     let error_expectation = match &scenario.expectation {
         ScenarioExpectation::Error(expectation) => Some(expectation.clone()),
-        _ => None,
+        ScenarioExpectation::Stream(_) => None,
     };
 
     let recorder = VcrRecorder::new_with(scenario.name, mode, &cassette_dir);
