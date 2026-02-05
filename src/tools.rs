@@ -2176,6 +2176,52 @@ fn truncate_line(line: &str, max_chars: usize) -> TruncateLineResult {
     }
 }
 
+fn process_rg_json_match_line(
+    line_res: std::io::Result<String>,
+    matches: &mut Vec<(PathBuf, usize)>,
+    match_count: &mut usize,
+    match_limit_reached: &mut bool,
+    effective_limit: usize,
+) -> Result<()> {
+    if *match_limit_reached {
+        return Ok(());
+    }
+
+    let line = line_res.map_err(|e| Error::tool("grep", e.to_string()))?;
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+        return Ok(());
+    };
+
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("match") {
+        return Ok(());
+    }
+
+    *match_count += 1;
+
+    let file_path = event
+        .pointer("/data/path/text")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let line_number = event
+        .pointer("/data/line_number")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok());
+
+    if let (Some(fp), Some(ln)) = (file_path, line_number) {
+        matches.push((fp, ln));
+    }
+
+    if *match_count >= effective_limit {
+        *match_limit_reached = true;
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for GrepTool {
@@ -2300,7 +2346,7 @@ impl Tool for GrepTool {
         let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
         let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
 
-        std::thread::spawn(move || {
+        let stdout_thread = std::thread::spawn(move || {
             let reader = std::io::BufReader::new(stdout);
             for line in reader.lines() {
                 if stdout_tx.send(line).is_err() {
@@ -2309,7 +2355,7 @@ impl Tool for GrepTool {
             }
         });
 
-        std::thread::spawn(move || {
+        let stderr_thread = std::thread::spawn(move || {
             let mut reader = std::io::BufReader::new(stderr);
             let mut buf = Vec::new();
             if reader.read_to_end(&mut buf).is_ok() {
@@ -2322,53 +2368,17 @@ impl Tool for GrepTool {
         let mut match_limit_reached = false;
         let mut stderr_bytes = Vec::new();
 
-        let mut process_stdout_line = |line_res: std::io::Result<String>| -> Result<()> {
-            if match_limit_reached {
-                return Ok(());
-            }
-
-            let line = line_res.map_err(|e| Error::tool("grep", e.to_string()))?;
-            if line.trim().is_empty() {
-                return Ok(());
-            }
-
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-                return Ok(());
-            };
-
-            if event.get("type").and_then(serde_json::Value::as_str) != Some("match") {
-                return Ok(());
-            }
-
-            match_count += 1;
-
-            let file_path = event
-                .pointer("/data/path/text")
-                .and_then(serde_json::Value::as_str)
-                .map(PathBuf::from);
-            let line_number = event
-                .pointer("/data/line_number")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|n| usize::try_from(n).ok());
-
-            if let (Some(fp), Some(ln)) = (file_path, line_number) {
-                matches.push((fp, ln));
-            }
-
-            if match_count >= effective_limit {
-                match_limit_reached = true;
-            }
-
-            Ok(())
-        };
-
         let tick = Duration::from_millis(10);
 
         loop {
             while let Ok(line_res) = stdout_rx.try_recv() {
-                if let Err(err) = process_stdout_line(line_res) {
-                    return Err(err);
-                }
+                process_rg_json_match_line(
+                    line_res,
+                    &mut matches,
+                    &mut match_count,
+                    &mut match_limit_reached,
+                    effective_limit,
+                )?;
                 if match_limit_reached {
                     break;
                 }
@@ -2392,20 +2402,18 @@ impl Tool for GrepTool {
         }
 
         while let Ok(line_res) = stdout_rx.try_recv() {
-            if let Err(err) = process_stdout_line(line_res) {
-                return Err(err);
-            }
+            process_rg_json_match_line(
+                line_res,
+                &mut matches,
+                &mut match_count,
+                &mut match_limit_reached,
+                effective_limit,
+            )?;
             if match_limit_reached {
                 break;
             }
         }
 
-        // Drain any remaining stderr
-        while let Ok(chunk) = stderr_rx.try_recv() {
-            stderr_bytes.extend_from_slice(&chunk);
-        }
-
-        let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         let code = if match_limit_reached {
             // Avoid buffering unbounded stdout/stderr once we've hit the match limit.
             // `kill()` also waits, ensuring the stdout reader threads can exit promptly.
@@ -2424,6 +2432,31 @@ impl Tool for GrepTool {
                 .unwrap_or(0)
         };
 
+        // Ensure stdout/stderr reader threads have fully drained the pipes before
+        // we decide whether matches were found. Without this, fast ripgrep runs can
+        // exit before the reader thread has delivered JSON match lines, causing
+        // false "No matches found" results.
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+
+        // Drain any remaining stdout/stderr produced after the last poll.
+        while let Ok(line_res) = stdout_rx.try_recv() {
+            process_rg_json_match_line(
+                line_res,
+                &mut matches,
+                &mut match_count,
+                &mut match_limit_reached,
+                effective_limit,
+            )?;
+            if match_limit_reached {
+                break;
+            }
+        }
+        while let Ok(chunk) = stderr_rx.try_recv() {
+            stderr_bytes.extend_from_slice(&chunk);
+        }
+
+        let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         if !match_limit_reached && code != 0 && code != 1 {
             let msg = if stderr_text.is_empty() {
                 format!("ripgrep exited with code {code}")
