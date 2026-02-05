@@ -108,6 +108,7 @@ Location: `tests/ext_conformance_diff.rs` + `tests/ext_conformance/`
 | Corpus | Passed | Total | Rate | Notes |
 |--------|--------|-------|------|-------|
 | Official | 60 | 60 | 100% | All pass, test runs in CI |
+| Built-in | 4 | 4 | 100% | Pi-mono built-in extensions (diff, files, prompt-url-widget, redraws) |
 | Community | 53 | 58 | 91.4% | 53/53 testable pass; 5 TS oracle env failures |
 | npm | 47 | 63 | 74.6% | 16 failures: 13 missing npm deps, 3 env issues |
 | Third-party | 19 | 23 | 82.6% | 19/19 testable pass; 4 known-unfixable skipped |
@@ -124,6 +125,12 @@ Location: `tests/ext_conformance_diff.rs` + `tests/ext_conformance/`
 - `marckrenn`: imports `@marckrenn/pi-sub-shared` (private npm package)
 - `ogulcancelik`: readFileSync adjacent `.html` file (VFS is in-memory only)
 - `qualisero`: imports `@sourcegraph/scip-typescript` (external npm package)
+
+**Built-in pi-mono extensions (source_tier `built-in-pi-mono`):**
+- `diff`: Slash command `/diff` showing git diff in TUI (uses `pi.exec`, `ctx.ui.custom`)
+- `files`: Slash command `/files` listing session file operations (uses `ctx.sessionManager`, `ctx.ui.custom`, `pi.exec`)
+- `prompt-url-widget`: Widget for PR/issue URLs with `gh` metadata (uses `pi.on`, `pi.exec`, `ctx.ui.setWidget`, `pi.getSessionName`, `pi.setSessionName`)
+- `redraws`: Slash command `/tui` showing TUI redraw stats (uses `ctx.ui.custom`, `ctx.ui.notify`)
 
 **Key runtime features enabling conformance:**
 - In-memory virtual filesystem (`__pi_vfs`) for `node:fs`

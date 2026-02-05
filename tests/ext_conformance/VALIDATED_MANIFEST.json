@@ -7475,6 +7475,98 @@
         "flags": [],
         "event_handlers": []
       }
+    },
+    {
+      "id": "diff",
+      "entry_path": "diff/diff.ts",
+      "source_tier": "built-in-pi-mono",
+      "capabilities": {
+        "registers_tools": false,
+        "registers_commands": true,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [],
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": true,
+        "uses_session": false,
+        "file_count": 1
+      },
+      "registrations": {
+        "tools": [],
+        "commands": ["diff"],
+        "flags": [],
+        "event_handlers": []
+      }
+    },
+    {
+      "id": "files",
+      "entry_path": "files/files.ts",
+      "source_tier": "built-in-pi-mono",
+      "capabilities": {
+        "registers_tools": false,
+        "registers_commands": true,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": true,
+        "uses_session": true,
+        "file_count": 1
+      },
+      "registrations": {
+        "tools": [],
+        "commands": ["files"],
+        "flags": [],
+        "event_handlers": []
+      }
+    },
+    {
+      "id": "prompt-url-widget",
+      "entry_path": "prompt-url-widget/prompt-url-widget.ts",
+      "source_tier": "built-in-pi-mono",
+      "capabilities": {
+        "registers_tools": false,
+        "registers_commands": false,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": ["before_agent_start", "session_switch", "session_start"],
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": true,
+        "uses_session": true,
+        "file_count": 1
+      },
+      "registrations": {
+        "tools": [],
+        "commands": [],
+        "flags": [],
+        "event_handlers": ["before_agent_start", "session_switch", "session_start"]
+      }
+    },
+    {
+      "id": "redraws",
+      "entry_path": "redraws/redraws.ts",
+      "source_tier": "built-in-pi-mono",
+      "capabilities": {
+        "registers_tools": false,
+        "registers_commands": true,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": true,
+        "uses_session": false,
+        "file_count": 1
+      },
+      "registrations": {
+        "tools": [],
+        "commands": ["tui"],
+        "flags": [],
+        "event_handlers": []
+      }
     }
   ]
 }

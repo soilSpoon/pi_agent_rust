@@ -288,6 +288,11 @@ fn official_extensions() -> &'static Vec<(String, String)> {
     OFFICIAL.get_or_init(|| extensions_by_tier("official-pi-mono"))
 }
 
+fn builtin_extensions() -> &'static Vec<(String, String)> {
+    static BUILTIN: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    BUILTIN.get_or_init(|| extensions_by_tier("built-in-pi-mono"))
+}
+
 #[allow(dead_code)]
 fn community_extensions() -> &'static Vec<(String, String)> {
     static COMMUNITY: OnceLock<Vec<(String, String)>> = OnceLock::new();
@@ -323,6 +328,10 @@ fn validated_manifest_has_all_tiers() {
     assert!(
         !thirdparty_extensions().is_empty(),
         "expected third-party-github extensions in validated manifest"
+    );
+    assert!(
+        !builtin_extensions().is_empty(),
+        "expected built-in-pi-mono extensions in validated manifest"
     );
 }
 
@@ -2102,4 +2111,65 @@ fn diff_thirdparty_manifest() {
         unexpected_failures.len(),
         unexpected_failures.join("\n")
     );
+}
+
+// ─── Built-in extensions (bd-k7i) ─────────────────────────────────────────
+
+/// Differential conformance tests on built-in pi-mono extensions (4 extensions
+/// from .pi/extensions/).
+#[test]
+fn diff_builtin_manifest() {
+    let selected: Vec<(String, String)> = builtin_extensions().clone();
+
+    eprintln!(
+        "[diff_builtin_manifest] Starting (selected={})",
+        selected.len(),
+    );
+
+    let mut failures = Vec::new();
+    for (idx, (extension_dir, entry_file)) in selected.iter().enumerate() {
+        let name = format!("{extension_dir}/{entry_file}");
+        eprintln!(
+            "[diff_builtin_manifest] {}/{}: {name}",
+            idx + 1,
+            selected.len()
+        );
+        let start = std::time::Instant::now();
+        if let Err(err) = run_differential_test_strict(extension_dir, entry_file) {
+            failures.push(format!("{name}: {err}"));
+        }
+        eprintln!(
+            "[diff_builtin_manifest] {}/{}: done in {:?}",
+            idx + 1,
+            selected.len(),
+            start.elapsed()
+        );
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Built-in conformance failures ({}):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn diff_redraws() {
+    run_differential_test("redraws", "redraws.ts");
+}
+
+#[test]
+fn diff_diff() {
+    run_differential_test("diff", "diff.ts");
+}
+
+#[test]
+fn diff_files() {
+    run_differential_test("files", "files.ts");
+}
+
+#[test]
+fn diff_prompt_url_widget() {
+    run_differential_test("prompt-url-widget", "prompt-url-widget.ts");
 }
