@@ -1559,7 +1559,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use std::fs;
+    use std::future::Future;
+
+    fn run_async<T>(future: impl Future<Output = T>) -> T {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(future)
+    }
 
     #[test]
     fn test_parse_command_args() {
@@ -1622,7 +1631,7 @@ mod tests {
 
     #[test]
     fn test_cli_extensions_load_when_no_extensions_flag_set() {
-        asupersync::test_utils::run_test(|| async {
+        run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let extension_path = temp_dir.path().join("ext.js");
             fs::write(&extension_path, "export default function() {}").expect("write extension");
@@ -1649,7 +1658,7 @@ mod tests {
 
     #[test]
     fn test_extension_paths_deduped_between_settings_and_cli() {
-        asupersync::test_utils::run_test(|| async {
+        run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let extension_path = temp_dir.path().join("ext.js");
             fs::write(&extension_path, "export default function() {}").expect("write extension");

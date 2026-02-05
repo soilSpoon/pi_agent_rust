@@ -2539,8 +2539,17 @@ fn maybe_emit_compat_ledgers(extensions: &[ResolvedResource]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use serde_json::json;
     use std::fs;
+    use std::future::Future;
+
+    fn run_async<T>(future: impl Future<Output = T>) -> T {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(future)
+    }
 
     #[test]
     fn test_parse_npm_spec_scoped_and_unscoped() {
@@ -2632,7 +2641,7 @@ mod tests {
 
     #[test]
     fn test_project_settings_override_global_package_filters() {
-        asupersync::test_utils::run_test(|| async {
+        run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let project_root = temp_dir.path().join("project");
             fs::create_dir_all(project_root.join(".pi")).expect("create project settings dir");
@@ -2708,7 +2717,7 @@ mod tests {
 
     #[test]
     fn test_resolve_extension_sources_uses_temporary_scope() {
-        asupersync::test_utils::run_test(|| async {
+        run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let extension_path = temp_dir.path().join("ext.js");
             fs::write(&extension_path, "export default function() {}").expect("write extension");
@@ -2774,7 +2783,7 @@ mod tests {
 
     #[test]
     fn test_manifest_extensions_resolve_with_patterns() {
-        asupersync::test_utils::run_test(|| async {
+        run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let package_root = temp_dir.path().join("pkg");
             let extensions_dir = package_root.join("extensions");
