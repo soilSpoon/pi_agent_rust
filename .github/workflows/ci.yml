@@ -121,11 +121,19 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: cargo clippy (wasm-host) [linux]
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --features wasm-host -- -D warnings
+
       - name: cargo doc
         run: cargo doc --no-deps
 
       - name: cargo test
         run: cargo test --all-targets
+
+      - name: cargo test (wasm-host) [linux]
+        if: runner.os == 'Linux'
+        run: cargo test --all-targets --features wasm-host
 
       - name: Coverage summary (llvm-cov)
         if: runner.os == 'Linux'
