@@ -1036,6 +1036,8 @@ impl JsModuleResolver for PiJsResolver {
             "https" => "node:https",
             "util" => "node:util",
             "readline" => "node:readline",
+            "url" => "node:url",
+            "net" => "node:net",
             other => other,
         };
 
@@ -1503,7 +1505,21 @@ export function fuzzyMatch(query, text, _opts = {}) {
   return { match, score, positions };
 }
 
-export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch };
+// Get editor keybindings configuration
+export function getEditorKeybindings() {
+  return {
+    save: 'ctrl+s',
+    quit: 'ctrl+q',
+    copy: 'ctrl+c',
+    paste: 'ctrl+v',
+    undo: 'ctrl+z',
+    redo: 'ctrl+y',
+    find: 'ctrl+f',
+    replace: 'ctrl+h',
+  };
+}
+
+export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings };
 "#
         .trim()
         .to_string(),
@@ -1987,7 +2003,22 @@ export function homedir() {
 export function tmpdir() {
   return "/tmp";
 }
-export default { homedir, tmpdir };
+export function hostname() {
+  return "pi-host";
+}
+export function platform() {
+  return "linux";
+}
+export function arch() {
+  return "x64";
+}
+export function type() {
+  return "Linux";
+}
+export function release() {
+  return "6.0.0";
+}
+export default { homedir, tmpdir, hostname, platform, arch, type, release };
 "#
         .trim()
         .to_string(),
@@ -2053,7 +2084,25 @@ export function mkdtempSync(prefix, _opts) {
   const p = String(prefix ?? "/tmp/tmp-");
   return `${p}${Date.now().toString(36)}`;
 }
-export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdtempSync };
+export function realpathSync(path, _opts) {
+  // Return the path as-is (no symlink resolution in stub)
+  return String(path ?? '');
+}
+export function unlinkSync(_path) { return; }
+export function rmdirSync(_path, _opts) { return; }
+export function copyFileSync(_src, _dest, _mode) { return; }
+export function renameSync(_oldPath, _newPath) { return; }
+export const promises = {
+  access: async (_path, _mode) => {},
+  mkdir: async (_path, _opts) => {},
+  readFile: async (_path, _opts) => '',
+  writeFile: async (_path, _data, _opts) => {},
+  unlink: async (_path) => {},
+  rmdir: async (_path, _opts) => {},
+  stat: async (_path) => { throw new Error('stat unavailable'); },
+  realpath: async (path, _opts) => String(path ?? ''),
+};
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, copyFileSync, renameSync, promises };
 "#
         .trim()
         .to_string(),
