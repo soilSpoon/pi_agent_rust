@@ -179,24 +179,35 @@ fn capture_registration_artifacts(harness: &common::TestHarness, manager: &Exten
     write_pretty_json(&models_path, &models_value);
     harness.record_artifact("registration_models.json", &models_path);
 
-    harness.log().info_ctx("snapshot", "Registration snapshot artifacts", |ctx| {
-        ctx.push(("commands".into(), commands_value.as_array().unwrap().len().to_string()));
-        ctx.push((
-            "shortcuts".into(),
-            shortcuts_value.as_array().unwrap().len().to_string(),
-        ));
-        ctx.push(("flags".into(), flags_value.as_array().unwrap().len().to_string()));
-        ctx.push((
-            "providers".into(),
-            providers_value.as_array().unwrap().len().to_string(),
-        ));
-        ctx.push((
-            "tool_defs".into(),
-            tool_defs_value.as_array().unwrap().len().to_string(),
-        ));
-        ctx.push(("models".into(), models_value.as_array().unwrap().len().to_string()));
-        ctx.push(("redactions".into(), redactions.to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("snapshot", "Registration snapshot artifacts", |ctx| {
+            ctx.push((
+                "commands".into(),
+                commands_value.as_array().unwrap().len().to_string(),
+            ));
+            ctx.push((
+                "shortcuts".into(),
+                shortcuts_value.as_array().unwrap().len().to_string(),
+            ));
+            ctx.push((
+                "flags".into(),
+                flags_value.as_array().unwrap().len().to_string(),
+            ));
+            ctx.push((
+                "providers".into(),
+                providers_value.as_array().unwrap().len().to_string(),
+            ));
+            ctx.push((
+                "tool_defs".into(),
+                tool_defs_value.as_array().unwrap().len().to_string(),
+            ));
+            ctx.push((
+                "models".into(),
+                models_value.as_array().unwrap().len().to_string(),
+            ));
+            ctx.push(("redactions".into(), redactions.to_string()));
+        });
 }
 
 fn write_pretty_json(path: &std::path::Path, value: &Value) {
@@ -268,21 +279,27 @@ fn redact_json_secrets(value: &mut Value) -> usize {
 
 fn is_sensitive_json_key(key: &str) -> bool {
     let key = key.trim().to_ascii_lowercase();
-    [
+    if [
         "api_key",
         "api-key",
         "apikey",
         "authorization",
-        "bearer",
         "cookie",
         "credential",
         "password",
         "private_key",
         "secret",
-        "token",
     ]
     .iter()
     .any(|needle| key.contains(needle))
+    {
+        return true;
+    }
+
+    // Treat token-like fields as sensitive, but avoid catching config keys like "maxTokens".
+    key == "token"
+        || key.ends_with("_token")
+        || (key.ends_with("token") && !key.ends_with("tokens"))
 }
 
 /// Write JSONL logs and artifact index if output directory is set.
@@ -495,6 +512,7 @@ fn e2e_full_registration_lifecycle() {
 fn e2e_command_execute_returns_display() {
     let harness = common::TestHarness::new("e2e_command_execute_returns_display");
     let manager = load_extension(&harness, FULL_REGISTRATION_EXTENSION);
+    capture_registration_artifacts(&harness, &manager);
 
     harness
         .log()
@@ -525,7 +543,6 @@ fn e2e_command_execute_returns_display() {
         Some("Hello from ext-hello!")
     );
 
-    capture_registration_artifacts(&harness, &manager);
     write_jsonl_artifacts(&harness);
 }
 
@@ -533,6 +550,7 @@ fn e2e_command_execute_returns_display() {
 fn e2e_command_execute_with_args() {
     let harness = common::TestHarness::new("e2e_command_execute_with_args");
     let manager = load_extension(&harness, FULL_REGISTRATION_EXTENSION);
+    capture_registration_artifacts(&harness, &manager);
 
     harness
         .log()
@@ -563,7 +581,6 @@ fn e2e_command_execute_with_args() {
         Some("Echo: world")
     );
 
-    capture_registration_artifacts(&harness, &manager);
     write_jsonl_artifacts(&harness);
 }
 
@@ -573,6 +590,7 @@ fn e2e_command_execute_with_args() {
 fn e2e_shortcut_execute() {
     let harness = common::TestHarness::new("e2e_shortcut_execute");
     let manager = load_extension(&harness, FULL_REGISTRATION_EXTENSION);
+    capture_registration_artifacts(&harness, &manager);
 
     harness
         .log()
@@ -605,7 +623,6 @@ fn e2e_shortcut_execute() {
         Some("Ctrl+E triggered")
     );
 
-    capture_registration_artifacts(&harness, &manager);
     write_jsonl_artifacts(&harness);
 }
 
@@ -615,6 +632,7 @@ fn e2e_shortcut_execute() {
 fn e2e_flag_set_value() {
     let harness = common::TestHarness::new("e2e_flag_set_value");
     let manager = load_extension(&harness, FULL_REGISTRATION_EXTENSION);
+    capture_registration_artifacts(&harness, &manager);
 
     // Verify the flag exists
     let flags = manager.list_flags();
@@ -647,7 +665,6 @@ fn e2e_flag_set_value() {
 
     assert!(result.is_ok(), "set_flag_value should succeed: {result:?}");
 
-    capture_registration_artifacts(&harness, &manager);
     write_jsonl_artifacts(&harness);
 }
 
