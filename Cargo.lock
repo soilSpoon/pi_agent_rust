@@ -304,6 +304,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "asupersync"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=393d13e134ba5908f03fde1e5cbc24e62de8f807#393d13e134ba5908f03fde1e5cbc24e62de8f807"
+dependencies = [
+ "base64 0.22.1",
+ "bincode",
+ "crossbeam-queue",
+ "getrandom 0.3.4",
+ "libc",
+ "nix 0.29.0",
+ "parking_lot",
+ "pin-project",
+ "polling",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha1",
+ "slab",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "visibility",
+]
+
+[[package]]
 name = "async-lock"
 version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -503,40 +530,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bubbles"
-version = "0.1.0"
-dependencies = [
- "bubbletea",
- "harmonica",
- "lipgloss",
- "parking_lot",
- "unicode-segmentation",
- "unicode-width 0.2.2",
-]
-
-[[package]]
-name = "bubbletea"
-version = "0.1.0"
-dependencies = [
- "bubbletea-macros",
- "crossterm",
- "parking_lot",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "bubbletea-macros"
-version = "0.1.0"
-dependencies = [
- "darling",
- "proc-macro-error2",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "built"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -661,6 +654,70 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "charmed-bubbles"
+version = "0.1.0"
+dependencies = [
+ "charmed-bubbletea",
+ "charmed-harmonica",
+ "charmed-lipgloss",
+ "parking_lot",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "charmed-bubbletea"
+version = "0.1.0"
+dependencies = [
+ "charmed-bubbletea-macros",
+ "crossterm",
+ "parking_lot",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "charmed-bubbletea-macros"
+version = "0.1.0"
+dependencies = [
+ "darling",
+ "proc-macro-error2",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "charmed-glamour"
+version = "0.1.0"
+dependencies = [
+ "charmed-lipgloss",
+ "lru 0.12.5",
+ "pulldown-cmark",
+ "tracing",
+ "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "charmed-harmonica"
+version = "0.1.0"
+
+[[package]]
+name = "charmed-lipgloss"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.10.0",
+ "colored",
+ "crossterm",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "unicode-width 0.1.14",
+]
 
 [[package]]
 name = "chrono"
@@ -2680,17 +2737,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glamour"
-version = "0.1.0"
-dependencies = [
- "lipgloss",
- "lru 0.12.5",
- "pulldown-cmark",
- "tracing",
- "unicode-width 0.1.14",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2719,10 +2765,6 @@ dependencies = [
  "crunchy",
  "zerocopy",
 ]
-
-[[package]]
-name = "harmonica"
-version = "0.1.0"
 
 [[package]]
 name = "hash32"
@@ -3303,21 +3345,6 @@ name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
-
-[[package]]
-name = "lipgloss"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.10.0",
- "colored",
- "crossterm",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "unicode-width 0.1.14",
-]
 
 [[package]]
 name = "litemap"
@@ -3970,11 +3997,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
- "asupersync",
+ "asupersync 0.1.0",
  "async-trait",
  "base64 0.22.1",
- "bubbles",
- "bubbletea",
+ "charmed-bubbles",
+ "charmed-bubbletea",
+ "charmed-glamour",
+ "charmed-lipgloss",
  "chrono",
  "clap",
  "clap_complete",
@@ -3985,13 +4014,11 @@ dependencies = [
  "dirs",
  "fs4",
  "futures",
- "glamour",
  "glob",
  "ignore",
  "image",
  "insta",
  "jsonschema",
- "lipgloss",
  "pretty_assertions",
  "proptest",
  "regex",
@@ -5145,7 +5172,7 @@ checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
 name = "sqlmodel-core"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0 (git+https://github.com/Dicklesworthstone/asupersync?rev=393d13e134ba5908f03fde1e5cbc24e62de8f807)",
  "regex",
  "serde",
  "serde_json",
@@ -5156,7 +5183,7 @@ dependencies = [
 name = "sqlmodel-sqlite"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0 (git+https://github.com/Dicklesworthstone/asupersync?rev=393d13e134ba5908f03fde1e5cbc24e62de8f807)",
  "serde",
  "serde_json",
  "sqlmodel-core",
