@@ -360,6 +360,43 @@ impl VcrRecorder {
                 message.push_str(&key);
                 message.push('\n');
             }
+
+            if env_truthy("VCR_DEBUG_BODY") {
+                let mut incoming_body = request.body.clone();
+                if let Some(body) = &mut incoming_body {
+                    redact_json(body);
+                }
+
+                if let Some(body) = &incoming_body {
+                    if let Ok(pretty) = serde_json::to_string_pretty(body) {
+                        message.push_str("\nIncoming JSON body (redacted):\n");
+                        message.push_str(&pretty);
+                        message.push('\n');
+                    }
+                }
+
+                if let Some(body_text) = &request.body_text {
+                    message.push_str("\nIncoming text body:\n");
+                    message.push_str(body_text);
+                    message.push('\n');
+                }
+
+                for (idx, interaction) in cassette.interactions.iter().enumerate() {
+                    if let Some(body) = &interaction.request.body {
+                        if let Ok(pretty) = serde_json::to_string_pretty(body) {
+                            message.push_str(&format!("\nRecorded JSON body [{idx}]:\n"));
+                            message.push_str(&pretty);
+                            message.push('\n');
+                        }
+                    }
+
+                    if let Some(body_text) = &interaction.request.body_text {
+                        message.push_str(&format!("\nRecorded text body [{idx}]:\n"));
+                        message.push_str(body_text);
+                        message.push('\n');
+                    }
+                }
+            }
             message.push_str(
                 "Match criteria: method + url + body + body_text (headers ignored). If the request changed, re-record with VCR_MODE=record.",
             );

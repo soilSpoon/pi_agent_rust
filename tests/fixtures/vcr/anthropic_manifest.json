@@ -1,7 +1,29 @@
 {
   "version": "1.0",
-  "generated_at": "2026-02-05T03:46:03.577Z",
+  "generated_at": "2026-02-05T03:51:46.127Z",
   "scenarios": [
+    {
+      "name": "anthropic_auth_failure_401",
+      "description": "Auth failure (HTTP 401)",
+      "cassette": "anthropic_auth_failure_401.json",
+      "model": "claude-sonnet-4-20250514",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "thinking_level": null,
+      "prompt_hash": "92184e1f70e142cc6473cb47d91cbf519720cb0518108fd29a700d078e5b3567",
+      "recorded_at": "2026-02-05T03:41:05.458Z"
+    },
+    {
+      "name": "anthropic_bad_request_400",
+      "description": "Bad request error (HTTP 400)",
+      "cassette": "anthropic_bad_request_400.json",
+      "model": "claude-sonnet-4-20250514",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "thinking_level": null,
+      "prompt_hash": "0e188080212f2a6ff698e70e316c2beb922a5c9e3ed23bafaf93a1402c88b149",
+      "recorded_at": "2026-02-05T03:41:05.458Z"
+    },
     {
       "name": "anthropic_empty_response",
       "description": "Empty response (no content blocks)",
@@ -25,6 +47,28 @@
       "recorded_at": "2026-02-05T03:43:56.804Z"
     },
     {
+      "name": "anthropic_forbidden_403",
+      "description": "Forbidden error (HTTP 403)",
+      "cassette": "anthropic_forbidden_403.json",
+      "model": "claude-sonnet-4-20250514",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "thinking_level": null,
+      "prompt_hash": "0059b42f044a374d148b8670b879d7e67338a33e141ce4c8144267bd575b7318",
+      "recorded_at": "2026-02-05T03:41:05.458Z"
+    },
+    {
+      "name": "anthropic_large_tool_args",
+      "description": "Large tool call arguments",
+      "cassette": "anthropic_large_tool_args.json",
+      "model": "claude-sonnet-4-20250514",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "thinking_level": null,
+      "prompt_hash": "5b5d5c57ff1a3a10ade19e4d5483d1feb76b16d58565e1f8e38e9824a5d8550d",
+      "recorded_at": "2026-02-05T03:41:07.395Z"
+    },
+    {
       "name": "anthropic_multi_paragraph",
       "description": "Multi-paragraph response",
       "cassette": "anthropic_multi_paragraph.json",
@@ -34,6 +78,39 @@
       "thinking_level": null,
       "prompt_hash": "cfddce9d4f4e72cc2579417335e4272825367c678cf75d677ef4e12c367b01b1",
       "recorded_at": "2026-02-05T03:41:04.803Z"
+    },
+    {
+      "name": "anthropic_overloaded_529",
+      "description": "Overloaded error (HTTP 529)",
+      "cassette": "anthropic_overloaded_529.json",
+      "model": "claude-sonnet-4-20250514",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "thinking_level": null,
+      "prompt_hash": "b8168609742623050204194d526e2509c107fa094b7d695551e3ba74998fb16f",
+      "recorded_at": "2026-02-05T03:41:05.458Z"
+    },
+    {
+      "name": "anthropic_rate_limit_429",
+      "description": "Rate limit error (HTTP 429)",
+      "cassette": "anthropic_rate_limit_429.json",
+      "model": "claude-sonnet-4-20250514",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "thinking_level": null,
+      "prompt_hash": "69ab5b014ccd1b03b11215452dcbf5efef0ed244f4b653318e51c43dddd67eca",
+      "recorded_at": "2026-02-05T03:41:05.458Z"
+    },
+    {
+      "name": "anthropic_server_error_500",
+      "description": "Server error (HTTP 500)",
+      "cassette": "anthropic_server_error_500.json",
+      "model": "claude-sonnet-4-20250514",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "thinking_level": null,
+      "prompt_hash": "039542db6228a70a2585d46dad0785b0683731835566acd0be7cd0e1a5473537",
+      "recorded_at": "2026-02-05T03:41:05.458Z"
     },
     {
       "name": "anthropic_simple_text",

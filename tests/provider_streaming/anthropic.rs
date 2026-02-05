@@ -4,12 +4,13 @@ use super::{
     tool_result_message, user_text, vcr_mode, vcr_strict,
 };
 use crate::common::TestHarness;
+use crate::common::harness::MockHttpResponse;
 use chrono::{SecondsFormat, Utc};
 use pi::http::client::Client;
 use pi::model::{Message, StopReason, ThinkingLevel};
 use pi::provider::{CacheRetention, Context, Provider, StreamOptions, ThinkingBudgets, ToolDef};
 use pi::providers::anthropic::AnthropicProvider;
-use pi::vcr::{Cassette, RecordedRequest, VcrMode, VcrRecorder};
+use pi::vcr::{Cassette, Interaction, RecordedRequest, VcrMode, VcrRecorder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
@@ -18,6 +19,7 @@ use std::sync::{Mutex, OnceLock};
 
 const SYSTEM_PROMPT: &str =
     "You are a test harness model. Follow instructions precisely and deterministically.";
+const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
 #[derive(Clone)]
 struct ScenarioOptions {
@@ -140,6 +142,53 @@ fn build_options(scenario: &Scenario, api_key: String) -> StreamOptions {
     }
 }
 
+fn normalize_mock_error_cassette(cassette_path: &Path, harness: &TestHarness) {
+    let raw = match std::fs::read_to_string(cassette_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            harness.log().warn(
+                "vcr",
+                format!("Failed to read cassette for normalization: {err}"),
+            );
+            return;
+        }
+    };
+    let mut cassette: Cassette = match serde_json::from_str(&raw) {
+        Ok(cassette) => cassette,
+        Err(err) => {
+            harness.log().warn(
+                "vcr",
+                format!("Failed to parse cassette for normalization: {err}"),
+            );
+            return;
+        }
+    };
+    let Some(mut interaction) = cassette.interactions.pop() else {
+        harness
+            .log()
+            .warn("vcr", "Cassette had no interactions to normalize");
+        return;
+    };
+    interaction.request.url = ANTHROPIC_MESSAGES_URL.to_string();
+    cassette.interactions = vec![interaction];
+
+    let serialized = match serde_json::to_string_pretty(&cassette) {
+        Ok(serialized) => serialized,
+        Err(err) => {
+            harness.log().warn(
+                "vcr",
+                format!("Failed to serialize normalized cassette: {err}"),
+            );
+            return;
+        }
+    };
+    if let Err(err) = std::fs::write(cassette_path, serialized) {
+        harness
+            .log()
+            .warn("vcr", format!("Failed to write normalized cassette: {err}"));
+    }
+}
+
 async fn run_scenario(scenario: Scenario) {
     let harness = TestHarness::new(format!("anthropic_{}", scenario.name));
     let cassette_dir = cassette_root();
@@ -147,19 +196,58 @@ async fn run_scenario(scenario: Scenario) {
     let cassette_path = cassette_dir.join(format!("{}.json", scenario.name));
     harness.record_artifact(format!("{}.json", scenario.name), &cassette_path);
 
-    if mode == VcrMode::Playback && !cassette_path.exists() {
+    let cassette_exists = cassette_path.exists();
+    if mode == VcrMode::Playback && !cassette_exists {
         let message = format!("Missing cassette {}", cassette_path.display());
         if vcr_strict() {
-            assert!(!vcr_strict(), "{message}");
+            assert!(cassette_exists, "{}", message);
         } else {
             harness.log().warn("vcr", message);
             return;
         }
     }
 
+    let is_recording =
+        mode == VcrMode::Record || (mode == VcrMode::Auto && !cassette_path.exists());
+    let error_expectation = match &scenario.expectation {
+        ScenarioExpectation::Error(expectation) => Some(expectation.clone()),
+        _ => None,
+    };
+
     let recorder = VcrRecorder::new_with(scenario.name, mode, &cassette_dir);
     let client = Client::new().with_vcr(recorder);
-    let provider = AnthropicProvider::new(scenario.model.clone()).with_client(client);
+    let mut provider = AnthropicProvider::new(scenario.model.clone()).with_client(client);
+    let _mock_server = if is_recording {
+        if let Some(expectation) = error_expectation.as_ref() {
+            let server = harness.start_mock_http_server();
+            let body = json!({
+                "type": "error",
+                "error": {
+                    "type": "test_error",
+                    "message": format!("Synthetic HTTP {} for VCR recording.", expectation.status),
+                }
+            });
+            let response = if expectation.status == 429 {
+                MockHttpResponse {
+                    status: expectation.status,
+                    headers: vec![
+                        ("Content-Type".to_string(), "application/json".to_string()),
+                        ("retry-after".to_string(), "1".to_string()),
+                    ],
+                    body: serde_json::to_vec(&body).unwrap_or_default(),
+                }
+            } else {
+                MockHttpResponse::json(expectation.status, &body)
+            };
+            server.add_route("POST", "/v1/messages", response);
+            provider = provider.with_base_url(format!("{}/v1/messages", server.base_url()));
+            Some(server)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let context = build_context(&scenario);
     let options = build_options(&scenario, anthropic_api_key(mode));
 
@@ -189,7 +277,7 @@ async fn run_scenario(scenario: Scenario) {
         }
         ScenarioExpectation::Error(expectation) => {
             let Err(err) = provider.stream(&context, &options).await else {
-                panic!("expected error, got success for scenario {}", scenario.name);
+                unreachable!("expected error, got success for scenario {}", scenario.name);
             };
             let message = err.to_string();
             let needle = format!("HTTP {}", expectation.status);
@@ -205,6 +293,10 @@ async fn run_scenario(scenario: Scenario) {
             }
             harness.log().info("error", message);
         }
+    }
+
+    if is_recording && error_expectation.is_some() {
+        normalize_mock_error_cassette(&cassette_path, &harness);
     }
 
     if mode == VcrMode::Record {
