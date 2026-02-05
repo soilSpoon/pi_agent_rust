@@ -15,7 +15,7 @@ use crate::extensions_js::{
 use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
 use crate::tools::ToolRegistry;
-use asupersync::Cx;
+use asupersync::{Budget, Cx};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeBuilder;
 #[cfg(feature = "wasm-host")]
@@ -32,10 +32,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
-#[cfg(feature = "wasm-host")]
-use std::sync::Weak;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -4735,6 +4732,9 @@ impl JsExtensionRuntimeHandle {
                         }
                     }
                 }
+                // Signal that the runtime thread has exited its event loop.
+                let _ = exit_tx.send(&cx, ());
+                tracing::info!(event = "extension_runtime.exit", "JS extension runtime thread exiting");
             });
         });
 
@@ -4744,7 +4744,50 @@ impl JsExtensionRuntimeHandle {
             .await
             .map_err(|_| Error::extension("JS extension runtime init cancelled"))??;
 
-        Ok(Self { sender: tx })
+        Ok(Self {
+            sender: tx,
+            exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
+        })
+    }
+
+    /// Request the JS runtime thread to shut down gracefully.
+    ///
+    /// Sends a `Shutdown` command and waits up to `budget` for the thread
+    /// to exit its event loop.  Returns `true` if the runtime exited
+    /// within the budget.
+    pub async fn shutdown(&self, budget: Duration) -> bool {
+        let cx = Cx::for_request();
+
+        // Send shutdown command (ignore error if channel already closed).
+        let _ = self
+            .sender
+            .send(&cx, JsRuntimeCommand::Shutdown)
+            .await;
+
+        // Take the exit signal — only the first caller can await it.
+        let exit_rx = {
+            let Ok(mut guard) = self.exit_signal.lock() else {
+                return false;
+            };
+            guard.take()
+        };
+
+        let Some(rx) = exit_rx else {
+            // Already shut down or another caller is waiting.
+            return true;
+        };
+
+        if let Ok(Ok(())) = timeout(wall_now(), budget, rx.recv(&cx)).await {
+            true
+        } else {
+            let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+            tracing::warn!(
+                event = "extension_runtime.shutdown_timeout",
+                budget_ms,
+                "JS extension runtime did not exit within cleanup budget"
+            );
+            false
+        }
     }
 
     async fn load_extensions_snapshots(
@@ -5448,8 +5491,8 @@ async fn resolve_js_hostcall_policy_decision(
 
     if let Some(extension_id) = extension_id {
         if let Some(allow) = host
-            .manager
-            .cached_policy_prompt_decision(extension_id, &capability)
+            .manager()
+            .and_then(|m| m.cached_policy_prompt_decision(extension_id, &capability))
         {
             decision = if allow {
                 PolicyDecision::Allow
@@ -5466,10 +5509,12 @@ async fn resolve_js_hostcall_policy_decision(
     }
 
     let prompt_extension_id = extension_id.unwrap_or(UNKNOWN_EXTENSION_ID);
-    let allow = prompt_capability_once(&host.manager, prompt_extension_id, &capability).await;
+    let Some(manager) = host.manager() else {
+        return (PolicyDecision::Deny, "shutdown".to_string(), capability);
+    };
+    let allow = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
     if let Some(extension_id) = extension_id {
-        host.manager
-            .cache_policy_prompt_decision(extension_id, &capability, allow);
+        manager.cache_policy_prompt_decision(extension_id, &capability, allow);
     }
     decision = if allow {
         PolicyDecision::Allow
@@ -5605,13 +5650,31 @@ async fn dispatch_hostcall_allowed(
             dispatch_hostcall_http(&call_id, &host.http, payload).await
         }
         (HostcallKind::Session { op }, payload) => {
-            dispatch_hostcall_session(&call_id, &host.manager, &op, payload).await
+            let Some(manager) = host.manager() else {
+                return HostcallOutcome::Error {
+                    code: "SHUTDOWN".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(&call_id, &manager, &op, payload).await
         }
         (HostcallKind::Ui { op }, payload) => {
-            dispatch_hostcall_ui(&call_id, &host.manager, &op, payload).await
+            let Some(manager) = host.manager() else {
+                return HostcallOutcome::Error {
+                    code: "SHUTDOWN".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_ui(&call_id, &manager, &op, payload).await
         }
         (HostcallKind::Events { op }, payload) => {
-            dispatch_hostcall_events(&call_id, &host.manager, &host.tools, &op, payload).await
+            let Some(manager) = host.manager() else {
+                return HostcallOutcome::Error {
+                    code: "SHUTDOWN".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(&call_id, &manager, &host.tools, &op, payload).await
         }
     }
 }
@@ -6500,6 +6563,8 @@ struct ExtensionManagerInner {
     current_thinking_level: Option<String>,
     host_actions: Option<Arc<dyn ExtensionHostActions>>,
     policy_prompt_cache: HashMap<String, HashMap<String, bool>>,
+    /// Budget for extension operations (structured concurrency).
+    extension_budget: Budget,
 }
 
 impl std::fmt::Debug for ExtensionManager {
@@ -6514,11 +6579,170 @@ impl Default for ExtensionManager {
     }
 }
 
+/// RAII guard for extension lifecycle with structured concurrency guarantees.
+///
+/// Wraps an [`ExtensionManager`] and ensures that the JS runtime thread is
+/// shut down when the region exits.  Provides:
+///
+/// - **No orphaned tasks**: the runtime thread exits on region close.
+/// - **Bounded cleanup**: shutdown is capped by a configurable budget.
+/// - **Drop safety**: best-effort shutdown if `shutdown()` was not called.
+pub struct ExtensionRegion {
+    manager: ExtensionManager,
+    cleanup_budget: Duration,
+    shutdown_done: std::sync::atomic::AtomicBool,
+}
+
+impl ExtensionRegion {
+    /// Create a new extension region with the default cleanup budget (5 s).
+    pub const fn new(manager: ExtensionManager) -> Self {
+        Self {
+            manager,
+            cleanup_budget: ExtensionManager::DEFAULT_CLEANUP_BUDGET,
+            shutdown_done: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Create a region with a custom cleanup budget.
+    pub const fn with_budget(manager: ExtensionManager, budget: Duration) -> Self {
+        Self {
+            manager,
+            cleanup_budget: budget,
+            shutdown_done: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Access the inner [`ExtensionManager`].
+    pub const fn manager(&self) -> &ExtensionManager {
+        &self.manager
+    }
+
+    /// Consume the region and return the inner manager (caller takes
+    /// responsibility for shutdown).
+    pub fn into_inner(mut self) -> ExtensionManager {
+        self.shutdown_done
+            .store(true, std::sync::atomic::Ordering::Release);
+        std::mem::take(&mut self.manager)
+    }
+
+    /// Explicitly shut down extensions with the configured budget.
+    ///
+    /// Returns `true` if the runtime exited cleanly within the budget.
+    /// Subsequent calls are no-ops and return `true`.
+    pub async fn shutdown(&self) -> bool {
+        if self
+            .shutdown_done
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return true; // already done
+        }
+        self.manager.shutdown(self.cleanup_budget).await
+    }
+}
+
+impl Drop for ExtensionRegion {
+    fn drop(&mut self) {
+        if self
+            .shutdown_done
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        // Best-effort: the Weak reference in JsRuntimeHost will fail to
+        // upgrade once the ExtensionManager's Arc refcount drops, causing
+        // the runtime thread to observe channel closure and exit.
+        tracing::debug!(
+            event = "extension_region.drop_without_shutdown",
+            "ExtensionRegion dropped without explicit shutdown; \
+             runtime thread will exit on Arc release"
+        );
+    }
+}
+
+impl std::fmt::Debug for ExtensionRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtensionRegion")
+            .field("manager", &self.manager)
+            .field("cleanup_budget", &self.cleanup_budget)
+            .field(
+                "shutdown_done",
+                &self
+                    .shutdown_done
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
 impl ExtensionManager {
+    /// Default cleanup budget for extension shutdown.
+    pub const DEFAULT_CLEANUP_BUDGET: Duration = Duration::from_secs(5);
+
     /// Create a new extension manager.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(ExtensionManagerInner::default())),
+        }
+    }
+
+    /// Create a new extension manager with a specific operation budget.
+    pub fn with_budget(budget: Budget) -> Self {
+        let inner = ExtensionManagerInner {
+            extension_budget: budget,
+            ..Default::default()
+        };
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    /// Set the budget for extension operations.
+    pub fn set_budget(&self, budget: Budget) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.extension_budget = budget;
+    }
+
+    /// Get the current extension operation budget.
+    pub fn budget(&self) -> Budget {
+        let guard = self.inner.lock().unwrap();
+        guard.extension_budget
+    }
+
+    /// Create a `Cx` for extension operations using the configured budget.
+    ///
+    /// If a budget with constraints is set, returns a budget-constrained Cx.
+    /// Otherwise returns a standard request-scoped Cx.
+    pub fn extension_cx(&self) -> Cx {
+        let budget = self.budget();
+        if budget.deadline.is_some()
+            || budget.poll_quota < u32::MAX
+            || budget.cost_quota.is_some()
+        {
+            Cx::for_request_with_budget(budget)
+        } else {
+            Cx::for_request()
+        }
+    }
+
+    /// Shut down the extension runtime with a cleanup budget.
+    ///
+    /// Sends a graceful shutdown to the JS runtime thread and waits up to
+    /// `budget` for it to exit.  Returns `true` if the runtime exited
+    /// cleanly within the budget.
+    pub async fn shutdown(&self, budget: Duration) -> bool {
+        let js_runtime = {
+            let guard = self.inner.lock().unwrap();
+            guard.js_runtime.clone()
+        };
+
+        if let Some(runtime) = js_runtime {
+            let ok = runtime.shutdown(budget).await;
+            // Clear the runtime handle so subsequent calls are no-ops.
+            let mut guard = self.inner.lock().unwrap();
+            guard.js_runtime = None;
+            ok
+        } else {
+            true
         }
     }
 
@@ -8104,7 +8328,7 @@ mod tests {
             let dir = tempdir().expect("tempdir");
             let host = JsRuntimeHost {
                 tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
-                manager: manager.clone(),
+                manager_ref: Arc::downgrade(&manager.inner),
                 http: Arc::new(HttpConnector::with_defaults()),
                 policy: ExtensionPolicy {
                     mode: ExtensionPolicyMode::Prompt,
@@ -8842,7 +9066,7 @@ mod tests {
 
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
-            manager,
+            manager_ref: Arc::downgrade(&manager.inner),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Prompt,
@@ -8944,9 +9168,10 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let cwd = dir.path().to_path_buf();
 
+        let mgr = ExtensionManager::new();
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
-            manager: ExtensionManager::new(),
+            manager_ref: Arc::downgrade(&mgr.inner),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Strict,
@@ -9001,13 +9226,14 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let cwd = dir.path().to_path_buf();
 
+        let mgr2 = ExtensionManager::new();
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(
                 &["read", "write"],
                 &cwd,
                 None,
             )),
-            manager: ExtensionManager::new(),
+            manager_ref: Arc::downgrade(&mgr2.inner),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Strict,

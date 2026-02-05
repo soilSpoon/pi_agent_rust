@@ -17,8 +17,8 @@ use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
-    ExtensionLoadSpec, ExtensionManager, ExtensionSendMessage, ExtensionSendUserMessage,
-    JsExtensionRuntimeHandle, resolve_extension_load_spec,
+    ExtensionLoadSpec, ExtensionManager, ExtensionRegion, ExtensionSendMessage,
+    ExtensionSendUserMessage, JsExtensionRuntimeHandle, resolve_extension_load_spec,
 };
 #[cfg(feature = "wasm-host")]
 use crate::extensions::{ExtensionPolicy, WasmExtensionHost, WasmExtensionLoadSpec};
@@ -1473,7 +1473,9 @@ pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
     save_enabled: bool,
-    pub extensions: Option<ExtensionManager>,
+    /// Extension lifecycle region — ensures the JS runtime thread is shut
+    /// down when the session ends.
+    pub extensions: Option<ExtensionRegion>,
     extensions_is_streaming: Arc<AtomicBool>,
 }
 
@@ -3123,7 +3125,7 @@ impl AgentSession {
         let wrappers = collect_extension_tool_wrappers(&manager, ctx_payload).await?;
         self.agent.extend_tools(wrappers);
         self.agent.extensions = Some(manager.clone());
-        self.extensions = Some(manager);
+        self.extensions = Some(ExtensionRegion::new(manager));
         Ok(())
     }
 
@@ -3224,7 +3226,7 @@ impl AgentSession {
         text: String,
         images: Vec<ImageContent>,
     ) -> Result<InputEventOutcome> {
-        let Some(extensions) = &self.extensions else {
+        let Some(region) = &self.extensions else {
             return Ok(InputEventOutcome::Continue { text, images });
         };
 
@@ -3235,7 +3237,8 @@ impl AgentSession {
             "source": "user",
         });
 
-        let response = extensions
+        let response = region
+            .manager()
             .dispatch_event_with_response(
                 ExtensionEventName::Input,
                 Some(payload),
@@ -3247,8 +3250,9 @@ impl AgentSession {
     }
 
     async fn dispatch_before_agent_start(&self) {
-        if let Some(extensions) = &self.extensions {
-            if let Err(err) = extensions
+        if let Some(region) = &self.extensions {
+            if let Err(err) = region
+                .manager()
                 .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
                 .await
             {
