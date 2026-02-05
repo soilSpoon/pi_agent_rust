@@ -7,13 +7,17 @@ use crate::agent_cx::AgentCx;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::extensions::ExtensionSession;
 use crate::model::{
     AssistantMessage, ContentBlock, Message, TextContent, ToolResultMessage, UserContent,
     UserMessage,
 };
 use crate::session_index::SessionIndex;
 use crate::tui::PiConsole;
+use asupersync::Cx;
 use asupersync::channel::oneshot;
+use asupersync::sync::Mutex;
+use async_trait::async_trait;
 use rich_rust::Theme;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,11 +26,120 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current session file format version.
 pub const SESSION_VERSION: u8 = 3;
+
+/// Handle to a thread-safe shared session.
+#[derive(Clone, Debug)]
+pub struct SessionHandle(pub Arc<Mutex<Session>>);
+
+#[async_trait]
+impl ExtensionSession for SessionHandle {
+    async fn get_state(&self) -> Value {
+        let cx = Cx::for_request();
+        let Ok(session) = self.0.lock(&cx).await else {
+            return serde_json::json!({
+                "sessionFile": "",
+                "sessionName": "",
+            });
+        };
+        let path = session
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let name = session.get_name().unwrap_or_default();
+        serde_json::json!({
+            "sessionFile": path,
+            "sessionName": name,
+        })
+    }
+
+    async fn get_messages(&self) -> Vec<SessionMessage> {
+        let cx = Cx::for_request();
+        let Ok(session) = self.0.lock(&cx).await else {
+            return Vec::new();
+        };
+        // Convert model messages back to session messages?
+        // Or just return session entries that are messages?
+        // The trait expects SessionMessage.
+        // Session entries store SessionMessage.
+        session
+            .entries
+            .iter()
+            .filter_map(|e| {
+                if let SessionEntry::Message(m) = e {
+                    Some(m.message.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    async fn get_entries(&self) -> Vec<Value> {
+        let cx = Cx::for_request();
+        let Ok(session) = self.0.lock(&cx).await else {
+            return Vec::new();
+        };
+        session
+            .entries
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+            .collect()
+    }
+
+    async fn get_branch(&self) -> Vec<Value> {
+        let cx = Cx::for_request();
+        let Ok(session) = self.0.lock(&cx).await else {
+            return Vec::new();
+        };
+        session
+            .entries_for_current_path()
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+            .collect()
+    }
+
+    async fn set_name(&self, name: String) -> Result<()> {
+        let cx = Cx::for_request();
+        let mut session = self
+            .0
+            .lock(&cx)
+            .await
+            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
+        session.set_name(&name);
+        // We should probably save? But ExtensionSession trait doesn't imply save.
+        // It modifies in-memory state. Agent loop handles saving.
+        Ok(())
+    }
+
+    async fn append_message(&self, message: SessionMessage) -> Result<()> {
+        let cx = Cx::for_request();
+        let mut session = self
+            .0
+            .lock(&cx)
+            .await
+            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
+        session.append_message(message);
+        Ok(())
+    }
+
+    async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()> {
+        let cx = Cx::for_request();
+        let mut session = self
+            .0
+            .lock(&cx)
+            .await
+            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
+        session.append_custom_entry(custom_type, data);
+        Ok(())
+    }
+}
 
 /// Default base URL for the Pi session share viewer.
 pub const DEFAULT_SHARE_VIEWER_URL: &str = "https://buildwithpi.ai/session/";

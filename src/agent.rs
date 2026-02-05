@@ -25,9 +25,9 @@ use crate::model::{
     StreamEvent, TextContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
-use crate::session::Session;
+use crate::session::{Session, SessionHandle};
 use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
-use asupersync::sync::Notify;
+use asupersync::sync::{Mutex, Notify};
 use chrono::Utc;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -1465,7 +1465,7 @@ struct ToolExecutionOutcome {
 
 pub struct AgentSession {
     pub agent: Agent,
-    pub session: Session,
+    pub session: Arc<Mutex<Session>>,
     save_enabled: bool,
     pub extensions: Option<ExtensionManager>,
 }
@@ -2525,7 +2525,7 @@ mod turn_event_tests {
 }
 
 impl AgentSession {
-    pub const fn new(agent: Agent, session: Session, save_enabled: bool) -> Self {
+    pub const fn new(agent: Agent, session: Arc<Mutex<Session>>, save_enabled: bool) -> Self {
         Self {
             agent,
             session,
@@ -2548,6 +2548,7 @@ impl AgentSession {
     ) -> Result<()> {
         let manager = ExtensionManager::new();
         manager.set_cwd(cwd.display().to_string());
+        manager.set_session(Arc::new(SessionHandle(self.session.clone())));
 
         let tools = Arc::new(ToolRegistry::new(enabled_tools, cwd, config));
         let js_runtime = JsExtensionRuntimeHandle::start(
@@ -2571,13 +2572,23 @@ impl AgentSession {
 
         // Fire the `startup` lifecycle hook once extensions are loaded.
         // Fail-open: extension errors must not prevent the agent from running.
+        let session_path = {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = self
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::extension(e.to_string()))?;
+            session.path.as_ref().map(|p| p.display().to_string())
+        };
+
         if let Err(err) = js_runtime
             .dispatch_event(
                 "startup".to_string(),
                 serde_json::json!({
                     "type": "startup",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "sessionFile": self.session.path.as_ref().map(|p| p.display().to_string()),
+                    "sessionFile": session_path,
                 }),
                 serde_json::json!({ "cwd": cwd.display().to_string() }),
                 EXTENSION_EVENT_TIMEOUT_MS,
@@ -2597,7 +2608,13 @@ impl AgentSession {
 
     pub async fn save_and_index(&mut self) -> Result<()> {
         if self.save_enabled {
-            self.session.save().await?;
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut session = self
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            session.save().await?;
         }
         Ok(())
     }
@@ -2606,7 +2623,13 @@ impl AgentSession {
         if !self.save_enabled {
             return Ok(());
         }
-        self.session.save().await?;
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        session.save().await?;
         Ok(())
     }
 
@@ -2735,8 +2758,16 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.agent
-            .replace_messages(self.session.to_messages_for_current_path());
+        let history = {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = self
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            session.to_messages_for_current_path()
+        };
+        self.agent.replace_messages(history);
         let start_len = self.agent.messages().len();
         let result = self.agent.run_with_abort(input, abort, on_event).await?;
         self.persist_new_messages(start_len).await?;
@@ -2749,8 +2780,16 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.agent
-            .replace_messages(self.session.to_messages_for_current_path());
+        let history = {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = self
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            session.to_messages_for_current_path()
+        };
+        self.agent.replace_messages(history);
         let start_len = self.agent.messages().len();
         let result = self
             .agent
@@ -2762,11 +2801,19 @@ impl AgentSession {
 
     async fn persist_new_messages(&mut self, start_len: usize) -> Result<()> {
         let new_messages = self.agent.messages()[start_len..].to_vec();
-        for message in new_messages {
-            self.session.append_model_message(message);
-        }
-        if self.save_enabled {
-            self.session.save().await?;
+        {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut session = self
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            for message in new_messages {
+                session.append_model_message(message);
+            }
+            if self.save_enabled {
+                session.save().await?;
+            }
         }
         Ok(())
     }
