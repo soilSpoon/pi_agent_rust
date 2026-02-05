@@ -286,6 +286,9 @@ impl HostcallRequest {
                 match &self.payload {
                     serde_json::Value::Object(obj) => {
                         for (key, value) in obj {
+                            if key == "cmd" {
+                                continue;
+                            }
                             map.insert(key.clone(), value.clone());
                         }
                     }
