@@ -6,11 +6,17 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashSet;
+#[cfg(feature = "wasm-host")]
+use std::time::Duration;
 
 use crate::error::{Error, Result};
+#[cfg(feature = "wasm-host")]
+use crate::extensions::WasmExtensionHandle;
 use crate::extensions::{ExtensionManager, JsExtensionRuntimeHandle};
 use crate::extensions_js::ExtensionToolDef;
 use crate::tools::{Tool, ToolOutput, ToolUpdate};
+#[cfg(feature = "wasm-host")]
+use asupersync::time::{timeout, wall_now};
 
 const DEFAULT_EXTENSION_TOOL_TIMEOUT_MS: u64 = 60_000;
 
@@ -49,6 +55,31 @@ impl ExtensionToolWrapper {
     }
 }
 
+#[cfg(feature = "wasm-host")]
+pub struct WasmExtensionToolWrapper {
+    def: ExtensionToolDef,
+    handle: WasmExtensionHandle,
+    timeout_ms: u64,
+}
+
+#[cfg(feature = "wasm-host")]
+impl WasmExtensionToolWrapper {
+    #[must_use]
+    pub fn new(def: ExtensionToolDef, handle: WasmExtensionHandle) -> Self {
+        Self {
+            def,
+            handle,
+            timeout_ms: DEFAULT_EXTENSION_TOOL_TIMEOUT_MS,
+        }
+    }
+
+    #[must_use]
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms.max(1);
+        self
+    }
+}
+
 /// Collect all registered extension tools and wrap them as Rust [`Tool`]s.
 ///
 /// This is intended to be called after extensions are loaded/activated so the returned tool list
@@ -57,29 +88,56 @@ pub async fn collect_extension_tool_wrappers(
     manager: &ExtensionManager,
     ctx_payload: Value,
 ) -> Result<Vec<Box<dyn Tool>>> {
-    let Some(runtime) = manager.js_runtime() else {
-        return Ok(Vec::new());
-    };
-
-    let mut defs = runtime.get_registered_tools().await?;
-    if let Some(active_tools) = manager.active_tools() {
-        let active = active_tools.into_iter().collect::<HashSet<_>>();
-        defs.retain(|def| active.contains(&def.name));
-    }
-
-    defs.sort_by(|a, b| a.name.cmp(&b.name));
+    let active = manager
+        .active_tools()
+        .map(|tools| tools.into_iter().collect::<HashSet<_>>());
 
     let mut wrappers: Vec<Box<dyn Tool>> = Vec::new();
     let mut seen = HashSet::new();
-    for def in defs {
-        if !seen.insert(def.name.clone()) {
-            tracing::warn!(tool = %def.name, "Duplicate extension tool name; ignoring");
-            continue;
+
+    if let Some(runtime) = manager.js_runtime() {
+        let mut defs = runtime.get_registered_tools().await?;
+        if let Some(active) = active.as_ref() {
+            defs.retain(|def| active.contains(&def.name));
         }
 
-        wrappers.push(Box::new(
-            ExtensionToolWrapper::new(def, runtime.clone()).with_ctx_payload(ctx_payload.clone()),
-        ));
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        for def in defs {
+            if !seen.insert(def.name.clone()) {
+                tracing::warn!(tool = %def.name, "Duplicate extension tool name; ignoring");
+                continue;
+            }
+
+            wrappers.push(Box::new(
+                ExtensionToolWrapper::new(def, runtime.clone())
+                    .with_ctx_payload(ctx_payload.clone()),
+            ));
+        }
+    }
+
+    #[cfg(feature = "wasm-host")]
+    {
+        let mut wasm_defs: Vec<(ExtensionToolDef, WasmExtensionHandle)> = Vec::new();
+        for handle in manager.wasm_extensions() {
+            for def in handle.tool_defs() {
+                wasm_defs.push((def.clone(), handle.clone()));
+            }
+        }
+
+        wasm_defs.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        for (def, handle) in wasm_defs {
+            if let Some(active) = active.as_ref() {
+                if !active.contains(&def.name) {
+                    continue;
+                }
+            }
+            if !seen.insert(def.name.clone()) {
+                tracing::warn!(tool = %def.name, "Duplicate extension tool name; ignoring");
+                continue;
+            }
+
+            wrappers.push(Box::new(WasmExtensionToolWrapper::new(def, handle)));
+        }
     }
 
     Ok(wrappers)
@@ -125,6 +183,66 @@ impl Tool for ExtensionToolWrapper {
             Error::tool(
                 self.name(),
                 format!("Invalid extension tool output (expected ToolOutput JSON): {err}"),
+            )
+        })
+    }
+}
+
+#[cfg(feature = "wasm-host")]
+#[async_trait]
+impl Tool for WasmExtensionToolWrapper {
+    fn name(&self) -> &str {
+        &self.def.name
+    }
+
+    fn label(&self) -> &str {
+        &self.def.label
+    }
+
+    fn description(&self) -> &str {
+        &self.def.description
+    }
+
+    fn parameters(&self) -> Value {
+        self.def.parameters.clone()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let fut = self.handle.handle_tool(&self.def.name, &input);
+        let output_json = if self.timeout_ms > 0 {
+            match timeout(
+                wall_now(),
+                Duration::from_millis(self.timeout_ms),
+                Box::pin(fut),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(Error::tool(
+                        self.name(),
+                        format!(
+                            "WASM tool '{}' timed out after {}ms",
+                            self.name(),
+                            self.timeout_ms
+                        ),
+                    ));
+                }
+            }
+        } else {
+            fut.await
+        }
+        .map_err(|err| Error::tool(self.name(), err.to_string()))?;
+
+        serde_json::from_str(&output_json).map_err(|err| {
+            Error::tool(
+                self.name(),
+                format!("Invalid WASM tool output (expected ToolOutput JSON): {err}"),
             )
         })
     }
