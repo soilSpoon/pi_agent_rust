@@ -1519,7 +1519,18 @@ export function getEditorKeybindings() {
   };
 }
 
-export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings };
+// Filter an array of items using fuzzy matching
+export function fuzzyFilter(query, items, _opts = {}) {
+  const q = String(query ?? '').toLowerCase();
+  if (!q) return items;
+  if (!Array.isArray(items)) return [];
+  return items.filter(item => {
+    const text = typeof item === 'string' ? item : String(item?.label ?? item?.name ?? item);
+    return fuzzyMatch(q, text).match;
+  });
+}
+
+export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter };
 "#
         .trim()
         .to_string(),
@@ -2117,17 +2128,23 @@ export function unlinkSync(_path) { return; }
 export function rmdirSync(_path, _opts) { return; }
 export function copyFileSync(_src, _dest, _mode) { return; }
 export function renameSync(_oldPath, _newPath) { return; }
+export function mkdirSync(_path, _opts) { return; }
 export const promises = {
   access: async (_path, _mode) => {},
   mkdir: async (_path, _opts) => {},
+  mkdtemp: async (prefix, _opts) => {
+    const p = String(prefix ?? '/tmp/tmp-');
+    return `${p}${Date.now().toString(36)}`;
+  },
   readFile: async (_path, _opts) => '',
   writeFile: async (_path, _data, _opts) => {},
   unlink: async (_path) => {},
   rmdir: async (_path, _opts) => {},
   stat: async (_path) => { throw new Error('stat unavailable'); },
   realpath: async (path, _opts) => String(path ?? ''),
+  readdir: async (_path, _opts) => [],
 };
-export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, copyFileSync, renameSync, promises };
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, copyFileSync, renameSync, mkdirSync, promises };
 "#
         .trim()
         .to_string(),
@@ -2138,9 +2155,18 @@ export default { constants, existsSync, readFileSync, appendFileSync, writeFileS
         r"
 export async function access(_path, _mode) { return; }
 export async function mkdir(_path, _opts) { return; }
+export async function mkdtemp(prefix, _opts) {
+  const p = String(prefix ?? '/tmp/tmp-');
+  return `${p}${Date.now().toString(36)}`;
+}
 export async function readFile(_path, _opts) { return ''; }
 export async function writeFile(_path, _data, _opts) { return; }
-export default { access, mkdir, readFile, writeFile };
+export async function unlink(_path) { return; }
+export async function rmdir(_path, _opts) { return; }
+export async function stat(_path) { throw new Error('stat unavailable'); }
+export async function realpath(path, _opts) { return String(path ?? ''); }
+export async function readdir(_path, _opts) { return []; }
+export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, rmdir, stat, realpath, readdir };
 "
         .trim()
         .to_string(),
