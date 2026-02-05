@@ -134,6 +134,7 @@ pub fn build_system_prompt(
     skills_prompt: Option<&str>,
     global_dir: &Path,
     package_dir: &Path,
+    test_mode: bool,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -162,7 +163,6 @@ pub fn build_system_prompt(
         prompt.push_str(skills_prompt);
     }
 
-    let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
     let date_time = if test_mode {
         "<TIMESTAMP>".to_string()
     } else {

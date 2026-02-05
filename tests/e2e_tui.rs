@@ -89,21 +89,15 @@ fn build_vcr_system_prompt(workdir: &Path, env_root: &Path) -> String {
     let enabled_tools = cli.enabled_tools();
     let global_dir = env_root.join("agent");
     let package_dir = env_root.join("packages");
-    let previous = std::env::var_os("PI_TEST_MODE");
-    std::env::set_var("PI_TEST_MODE", "1");
-    let prompt = build_system_prompt(
+    build_system_prompt(
         &cli,
         workdir,
         &enabled_tools,
         None,
         &global_dir,
         &package_dir,
-    );
-    match previous {
-        Some(value) => std::env::set_var("PI_TEST_MODE", value),
-        None => std::env::remove_var("PI_TEST_MODE"),
-    }
-    prompt
+        true,
+    )
 }
 
 fn read_output_for_sample(cwd: &Path, path: &str) -> String {
@@ -604,7 +598,7 @@ fn e2e_tui_artifact_format() {
         let parsed: serde_json::Value = match serde_json::from_str(line) {
             Ok(parsed) => parsed,
             Err(err) => {
-                panic!("Invalid JSONL line: {err}\n{line}");
+                unreachable!("Invalid JSONL line: {err}\n{line}");
             }
         };
         assert!(parsed.get("label").is_some(), "Missing 'label' in step");
@@ -630,7 +624,7 @@ fn e2e_tui_artifact_format() {
         let _parsed: serde_json::Value = match serde_json::from_str(line) {
             Ok(parsed) => parsed,
             Err(err) => {
-                panic!("Invalid log JSONL line: {err}\n{line}");
+                unreachable!("Invalid log JSONL line: {err}\n{line}");
             }
         };
     }

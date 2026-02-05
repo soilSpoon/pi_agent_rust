@@ -192,6 +192,7 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
     } else {
         String::new()
     };
+    let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
     let system_prompt = pi::app::build_system_prompt(
         &cli,
         &cwd,
@@ -203,6 +204,7 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
         },
         &global_dir,
         &package_dir,
+        test_mode,
     );
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
