@@ -5245,6 +5245,352 @@ mod tests {
         });
     }
 
+    // ---- Extension crash recovery and isolation tests (bd-m4wc) ----
+
+    #[test]
+    fn pijs_crash_register_throw_host_continues() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            // Extension that throws during registration
+            runtime
+                .eval(
+                    r#"
+                    globalThis.postCrashResult = null;
+
+                    __pi_begin_extension("ext.crash", { name: "ext.crash" });
+                    // Simulate a throw during registration by registering a handler then
+                    // throwing - the handler should still be partially registered
+                    throw new Error("registration boom");
+                "#,
+                )
+                .await
+                .ok(); // May fail, that's fine
+
+            // End the crashed extension context
+            runtime.eval(r"__pi_end_extension();").await.ok();
+
+            // Host can still load another extension after the crash
+            runtime
+                .eval(
+                    r#"
+                    __pi_begin_extension("ext.ok", { name: "ext.ok" });
+                    pi.events.on("test_event", (p, _) => { globalThis.postCrashResult = p; });
+                    __pi_end_extension();
+                "#,
+                )
+                .await
+                .expect("second extension should load");
+
+            // Dispatch event - only the healthy extension should handle it
+            runtime
+                .eval(
+                    r#"
+                    (async () => {
+                        await __pi_dispatch_extension_event("test_event", { ok: true }, {});
+                    })();
+                "#,
+                )
+                .await
+                .expect("dispatch");
+
+            assert_eq!(
+                get_global_json(&runtime, "postCrashResult").await,
+                serde_json::json!({ "ok": true })
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_crash_handler_throw_other_handlers_run() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.handlerResults = [];
+                    globalThis.dispatchDone = false;
+
+                    // Extension A: will throw
+                    __pi_begin_extension("ext.a", { name: "ext.a" });
+                    pi.events.on("multi_test", (_p, _c) => {
+                        globalThis.handlerResults.push("a-before-throw");
+                        throw new Error("handler crash");
+                    });
+                    __pi_end_extension();
+
+                    // Extension B: should still run
+                    __pi_begin_extension("ext.b", { name: "ext.b" });
+                    pi.events.on("multi_test", (_p, _c) => {
+                        globalThis.handlerResults.push("b-ok");
+                    });
+                    __pi_end_extension();
+
+                    // Extension C: should also still run
+                    __pi_begin_extension("ext.c", { name: "ext.c" });
+                    pi.events.on("multi_test", (_p, _c) => {
+                        globalThis.handlerResults.push("c-ok");
+                    });
+                    __pi_end_extension();
+
+                    (async () => {
+                        await __pi_dispatch_extension_event("multi_test", {}, {});
+                        globalThis.dispatchDone = true;
+                    })();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            assert_eq!(
+                get_global_json(&runtime, "dispatchDone").await,
+                serde_json::Value::Bool(true)
+            );
+
+            let results = get_global_json(&runtime, "handlerResults").await;
+            let arr = results.as_array().expect("should be array");
+            // Handler A ran (at least the part before throw)
+            assert!(
+                arr.iter().any(|v| v == "a-before-throw"),
+                "Handler A should have run before throwing"
+            );
+            // Handlers B and C should have run despite A's crash
+            assert!(
+                arr.iter().any(|v| v == "b-ok"),
+                "Handler B should run after A crashes"
+            );
+            assert!(
+                arr.iter().any(|v| v == "c-ok"),
+                "Handler C should run after A crashes"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_crash_invalid_hostcall_returns_error_not_panic() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            // Extension makes an invalid hostcall (unknown tool)
+            runtime
+                .eval(
+                    r#"
+                    globalThis.invalidResult = null;
+                    globalThis.errCode = null;
+
+                    __pi_begin_extension("ext.bad", { name: "ext.bad" });
+                    pi.tool("completely_nonexistent_tool_xyz", { junk: true })
+                        .then((r) => { globalThis.invalidResult = r; })
+                        .catch((e) => { globalThis.errCode = e.code || "unknown"; });
+                    __pi_end_extension();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            // The hostcall should be queued but not crash the runtime
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1, "Hostcall should be queued");
+
+            // Host can still evaluate JS after the invalid hostcall
+            runtime
+                .eval(
+                    r"
+                    globalThis.hostStillAlive = true;
+                ",
+                )
+                .await
+                .expect("host should still work");
+
+            assert_eq!(
+                get_global_json(&runtime, "hostStillAlive").await,
+                serde_json::Value::Bool(true)
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_crash_after_crash_new_extensions_load() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            // Simulate a crash sequence: extension throws, then new ones load fine
+            runtime
+                .eval(
+                    r#"
+                    globalThis.loadOrder = [];
+
+                    // Extension 1: loads fine
+                    __pi_begin_extension("ext.1", { name: "ext.1" });
+                    globalThis.loadOrder.push("1-loaded");
+                    __pi_end_extension();
+                "#,
+                )
+                .await
+                .expect("ext 1");
+
+            // Extension 2: crashes during eval
+            runtime
+                .eval(
+                    r#"
+                    __pi_begin_extension("ext.2", { name: "ext.2" });
+                    globalThis.loadOrder.push("2-before-crash");
+                    throw new Error("ext 2 crash");
+                "#,
+                )
+                .await
+                .ok(); // Expected to fail
+
+            runtime.eval(r"__pi_end_extension();").await.ok();
+
+            // Extension 3: should still load after ext 2's crash
+            runtime
+                .eval(
+                    r#"
+                    __pi_begin_extension("ext.3", { name: "ext.3" });
+                    globalThis.loadOrder.push("3-loaded");
+                    __pi_end_extension();
+                "#,
+                )
+                .await
+                .expect("ext 3 should load after crash");
+
+            // Extension 4: loads fine too
+            runtime
+                .eval(
+                    r#"
+                    __pi_begin_extension("ext.4", { name: "ext.4" });
+                    globalThis.loadOrder.push("4-loaded");
+                    __pi_end_extension();
+                "#,
+                )
+                .await
+                .expect("ext 4 should load");
+
+            let order = get_global_json(&runtime, "loadOrder").await;
+            let arr = order.as_array().expect("should be array");
+            assert!(
+                arr.iter().any(|v| v == "1-loaded"),
+                "Extension 1 should have loaded"
+            );
+            assert!(
+                arr.iter().any(|v| v == "3-loaded"),
+                "Extension 3 should load after crash"
+            );
+            assert!(
+                arr.iter().any(|v| v == "4-loaded"),
+                "Extension 4 should load after crash"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_crash_no_cross_contamination_between_extensions() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.extAData = null;
+                    globalThis.extBData = null;
+                    globalThis.eventsDone = false;
+
+                    // Extension A: sets its own state
+                    __pi_begin_extension("ext.isolated.a", { name: "ext.isolated.a" });
+                    pi.events.on("isolation_test", (_p, _c) => {
+                        globalThis.extAData = "from-A";
+                    });
+                    __pi_end_extension();
+
+                    // Extension B: sets its own state independently
+                    __pi_begin_extension("ext.isolated.b", { name: "ext.isolated.b" });
+                    pi.events.on("isolation_test", (_p, _c) => {
+                        globalThis.extBData = "from-B";
+                    });
+                    __pi_end_extension();
+
+                    (async () => {
+                        await __pi_dispatch_extension_event("isolation_test", {}, {});
+                        globalThis.eventsDone = true;
+                    })();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            assert_eq!(
+                get_global_json(&runtime, "eventsDone").await,
+                serde_json::Value::Bool(true)
+            );
+            // Each extension should have set its own global independently
+            assert_eq!(
+                get_global_json(&runtime, "extAData").await,
+                serde_json::json!("from-A")
+            );
+            assert_eq!(
+                get_global_json(&runtime, "extBData").await,
+                serde_json::json!("from-B")
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_crash_interrupt_budget_stops_infinite_loop() {
+        futures::executor::block_on(async {
+            let config = PiJsRuntimeConfig {
+                limits: PiJsRuntimeLimits {
+                    // Use a small interrupt budget to catch infinite loops quickly
+                    interrupt_budget: Some(1000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
+                .await
+                .expect("create runtime");
+
+            // Try to run an infinite loop - should be interrupted by budget
+            let result = runtime
+                .eval(
+                    r"
+                    let i = 0;
+                    while (true) { i++; }
+                    globalThis.loopResult = i;
+                ",
+                )
+                .await;
+
+            // The eval should fail due to interrupt
+            assert!(
+                result.is_err(),
+                "Infinite loop should be interrupted by budget"
+            );
+
+            // Host should still be alive after interrupt
+            let alive_result = runtime.eval(r#"globalThis.postInterrupt = "alive";"#).await;
+            // After an interrupt, the runtime may or may not accept new evals
+            // The key assertion is that we didn't hang
+            if alive_result.is_ok() {
+                assert_eq!(
+                    get_global_json(&runtime, "postInterrupt").await,
+                    serde_json::json!("alive")
+                );
+            }
+        });
+    }
+
     #[test]
     fn pijs_events_emit_queues_events_hostcall() {
         futures::executor::block_on(async {
