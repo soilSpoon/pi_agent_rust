@@ -15,6 +15,7 @@ use pi::session::{
     SessionEntry, SessionMessage,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -1024,6 +1025,346 @@ fn to_messages_for_current_path_with_missing_first_kept_entry_id_keeps_only_summ
     let messages = session.to_messages_for_current_path();
     assert_eq!(messages.len(), 1);
     assert!(model_message_text(&messages[0]).contains("SUM"));
+}
+
+#[test]
+fn compaction_pipeline_save_and_open_round_trip_rehydrates_compaction_context() {
+    let harness = TestHarness::new(
+        "compaction_pipeline_save_and_open_round_trip_rehydrates_compaction_context",
+    );
+
+    let mut session = Session::in_memory();
+    session.header.id = "sess-bd-p2l".to_string();
+    session.header.timestamp = TS.to_string();
+    session.header.cwd = "/data/projects/pi_agent_rust".to_string();
+
+    session.entries = vec![
+        message_entry("u0", None, user_text("old")),
+        message_entry(
+            "a0",
+            Some("u0"),
+            assistant_with_tool_calls(vec![("read", json!({"path": "old.txt"}))]),
+        ),
+        message_entry("tr0", Some("a0"), tool_result("call-0", "read", "ok")),
+        message_entry("u1", Some("tr0"), user_text(text_of_tokens(1))),
+        message_entry("a1", Some("u1"), assistant_text("keep", 100)),
+        message_entry("u2", Some("a1"), user_text(text_of_tokens(1))),
+    ];
+    session.leaf_id = Some("u2".to_string());
+
+    dump_timeline(&harness, "before", &session.entries);
+
+    let before_path = harness.temp_path("session-before-compaction.jsonl");
+    let mut before = session.clone();
+    before.path = Some(before_path.clone());
+    run_async(async move { before.save().await }).expect("save before-compaction session");
+    harness.record_artifact("session-before-compaction.jsonl", &before_path);
+
+    let prep = prepare_compaction(&session.entries, make_settings(3)).expect("prep");
+    log_preparation(&harness, &session.entries, &prep);
+    assert_eq!(prep.first_kept_entry_id, "u1");
+
+    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["SUM1"]));
+    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
+        .expect("compact");
+    log_result(&harness, &result);
+
+    let mut hasher = Sha256::new();
+    hasher.update(result.summary.as_bytes());
+    let summary_hash = format!("{:x}", hasher.finalize());
+    harness.log().info_ctx("compaction", "summary_hash", |ctx| {
+        ctx.push(("sha256".into(), summary_hash));
+    });
+
+    let details = pi::compaction::compaction_details_to_value(&result.details).expect("details");
+    session.entries.push(compaction_entry(
+        "c1",
+        Some("u2"),
+        &result.summary,
+        &result.first_kept_entry_id,
+        result.tokens_before,
+        Some(details),
+        None,
+    ));
+    session.leaf_id = Some("c1".to_string());
+
+    dump_timeline(&harness, "after", &session.entries);
+    let messages = session.to_messages_for_current_path();
+    assert!(!messages.is_empty());
+    assert!(model_message_text(&messages[0]).contains("SUM1"));
+
+    let kept = messages
+        .iter()
+        .skip(1)
+        .map(model_message_text)
+        .collect::<Vec<_>>()
+        .join("|");
+    assert!(kept.contains("keep"));
+    assert!(!kept.contains("old"));
+
+    let after_path = harness.temp_path("session-after-compaction.jsonl");
+    let mut after = session.clone();
+    after.path = Some(after_path.clone());
+    run_async(async move { after.save().await }).expect("save after-compaction session");
+    harness.record_artifact("session-after-compaction.jsonl", &after_path);
+
+    let reopened_path = after_path.to_string_lossy().to_string();
+    let reopened = run_async(async move { Session::open(&reopened_path).await })
+        .expect("reopen after-compaction session");
+
+    let reopened_messages = reopened.to_messages_for_current_path();
+    assert!(!reopened_messages.is_empty());
+    assert!(model_message_text(&reopened_messages[0]).contains("SUM1"));
+
+    let log_path = harness.temp_path("compaction-pipeline-log.jsonl");
+    harness
+        .write_jsonl_logs(&log_path)
+        .expect("write jsonl log");
+    harness.record_artifact("compaction-pipeline-log.jsonl", &log_path);
+
+    let artifact_index = harness.temp_path("compaction-pipeline-artifacts.jsonl");
+    harness
+        .write_artifact_index_jsonl(&artifact_index)
+        .expect("write artifact index");
+    harness.record_artifact("compaction-pipeline-artifacts.jsonl", &artifact_index);
+}
+
+#[test]
+fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() {
+    let harness = TestHarness::new(
+        "compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary",
+    );
+
+    let entries = vec![
+        message_entry("u0", None, user_text("pre")),
+        message_entry(
+            "a0",
+            Some("u0"),
+            assistant_with_tool_calls(vec![
+                ("read", json!({"path": "r1.txt"})),
+                ("edit", json!({"path": "m1.txt"})),
+            ]),
+        ),
+        message_entry("u1", Some("a0"), user_text(text_of_tokens(1))),
+        message_entry("a1", Some("u1"), assistant_text("keep", 0)),
+        message_entry("u2", Some("a1"), user_text(text_of_tokens(1))),
+    ];
+
+    let prep1 = prepare_compaction(&entries, make_settings(3)).expect("prep1");
+    assert_eq!(prep1.first_kept_entry_id, "u1");
+    let provider1_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S1"]));
+    let result1 = run_async(async move { compact(prep1, provider1_dyn, "test-key", None).await })
+        .expect("compact1");
+
+    let details1 = pi::compaction::compaction_details_to_value(&result1.details).expect("details1");
+
+    let mut entries2 = entries;
+    entries2.push(compaction_entry(
+        "c1",
+        Some("u2"),
+        &result1.summary,
+        &result1.first_kept_entry_id,
+        result1.tokens_before,
+        Some(details1),
+        None,
+    ));
+    entries2.push(message_entry(
+        "u3",
+        Some("c1"),
+        user_text(text_of_tokens(1)),
+    ));
+    entries2.push(message_entry(
+        "a3",
+        Some("u3"),
+        assistant_with_tool_calls(vec![
+            ("read", json!({"path": "r2.txt"})),
+            ("write", json!({"path": "m2.txt"})),
+        ]),
+    ));
+    entries2.push(message_entry(
+        "u4",
+        Some("a3"),
+        user_text(text_of_tokens(1)),
+    ));
+
+    dump_timeline(&harness, "setup", &entries2);
+
+    let provider2 = Arc::new(ScriptedProvider::new(["S2"]));
+    let provider2_dyn: Arc<dyn Provider> = provider2.clone();
+
+    let prep2 = prepare_compaction(&entries2, make_settings(1)).expect("prep2");
+    log_preparation(&harness, &entries2, &prep2);
+    assert_eq!(prep2.first_kept_entry_id, "u4");
+    assert!(
+        prep2
+            .previous_summary
+            .as_deref()
+            .is_some_and(|s| s.contains("S1"))
+    );
+
+    let result2 = run_async(async move { compact(prep2, provider2_dyn, "test-key", None).await })
+        .expect("compact2");
+    log_result(&harness, &result2);
+
+    assert_eq!(
+        result2.details.read_files,
+        vec!["r1.txt".to_string(), "r2.txt".to_string()]
+    );
+    assert_eq!(
+        result2.details.modified_files,
+        vec!["m1.txt".to_string(), "m2.txt".to_string()]
+    );
+
+    let prompt = provider2.prompts().first().expect("prompt").clone();
+    assert!(prompt.contains("<previous-summary>"));
+    assert!(prompt.contains("S1"));
+    assert!(prompt.contains("Update the existing structured summary"));
+
+    let mut session = Session::in_memory();
+    session.header.id = "sess-bd-p2l-2".to_string();
+    session.header.timestamp = TS.to_string();
+    session.header.cwd = "/data/projects/pi_agent_rust".to_string();
+    session.entries = entries2;
+
+    let details2 = pi::compaction::compaction_details_to_value(&result2.details).expect("details2");
+    session.entries.push(compaction_entry(
+        "c2",
+        Some("u4"),
+        &result2.summary,
+        &result2.first_kept_entry_id,
+        result2.tokens_before,
+        Some(details2),
+        None,
+    ));
+    session.leaf_id = Some("c2".to_string());
+
+    let messages = session.to_messages_for_current_path();
+    assert!(!messages.is_empty());
+    assert!(model_message_text(&messages[0]).contains("S2"));
+    assert!(!model_message_text(&messages[0]).contains("S1"));
+
+    let kept = messages
+        .iter()
+        .skip(1)
+        .map(model_message_text)
+        .collect::<Vec<_>>()
+        .join("|");
+    assert!(kept.contains('a'));
+    assert!(!kept.contains("pre"));
+
+    let log_path = harness.temp_path("compaction-second-pass-log.jsonl");
+    harness
+        .write_jsonl_logs(&log_path)
+        .expect("write jsonl log");
+    harness.record_artifact("compaction-second-pass-log.jsonl", &log_path);
+
+    let artifact_index = harness.temp_path("compaction-second-pass-artifacts.jsonl");
+    harness
+        .write_artifact_index_jsonl(&artifact_index)
+        .expect("write artifact index");
+    harness.record_artifact("compaction-second-pass-artifacts.jsonl", &artifact_index);
+}
+
+#[test]
+fn prepare_compaction_ignores_malformed_previous_compaction_details() {
+    let harness =
+        TestHarness::new("prepare_compaction_ignores_malformed_previous_compaction_details");
+
+    let entries = vec![
+        message_entry("u0", None, user_text("pre")),
+        compaction_entry(
+            "c0",
+            Some("u0"),
+            "prev",
+            "u0",
+            10,
+            Some(json!({"readFiles": [123, null, "r1.txt"], "modifiedFiles": "nope"})),
+            None,
+        ),
+        message_entry(
+            "a1",
+            Some("c0"),
+            assistant_with_tool_calls(vec![("read", json!({"path": "r2.txt"}))]),
+        ),
+        message_entry("u1", Some("a1"), user_text(text_of_tokens(1))),
+    ];
+
+    let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
+    log_preparation(&harness, &entries, &prep);
+
+    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S"]));
+    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
+        .expect("compact");
+    log_result(&harness, &result);
+
+    assert_eq!(
+        result.details.read_files,
+        vec!["r1.txt".to_string(), "r2.txt".to_string()]
+    );
+    assert!(result.details.modified_files.is_empty());
+}
+
+#[test]
+fn compact_returns_error_when_provider_stops_with_error() {
+    struct ErrorProvider;
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for ErrorProvider {
+        fn name(&self) -> &str {
+            "error-provider"
+        }
+
+        fn api(&self) -> &str {
+            "error-provider"
+        }
+
+        fn model_id(&self) -> &str {
+            "error-provider"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> pi::error::Result<
+            Pin<Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>>,
+        > {
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("ignored"))],
+                api: "error-provider".to_string(),
+                provider: "error-provider".to_string(),
+                model: "error-provider".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some("provider failed".to_string()),
+                timestamp: 0,
+            };
+
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                pi::model::StreamEvent::Done {
+                    reason: StopReason::Error,
+                    message,
+                },
+            )])))
+        }
+    }
+
+    let harness = TestHarness::new("compact_returns_error_when_provider_stops_with_error");
+
+    let entries = vec![
+        message_entry("u0", None, user_text("old")),
+        message_entry("u1", Some("u0"), user_text(text_of_tokens(1))),
+    ];
+
+    let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
+    log_preparation(&harness, &entries, &prep);
+
+    let provider_dyn: Arc<dyn Provider> = Arc::new(ErrorProvider);
+    let err = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
+        .expect_err("compact should error");
+
+    assert!(err.to_string().contains("provider failed"));
 }
 
 #[test]
