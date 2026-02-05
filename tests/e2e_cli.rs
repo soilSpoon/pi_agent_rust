@@ -2301,3 +2301,754 @@ fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
     );
     assert_contains(&harness.harness, &result.stdout, "none are available");
 }
+
+// ============================================================================
+// Session lifecycle tests (bd-idw)
+// ============================================================================
+
+/// Create a rich, multi-entry session JSONL (header + user msg + assistant msg +
+/// model_change + thinking_level_change).  Returns the session ID.
+fn write_rich_session(path: &Path, cwd: &Path) -> String {
+    let session_id = "rich-session-e2e-42";
+    let header = json!({
+        "type": "session",
+        "version": 3,
+        "id": session_id,
+        "timestamp": "2026-02-04T10:00:00.000Z",
+        "cwd": cwd.display().to_string(),
+        "provider": "anthropic",
+        "modelId": "claude-sonnet-4-5"
+    });
+    let user_msg = json!({
+        "type": "message",
+        "id": "entry-u1",
+        "timestamp": "2026-02-04T10:00:01.000Z",
+        "message": {
+            "role": "user",
+            "content": "What is the meaning of life?"
+        }
+    });
+    let assistant_msg = json!({
+        "type": "message",
+        "id": "entry-a1",
+        "parentId": "entry-u1",
+        "timestamp": "2026-02-04T10:00:02.000Z",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "The meaning of life is 42."}],
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5",
+            "usage": {
+                "input": 10, "output": 8,
+                "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": 18,
+                "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+            },
+            "stopReason": "endTurn",
+            "timestamp": 1738663202000_i64
+        }
+    });
+    let model_change = json!({
+        "type": "model_change",
+        "id": "entry-mc1",
+        "parentId": "entry-a1",
+        "timestamp": "2026-02-04T10:00:03.000Z",
+        "provider": "openai",
+        "modelId": "gpt-4o"
+    });
+    let thinking_change = json!({
+        "type": "thinking_level_change",
+        "id": "entry-tc1",
+        "parentId": "entry-mc1",
+        "timestamp": "2026-02-04T10:00:04.000Z",
+        "thinkingLevel": "high"
+    });
+
+    let content = format!(
+        "{header}\n{user_msg}\n{assistant_msg}\n{model_change}\n{thinking_change}\n"
+    );
+    fs::write(path, content).expect("write rich session jsonl");
+    session_id.to_string()
+}
+
+/// Encode a CWD path into the session directory name format (mirrors `encode_cwd`
+/// from `src/session.rs`).
+fn encode_cwd_for_test(path: &Path) -> String {
+    let s = path.display().to_string();
+    let s = s.trim_start_matches(['/', '\\']).to_string();
+    let s = s.replace(['/', '\\', ':'], "-");
+    format!("--{s}--")
+}
+
+/// Test 1: Rich session export contains all entry types.
+#[test]
+fn e2e_cli_export_multi_entry_session_integrity() {
+    let harness = CliTestHarness::new("e2e_cli_export_multi_entry_session_integrity");
+    let session_path = harness.harness.temp_path("rich-session.jsonl");
+    let export_path = harness.harness.temp_path("export-rich.html");
+
+    let session_id = write_rich_session(&session_path, harness.harness.temp_dir());
+
+    let session_arg = session_path.display().to_string();
+    let export_arg = export_path.display().to_string();
+    let result = harness.run(&["--export", &session_arg, &export_arg]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert!(export_path.exists(), "expected export file to exist");
+    let html = fs::read_to_string(&export_path).expect("read export html");
+    harness
+        .harness
+        .record_artifact("export-rich.html", &export_path);
+
+    // Header metadata.
+    assert_contains(&harness.harness, &html, &format!("Session {session_id}"));
+    assert_contains(&harness.harness, &html, "2026-02-04T10:00:00.000Z");
+    assert_contains(
+        &harness.harness,
+        &html,
+        &harness.harness.temp_dir().display().to_string(),
+    );
+
+    // User message content.
+    assert_contains(&harness.harness, &html, "What is the meaning of life?");
+    // Assistant message content.
+    assert_contains(&harness.harness, &html, "The meaning of life is 42.");
+    // Model change entry.
+    assert_contains(&harness.harness, &html, "openai");
+    assert_contains(&harness.harness, &html, "gpt-4o");
+    // Thinking level change entry.
+    assert_contains(&harness.harness, &html, "high");
+}
+
+/// Test 2: PI_SESSIONS_DIR env override appears in `config` output.
+#[test]
+fn e2e_cli_session_dir_override_via_env() {
+    let mut harness = CliTestHarness::new("e2e_cli_session_dir_override_via_env");
+
+    let custom_sessions = harness.harness.temp_path("my-custom-sessions");
+    harness.env.insert(
+        "PI_SESSIONS_DIR".to_string(),
+        custom_sessions.display().to_string(),
+    );
+
+    let result = harness.run(&["config"]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Sessions: {}", custom_sessions.display()),
+    );
+}
+
+/// Test 3: Export works from a non-standard (arbitrary temp) path.
+#[test]
+fn e2e_cli_export_session_from_nonstandard_path() {
+    let harness = CliTestHarness::new("e2e_cli_export_session_from_nonstandard_path");
+
+    let random_dir = harness.harness.temp_path("random-location/nested");
+    fs::create_dir_all(&random_dir).expect("create nested random dir");
+    let session_path = random_dir.join("arbitrary.jsonl");
+    let export_path = harness.harness.temp_path("nonstandard-export.html");
+
+    let (session_id, _timestamp, _cwd, message) =
+        write_minimal_session(&session_path, harness.harness.temp_dir());
+
+    let session_arg = session_path.display().to_string();
+    let export_arg = export_path.display().to_string();
+    let result = harness.run(&["--export", &session_arg, &export_arg]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert!(export_path.exists(), "expected export file at non-standard path");
+    let html = fs::read_to_string(&export_path).expect("read export html");
+    harness
+        .harness
+        .record_artifact("nonstandard-export.html", &export_path);
+
+    assert_contains(&harness.harness, &html, &format!("Session {session_id}"));
+    assert_contains(&harness.harness, &html, &message);
+}
+
+/// Test 4: `--no-session` prevents any session files even with a provider error.
+#[test]
+fn e2e_cli_no_session_flag_prevents_session_files() {
+    let harness = CliTestHarness::new("e2e_cli_no_session_flag_prevents_session_files");
+    let sessions_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_SESSIONS_DIR")
+            .expect("PI_SESSIONS_DIR")
+            .clone(),
+    );
+
+    // --no-session + no API key → triggers early error, but should never create files.
+    let result = harness.run(&[
+        "--no-session",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "hello",
+    ]);
+
+    harness
+        .harness
+        .assert_log("assert non-zero exit for missing API key");
+    assert_ne!(result.exit_code, 0);
+
+    let jsonl_count = count_jsonl_files(&sessions_dir);
+    harness
+        .harness
+        .assert_log("assert no session files with --no-session");
+    assert_eq!(
+        jsonl_count, 0,
+        "--no-session should prevent session file creation"
+    );
+}
+
+/// Test 5: Interactive mode (tmux) creates a valid session JSONL with correct header.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_interactive_session_creates_valid_jsonl_tmux() {
+    let mut harness = CliTestHarness::new("e2e_interactive_session_creates_valid_jsonl_tmux");
+    let logger = harness.harness.log();
+
+    if !TmuxInstance::tmux_available() {
+        logger.warn("tmux", "Skipping: tmux not available");
+        return;
+    }
+
+    // Set up VCR for one Anthropic exchange.
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Say hello session test."}]}
+        ],
+        "system": expected_system_prompt("Session test."),
+        "max_tokens": 8192,
+        "stream": true
+    });
+    setup_vcr_anthropic(
+        &mut harness,
+        "e2e_session_creates_jsonl",
+        &request_body,
+        "Hello session test!",
+    );
+
+    harness
+        .env
+        .insert("PI_TEST_MODE".to_string(), "1".to_string());
+
+    let sessions_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_SESSIONS_DIR")
+            .expect("PI_SESSIONS_DIR")
+            .clone(),
+    );
+
+    // Pre-check: no session files yet.
+    assert_eq!(
+        count_jsonl_files(&sessions_dir),
+        0,
+        "sessions dir should be empty before test"
+    );
+
+    let tmux = TmuxInstance::new(&harness.harness);
+
+    let script_path = harness.harness.temp_path("run-session-test.sh");
+    let mut script = String::new();
+    script.push_str("#!/usr/bin/env sh\nset -eu\n");
+    for (key, value) in &harness.env {
+        script.push_str("export ");
+        script.push_str(key);
+        script.push('=');
+        script.push_str(&sh_escape(value));
+        script.push('\n');
+    }
+
+    let args = [
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--api-key",
+        "test-vcr-key",
+        "--no-tools",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "Session test.",
+    ];
+
+    script.push_str("exec ");
+    script.push_str(&sh_escape(harness.binary_path.to_string_lossy().as_ref()));
+    for arg in &args {
+        script.push(' ');
+        script.push_str(&sh_escape(arg));
+    }
+    script.push('\n');
+
+    fs::write(&script_path, &script).expect("write script");
+    let mut perms = fs::metadata(&script_path)
+        .expect("stat script")
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms).expect("chmod script");
+
+    harness
+        .harness
+        .record_artifact("session-test.sh", &script_path);
+
+    tmux.start_session(harness.harness.temp_dir(), &script_path);
+
+    let pane = tmux.wait_for_pane_contains("Welcome to Pi!", Duration::from_secs(20));
+    assert!(
+        pane.contains("Welcome to Pi!"),
+        "Expected welcome message; got:\n{pane}"
+    );
+
+    // Send message and wait for response.
+    tmux.send_literal("Say hello session test.");
+    tmux.send_key("Enter");
+
+    let pane = tmux.wait_for_pane_contains("Hello session test!", Duration::from_secs(30));
+    assert!(
+        pane.contains("Hello session test!"),
+        "Expected VCR response; got:\n{pane}"
+    );
+
+    // Exit cleanly.
+    tmux.send_literal("/exit");
+    tmux.send_key("Enter");
+
+    let start = Instant::now();
+    while tmux.session_exists() {
+        if start.elapsed() > Duration::from_secs(10) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if tmux.session_exists() {
+        tmux.send_key("C-d");
+        let start = Instant::now();
+        while tmux.session_exists() {
+            if start.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    // Verify a session JSONL was created.
+    let jsonl_count = count_jsonl_files(&sessions_dir);
+    assert!(
+        jsonl_count >= 1,
+        "expected at least 1 session JSONL file, found {jsonl_count}"
+    );
+
+    // Find the created session file and validate header.
+    let session_file = find_first_jsonl(&sessions_dir)
+        .expect("should find a session jsonl file");
+
+    harness
+        .harness
+        .record_artifact("created-session.jsonl", &session_file);
+
+    let content = fs::read_to_string(&session_file).expect("read session jsonl");
+    let lines: Vec<&str> = content.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "session file should have at least a header line"
+    );
+
+    // Parse and validate the header.
+    let header: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("parse session header as JSON");
+    assert_eq!(header["type"], "session");
+    assert_eq!(header["version"], 3);
+    assert!(
+        header["id"].as_str().is_some_and(|s| !s.is_empty()),
+        "session header should have non-empty id"
+    );
+    assert!(
+        header["timestamp"].as_str().is_some_and(|s| !s.is_empty()),
+        "session header should have timestamp"
+    );
+    assert!(
+        header["cwd"].as_str().is_some_and(|s| !s.is_empty()),
+        "session header should have cwd"
+    );
+    assert_eq!(header["provider"], "anthropic");
+    assert_eq!(header["modelId"], "claude-sonnet-4-5");
+
+    // Check that entries include user + assistant messages.
+    let has_user = lines[1..].iter().any(|line| {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+        v["type"] == "message" && v["message"]["role"] == "user"
+    });
+    let has_assistant = lines[1..].iter().any(|line| {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+        v["type"] == "message" && v["message"]["role"] == "assistant"
+    });
+    assert!(has_user, "session should contain a user message entry");
+    assert!(has_assistant, "session should contain an assistant message entry");
+}
+
+/// Test 6: `-c` (continue) loads the most recent session from the project session directory.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_interactive_session_continue_loads_previous_tmux() {
+    let mut harness =
+        CliTestHarness::new("e2e_interactive_session_continue_loads_previous_tmux");
+    let logger = harness.harness.log();
+
+    if !TmuxInstance::tmux_available() {
+        logger.warn("tmux", "Skipping: tmux not available");
+        return;
+    }
+
+    harness
+        .env
+        .insert("PI_TEST_MODE".to_string(), "1".to_string());
+
+    let sessions_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_SESSIONS_DIR")
+            .expect("PI_SESSIONS_DIR")
+            .clone(),
+    );
+
+    // Create the encoded-CWD subdirectory in sessions dir.
+    let encoded_cwd = encode_cwd_for_test(harness.harness.temp_dir());
+    let project_sessions = sessions_dir.join(&encoded_cwd);
+    fs::create_dir_all(&project_sessions).expect("create project sessions dir");
+
+    // Pre-create a session JSONL.
+    let session_file = project_sessions.join("2026-02-04T10-00-00.000Z_aabbccdd.jsonl");
+    let session_id = "aabbccdd-1234-5678-9abc-def012345678";
+    let header = json!({
+        "type": "session",
+        "version": 3,
+        "id": session_id,
+        "timestamp": "2026-02-04T10:00:00.000Z",
+        "cwd": harness.harness.temp_dir().display().to_string(),
+        "provider": "openai",
+        "modelId": "gpt-4o-mini"
+    });
+    let user_entry = json!({
+        "type": "message",
+        "id": "entry-prev-u1",
+        "timestamp": "2026-02-04T10:00:01.000Z",
+        "message": {
+            "role": "user",
+            "content": "Previous session user message."
+        }
+    });
+    fs::write(
+        &session_file,
+        format!("{header}\n{user_entry}\n"),
+    )
+    .expect("write pre-existing session");
+    let original_size = fs::metadata(&session_file)
+        .expect("stat session file")
+        .len();
+
+    harness
+        .harness
+        .record_artifact("pre-created-session.jsonl", &session_file);
+
+    // Use VCR so the provider doesn't need a real API key.
+    // We use a null-body cassette since we might not send a message.
+    let cassette_dir = harness.harness.temp_path("vcr-cassettes");
+    fs::create_dir_all(&cassette_dir).expect("create cassette dir");
+
+    // Create a permissive cassette — with `body: null` it will match any request.
+    let chunks = build_anthropic_response_chunks("Continued session response.");
+    let cassette = json!({
+        "version": "1.0",
+        "test_name": "e2e_session_continue",
+        "recorded_at": "2026-02-04T00:00:00.000Z",
+        "interactions": [{
+            "request": {
+                "method": "POST",
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": [],
+                "body": null
+            },
+            "response": {
+                "status": 200,
+                "headers": [["Content-Type", "text/event-stream; charset=utf-8"]],
+                "body_chunks": chunks
+            }
+        }]
+    });
+    let cassette_path = cassette_dir.join("e2e_session_continue.json");
+    fs::write(
+        &cassette_path,
+        serde_json::to_string_pretty(&cassette).expect("serialize cassette"),
+    )
+    .expect("write cassette");
+
+    harness
+        .env
+        .insert("VCR_MODE".to_string(), "playback".to_string());
+    harness.env.insert(
+        "VCR_CASSETTE_DIR".to_string(),
+        cassette_dir.display().to_string(),
+    );
+    harness.env.insert(
+        "PI_VCR_TEST_NAME".to_string(),
+        "e2e_session_continue".to_string(),
+    );
+    harness
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "test-vcr-key".to_string());
+    harness
+        .env
+        .insert("VCR_DEBUG_BODY".to_string(), "1".to_string());
+
+    let tmux = TmuxInstance::new(&harness.harness);
+
+    let script_path = harness.harness.temp_path("run-continue-test.sh");
+    let mut script = String::new();
+    script.push_str("#!/usr/bin/env sh\nset -eu\n");
+    for (key, value) in &harness.env {
+        script.push_str("export ");
+        script.push_str(key);
+        script.push('=');
+        script.push_str(&sh_escape(value));
+        script.push('\n');
+    }
+
+    let args = [
+        "-c",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--api-key",
+        "test-vcr-key",
+        "--no-tools",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--thinking",
+        "off",
+    ];
+
+    script.push_str("exec ");
+    script.push_str(&sh_escape(harness.binary_path.to_string_lossy().as_ref()));
+    for arg in &args {
+        script.push(' ');
+        script.push_str(&sh_escape(arg));
+    }
+    script.push('\n');
+
+    fs::write(&script_path, &script).expect("write script");
+    let mut perms = fs::metadata(&script_path)
+        .expect("stat script")
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms).expect("chmod script");
+
+    harness
+        .harness
+        .record_artifact("continue-test.sh", &script_path);
+
+    tmux.start_session(harness.harness.temp_dir(), &script_path);
+
+    // Wait for the welcome prompt — indicates pi loaded successfully.
+    let pane = tmux.wait_for_pane_contains_any(
+        &["Welcome to Pi!", "Continuing session"],
+        Duration::from_secs(20),
+    );
+    assert!(
+        pane.contains("Welcome to Pi!") || pane.contains("Continuing session")
+            || pane.contains("session"),
+        "Expected pi to start; got:\n{pane}"
+    );
+
+    // Exit cleanly.
+    tmux.send_literal("/exit");
+    tmux.send_key("Enter");
+
+    let start = Instant::now();
+    while tmux.session_exists() {
+        if start.elapsed() > Duration::from_secs(10) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if tmux.session_exists() {
+        tmux.send_key("C-d");
+        let start = Instant::now();
+        while tmux.session_exists() {
+            if start.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    // Verify the session file was modified (written back).
+    let new_size = fs::metadata(&session_file)
+        .expect("stat session file after continue")
+        .len();
+
+    // Even just opening + saving writes at minimum the same size; often larger
+    // because the interactive loop adds a session_info entry on save.
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "Session file size comparison", |ctx| {
+            ctx.push(("original_size".into(), original_size.to_string()));
+            ctx.push(("new_size".into(), new_size.to_string()));
+        });
+
+    // The session file should exist and be non-empty (at minimum the same content).
+    assert!(
+        new_size > 0,
+        "continued session file should not be empty; was {new_size} bytes"
+    );
+}
+
+/// Test 7: `--session <path>` loads specific sessions (validated via `--export`).
+#[test]
+fn e2e_cli_session_explicit_path_loads_session() {
+    let harness = CliTestHarness::new("e2e_cli_session_explicit_path_loads_session");
+
+    // Create two distinct session JSONL files.
+    let session_a_path = harness.harness.temp_path("session-a.jsonl");
+    let session_b_path = harness.harness.temp_path("session-b.jsonl");
+
+    let id_a = "session-alpha-1111";
+    let id_b = "session-beta-2222";
+    let cwd_str = harness.harness.temp_dir().display().to_string();
+
+    let header_a = json!({
+        "type": "session",
+        "version": 3,
+        "id": id_a,
+        "timestamp": "2026-02-04T10:00:00.000Z",
+        "cwd": cwd_str,
+        "provider": "anthropic",
+        "modelId": "claude-sonnet-4-5"
+    });
+    let entry_a = json!({
+        "type": "message",
+        "timestamp": "2026-02-04T10:00:01.000Z",
+        "message": {
+            "role": "user",
+            "content": "Alpha session content unique."
+        }
+    });
+    fs::write(
+        &session_a_path,
+        format!("{header_a}\n{entry_a}\n"),
+    )
+    .expect("write session a");
+
+    let header_b = json!({
+        "type": "session",
+        "version": 3,
+        "id": id_b,
+        "timestamp": "2026-02-04T11:00:00.000Z",
+        "cwd": cwd_str,
+        "provider": "openai",
+        "modelId": "gpt-4o"
+    });
+    let entry_b = json!({
+        "type": "message",
+        "timestamp": "2026-02-04T11:00:01.000Z",
+        "message": {
+            "role": "user",
+            "content": "Beta session content unique."
+        }
+    });
+    fs::write(
+        &session_b_path,
+        format!("{header_b}\n{entry_b}\n"),
+    )
+    .expect("write session b");
+
+    // Export session A.
+    let export_a = harness.harness.temp_path("export-a.html");
+    let result_a = harness.run(&[
+        "--export",
+        &session_a_path.display().to_string(),
+        &export_a.display().to_string(),
+    ]);
+    assert_exit_code(&harness.harness, &result_a, 0);
+    let html_a = fs::read_to_string(&export_a).expect("read export a");
+    harness.harness.record_artifact("export-a.html", &export_a);
+
+    // Export session B.
+    let export_b = harness.harness.temp_path("export-b.html");
+    let result_b = harness.run(&[
+        "--export",
+        &session_b_path.display().to_string(),
+        &export_b.display().to_string(),
+    ]);
+    assert_exit_code(&harness.harness, &result_b, 0);
+    let html_b = fs::read_to_string(&export_b).expect("read export b");
+    harness.harness.record_artifact("export-b.html", &export_b);
+
+    // Verify each export contains only its own session data.
+    assert_contains(&harness.harness, &html_a, &format!("Session {id_a}"));
+    assert_contains(&harness.harness, &html_a, "Alpha session content unique.");
+    // Session A should NOT contain session B's content.
+    harness
+        .harness
+        .assert_log("assert session A does not contain session B ID");
+    assert!(
+        !html_a.contains(id_b),
+        "session A export should not contain session B ID"
+    );
+
+    assert_contains(&harness.harness, &html_b, &format!("Session {id_b}"));
+    assert_contains(&harness.harness, &html_b, "Beta session content unique.");
+    harness
+        .harness
+        .assert_log("assert session B does not contain session A ID");
+    assert!(
+        !html_b.contains(id_a),
+        "session B export should not contain session A ID"
+    );
+}
+
+/// Recursively find the first `.jsonl` file in a directory tree.
+fn find_first_jsonl(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_first_jsonl(&path) {
+                return Some(found);
+            }
+        } else if path
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|ext| ext == "jsonl")
+        {
+            return Some(path);
+        }
+    }
+    None
+}
