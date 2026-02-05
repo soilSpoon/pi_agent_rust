@@ -2146,6 +2146,7 @@ export const promises = {
   stat: async (_path) => { throw new Error('stat unavailable'); },
   realpath: async (path, _opts) => String(path ?? ''),
   readdir: async (_path, _opts) => [],
+  rm: async (_path, _opts) => {},
 };
 export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, copyFileSync, renameSync, mkdirSync, promises };
 "#
