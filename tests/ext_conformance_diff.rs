@@ -89,6 +89,20 @@ const DEFAULT_DETERMINISTIC_CWD: &str = "/tmp/ext-conformance-test";
 const DEFAULT_DETERMINISTIC_HOME: &str = "/tmp/ext-conformance-home";
 const DEFAULT_TS_ORACLE_TIMEOUT_SECS: u64 = 30;
 
+const EVENT_DISPATCH_BENCH_EVENT_NAMES: [&str; 11] = [
+    "tool_call",
+    "tool_result",
+    "turn_start",
+    "turn_end",
+    "before_agent_start",
+    "input",
+    "context",
+    "resources_discover",
+    "user_bash",
+    "session_before_compact",
+    "session_before_tree",
+];
+
 struct DeterministicSettings {
     time_ms: String,
     time_step_ms: String,
@@ -600,9 +614,9 @@ fn run_ts_event_dispatch_bench_result(
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    let output = child.wait_with_output().map_err(|err| {
-        format!("failed to capture TS event dispatch bench output: {err}")
-    })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to capture TS event dispatch bench output: {err}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -626,6 +640,193 @@ fn run_ts_event_dispatch_bench_result(
             "TS event dispatch bench returned invalid JSON for {}:\n  error: {e}\n  stdout: {stdout}\n  stderr: {stderr}",
             extension_path.display()
         )
+    })
+}
+
+fn adapt_input_payload(payload: &Value) -> Value {
+    let text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("content").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let images = payload
+        .get("images")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("attachments").and_then(Value::as_array))
+        .map_or_else(Vec::new, Clone::clone);
+    let source = payload
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("user")
+        .to_string();
+
+    serde_json::json!({
+        "type": "input",
+        "text": text,
+        "images": images,
+        "source": source,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_rust_event_dispatch_bench_result(
+    extension_path: &Path,
+    payloads_path: &Path,
+    iters: usize,
+    warmup: usize,
+) -> Result<Value, String> {
+    let settings = deterministic_settings_for(extension_path);
+    ensure_deterministic_dirs(&settings);
+    let cwd = PathBuf::from(&settings.cwd);
+    let extension_path = extension_path.to_path_buf();
+
+    let payload_root: Value = serde_json::from_str(
+        &fs::read_to_string(payloads_path)
+            .map_err(|err| format!("read event payloads {}: {err}", payloads_path.display()))?,
+    )
+    .map_err(|err| format!("parse event payloads {}: {err}", payloads_path.display()))?;
+    let payloads = payload_root
+        .get("event_payloads")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "event payloads file missing event_payloads object".to_string())?;
+
+    let mut payloads_by_event: HashMap<String, Vec<Value>> = HashMap::new();
+    for name in EVENT_DISPATCH_BENCH_EVENT_NAMES {
+        let list = payloads
+            .get(name)
+            .and_then(Value::as_array)
+            .map_or_else(Vec::new, Clone::clone);
+        let extracted = list
+            .into_iter()
+            .map(|case| case.get("payload").cloned().unwrap_or(case))
+            .collect::<Vec<_>>();
+        payloads_by_event.insert(name.to_string(), extracted);
+    }
+
+    common::run_async(async move {
+        let spec = JsExtensionLoadSpec::from_entry_path(&extension_path)
+            .map_err(|e| format!("load spec: {e}"))?;
+
+        let manager = ExtensionManager::new();
+        let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+        let mut env = HashMap::new();
+        env.insert(
+            "PI_DETERMINISTIC_TIME_MS".to_string(),
+            settings.time_ms.clone(),
+        );
+        env.insert(
+            "PI_DETERMINISTIC_TIME_STEP_MS".to_string(),
+            settings.time_step_ms.clone(),
+        );
+        env.insert("PI_DETERMINISTIC_CWD".to_string(), settings.cwd.clone());
+        env.insert("PI_DETERMINISTIC_HOME".to_string(), settings.home.clone());
+        env.insert("HOME".to_string(), settings.home.clone());
+        if let Some(random_value) = settings.random_value.as_ref() {
+            env.insert("PI_DETERMINISTIC_RANDOM".to_string(), random_value.clone());
+        } else {
+            env.insert(
+                "PI_DETERMINISTIC_RANDOM_SEED".to_string(),
+                settings.random_seed.clone(),
+            );
+        }
+        let js_config = PiJsRuntimeConfig {
+            cwd: settings.cwd.clone(),
+            env,
+            ..Default::default()
+        };
+
+        let runtime = JsExtensionRuntimeHandle::start(js_config, tools, manager.clone())
+            .await
+            .map_err(|e| format!("start runtime: {e}"))?;
+        manager.set_js_runtime(runtime.clone());
+
+        manager
+            .load_js_extensions(vec![spec])
+            .await
+            .map_err(|e| format!("load extension: {e}"))?;
+
+        let ctx_payload = serde_json::json!({
+            "hasUI": false,
+            "cwd": settings.cwd,
+            "sessionEntries": [],
+            "sessionBranch": [],
+            "sessionLeafEntry": null,
+            "modelRegistry": {},
+        });
+
+        let timeout_ms = 20000;
+        let mut results = serde_json::Map::new();
+        for name in EVENT_DISPATCH_BENCH_EVENT_NAMES {
+            let Some(cases) = payloads_by_event.get(name) else {
+                results.insert(
+                    name.to_string(),
+                    serde_json::json!({ "summary": summarize_us(&[]) }),
+                );
+                continue;
+            };
+            if cases.is_empty() {
+                results.insert(
+                    name.to_string(),
+                    serde_json::json!({ "summary": summarize_us(&[]) }),
+                );
+                continue;
+            }
+
+            // Warmup
+            for i in 0..warmup {
+                let base = cases.get(i % cases.len()).cloned().unwrap_or(Value::Null);
+                let payload = if name == "input" {
+                    adapt_input_payload(&base)
+                } else {
+                    base
+                };
+                runtime
+                    .dispatch_event(name.to_string(), payload, ctx_payload.clone(), timeout_ms)
+                    .await
+                    .map_err(|e| format!("dispatch {name} warmup: {e}"))?;
+            }
+
+            let mut durations_us = Vec::with_capacity(iters);
+            for i in 0..iters {
+                let base = cases.get(i % cases.len()).cloned().unwrap_or(Value::Null);
+                let payload = if name == "input" {
+                    adapt_input_payload(&base)
+                } else {
+                    base
+                };
+                let start = Instant::now();
+                runtime
+                    .dispatch_event(name.to_string(), payload, ctx_payload.clone(), timeout_ms)
+                    .await
+                    .map_err(|e| format!("dispatch {name}: {e}"))?;
+                let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                durations_us.push(elapsed_us);
+            }
+
+            results.insert(
+                name.to_string(),
+                serde_json::json!({ "summary": summarize_us(&durations_us) }),
+            );
+        }
+
+        let report = serde_json::json!({
+            "schema": "pi.ext.event_dispatch_latency.v1",
+            "generated_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            "toolchain": "rust",
+            "iters": iters,
+            "warmup": warmup,
+            "extension": {
+                "path": extension_path.display().to_string(),
+            },
+            "results": results,
+        });
+
+        Ok(serde_json::json!({
+            "success": true,
+            "error": null,
+            "report": report,
+        }))
     })
 }
 
@@ -1373,6 +1574,107 @@ fn load_time_benchmark_official() {
 
     eprintln!(
         "[load_time_benchmark] Wrote report to {}",
+        report_path.display()
+    );
+}
+
+#[test]
+#[ignore = "bd-sas4: generate event dispatch latency report"]
+fn event_dispatch_latency_benchmark() {
+    let extension_path = event_dispatch_bench_extension_path();
+    let payloads_path = event_payloads_path();
+    let iters = std::env::var("PI_EVENT_BENCH_ITERS")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(1000);
+    let warmup = std::env::var("PI_EVENT_BENCH_WARMUP")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(25);
+
+    eprintln!("[event_dispatch_latency] Starting (iters={iters} warmup={warmup})");
+
+    let ts_result =
+        match run_ts_event_dispatch_bench_result(&extension_path, &payloads_path, iters, warmup) {
+            Ok(value) => value,
+            Err(err) => serde_json::json!({ "success": false, "error": err, "report": null }),
+        };
+    let rust_result = match run_rust_event_dispatch_bench_result(
+        &extension_path,
+        &payloads_path,
+        iters,
+        warmup,
+    ) {
+        Ok(value) => value,
+        Err(err) => serde_json::json!({ "success": false, "error": err, "report": null }),
+    };
+
+    let mut checks = serde_json::Map::new();
+    for name in EVENT_DISPATCH_BENCH_EVENT_NAMES {
+        let ts_summary = ts_result
+            .get("report")
+            .and_then(|report| report.get("results"))
+            .and_then(|results| results.get(name))
+            .and_then(|entry| entry.get("summary"));
+        let rust_summary = rust_result
+            .get("report")
+            .and_then(|report| report.get("results"))
+            .and_then(|results| results.get(name))
+            .and_then(|entry| entry.get("summary"));
+
+        let ts_p50 = ts_summary
+            .and_then(|s| s.get("p50_us"))
+            .and_then(Value::as_u64);
+        let ts_p99 = ts_summary
+            .and_then(|s| s.get("p99_us"))
+            .and_then(Value::as_u64);
+        let rust_p50 = rust_summary
+            .and_then(|s| s.get("p50_us"))
+            .and_then(Value::as_u64);
+        let rust_p99 = rust_summary
+            .and_then(|s| s.get("p99_us"))
+            .and_then(Value::as_u64);
+
+        let rust_p99_lt_5ms = rust_p99.map(|value| value <= 5000);
+        let rust_p50_lt_ts_p50 = match (rust_p50, ts_p50) {
+            (Some(rust), Some(ts)) => Some(rust < ts),
+            _ => None,
+        };
+
+        checks.insert(
+            name.to_string(),
+            serde_json::json!({
+                "ts_p50_us": ts_p50,
+                "ts_p99_us": ts_p99,
+                "rust_p50_us": rust_p50,
+                "rust_p99_us": rust_p99,
+                "rust_p99_lt_5ms": rust_p99_lt_5ms,
+                "rust_p50_lt_ts_p50": rust_p50_lt_ts_p50,
+            }),
+        );
+    }
+
+    let report = serde_json::json!({
+        "schema": "pi.ext.event_dispatch_latency_report.v1",
+        "generated_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        "iters": iters,
+        "warmup": warmup,
+        "extension": extension_path.display().to_string(),
+        "ts": ts_result,
+        "rust": rust_result,
+        "checks": checks,
+    });
+
+    let report_path =
+        project_root().join("tests/ext_conformance/reports/event_dispatch_latency.json");
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent).expect("create report directory");
+    }
+    fs::write(&report_path, serde_json::to_string_pretty(&report).unwrap())
+        .expect("write event dispatch latency report");
+
+    eprintln!(
+        "[event_dispatch_latency] Wrote report to {}",
         report_path.display()
     );
 }
