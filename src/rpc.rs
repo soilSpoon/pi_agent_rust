@@ -1272,7 +1272,7 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    fork_session(&mut guard, entry_id)?
+                    fork_session(&mut guard, entry_id, &cx).await?
                 };
 
                 {
@@ -2505,9 +2505,16 @@ async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Res
     guard.persist_session().await
 }
 
-fn fork_session(guard: &mut AgentSession, entry_id: &str) -> Result<(Option<String>, bool)> {
-    let entry = guard
-        .session
+async fn fork_session(
+    guard: &mut AgentSession,
+    entry_id: &str,
+    cx: &Cx,
+) -> Result<(Option<String>, bool)> {
+    let mut inner_session = guard.session.lock(cx).await.map_err(|err| {
+        Error::session(format!("inner session lock failed: {err}"))
+    })?;
+
+    let entry = inner_session
         .get_entry(entry_id)
         .ok_or_else(|| Error::session("Entry not found"))?;
 
@@ -2522,32 +2529,33 @@ fn fork_session(guard: &mut AgentSession, entry_id: &str) -> Result<(Option<Stri
     let selected_text = extract_user_text(content);
     let parent_id = message_entry.base.parent_id.clone();
 
-    let session_dir = guard.session.session_dir.clone();
+    let session_dir = inner_session.session_dir.clone();
     let mut new_session = if guard.save_enabled() {
         crate::session::Session::create_with_dir(session_dir)
     } else {
         crate::session::Session::in_memory()
     };
-    new_session.header.parent_session =
-        guard.session.path.as_ref().map(|p| p.display().to_string());
+    new_session.header.parent_session = inner_session
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string());
     new_session
         .header
         .provider
-        .clone_from(&guard.session.header.provider);
+        .clone_from(&inner_session.header.provider);
     new_session
         .header
         .model_id
-        .clone_from(&guard.session.header.model_id);
+        .clone_from(&inner_session.header.model_id);
     new_session
         .header
         .thinking_level
-        .clone_from(&guard.session.header.thinking_level);
+        .clone_from(&inner_session.header.thinking_level);
 
     if let Some(parent_id) = parent_id {
-        let path_ids = guard.session.get_path_to_entry(&parent_id);
+        let path_ids = inner_session.get_path_to_entry(&parent_id);
         let path_set: HashSet<&str> = path_ids.iter().map(String::as_str).collect();
-        new_session.entries = guard
-            .session
+        new_session.entries = inner_session
             .entries
             .iter()
             .filter(|entry| {
@@ -2560,11 +2568,13 @@ fn fork_session(guard: &mut AgentSession, entry_id: &str) -> Result<(Option<Stri
         new_session.leaf_id = Some(parent_id);
     }
 
-    guard.session = new_session;
-    guard
-        .agent
-        .replace_messages(guard.session.to_messages_for_current_path());
-    guard.agent.stream_options_mut().session_id = Some(guard.session.header.id.clone());
+    *inner_session = new_session;
+    let messages = inner_session.to_messages_for_current_path();
+    let session_id = inner_session.header.id.clone();
+    drop(inner_session);
+
+    guard.agent.replace_messages(messages);
+    guard.agent.stream_options_mut().session_id = Some(session_id);
 
     Ok((selected_text, false))
 }
@@ -2648,12 +2658,20 @@ async fn cycle_model_for_rpc(
         return Ok(None);
     }
 
-    let current_provider = guard.session.header.provider.as_deref();
-    let current_model_id = guard.session.header.model_id.as_deref();
+    let cx = Cx::for_request();
+    let (current_provider, current_model_id) = {
+        let inner_session = guard.session.lock(&cx).await.map_err(|err| {
+            Error::session(format!("inner session lock failed: {err}"))
+        })?;
+        (
+            inner_session.header.provider.clone(),
+            inner_session.header.model_id.clone(),
+        )
+    };
 
     let current_index = candidates.iter().position(|entry| {
-        current_provider == Some(entry.model.provider.as_str())
-            && current_model_id == Some(entry.model.id.as_str())
+        current_provider.as_deref() == Some(entry.model.provider.as_str())
+            && current_model_id.as_deref() == Some(entry.model.id.as_str())
     });
 
     let next_index = current_index.map_or(0, |idx| (idx + 1) % candidates.len());
