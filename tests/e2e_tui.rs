@@ -57,7 +57,7 @@ const VCR_TEST_NAME: &str = "e2e_tui_tool_read";
 const VCR_BASIC_CHAT_TEST_NAME: &str = "e2e_tui_basic_chat";
 const VCR_MODEL: &str = "claude-sonnet-4-20250514";
 const VCR_PROMPT: &str = "Readsample.txt";
-const VCR_BASIC_CHAT_PROMPT: &str = "Say hello";
+const VCR_BASIC_CHAT_PROMPT: &str = "Sayhello";
 const VCR_BASIC_CHAT_RESPONSE: &str = "Hello! How can I help you today?";
 const SAMPLE_FILE_NAME: &str = "sample.txt";
 const SAMPLE_FILE_CONTENT: &str = "Hello\nWorld\n";
@@ -766,6 +766,7 @@ fn e2e_tui_artifact_format() {
 
 /// E2E interactive: basic chat via VCR playback (no tools).
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_tui_basic_chat_vcr() {
     let Some(mut session) = TuiSession::new("e2e_tui_basic_chat_vcr") else {
         eprintln!("Skipping: tmux not available");
@@ -802,6 +803,33 @@ fn e2e_tui_basic_chat_vcr() {
     session.set_env(VCR_ENV_DIR, &cassette_dir_str);
     session.set_env("PI_VCR_TEST_NAME", VCR_BASIC_CHAT_TEST_NAME);
     session.set_env("PI_TEST_MODE", "1");
+    session.set_env("VCR_DEBUG_BODY", "1");
+    session.set_env("VCR_DEBUG_BODY_FILE", "/tmp/vcr_debug_bodies.txt");
+
+    // Diagnostic: write the expected request body for comparison
+    let diag_path = session.harness.temp_path("expected_body.json");
+    let expected_body = json!({
+        "model": VCR_MODEL,
+        "messages": [
+            { "role": "user", "content": [ { "type": "text", "text": VCR_BASIC_CHAT_PROMPT } ] }
+        ],
+        "system": &system_prompt,
+        "max_tokens": 8192,
+        "stream": true,
+    });
+    std::fs::write(
+        &diag_path,
+        serde_json::to_string_pretty(&expected_body).unwrap(),
+    )
+    .expect("write expected body");
+    session
+        .harness
+        .record_artifact("expected_body.json", &diag_path);
+
+    // Write stderr log path for the binary
+    let stderr_log = session.harness.temp_path("pi-stderr.log");
+    session.set_env("PI_STDERR_LOG", &stderr_log.display().to_string());
+    session.set_env("RUST_LOG", "debug");
 
     session.harness.section("launch");
     session.launch(&vcr_interactive_args_no_tools());
@@ -819,6 +847,26 @@ fn e2e_tui_basic_chat_vcr() {
         VCR_BASIC_CHAT_RESPONSE,
         COMMAND_TIMEOUT,
     );
+
+    // If VCR failed, dump full pane for debugging
+    if !pane.contains(VCR_BASIC_CHAT_RESPONSE) {
+        let debug_pane_path = session.harness.temp_path("debug-pane.txt");
+        std::fs::write(&debug_pane_path, &pane).expect("write debug pane");
+        session
+            .harness
+            .record_artifact("debug-pane.txt", &debug_pane_path);
+
+        // Print pane content to test output for visibility
+        eprintln!("=== VCR MISMATCH DEBUG ===");
+        eprintln!("System prompt: {:?}", &system_prompt);
+        eprintln!(
+            "Expected body:\n{}",
+            serde_json::to_string_pretty(&expected_body).unwrap()
+        );
+        eprintln!("Pane output:\n{pane}");
+        eprintln!("=== END VCR MISMATCH DEBUG ===");
+    }
+
     assert!(
         pane.contains(VCR_BASIC_CHAT_RESPONSE),
         "Expected VCR response in pane; got:\n{pane}"
