@@ -7492,6 +7492,21 @@ impl ExtensionManager {
         flags
     }
 
+    /// List all event hook names registered by all loaded extensions.
+    pub fn list_event_hooks(&self) -> Vec<String> {
+        let guard = self.inner.lock().unwrap();
+        let mut hooks = Vec::new();
+        for ext in &guard.extensions {
+            for hook in &ext.event_hooks {
+                if !hooks.contains(hook) {
+                    hooks.push(hook.clone());
+                }
+            }
+        }
+        drop(guard);
+        hooks
+    }
+
     /// Execute an extension shortcut via the JS runtime.
     pub async fn execute_shortcut(
         &self,
