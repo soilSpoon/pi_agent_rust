@@ -15,7 +15,6 @@ use asupersync::Cx;
 use asupersync::channel::mpsc;
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
-use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use bubbles::list::{DefaultDelegate, Item as ListItem, List};
 use bubbles::spinner::{SpinnerModel, spinners};
@@ -1521,7 +1520,7 @@ const fn bool_label(value: bool) -> &'static str {
 
 fn run_command_output(
     program: &str,
-    args: Vec<OsString>,
+    args: &[OsString],
     cwd: &Path,
     abort_signal: &crate::agent::AbortSignal,
 ) -> std::io::Result<std::process::Output> {
@@ -1555,7 +1554,7 @@ fn run_command_output(
 
         match rx.recv_timeout(tick) {
             Ok(result) => return result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {},
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(std::io::Error::other("command output channel disconnected"));
             }
@@ -8362,7 +8361,7 @@ impl PiApp {
                         OsString::from("--public=false"),
                         temp_path.as_os_str().to_os_string(),
                     ];
-                    let output = match run_command_output(&gh, gist_args, &cwd, &abort_signal) {
+                    let output = match run_command_output(&gh, &gist_args, &cwd, &abort_signal) {
                             Ok(output) => output,
                             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                                 let message = "GitHub CLI `gh` not found.\nInstall it and run `gh auth login`, then retry `/share`.".to_string();
