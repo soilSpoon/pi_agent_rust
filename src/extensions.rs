@@ -7476,6 +7476,7 @@ impl ExtensionManager {
                     .unwrap_or_default();
                 let description = shortcut.get("description").and_then(Value::as_str);
                 shortcuts.push(json!({
+                    "shortcut": key_id,  // Primary field matching TS oracle output
                     "key_id": key_id,
                     "key": shortcut.get("key"),
                     "description": description,
