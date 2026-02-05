@@ -1519,7 +1519,7 @@ const fn bool_label(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
-async fn run_command_output(
+fn run_command_output(
     program: &str,
     args: Vec<OsString>,
     cwd: &Path,
@@ -1553,10 +1553,10 @@ async fn run_command_output(
             ));
         }
 
-        match rx.try_recv() {
+        match rx.recv_timeout(tick) {
             Ok(result) => return result,
-            Err(std_mpsc::TryRecvError::Empty) => sleep(wall_now(), tick).await,
-            Err(std_mpsc::TryRecvError::Disconnected) => {
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(std::io::Error::other("command output channel disconnected"));
             }
         }
@@ -8286,7 +8286,7 @@ impl PiApp {
                         .unwrap_or_else(|| "gh".to_string());
 
                     let auth_args = vec![OsString::from("auth"), OsString::from("status")];
-                    match run_command_output(&gh, auth_args, &cwd, &abort_signal).await {
+                    match run_command_output(&gh, auth_args, &cwd, &abort_signal) {
                         Ok(output) => {
                             if !output.status.success() {
                                 let details = format_command_output(&output);
@@ -8362,8 +8362,7 @@ impl PiApp {
                         OsString::from("--public=false"),
                         temp_path.as_os_str().to_os_string(),
                     ];
-                    let output =
-                        match run_command_output(&gh, gist_args, &cwd, &abort_signal).await {
+                    let output = match run_command_output(&gh, gist_args, &cwd, &abort_signal) {
                             Ok(output) => output,
                             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                                 let message = "GitHub CLI `gh` not found.\nInstall it and run `gh auth login`, then retry `/share`.".to_string();

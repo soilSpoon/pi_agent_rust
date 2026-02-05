@@ -10,7 +10,7 @@ use pi::http::client::Client;
 use pi::model::{Message, StopReason, ThinkingLevel};
 use pi::provider::{CacheRetention, Context, Provider, StreamOptions, ThinkingBudgets, ToolDef};
 use pi::providers::anthropic::AnthropicProvider;
-use pi::vcr::{Cassette, Interaction, RecordedRequest, VcrMode, VcrRecorder};
+use pi::vcr::{Cassette, RecordedRequest, VcrMode, VcrRecorder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
