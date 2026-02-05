@@ -2854,26 +2854,47 @@ function __pi_register_shortcut(key, spec) {
     ext.shortcuts.set(keyId, entry);
 }
 
-function __pi_register_hook(event_name, handler) {
-    const ext = __pi_current_extension_or_throw();
-    const eventName = String(event_name || '').trim();
-    if (!eventName) {
-        throw new Error('on: event name is required');
-    }
-    if (typeof handler !== 'function') {
-        throw new Error('on: handler must be a function');
-    }
+	function __pi_register_hook(event_name, handler) {
+	    const ext = __pi_current_extension_or_throw();
+	    const eventName = String(event_name || '').trim();
+	    if (!eventName) {
+	        throw new Error('on: event name is required');
+	    }
+	    if (typeof handler !== 'function') {
+	        throw new Error('on: handler must be a function');
+	    }
 
-    if (!ext.hooks.has(eventName)) {
-        ext.hooks.set(eventName, []);
-    }
-    ext.hooks.get(eventName).push(handler);
+	    if (!ext.hooks.has(eventName)) {
+	        ext.hooks.set(eventName, []);
+	    }
+	    ext.hooks.get(eventName).push(handler);
 
-    if (!__pi_hook_index.has(eventName)) {
-        __pi_hook_index.set(eventName, []);
-    }
-    __pi_hook_index.get(eventName).push({ extensionId: ext.id, handler: handler });
-}
+	    if (!__pi_hook_index.has(eventName)) {
+	        __pi_hook_index.set(eventName, []);
+	    }
+	    const indexed = { extensionId: ext.id, handler: handler };
+	    __pi_hook_index.get(eventName).push(indexed);
+
+	    let removed = false;
+	    return function unsubscribe() {
+	        if (removed) return;
+	        removed = true;
+
+	        const local = ext.hooks.get(eventName);
+	        if (Array.isArray(local)) {
+	            const idx = local.indexOf(handler);
+	            if (idx !== -1) local.splice(idx, 1);
+	            if (local.length === 0) ext.hooks.delete(eventName);
+	        }
+
+	        const global = __pi_hook_index.get(eventName);
+	        if (Array.isArray(global)) {
+	            const idx = global.indexOf(indexed);
+	            if (idx !== -1) global.splice(idx, 1);
+	            if (global.length === 0) __pi_hook_index.delete(eventName);
+	        }
+	    };
+	}
 
 function __pi_register_flag(flag_name, spec) {
     const ext = __pi_current_extension_or_throw();
@@ -3164,11 +3185,11 @@ function __pi_make_extension_ctx(ctx_payload) {
     };
 }
 
-async function __pi_dispatch_extension_event(event_name, event_payload, ctx_payload) {
-    const eventName = String(event_name || '').trim();
-    if (!eventName) {
-        throw new Error('dispatch_event: event name is required');
-    }
+	async function __pi_dispatch_extension_event(event_name, event_payload, ctx_payload) {
+	    const eventName = String(event_name || '').trim();
+	    if (!eventName) {
+	        throw new Error('dispatch_event: event name is required');
+	    }
 
     const handlers = __pi_hook_index.get(eventName) || [];
     if (handlers.length === 0) {
@@ -3176,25 +3197,31 @@ async function __pi_dispatch_extension_event(event_name, event_payload, ctx_payl
     }
 
     const ctx = __pi_make_extension_ctx(ctx_payload);
-    if (eventName === 'input') {
-        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
-        const originalText = typeof base.text === 'string' ? base.text : String(base.text ?? '');
-        const originalImages = Array.isArray(base.images) ? base.images : undefined;
-        const source = base.source !== undefined ? base.source : 'extension';
+	    if (eventName === 'input') {
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        const originalText = typeof base.text === 'string' ? base.text : String(base.text ?? '');
+	        const originalImages = Array.isArray(base.images) ? base.images : undefined;
+	        const source = base.source !== undefined ? base.source : 'extension';
 
         let currentText = originalText;
         let currentImages = originalImages;
 
-        for (const entry of handlers) {
-            const handler = entry && entry.handler;
-            if (typeof handler !== 'function') continue;
-            const event = { type: 'input', text: currentText, images: currentImages, source: source };
-            const result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
-            if (result && typeof result === 'object') {
-                if (result.action === 'handled') return result;
-                if (result.action === 'transform' && typeof result.text === 'string') {
-                    currentText = result.text;
-                    if (result.images !== undefined) currentImages = result.images;
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            const event = { type: 'input', text: currentText, images: currentImages, source: source };
+	            let result = undefined;
+	            try {
+	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                console.error('Event handler error:', eventName, entry.extensionId, e);
+	                continue;
+	            }
+	            if (result && typeof result === 'object') {
+	                if (result.action === 'handled') return result;
+	                if (result.action === 'transform' && typeof result.text === 'string') {
+	                    currentText = result.text;
+	                    if (result.images !== undefined) currentImages = result.images;
                 }
             }
         }
@@ -3205,24 +3232,30 @@ async function __pi_dispatch_extension_event(event_name, event_payload, ctx_payl
         return { action: 'continue' };
     }
 
-    if (eventName === 'before_agent_start') {
-        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
-        const prompt = typeof base.prompt === 'string' ? base.prompt : '';
-        const images = Array.isArray(base.images) ? base.images : undefined;
-        let currentSystemPrompt = typeof base.systemPrompt === 'string' ? base.systemPrompt : '';
-        let modified = false;
-        const messages = [];
+	    if (eventName === 'before_agent_start') {
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        const prompt = typeof base.prompt === 'string' ? base.prompt : '';
+	        const images = Array.isArray(base.images) ? base.images : undefined;
+	        let currentSystemPrompt = typeof base.systemPrompt === 'string' ? base.systemPrompt : '';
+	        let modified = false;
+	        const messages = [];
 
-        for (const entry of handlers) {
-            const handler = entry && entry.handler;
-            if (typeof handler !== 'function') continue;
-            const event = { type: 'before_agent_start', prompt, images, systemPrompt: currentSystemPrompt };
-            const result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
-            if (result && typeof result === 'object') {
-                if (result.message !== undefined) messages.push(result.message);
-                if (result.systemPrompt !== undefined) {
-                    currentSystemPrompt = String(result.systemPrompt);
-                    modified = true;
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            const event = { type: 'before_agent_start', prompt, images, systemPrompt: currentSystemPrompt };
+	            let result = undefined;
+	            try {
+	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                console.error('Event handler error:', eventName, entry.extensionId, e);
+	                continue;
+	            }
+	            if (result && typeof result === 'object') {
+	                if (result.message !== undefined) messages.push(result.message);
+	                if (result.systemPrompt !== undefined) {
+	                    currentSystemPrompt = String(result.systemPrompt);
+	                    modified = true;
                 }
             }
         }
@@ -3233,12 +3266,18 @@ async function __pi_dispatch_extension_event(event_name, event_payload, ctx_payl
         return undefined;
     }
 
-    let last = undefined;
-    for (const entry of handlers) {
-        const handler = entry && entry.handler;
-        if (typeof handler !== 'function') continue;
-        const value = await __pi_with_extension_async(entry.extensionId, () => handler(event_payload, ctx));
-        if (value === undefined) continue;
+	    let last = undefined;
+	    for (const entry of handlers) {
+	        const handler = entry && entry.handler;
+	        if (typeof handler !== 'function') continue;
+	        let value = undefined;
+	        try {
+	            value = await __pi_with_extension_async(entry.extensionId, () => handler(event_payload, ctx));
+	        } catch (e) {
+	            console.error('Event handler error:', eventName, entry.extensionId, e);
+	            continue;
+	        }
+	        if (value === undefined) continue;
 
         // First-result semantics (legacy parity)
         if (eventName === 'user_bash') {
@@ -3432,7 +3471,7 @@ function __pi_sleep(ms) {
 
 // Create the pi global object with Promise-returning methods
 const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
-const pi = {
+	const pi = {
     // pi.tool(name, input) - invoke a tool
     tool: __pi_make_hostcall(__pi_tool_native),
 
@@ -3448,8 +3487,8 @@ const pi = {
     // pi.ui(op, args) - UI operations
     ui: __pi_make_hostcall(__pi_ui_native),
 
-    // pi.events(op, args) - event operations
-    events: __pi_make_hostcall(__pi_events_native),
+	    // pi.events(op, args) - event operations
+	    events: __pi_make_hostcall(__pi_events_native),
 
     // Extension API (legacy-compatible subset)
     registerTool: __pi_register_tool,
@@ -3466,13 +3505,31 @@ const pi = {
     getThinkingLevel: __pi_get_thinking_level,
     setThinkingLevel: __pi_set_thinking_level,
     appendEntry: __pi_append_entry,
-    sendMessage: __pi_send_message,
-    sendUserMessage: __pi_send_user_message,
-};
+	    sendMessage: __pi_send_message,
+	    sendUserMessage: __pi_send_user_message,
+	};
 
-pi.env = {
-    get: __pi_env_get,
-};
+	// Convenience API: pi.events.emit/on (inter-extension bus).
+	// Keep pi.events callable for legacy hostcall operations.
+	pi.events.emit = (event, data, options = undefined) => {
+	    const name = String(event || '').trim();
+	    if (!name) {
+	        throw new Error('events.emit: event name is required');
+	    }
+	    const payload = { event: name, data: (data === undefined ? null : data) };
+	    if (options && typeof options === 'object') {
+	        if (options.ctx !== undefined) payload.ctx = options.ctx;
+	        if (options.timeout_ms !== undefined) payload.timeout_ms = options.timeout_ms;
+	        if (options.timeoutMs !== undefined) payload.timeoutMs = options.timeoutMs;
+	        if (options.timeout !== undefined) payload.timeout = options.timeout;
+	    }
+	    return pi.events('emit', payload);
+	};
+	pi.events.on = (event, handler) => __pi_register_hook(event, handler);
+
+	pi.env = {
+	    get: __pi_env_get,
+	};
 
 pi.process = {
     cwd: __pi_process_cwd_native(),
@@ -4932,6 +4989,116 @@ mod tests {
             let a = run_seeded_runtime_trace(0x00C0_FFEE).await;
             let b = run_seeded_runtime_trace(0x00C0_FFEE).await;
             assert_eq!(a, b);
+        });
+    }
+
+    #[test]
+    fn pijs_events_on_returns_unsubscribe_and_removes_handler() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.seen = [];
+                    globalThis.done = false;
+
+                    __pi_begin_extension("ext.b", { name: "ext.b" });
+                    const off = pi.events.on("custom_event", (payload, _ctx) => { globalThis.seen.push(payload); });
+                    if (typeof off !== "function") throw new Error("expected unsubscribe function");
+                    __pi_end_extension();
+
+                    (async () => {
+                      await __pi_dispatch_extension_event("custom_event", { n: 1 }, {});
+                      off();
+                      await __pi_dispatch_extension_event("custom_event", { n: 2 }, {});
+                      globalThis.done = true;
+                    })();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            assert_eq!(get_global_json(&runtime, "done").await, serde_json::Value::Bool(true));
+            assert_eq!(
+                get_global_json(&runtime, "seen").await,
+                serde_json::json!([{ "n": 1 }])
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_event_dispatch_continues_after_handler_error() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.seen = [];
+                    globalThis.done = false;
+
+                    __pi_begin_extension("ext.err", { name: "ext.err" });
+                    pi.events.on("custom_event", (_payload, _ctx) => { throw new Error("boom"); });
+                    __pi_end_extension();
+
+                    __pi_begin_extension("ext.ok", { name: "ext.ok" });
+                    pi.events.on("custom_event", (payload, _ctx) => { globalThis.seen.push(payload); });
+                    __pi_end_extension();
+
+                    (async () => {
+                      await __pi_dispatch_extension_event("custom_event", { hello: "world" }, {});
+                      globalThis.done = true;
+                    })();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            assert_eq!(get_global_json(&runtime, "done").await, serde_json::Value::Bool(true));
+            assert_eq!(
+                get_global_json(&runtime, "seen").await,
+                serde_json::json!([{ "hello": "world" }])
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_events_emit_queues_events_hostcall() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    __pi_begin_extension("ext.test", { name: "Test" });
+                    pi.events.emit("custom_event", { a: 1 });
+                    __pi_end_extension();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let req = &requests[0];
+            assert_eq!(req.extension_id.as_deref(), Some("ext.test"));
+            assert!(
+                matches!(&req.kind, HostcallKind::Events { op } if op == "emit"),
+                "unexpected hostcall kind: {:?}",
+                req.kind
+            );
+            assert_eq!(
+                req.payload,
+                serde_json::json!({ "event": "custom_event", "data": { "a": 1 } })
+            );
         });
     }
 }

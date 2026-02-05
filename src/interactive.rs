@@ -3956,6 +3956,53 @@ impl ExtensionSession for InteractiveExtensionSession {
         }
         Ok(())
     }
+
+    async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
+        let cx = Cx::for_request();
+        let mut guard =
+            self.session.lock(&cx).await.map_err(|err| {
+                crate::error::Error::session(format!("session lock failed: {err}"))
+            })?;
+        guard.append_model_change(provider.clone(), model_id.clone());
+        guard.set_model_header(Some(provider), Some(model_id), None);
+        if self.save_enabled {
+            guard.save().await?;
+        }
+        Ok(())
+    }
+
+    async fn get_model(&self) -> (Option<String>, Option<String>) {
+        let cx = Cx::for_request();
+        let Ok(guard) = self.session.lock(&cx).await else {
+            return (None, None);
+        };
+        (
+            guard.header.provider.clone(),
+            guard.header.model_id.clone(),
+        )
+    }
+
+    async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
+        let cx = Cx::for_request();
+        let mut guard =
+            self.session.lock(&cx).await.map_err(|err| {
+                crate::error::Error::session(format!("session lock failed: {err}"))
+            })?;
+        guard.append_thinking_level_change(level.clone());
+        guard.set_model_header(None, None, Some(level));
+        if self.save_enabled {
+            guard.save().await?;
+        }
+        Ok(())
+    }
+
+    async fn get_thinking_level(&self) -> Option<String> {
+        let cx = Cx::for_request();
+        let Ok(guard) = self.session.lock(&cx).await else {
+            return None;
+        };
+        guard.header.thinking_level.clone()
+    }
 }
 
 /// A message in the conversation history.
