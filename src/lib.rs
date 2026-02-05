@@ -60,6 +60,8 @@ pub mod scheduler;
 pub mod session;
 pub mod session_index;
 pub mod session_picker;
+#[cfg(feature = "sqlite-sessions")]
+pub mod session_sqlite;
 pub mod sse;
 pub mod theme;
 pub mod tools;

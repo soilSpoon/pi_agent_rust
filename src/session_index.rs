@@ -131,7 +131,7 @@ impl SessionIndex {
         }
 
         let mut metas = Vec::new();
-        for entry in walk_jsonl(sessions_root) {
+        for entry in walk_sessions(sessions_root) {
             let Ok(path) = entry else { continue };
             if let Ok(meta) = build_meta_from_file(&path) {
                 metas.push(meta);
@@ -317,6 +317,15 @@ fn build_meta(
 }
 
 fn build_meta_from_file(path: &Path) -> Result<SessionMeta> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonl") => build_meta_from_jsonl(path),
+        #[cfg(feature = "sqlite-sessions")]
+        Some("sqlite") => build_meta_from_sqlite(path),
+        _ => build_meta_from_jsonl(path),
+    }
+}
+
+fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
     let content = fs::read_to_string(path)
         .map_err(|err| Error::session(format!("Read session file {}: {err}", path.display())))?;
     let mut lines = content.lines();
@@ -337,6 +346,26 @@ fn build_meta_from_file(path: &Path) -> Result<SessionMeta> {
     }
 
     build_meta(path, &header, &entries)
+}
+
+#[cfg(feature = "sqlite-sessions")]
+fn build_meta_from_sqlite(path: &Path) -> Result<SessionMeta> {
+    let meta = futures::executor::block_on(async {
+        crate::session_sqlite::load_session_meta(path).await
+    })?;
+    let header = meta.header;
+    let (last_modified_ms, size_bytes) = file_stats(path)?;
+
+    Ok(SessionMeta {
+        path: path.display().to_string(),
+        id: header.id,
+        cwd: header.cwd,
+        timestamp: header.timestamp,
+        message_count: meta.message_count,
+        last_modified_ms,
+        size_bytes,
+        name: meta.name,
+    })
 }
 
 fn session_stats(entries: &[SessionEntry]) -> (u64, Option<String>) {
@@ -368,14 +397,23 @@ fn file_stats(path: &Path) -> Result<(i64, u64)> {
     Ok((ms, size))
 }
 
-fn walk_jsonl(root: &Path) -> Vec<std::io::Result<PathBuf>> {
+fn is_session_file_path(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonl") => true,
+        #[cfg(feature = "sqlite-sessions")]
+        Some("sqlite") => true,
+        _ => false,
+    }
+}
+
+fn walk_sessions(root: &Path) -> Vec<std::io::Result<PathBuf>> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                out.extend(walk_jsonl(&path));
-            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                out.extend(walk_sessions(&path));
+            } else if is_session_file_path(&path) {
                 out.push(Ok(path));
             }
         }

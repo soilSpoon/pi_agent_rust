@@ -3,6 +3,7 @@
 //! Provides an interactive list for choosing which session to resume.
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -350,8 +351,25 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
         sessions = index.list_sessions(Some(&cwd_key)).unwrap_or_default();
     }
 
-    if sessions.is_empty() {
-        sessions = scan_sessions_on_disk(&project_session_dir);
+    sessions.retain(|meta| Path::new(&meta.path).exists());
+
+    let scanned = scan_sessions_on_disk(&project_session_dir);
+    if !scanned.is_empty() {
+        let mut by_path: HashMap<String, SessionMeta> = sessions
+            .into_iter()
+            .map(|meta| (meta.path.clone(), meta))
+            .collect();
+
+        for meta in scanned {
+            let should_replace = by_path
+                .get(&meta.path)
+                .is_some_and(|existing| meta.last_modified_ms > existing.last_modified_ms);
+            if should_replace || !by_path.contains_key(&meta.path) {
+                by_path.insert(meta.path.clone(), meta);
+            }
+        }
+
+        sessions = by_path.into_values().collect();
     }
 
     sessions.sort_by_key(|m| Reverse(m.last_modified_ms));
@@ -367,7 +385,7 @@ fn scan_sessions_on_disk(project_session_dir: &Path) -> Vec<SessionMeta> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "jsonl") {
+        if is_session_file_path(&path) {
             if let Ok(meta) = build_meta_from_file(&path) {
                 out.push(meta);
             }
@@ -378,6 +396,18 @@ fn scan_sessions_on_disk(project_session_dir: &Path) -> Vec<SessionMeta> {
 }
 
 fn build_meta_from_file(path: &Path) -> crate::error::Result<SessionMeta> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonl") => build_meta_from_jsonl(path),
+        #[cfg(feature = "sqlite-sessions")]
+        Some("sqlite") => build_meta_from_sqlite(path),
+        _ => Err(Error::session(format!(
+            "Unsupported session file extension: {}",
+            path.display()
+        ))),
+    }
+}
+
+fn build_meta_from_jsonl(path: &Path) -> crate::error::Result<SessionMeta> {
     let content = fs::read_to_string(path)?;
     let mut lines = content.lines();
     let header: SessionHeader = lines
@@ -421,6 +451,43 @@ fn build_meta_from_file(path: &Path) -> crate::error::Result<SessionMeta> {
         size_bytes,
         name,
     })
+}
+
+#[cfg(feature = "sqlite-sessions")]
+fn build_meta_from_sqlite(path: &Path) -> crate::error::Result<SessionMeta> {
+    let meta = futures::executor::block_on(async {
+        crate::session_sqlite::load_session_meta(path).await
+    })?;
+    let header = meta.header;
+
+    let sqlite_meta = fs::metadata(path)?;
+    let size_bytes = sqlite_meta.len();
+    let modified = sqlite_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let millis = modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let last_modified_ms = i64::try_from(millis).unwrap_or(i64::MAX);
+
+    Ok(SessionMeta {
+        path: path.display().to_string(),
+        id: header.id,
+        cwd: header.cwd,
+        timestamp: header.timestamp,
+        message_count: meta.message_count,
+        last_modified_ms,
+        size_bytes,
+        name: meta.name,
+    })
+}
+
+fn is_session_file_path(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonl") => true,
+        #[cfg(feature = "sqlite-sessions")]
+        Some("sqlite") => true,
+        _ => false,
+    }
 }
 
 pub(crate) fn delete_session_file(path: &Path) -> Result<()> {

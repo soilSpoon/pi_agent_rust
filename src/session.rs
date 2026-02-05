@@ -50,6 +50,52 @@ pub fn get_share_viewer_url(gist_id: &str) -> String {
     build_share_viewer_url(base_url.as_deref(), gist_id)
 }
 
+/// Session persistence backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStoreKind {
+    Jsonl,
+    #[cfg(feature = "sqlite-sessions")]
+    Sqlite,
+}
+
+impl SessionStoreKind {
+    fn from_config(config: &Config) -> Self {
+        let Some(value) = config.session_store.as_deref() else {
+            return Self::Jsonl;
+        };
+
+        if value.eq_ignore_ascii_case("jsonl") {
+            return Self::Jsonl;
+        }
+
+        if value.eq_ignore_ascii_case("sqlite") {
+            #[cfg(feature = "sqlite-sessions")]
+            {
+                return Self::Sqlite;
+            }
+
+            #[cfg(not(feature = "sqlite-sessions"))]
+            {
+                tracing::warn!(
+                    "Config requests session_store=sqlite but binary lacks `sqlite-sessions`; falling back to jsonl"
+                );
+                return Self::Jsonl;
+            }
+        }
+
+        tracing::warn!("Unknown session_store `{value}`, falling back to jsonl");
+        Self::Jsonl
+    }
+
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            #[cfg(feature = "sqlite-sessions")]
+            Self::Sqlite => "sqlite",
+        }
+    }
+}
+
 // ============================================================================
 // Session
 // ============================================================================
@@ -67,6 +113,7 @@ pub struct Session {
     pub leaf_id: Option<String>,
     /// Base directory for session storage (optional override)
     pub session_dir: Option<PathBuf>,
+    store_kind: SessionStoreKind,
 }
 
 /// Result of planning a `/fork` operation from a specific user message.
@@ -145,8 +192,10 @@ impl Session {
             return Self::continue_recent_in_dir(session_dir.as_deref(), config).await;
         }
 
+        let store_kind = SessionStoreKind::from_config(config);
+
         // Create a new session
-        Ok(Self::create_with_dir(session_dir))
+        Ok(Self::create_with_dir_and_store(session_dir, store_kind))
     }
 
     /// Resume a session by prompting the user to select from recent sessions.
@@ -162,15 +211,16 @@ impl Session {
         }
 
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
+        let store_kind = SessionStoreKind::from_config(config);
         let cwd = std::env::current_dir()?;
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
 
         if !project_session_dir.exists() {
-            return Ok(Self::create_with_dir(Some(base_dir)));
+            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
         }
 
-        let mut entries: Vec<SessionPickEntry> = SessionIndex::for_sessions_root(&base_dir)
+        let entries: Vec<SessionPickEntry> = SessionIndex::for_sessions_root(&base_dir)
             .list_sessions(Some(&cwd.display().to_string()))
             .map(|list| {
                 list.into_iter()
@@ -179,12 +229,22 @@ impl Session {
             })
             .unwrap_or_default();
 
-        if entries.is_empty() {
-            entries = scan_sessions_on_disk(&project_session_dir)?;
+        let scanned = scan_sessions_on_disk(&project_session_dir)?;
+        let mut by_path: HashMap<PathBuf, SessionPickEntry> = HashMap::new();
+        for entry in entries.into_iter().chain(scanned.into_iter()) {
+            by_path
+                .entry(entry.path.clone())
+                .and_modify(|existing| {
+                    if entry.last_modified_ms > existing.last_modified_ms {
+                        *existing = entry.clone();
+                    }
+                })
+                .or_insert(entry);
         }
+        let mut entries = by_path.into_values().collect::<Vec<_>>();
 
         if entries.is_empty() {
-            return Ok(Self::create_with_dir(Some(base_dir)));
+            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
         }
 
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_modified_ms));
@@ -219,7 +279,7 @@ impl Session {
             attempts += 1;
             if attempts > 3 {
                 console.render_warning("No selection made. Starting a new session.");
-                return Ok(Self::create_with_dir(Some(base_dir)));
+                return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
             }
 
             print!(
@@ -238,7 +298,7 @@ impl Session {
             let input = input.trim();
             if input.is_empty() {
                 console.render_info("Starting a new session.");
-                return Ok(Self::create_with_dir(Some(base_dir)));
+                return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
             }
 
             match input.parse::<usize>() {
@@ -292,6 +352,7 @@ impl Session {
             path: None,
             leaf_id: None,
             session_dir: None,
+            store_kind: SessionStoreKind::Jsonl,
         }
     }
 
@@ -302,6 +363,13 @@ impl Session {
 
     /// Create a new session with an optional base directory override.
     pub fn create_with_dir(session_dir: Option<PathBuf>) -> Self {
+        Self::create_with_dir_and_store(session_dir, SessionStoreKind::Jsonl)
+    }
+
+    pub fn create_with_dir_and_store(
+        session_dir: Option<PathBuf>,
+        store_kind: SessionStoreKind,
+    ) -> Self {
         let header = SessionHeader::new();
         Self {
             header,
@@ -309,6 +377,7 @@ impl Session {
             path: None,
             leaf_id: None,
             session_dir,
+            store_kind,
         }
     }
 
@@ -330,7 +399,26 @@ impl Session {
             });
         }
 
-        let content = asupersync::fs::read_to_string(&path).await?;
+        if path.extension().is_some_and(|ext| ext == "sqlite") {
+            #[cfg(feature = "sqlite-sessions")]
+            {
+                let session = Self::open_sqlite(&path).await?;
+                return Ok((session, SessionOpenDiagnostics::default()));
+            }
+
+            #[cfg(not(feature = "sqlite-sessions"))]
+            {
+                return Err(Error::session(
+                    "SQLite session files require building with `--features sqlite-sessions`",
+                ));
+            }
+        }
+
+        Self::open_jsonl_with_diagnostics(&path).await
+    }
+
+    async fn open_jsonl_with_diagnostics(path: &Path) -> Result<(Self, SessionOpenDiagnostics)> {
+        let content = asupersync::fs::read_to_string(path).await?;
         let mut lines = content.lines();
 
         // Parse header (first line)
@@ -363,19 +451,54 @@ impl Session {
             Self {
                 header,
                 entries,
-                path: Some(path),
+                path: Some(path.to_path_buf()),
                 leaf_id,
                 session_dir: None,
+                store_kind: SessionStoreKind::Jsonl,
             },
             diagnostics,
         ))
     }
 
+    #[cfg(feature = "sqlite-sessions")]
+    async fn open_sqlite(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
+        let (tx, rx) = oneshot::channel();
+
+        thread::spawn(move || {
+            let res = (|| -> Result<Self> {
+                let (header, mut entries) = futures::executor::block_on(async {
+                    crate::session_sqlite::load_session(&path).await
+                })?;
+                ensure_entry_ids(&mut entries);
+                let leaf_id = entries.iter().rev().find_map(|e| e.base_id().cloned());
+
+                Ok(Self {
+                    header,
+                    entries,
+                    path: Some(path),
+                    leaf_id,
+                    session_dir: None,
+                    store_kind: SessionStoreKind::Sqlite,
+                })
+            })();
+
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
+        });
+
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
+            .await
+            .map_err(|_| Error::session("Open task cancelled"))?
+    }
+
     /// Continue the most recent session.
     pub async fn continue_recent_in_dir(
         override_dir: Option<&Path>,
-        _config: &Config,
+        config: &Config,
     ) -> Result<Self> {
+        let store_kind = SessionStoreKind::from_config(config);
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
         let cwd = std::env::current_dir()?;
         let cwd_display = cwd.display().to_string();
@@ -383,53 +506,84 @@ impl Session {
         let project_session_dir = base_dir.join(&encoded_cwd);
 
         if !project_session_dir.exists() {
-            return Ok(Self::create_with_dir(Some(base_dir)));
+            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
         }
 
         // Prefer the session index for fast lookup.
         let index = SessionIndex::for_sessions_root(&base_dir);
-        let mut indexed_sessions = index.list_sessions(Some(&cwd_display)).ok();
+        let mut indexed_sessions: Vec<SessionPickEntry> = index
+            .list_sessions(Some(&cwd_display))
+            .map(|list| {
+                list.into_iter()
+                    .filter_map(SessionPickEntry::from_meta)
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        if indexed_sessions
-            .as_ref()
-            .is_some_and(std::vec::Vec::is_empty)
-            && index.reindex_all().is_ok()
-        {
-            indexed_sessions = index.list_sessions(Some(&cwd_display)).ok();
+        if indexed_sessions.is_empty() && index.reindex_all().is_ok() {
+            indexed_sessions = index
+                .list_sessions(Some(&cwd_display))
+                .map(|list| {
+                    list.into_iter()
+                        .filter_map(SessionPickEntry::from_meta)
+                        .collect()
+                })
+                .unwrap_or_default();
         }
 
-        if let Some(list) = indexed_sessions {
-            if let Some(meta) = list.first() {
-                let mut session = Self::open(&meta.path).await?;
-                session.session_dir = Some(base_dir);
-                return Ok(session);
-            }
+        let scanned = scan_sessions_on_disk(&project_session_dir)?;
+
+        let mut by_path: HashMap<PathBuf, SessionPickEntry> = HashMap::new();
+        for entry in indexed_sessions.into_iter().chain(scanned.into_iter()) {
+            by_path
+                .entry(entry.path.clone())
+                .and_modify(|existing| {
+                    if entry.last_modified_ms > existing.last_modified_ms {
+                        *existing = entry.clone();
+                    }
+                })
+                .or_insert(entry);
         }
 
-        // Fallback: scan the filesystem for the most recent session file.
-        let mut entries: Vec<_> = std::fs::read_dir(&project_session_dir)?
-            .filter_map(std::result::Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-            .collect();
+        let mut candidates = by_path.into_values().collect::<Vec<_>>();
+        candidates.sort_by_key(|entry| std::cmp::Reverse(entry.last_modified_ms));
 
-        entries.sort_by_key(|e| {
-            e.metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        });
-
-        if let Some(entry) = entries.pop() {
-            let mut session = Self::open(entry.path().to_string_lossy().as_ref()).await?;
+        if let Some(entry) = candidates.first() {
+            let mut session = Self::open(entry.path.to_string_lossy().as_ref()).await?;
             session.session_dir = Some(base_dir);
             Ok(session)
         } else {
-            Ok(Self::create_with_dir(Some(base_dir)))
+            Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind))
         }
     }
 
     /// Save the session to disk.
+    #[allow(clippy::too_many_lines)]
     pub async fn save(&mut self) -> Result<()> {
         ensure_entry_ids(&mut self.entries);
+
+        let store_kind = match self
+            .path
+            .as_ref()
+            .and_then(|path| path.extension().and_then(|ext| ext.to_str()))
+        {
+            Some("jsonl") => SessionStoreKind::Jsonl,
+            Some("sqlite") => {
+                #[cfg(feature = "sqlite-sessions")]
+                {
+                    SessionStoreKind::Sqlite
+                }
+
+                #[cfg(not(feature = "sqlite-sessions"))]
+                {
+                    return Err(Error::session(
+                        "SQLite session files require building with `--features sqlite-sessions`",
+                    ));
+                }
+            }
+            _ => self.store_kind,
+        };
+
         if self.path.is_none() {
             // Create a new path
             let base_dir = self
@@ -443,50 +597,84 @@ impl Session {
             asupersync::fs::create_dir_all(&project_session_dir).await?;
 
             let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
-            let filename = format!("{}_{}.jsonl", timestamp, &self.header.id[..8]);
+            let filename = format!(
+                "{}_{}.{}",
+                timestamp,
+                &self.header.id[..8],
+                store_kind.extension()
+            );
             self.path = Some(project_session_dir.join(filename));
         }
 
-        let path = self.path.clone().unwrap();
-        let mut content = String::new();
-
-        // Write header
-        content.push_str(&serde_json::to_string(&self.header)?);
-        content.push('\n');
-
-        // Write entries
-        for entry in &self.entries {
-            content.push_str(&serde_json::to_string(entry)?);
-            content.push('\n');
-        }
-
         let session_clone = self.clone();
-        let path_clone = path.clone();
-        let content_clone = content.clone();
         let session_dir_clone = self.session_dir.clone();
+        let path = self.path.clone().unwrap();
+        let path_clone = path.clone();
 
         let (tx, rx) = oneshot::channel();
 
-        thread::spawn(move || {
-            let res = || -> Result<()> {
-                let parent = path_clone.parent().unwrap_or_else(|| Path::new("."));
-                let temp_file = tempfile::NamedTempFile::new_in(parent)?;
-                std::fs::write(temp_file.path(), content_clone)?;
-                temp_file
-                    .persist(&path_clone)
-                    .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
+        match store_kind {
+            SessionStoreKind::Jsonl => {
+                let mut content = String::new();
 
-                let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
-                if let Err(err) =
-                    SessionIndex::for_sessions_root(&sessions_root).index_session(&session_clone)
-                {
-                    tracing::warn!("Failed to update session index: {err}");
+                // Write header
+                content.push_str(&serde_json::to_string(&session_clone.header)?);
+                content.push('\n');
+
+                // Write entries
+                for entry in &session_clone.entries {
+                    content.push_str(&serde_json::to_string(entry)?);
+                    content.push('\n');
                 }
-                Ok(())
-            }();
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
+
+                thread::spawn(move || {
+                    let res = || -> Result<()> {
+                        let parent = path_clone.parent().unwrap_or_else(|| Path::new("."));
+                        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+                        std::fs::write(temp_file.path(), content)?;
+                        temp_file
+                            .persist(&path_clone)
+                            .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
+
+                        let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
+                        if let Err(err) = SessionIndex::for_sessions_root(&sessions_root)
+                            .index_session(&session_clone)
+                        {
+                            tracing::warn!("Failed to update session index: {err}");
+                        }
+                        Ok(())
+                    }();
+                    let cx = AgentCx::for_request();
+                    let _ = tx.send(cx.cx(), res);
+                });
+            }
+            #[cfg(feature = "sqlite-sessions")]
+            SessionStoreKind::Sqlite => {
+                thread::spawn(move || {
+                    let res = || -> Result<()> {
+                        futures::executor::block_on(async {
+                            crate::session_sqlite::save_session(
+                                &path_clone,
+                                &session_clone.header,
+                                &session_clone.entries,
+                            )
+                            .await
+                        })?;
+
+                        let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
+                        if let Err(err) = SessionIndex::for_sessions_root(&sessions_root)
+                            .index_session(&session_clone)
+                        {
+                            tracing::warn!("Failed to update session index: {err}");
+                        }
+                        Ok(())
+                    }();
+
+                    let cx = AgentCx::for_request();
+                    let _ = tx.send(cx.cx(), res);
+                });
+            }
+        }
 
         let cx = AgentCx::for_request();
         rx.recv(cx.cx())
@@ -1140,7 +1328,7 @@ fn scan_sessions_on_disk(project_session_dir: &Path) -> Result<Vec<SessionPickEn
     for entry in dir_entries {
         let entry = entry.map_err(|e| Error::session(format!("Read dir entry: {e}")))?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "jsonl") {
+        if is_session_file_path(&path) {
             if let Ok(meta) = load_session_meta(&path) {
                 entries.push(meta);
             }
@@ -1149,7 +1337,28 @@ fn scan_sessions_on_disk(project_session_dir: &Path) -> Result<Vec<SessionPickEn
     Ok(entries)
 }
 
+fn is_session_file_path(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonl") => true,
+        #[cfg(feature = "sqlite-sessions")]
+        Some("sqlite") => true,
+        _ => false,
+    }
+}
+
 fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonl") => load_session_meta_jsonl(path),
+        #[cfg(feature = "sqlite-sessions")]
+        Some("sqlite") => load_session_meta_sqlite(path),
+        _ => Err(Error::session(format!(
+            "Unsupported session file extension: {}",
+            path.display()
+        ))),
+    }
+}
+
+fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| Error::session(format!("Failed to read session: {e}")))?;
     let mut lines = content.lines();
@@ -1190,6 +1399,32 @@ fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
         timestamp: header.timestamp,
         message_count,
         name,
+        last_modified_ms,
+    })
+}
+
+#[cfg(feature = "sqlite-sessions")]
+fn load_session_meta_sqlite(path: &Path) -> Result<SessionPickEntry> {
+    let meta = futures::executor::block_on(async {
+        crate::session_sqlite::load_session_meta(path).await
+    })?;
+    let header = meta.header;
+
+    let modified = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    #[allow(clippy::cast_possible_truncation)]
+    let last_modified_ms = modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64; // i64::MAX ms = ~292 million years, so truncation is safe
+
+    Ok(SessionPickEntry {
+        path: path.to_path_buf(),
+        id: header.id,
+        timestamp: header.timestamp,
+        message_count: meta.message_count,
+        name: meta.name,
         last_modified_ms,
     })
 }

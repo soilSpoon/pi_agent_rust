@@ -48,6 +48,9 @@ pub struct Config {
     /// Non-interactive session picker selection (1-based index).
     #[serde(alias = "sessionPickerInput")]
     pub session_picker_input: Option<u32>,
+    /// Session persistence backend: `jsonl` (default) or `sqlite` (requires `sqlite-sessions`).
+    #[serde(alias = "sessionStore", alias = "sessionBackend")]
+    pub session_store: Option<String>,
 
     // Compaction
     pub compaction: Option<CompactionSettings>,
@@ -296,6 +299,7 @@ impl Config {
                 .autocomplete_max_visible
                 .or(base.autocomplete_max_visible),
             session_picker_input: other.session_picker_input.or(base.session_picker_input),
+            session_store: other.session_store.or(base.session_store),
 
             // Compaction
             compaction: merge_compaction(base.compaction, other.compaction),
