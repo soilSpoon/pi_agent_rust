@@ -1010,4 +1010,256 @@ mod tests {
         assert_eq!(config.steering_queue_mode(), QueueMode::OneAtATime);
         assert_eq!(config.follow_up_queue_mode(), QueueMode::OneAtATime);
     }
+
+    // ── thinking_budget accessor ───────────────────────────────────────
+
+    #[test]
+    fn thinking_budget_returns_defaults_when_unset() {
+        let config = Config::default();
+        assert_eq!(config.thinking_budget("minimal"), 1024);
+        assert_eq!(config.thinking_budget("low"), 2048);
+        assert_eq!(config.thinking_budget("medium"), 8192);
+        assert_eq!(config.thinking_budget("high"), 16384);
+        assert_eq!(config.thinking_budget("xhigh"), u32::MAX);
+        assert_eq!(config.thinking_budget("unknown-level"), 0);
+    }
+
+    #[test]
+    fn thinking_budget_uses_custom_values() {
+        let config = Config {
+            thinking_budgets: Some(super::ThinkingBudgets {
+                minimal: Some(100),
+                low: Some(200),
+                medium: Some(300),
+                high: Some(400),
+                xhigh: Some(500),
+            }),
+            ..Config::default()
+        };
+        assert_eq!(config.thinking_budget("minimal"), 100);
+        assert_eq!(config.thinking_budget("low"), 200);
+        assert_eq!(config.thinking_budget("medium"), 300);
+        assert_eq!(config.thinking_budget("high"), 400);
+        assert_eq!(config.thinking_budget("xhigh"), 500);
+    }
+
+    // ── enable_skill_commands ──────────────────────────────────────────
+
+    #[test]
+    fn enable_skill_commands_defaults_to_true() {
+        let config = Config::default();
+        assert!(config.enable_skill_commands());
+    }
+
+    #[test]
+    fn enable_skill_commands_can_be_disabled() {
+        let config = Config {
+            enable_skill_commands: Some(false),
+            ..Config::default()
+        };
+        assert!(!config.enable_skill_commands());
+    }
+
+    // ── branch_summary_reserve_tokens ──────────────────────────────────
+
+    #[test]
+    fn branch_summary_reserve_tokens_falls_back_to_compaction() {
+        let config = Config {
+            compaction: Some(super::CompactionSettings {
+                reserve_tokens: Some(9999),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        assert_eq!(config.branch_summary_reserve_tokens(), 9999);
+    }
+
+    #[test]
+    fn branch_summary_reserve_tokens_uses_own_value() {
+        let config = Config {
+            compaction: Some(super::CompactionSettings {
+                reserve_tokens: Some(9999),
+                ..Default::default()
+            }),
+            branch_summary: Some(super::BranchSummarySettings {
+                reserve_tokens: Some(1111),
+            }),
+            ..Config::default()
+        };
+        assert_eq!(config.branch_summary_reserve_tokens(), 1111);
+    }
+
+    // ── deep_merge_settings_value ──────────────────────────────────────
+
+    #[test]
+    fn deep_merge_null_value_removes_key() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let settings_path =
+            Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd);
+
+        write_file(
+            &settings_path,
+            r#"{ "theme": "dark", "default_provider": "anthropic" }"#,
+        );
+
+        Config::patch_settings_with_roots(
+            SettingsScope::Project,
+            &global_dir,
+            &cwd,
+            json!({ "theme": null }),
+        )
+        .expect("patch");
+
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        assert!(stored.get("theme").is_none());
+        assert_eq!(stored["default_provider"], json!("anthropic"));
+    }
+
+    // ── parse_queue_mode ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_queue_mode_parses_known_values() {
+        assert_eq!(
+            super::parse_queue_mode(Some("all")),
+            Some(QueueMode::All)
+        );
+        assert_eq!(
+            super::parse_queue_mode(Some("one-at-a-time")),
+            Some(QueueMode::OneAtATime)
+        );
+        assert_eq!(super::parse_queue_mode(Some("unknown")), None);
+        assert_eq!(super::parse_queue_mode(None), None);
+    }
+
+    // ── PackageSource serde ────────────────────────────────────────────
+
+    #[test]
+    fn package_source_serde_string_variant() {
+        let parsed: super::PackageSource =
+            serde_json::from_value(json!("npm:my-ext@1.0")).expect("parse");
+        assert!(matches!(parsed, super::PackageSource::String(s) if s == "npm:my-ext@1.0"));
+    }
+
+    #[test]
+    fn package_source_serde_detailed_variant() {
+        let parsed: super::PackageSource = serde_json::from_value(json!({
+            "source": "git:org/repo",
+            "local": true,
+            "kind": "extension"
+        }))
+        .expect("parse");
+        assert!(matches!(
+            parsed,
+            super::PackageSource::Detailed { source, local: Some(true), kind: Some(_) } if source == "git:org/repo"
+        ));
+    }
+
+    // ── settings_path_with_roots ───────────────────────────────────────
+
+    #[test]
+    fn settings_path_global_and_project_differ() {
+        let global_path = Config::settings_path_with_roots(
+            SettingsScope::Global,
+            std::path::Path::new("/global"),
+            std::path::Path::new("/project"),
+        );
+        let project_path = Config::settings_path_with_roots(
+            SettingsScope::Project,
+            std::path::Path::new("/global"),
+            std::path::Path::new("/project"),
+        );
+        assert_ne!(global_path, project_path);
+        assert!(global_path.starts_with("/global"));
+        assert!(project_path.starts_with("/project"));
+    }
+
+    // ── SettingsScope equality ──────────────────────────────────────────
+
+    #[test]
+    fn settings_scope_equality() {
+        assert_eq!(SettingsScope::Global, SettingsScope::Global);
+        assert_eq!(SettingsScope::Project, SettingsScope::Project);
+        assert_ne!(SettingsScope::Global, SettingsScope::Project);
+    }
+
+    // ── camelCase alias fields ─────────────────────────────────────────
+
+    #[test]
+    fn camel_case_aliases_are_parsed() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{
+                "hideThinkingBlock": true,
+                "showHardwareCursor": true,
+                "quietStartup": true,
+                "collapseChangelog": true,
+                "doubleEscapeAction": "quit",
+                "editorPaddingX": 5,
+                "autocompleteMaxVisible": 15,
+                "sessionPickerInput": 2
+            }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        assert_eq!(config.hide_thinking_block, Some(true));
+        assert_eq!(config.show_hardware_cursor, Some(true));
+        assert_eq!(config.quiet_startup, Some(true));
+        assert_eq!(config.collapse_changelog, Some(true));
+        assert_eq!(config.double_escape_action.as_deref(), Some("quit"));
+        assert_eq!(config.editor_padding_x, Some(5));
+        assert_eq!(config.autocomplete_max_visible, Some(15));
+        assert_eq!(config.session_picker_input, Some(2));
+    }
+
+    // ── Config serde roundtrip ─────────────────────────────────────────
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = Config {
+            theme: Some("dark".to_string()),
+            default_provider: Some("anthropic".to_string()),
+            compaction: Some(super::CompactionSettings {
+                enabled: Some(true),
+                reserve_tokens: Some(1000),
+                keep_recent_tokens: Some(2000),
+            }),
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let deserialized: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.theme.as_deref(), Some("dark"));
+        assert_eq!(
+            deserialized.default_provider.as_deref(),
+            Some("anthropic")
+        );
+        assert!(deserialized.compaction_enabled());
+    }
+
+    // ── merge thinking budgets ─────────────────────────────────────────
+
+    #[test]
+    fn merge_thinking_budgets_combines_values() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "thinking_budgets": { "minimal": 100, "low": 200 } }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{ "thinking_budgets": { "minimal": 999 } }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
+        assert_eq!(config.thinking_budget("minimal"), 999);
+        assert_eq!(config.thinking_budget("low"), 200);
+    }
 }

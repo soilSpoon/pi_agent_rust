@@ -621,4 +621,153 @@ mod tests {
             InputEventOutcome::Continue { .. } => panic!("expected block"),
         }
     }
+
+    // ── unknown action falls through to continue ───────────────────────
+
+    #[test]
+    fn apply_input_event_response_unknown_action_falls_through() {
+        let original_images = sample_images();
+        // Unknown action, no block flag, no text override → falls through to original
+        let outcome = apply_input_event_response(
+            Some(json!({ "action": "unknown_action" })),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(outcome, "original", &original_images);
+    }
+
+    // ── non-object, non-string, non-null response ──────────────────────
+
+    #[test]
+    fn apply_input_event_response_number_returns_original() {
+        let original_images = sample_images();
+        let outcome = apply_input_event_response(
+            Some(json!(42)),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(outcome, "original", &original_images);
+    }
+
+    #[test]
+    fn apply_input_event_response_boolean_returns_original() {
+        let original_images = sample_images();
+        let outcome = apply_input_event_response(
+            Some(json!(true)),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(outcome, "original", &original_images);
+    }
+
+    #[test]
+    fn apply_input_event_response_array_returns_original() {
+        let original_images = sample_images();
+        let outcome = apply_input_event_response(
+            Some(json!([1, 2, 3])),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(outcome, "original", &original_images);
+    }
+
+    // ── ToolCallEventResult default ────────────────────────────────────
+
+    #[test]
+    fn tool_call_event_result_default_is_not_blocked() {
+        let result = ToolCallEventResult::default();
+        assert!(!result.block);
+        assert!(result.reason.is_none());
+    }
+
+    // ── InputEventResult equality ──────────────────────────────────────
+
+    #[test]
+    fn input_event_result_equality() {
+        let a = InputEventResult {
+            content: Some("hello".to_string()),
+            block: false,
+            reason: None,
+        };
+        let b = InputEventResult {
+            content: Some("hello".to_string()),
+            block: false,
+            reason: None,
+        };
+        assert_eq!(a, b);
+    }
+
+    // ── transform with content key instead of text ─────────────────────
+
+    #[test]
+    fn apply_input_event_response_transform_uses_content_key() {
+        let original_images = sample_images();
+        let outcome = apply_input_event_response(
+            Some(json!({ "action": "transform", "content": "transformed via content" })),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(outcome, "transformed via content", &original_images);
+    }
+
+    // ── text override without action ───────────────────────────────────
+
+    #[test]
+    fn apply_input_event_response_text_override_without_action() {
+        let original_images = sample_images();
+        let outcome = apply_input_event_response(
+            Some(json!({ "text": "overridden text" })),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(outcome, "overridden text", &original_images);
+    }
+
+    // ── attachments key for images ─────────────────────────────────────
+
+    #[test]
+    fn apply_input_event_response_attachments_key_for_images() {
+        let outcome = apply_input_event_response(
+            Some(json!({
+                "text": "with attachments",
+                "attachments": [{ "data": "ATT_BASE64", "mimeType": "image/gif" }]
+            })),
+            "original".to_string(),
+            sample_images(),
+        );
+        match outcome {
+            InputEventOutcome::Continue { text, images } => {
+                assert_eq!(text, "with attachments");
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].data, "ATT_BASE64");
+            }
+            InputEventOutcome::Block { .. } => panic!("expected continue"),
+        }
+    }
+
+    // ── block: false doesn't block ─────────────────────────────────────
+
+    #[test]
+    fn apply_input_event_response_block_false_does_not_block() {
+        let original_images = sample_images();
+        let outcome = apply_input_event_response(
+            Some(json!({ "block": false })),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(outcome, "original", &original_images);
+    }
+
+    // ── empty object returns original ──────────────────────────────────
+
+    #[test]
+    fn apply_input_event_response_empty_object_returns_original() {
+        let original_images = sample_images();
+        let outcome = apply_input_event_response(
+            Some(json!({})),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(outcome, "original", &original_images);
+    }
 }
