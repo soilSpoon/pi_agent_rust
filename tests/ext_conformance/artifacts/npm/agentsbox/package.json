@@ -1,0 +1,78 @@
+{
+  "name": "agentsbox",
+  "version": "0.1.3",
+  "description": "Tool-search facade for MCP servers (OpenCode + pi integrations)",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./opencode": {
+      "import": "./dist/opencode.js"
+    },
+    "./pi": {
+      "import": "./dist/pi.js"
+    }
+  },
+  "bin": {
+    "agentsbox": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts src/opencode.ts src/pi.ts src/cli.ts --outdir dist --target node --external '@mariozechner/clipboard-*' && bun scripts/prepare-pi-extension.ts",
+    "dev": "bun --hot src/opencode.ts",
+    "check": "biome check .",
+    "check:fix": "biome check --write --unsafe .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage",
+    "bench": "bun run bench:search && bun run bench:init && bun run bench:concurrent",
+    "bench:search": "bun run bench/search.bench.ts",
+    "bench:init": "bun run bench/init.bench.ts",
+    "bench:concurrent": "bun run bench/concurrent.bench.ts",
+    "prepare": "node -e \"const { existsSync } = require('node:fs'); const { execSync } = require('node:child_process'); if (process.env.CI) process.exit(0); if (existsSync('.git')) execSync('husky', { stdio: 'inherit' });\""
+  },
+  "lint-staged": {
+    "**/*.{ts,tsx,js,jsx,json,jsonc}": [
+      "biome check --write --unsafe --files-ignore-unknown true"
+    ]
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CONFIG.md",
+    "example-config.jsonc",
+    "agentsbox.schema.json",
+    "skill"
+  ],
+  "keywords": [
+    "opencode",
+    "plugin",
+    "tool-search",
+    "mcp"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/assagman/agentsbox"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.11",
+    "@types/bun": "^1.3.5",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.5.2",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.49.2",
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "@opencode-ai/plugin": "^1.1.6",
+    "@sinclair/typebox": "^0.34.41",
+    "jsonc-parser": "^3.3.1",
+    "zod": "^4.3.5"
+  }
+}

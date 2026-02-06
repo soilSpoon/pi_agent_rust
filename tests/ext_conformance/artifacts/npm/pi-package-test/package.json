@@ -1,0 +1,46 @@
+{
+  "name": "pi-package-test",
+  "version": "0.1.6",
+  "description": "Test package for pi coding agent with extensions, skills, themes, and prompts",
+  "keywords": ["pi", "pi-package", "coding-agent", "extensions", "skills", "themes"],
+  "author": "Mario Zechner",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/badlogic/pi-package-test.git"
+  },
+  "dependencies": {
+    "shitty-extensions": "^1.0.1"
+  },
+  "bundledDependencies": [
+    "shitty-extensions"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "extensions",
+      "node_modules/shitty-extensions/extensions",
+      "!**/cost-tracker.ts",
+      "!**/flicker-corp.ts",
+      "!**/funny-working-message.ts",
+      "!**/handoff.ts",
+      "!**/loop.ts",
+      "!**/plan-mode.ts",
+      "!**/speedreading.ts",
+      "!**/status-widget.ts",
+      "!**/ultrathink.ts",
+      "!**/usage-bar.ts"
+    ],
+    "skills": [
+      "skills",
+      "node_modules/shitty-extensions/skills"
+    ],
+    "themes": ["themes"],
+    "prompts": ["prompts"]
+  }
+}
