@@ -11382,4 +11382,332 @@ mod tests {
         let response = parse_extension_ui_response(&request, "beta").unwrap();
         assert_eq!(response.value, Some(json!("beta")));
     }
+
+    // --- tool_content_blocks_to_text tests ---
+
+    #[test]
+    fn tool_content_blocks_text_only() {
+        let blocks = vec![ContentBlock::Text(TextContent::new("hello world"))];
+        let result = tool_content_blocks_to_text(&blocks, false);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn tool_content_blocks_multiple_text() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("line 1")),
+            ContentBlock::Text(TextContent::new("line 2")),
+        ];
+        let result = tool_content_blocks_to_text(&blocks, false);
+        assert!(result.contains("line 1"));
+        assert!(result.contains("line 2"));
+    }
+
+    #[test]
+    fn tool_content_blocks_images_hidden() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("text")),
+            ContentBlock::Image(crate::model::ImageContent {
+                data: String::new(),
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Image(crate::model::ImageContent {
+                data: String::new(),
+                mime_type: "image/png".to_string(),
+            }),
+        ];
+        let result = tool_content_blocks_to_text(&blocks, false);
+        assert!(result.contains("text"));
+        assert!(result.contains("[2 image(s) hidden]"));
+    }
+
+    #[test]
+    fn tool_content_blocks_thinking() {
+        let blocks = vec![ContentBlock::Thinking(crate::model::ThinkingContent {
+            thinking: "reasoning here".to_string(),
+            signature: None,
+        })];
+        let result = tool_content_blocks_to_text(&blocks, false);
+        assert_eq!(result, "reasoning here");
+    }
+
+    #[test]
+    fn tool_content_blocks_tool_call() {
+        let blocks = vec![ContentBlock::ToolCall(crate::model::ToolCallContent {
+            id: "tc-1".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({"command": "ls"}),
+        })];
+        let result = tool_content_blocks_to_text(&blocks, false);
+        assert!(result.contains("[tool call: bash]"));
+    }
+
+    #[test]
+    fn tool_content_blocks_empty() {
+        let result = tool_content_blocks_to_text(&[], false);
+        assert!(result.is_empty());
+    }
+
+    // --- format_resource_diagnostics tests ---
+
+    #[test]
+    fn format_resource_diagnostics_single_warning() {
+        let diags = vec![crate::resources::ResourceDiagnostic {
+            kind: crate::resources::DiagnosticKind::Warning,
+            message: "File too large".to_string(),
+            path: PathBuf::from("/tmp/skills/big.md"),
+            collision: None,
+        }];
+        let (text, count) = format_resource_diagnostics("Skills", &diags);
+        assert_eq!(count, 1);
+        assert!(text.contains("Skills:"));
+        assert!(text.contains("warning: File too large"));
+        assert!(text.contains("/tmp/skills/big.md"));
+    }
+
+    #[test]
+    fn format_resource_diagnostics_collision() {
+        let diags = vec![crate::resources::ResourceDiagnostic {
+            kind: crate::resources::DiagnosticKind::Collision,
+            message: "Duplicate skill name".to_string(),
+            path: PathBuf::from("/a/skill.md"),
+            collision: Some(crate::resources::CollisionInfo {
+                resource_type: "skill".to_string(),
+                name: "deploy".to_string(),
+                winner_path: PathBuf::from("/a/skill.md"),
+                loser_path: PathBuf::from("/b/skill.md"),
+            }),
+        }];
+        let (text, count) = format_resource_diagnostics("Skills", &diags);
+        assert_eq!(count, 1);
+        assert!(text.contains("collision:"));
+        assert!(text.contains("[winner: /a/skill.md loser: /b/skill.md]"));
+    }
+
+    #[test]
+    fn format_resource_diagnostics_sorts_by_path_then_kind() {
+        let diags = vec![
+            crate::resources::ResourceDiagnostic {
+                kind: crate::resources::DiagnosticKind::Collision,
+                message: "z-message".to_string(),
+                path: PathBuf::from("/a"),
+                collision: None,
+            },
+            crate::resources::ResourceDiagnostic {
+                kind: crate::resources::DiagnosticKind::Warning,
+                message: "a-message".to_string(),
+                path: PathBuf::from("/a"),
+                collision: None,
+            },
+            crate::resources::ResourceDiagnostic {
+                kind: crate::resources::DiagnosticKind::Warning,
+                message: "b-message".to_string(),
+                path: PathBuf::from("/b"),
+                collision: None,
+            },
+        ];
+        let (text, count) = format_resource_diagnostics("Test", &diags);
+        assert_eq!(count, 3);
+        // Within /a: warning (rank 0) comes before collision (rank 1)
+        let warn_pos = text.find("a-message").unwrap();
+        let coll_pos = text.find("z-message").unwrap();
+        assert!(warn_pos < coll_pos, "Warning should appear before collision for same path");
+    }
+
+    #[test]
+    fn format_resource_diagnostics_empty() {
+        let (text, count) = format_resource_diagnostics("Skills", &[]);
+        assert_eq!(count, 0);
+        assert!(text.contains("Skills:"));
+    }
+
+    // --- kind_rank tests ---
+
+    #[test]
+    fn kind_rank_ordering() {
+        assert!(
+            kind_rank(&crate::resources::DiagnosticKind::Warning)
+                < kind_rank(&crate::resources::DiagnosticKind::Collision)
+        );
+    }
+
+    // --- user_content_to_text tests ---
+
+    #[test]
+    fn user_content_text_variant() {
+        let content = UserContent::Text("hello".to_string());
+        assert_eq!(user_content_to_text(&content), "hello");
+    }
+
+    #[test]
+    fn user_content_blocks_variant() {
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("first")),
+            ContentBlock::Text(TextContent::new("second")),
+        ]);
+        let result = user_content_to_text(&content);
+        assert!(result.contains("first"));
+        assert!(result.contains("second"));
+    }
+
+    // --- content_blocks_to_text tests ---
+
+    #[test]
+    fn content_blocks_to_text_mixed() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("text")),
+            ContentBlock::Thinking(crate::model::ThinkingContent {
+                thinking: "think".to_string(),
+                signature: None,
+            }),
+            ContentBlock::ToolCall(crate::model::ToolCallContent {
+                id: "tc-1".to_string(),
+                name: "read".to_string(),
+                arguments: json!({}),
+            }),
+        ];
+        let result = content_blocks_to_text(&blocks);
+        assert!(result.contains("text"));
+        assert!(result.contains("think"));
+        assert!(result.contains("[tool call: read]"));
+    }
+
+    // --- split_content_blocks_for_input tests ---
+
+    #[test]
+    fn split_content_blocks_text_and_images() {
+        let img = crate::model::ImageContent {
+            data: "base64data".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("hello")),
+            ContentBlock::Image(img.clone()),
+            ContentBlock::Thinking(crate::model::ThinkingContent {
+                thinking: "ignored".to_string(),
+                signature: None,
+            }),
+        ];
+        let (text, images) = split_content_blocks_for_input(&blocks);
+        assert_eq!(text, "hello");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "base64data");
+    }
+
+    #[test]
+    fn split_content_blocks_empty() {
+        let (text, images) = split_content_blocks_for_input(&[]);
+        assert!(text.is_empty());
+        assert!(images.is_empty());
+    }
+
+    // --- build_content_blocks_for_input tests ---
+
+    #[test]
+    fn build_content_blocks_text_and_images() {
+        let img = crate::model::ImageContent {
+            data: "d".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        let blocks = build_content_blocks_for_input("hello", &[img]);
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t.text == "hello"));
+        assert!(matches!(&blocks[1], ContentBlock::Image(_)));
+    }
+
+    #[test]
+    fn build_content_blocks_empty_text_skipped() {
+        let blocks = build_content_blocks_for_input("  ", &[]);
+        assert!(blocks.is_empty());
+    }
+
+    // --- next_non_whitespace_token tests ---
+
+    #[test]
+    fn next_token_basic() {
+        let (token, end) = next_non_whitespace_token("hello world", 0);
+        assert_eq!(token, "hello");
+        assert_eq!(end, 5);
+    }
+
+    #[test]
+    fn next_token_past_end() {
+        let (token, end) = next_non_whitespace_token("abc", 10);
+        assert_eq!(token, "");
+        assert_eq!(end, 3);
+    }
+
+    #[test]
+    fn next_token_last_word() {
+        let (token, end) = next_non_whitespace_token("a bc", 2);
+        assert_eq!(token, "bc");
+        assert_eq!(end, 4);
+    }
+
+    // --- SlashCommand::parse additional coverage ---
+
+    #[test]
+    fn slash_command_all_variants_parse() {
+        // Verify all main slash commands parse correctly
+        let cases = vec![
+            ("/login", SlashCommand::Login),
+            ("/logout", SlashCommand::Logout),
+            ("/settings", SlashCommand::Settings),
+            ("/s", SlashCommand::Settings),
+            ("/history", SlashCommand::History),
+            ("/export", SlashCommand::Export),
+            ("/session", SlashCommand::Session),
+            ("/theme", SlashCommand::Theme),
+            ("/resume", SlashCommand::Resume),
+            ("/new", SlashCommand::New),
+            ("/copy", SlashCommand::Copy),
+            ("/name", SlashCommand::Name),
+            ("/hotkeys", SlashCommand::Hotkeys),
+            ("/changelog", SlashCommand::Changelog),
+            ("/tree", SlashCommand::Tree),
+            ("/fork", SlashCommand::Fork),
+            ("/compact", SlashCommand::Compact),
+            ("/reload", SlashCommand::Reload),
+            ("/share", SlashCommand::Share),
+        ];
+        for (input, expected) in cases {
+            let result = SlashCommand::parse(input);
+            assert!(
+                result.is_some(),
+                "Expected {input} to parse as a SlashCommand"
+            );
+            let (cmd, _) = result.unwrap();
+            assert_eq!(
+                std::mem::discriminant(&cmd),
+                std::mem::discriminant(&expected),
+                "Mismatch for input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_command_empty_and_whitespace() {
+        assert!(SlashCommand::parse("").is_none());
+        assert!(SlashCommand::parse("  ").is_none());
+        assert!(SlashCommand::parse("/").is_none());
+    }
+
+    // --- ConversationMessage collapse boundary ---
+
+    #[test]
+    fn tool_collapse_single_line() {
+        let msg = ConversationMessage::tool("one line".to_string());
+        assert!(!msg.collapsed);
+    }
+
+    #[test]
+    fn tool_collapse_exactly_threshold_plus_one() {
+        // TOOL_AUTO_COLLAPSE_THRESHOLD + 1 lines
+        let content = (1..=TOOL_AUTO_COLLAPSE_THRESHOLD + 1)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = ConversationMessage::tool(content);
+        assert!(msg.collapsed);
+    }
 }
