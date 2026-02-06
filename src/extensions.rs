@@ -13808,6 +13808,276 @@ globalThis.__done = false;
         });
     }
 
+    // --- Table-driven session dispatch taxonomy parity tests ---
+
+    /// Helper: extract (code, message) from a `HostcallOutcome::Error`, panics otherwise.
+    fn expect_error(outcome: HostcallOutcome) -> (String, String) {
+        match outcome {
+            HostcallOutcome::Error { code, message } => (code, message),
+            HostcallOutcome::Success(v) => panic!("expected error, got success: {v}"),
+            HostcallOutcome::StreamChunk { .. } => panic!("expected error, got stream chunk"),
+        }
+    }
+
+    #[test]
+    fn session_dispatch_taxonomy_no_session_returns_denied() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+
+            // Every op should return "denied" when no session is configured.
+            let ops: &[(&str, Value)] = &[
+                ("get_state", json!({})),
+                ("get_name", json!({})),
+                ("set_name", json!({ "name": "x" })),
+                ("get_model", json!({})),
+                ("set_model", json!({ "provider": "a", "modelId": "b" })),
+                ("get_thinking_level", json!({})),
+                ("set_thinking_level", json!({ "level": "high" })),
+                ("set_label", json!({ "targetId": "e1", "label": "L" })),
+                ("append_message", json!({ "message": { "role": "user", "content": "hi" } })),
+                ("append_entry", json!({ "customType": "note", "data": {} })),
+            ];
+
+            for (op, payload) in ops {
+                let outcome =
+                    dispatch_hostcall_session("call-t", &manager, op, payload.clone()).await;
+                let (code, msg) = expect_error(outcome);
+                assert_eq!(
+                    code, "denied",
+                    "op={op}: expected 'denied', got '{code}': {msg}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn session_dispatch_taxonomy_unknown_op_returns_invalid_request() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session);
+
+            let outcome =
+                dispatch_hostcall_session("call-t", &manager, "bogus_op", json!({})).await;
+            let (code, msg) = expect_error(outcome);
+            assert_eq!(
+                code, "invalid_request",
+                "unknown op should be invalid_request, got '{code}': {msg}"
+            );
+            assert!(
+                msg.contains("bogus_op"),
+                "error message should mention the bad op name"
+            );
+        });
+    }
+
+    #[test]
+    fn session_dispatch_taxonomy_set_model_missing_fields() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session);
+
+            // Missing modelId.
+            let outcome = dispatch_hostcall_session(
+                "call-t",
+                &manager,
+                "set_model",
+                json!({ "provider": "anthropic" }),
+            )
+            .await;
+            let (code, _) = expect_error(outcome);
+            assert_eq!(code, "invalid_request", "missing modelId → invalid_request");
+
+            // Missing provider.
+            let outcome = dispatch_hostcall_session(
+                "call-t",
+                &manager,
+                "set_model",
+                json!({ "modelId": "claude-sonnet-4-5" }),
+            )
+            .await;
+            let (code, _) = expect_error(outcome);
+            assert_eq!(
+                code, "invalid_request",
+                "missing provider → invalid_request"
+            );
+
+            // Both empty strings.
+            let outcome = dispatch_hostcall_session(
+                "call-t",
+                &manager,
+                "set_model",
+                json!({ "provider": "", "modelId": "" }),
+            )
+            .await;
+            let (code, _) = expect_error(outcome);
+            assert_eq!(
+                code, "invalid_request",
+                "empty provider+modelId → invalid_request"
+            );
+        });
+    }
+
+    #[test]
+    fn session_dispatch_taxonomy_set_thinking_level_missing() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session);
+
+            let outcome = dispatch_hostcall_session(
+                "call-t",
+                &manager,
+                "set_thinking_level",
+                json!({}),
+            )
+            .await;
+            let (code, _) = expect_error(outcome);
+            assert_eq!(
+                code, "invalid_request",
+                "missing level → invalid_request"
+            );
+        });
+    }
+
+    #[test]
+    fn session_dispatch_taxonomy_set_label_missing_target_id() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session);
+
+            let outcome = dispatch_hostcall_session(
+                "call-t",
+                &manager,
+                "set_label",
+                json!({ "label": "important" }),
+            )
+            .await;
+            let (code, _) = expect_error(outcome);
+            assert_eq!(
+                code, "invalid_request",
+                "missing targetId → invalid_request"
+            );
+        });
+    }
+
+    #[test]
+    fn session_dispatch_taxonomy_success_ops() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session);
+
+            // All these ops should succeed with a proper session.
+            let success_cases: &[(&str, Value)] = &[
+                ("get_state", json!({})),
+                ("get_name", json!({})),
+                ("get_file", json!({})),
+                ("get_messages", json!({})),
+                ("get_entries", json!({})),
+                ("get_branch", json!({})),
+                ("get_model", json!({})),
+                ("get_thinking_level", json!({})),
+                ("set_name", json!({ "name": "test-session" })),
+                (
+                    "set_model",
+                    json!({ "provider": "openai", "modelId": "gpt-4o" }),
+                ),
+                ("set_thinking_level", json!({ "level": "high" })),
+                ("set_label", json!({ "targetId": "e1", "label": "ok" })),
+                (
+                    "append_entry",
+                    json!({ "customType": "note", "data": { "x": 1 } }),
+                ),
+            ];
+
+            for (op, payload) in success_cases {
+                let outcome =
+                    dispatch_hostcall_session("call-t", &manager, op, payload.clone()).await;
+                assert!(
+                    matches!(outcome, HostcallOutcome::Success(_)),
+                    "op={op}: expected success, got {outcome:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn session_dispatch_taxonomy_camel_and_snake_case_parity() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session);
+
+            // Both camelCase and snake_case variants should route to the same handler.
+            let pairs: &[(&str, &str, Value)] = &[
+                ("get_state", "getState", json!({})),
+                ("get_name", "getName", json!({})),
+                ("set_name", "setName", json!({ "name": "n" })),
+                ("get_model", "getModel", json!({})),
+                (
+                    "set_model",
+                    "setModel",
+                    json!({ "provider": "a", "modelId": "b" }),
+                ),
+                ("get_thinking_level", "getThinkingLevel", json!({})),
+                (
+                    "set_thinking_level",
+                    "setThinkingLevel",
+                    json!({ "level": "high" }),
+                ),
+                ("get_messages", "getMessages", json!({})),
+                ("get_entries", "getEntries", json!({})),
+                ("get_branch", "getBranch", json!({})),
+                ("get_file", "getFile", json!({})),
+                (
+                    "set_label",
+                    "setLabel",
+                    json!({ "targetId": "e1", "label": "L" }),
+                ),
+            ];
+
+            for (snake, camel, payload) in pairs {
+                let out_snake =
+                    dispatch_hostcall_session("c1", &manager, snake, payload.clone()).await;
+                let out_camel =
+                    dispatch_hostcall_session("c2", &manager, camel, payload.clone()).await;
+
+                let snake_ok = matches!(&out_snake, HostcallOutcome::Success(_));
+                let camel_ok = matches!(&out_camel, HostcallOutcome::Success(_));
+                assert_eq!(
+                    snake_ok, camel_ok,
+                    "op '{snake}' vs '{camel}': success parity mismatch"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn session_dispatch_taxonomy_append_message_bad_payload_returns_invalid_request() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session);
+
+            // Send a payload that cannot be deserialized as a SessionMessage.
+            let outcome = dispatch_hostcall_session(
+                "call-t",
+                &manager,
+                "append_message",
+                json!({ "message": { "not_a_valid_field": 42 } }),
+            )
+            .await;
+            let (code, _) = expect_error(outcome);
+            assert_eq!(
+                code, "invalid_request",
+                "bad append_message payload should be invalid_request"
+            );
+        });
+    }
+
     // --- registerFlag hostcall tests ---
 
     #[test]

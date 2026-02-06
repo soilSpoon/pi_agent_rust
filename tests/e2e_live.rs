@@ -697,8 +697,12 @@ fn assert_basic_stream_success(
     );
 
     // Accept TextDelta, TextEnd, or ThinkingDelta as "content" events.
-    // Some providers (e.g. Gemini 2.5) may deliver content via thinking events.
-    let has_content = events.iter().any(|e| {
+    // Some providers (e.g. Gemini 2.5 Flash) deliver all text in the first
+    // SSE chunk, which the Gemini provider emits as a Start event.  In that
+    // case there are zero TextDelta events, but the Done message still
+    // contains the accumulated text.  So we also accept non-empty text in the
+    // Done message as proof of content.
+    let has_delta_content = events.iter().any(|e| {
         matches!(
             e,
             StreamEvent::TextDelta { .. }
@@ -706,9 +710,16 @@ fn assert_basic_stream_success(
                 | StreamEvent::ThinkingDelta { .. }
         )
     });
+    let done_has_text = events.iter().any(|e| match e {
+        StreamEvent::Done { message, .. } => message
+            .content
+            .iter()
+            .any(|c| matches!(c, pi::model::ContentBlock::Text(tc) if !tc.text.is_empty())),
+        _ => false,
+    });
     assert!(
-        has_content,
-        "{test_name}: expected at least one content event (TextDelta/TextEnd/ThinkingDelta)"
+        has_delta_content || done_has_text,
+        "{test_name}: expected content events or non-empty text in Done message"
     );
 
     let has_done = events.iter().any(|e| matches!(e, StreamEvent::Done { .. }));
@@ -1329,7 +1340,7 @@ mod cross_provider {
 
                 let has_start = matches!(events.first(), Some(StreamEvent::Start { .. }));
                 let has_done = matches!(events.last(), Some(StreamEvent::Done { .. }));
-                let has_content = events.iter().any(|e| {
+                let has_delta_content = events.iter().any(|e| {
                     matches!(
                         e,
                         StreamEvent::TextDelta { .. }
@@ -1337,6 +1348,13 @@ mod cross_provider {
                             | StreamEvent::ThinkingDelta { .. }
                     )
                 });
+                let done_has_text = events.iter().any(|e| match e {
+                    StreamEvent::Done { message, .. } => message.content.iter().any(|c| {
+                        matches!(c, pi::model::ContentBlock::Text(tc) if !tc.text.is_empty())
+                    }),
+                    _ => false,
+                });
+                let has_content = has_delta_content || done_has_text;
 
                 let _text_deltas = events
                     .iter()

@@ -1900,6 +1900,11 @@ fn rpc_parse_extension_ui_response(
                 cancelled: false,
             })
         }
+        "notify" => Ok(ExtensionUiResponse {
+            id: active.id.clone(),
+            value: None,
+            cancelled: false,
+        }),
         other => Err(format!("Unsupported extension UI method: {other}")),
     }
 }
@@ -3118,4 +3123,735 @@ async fn cycle_model_for_rpc(
     apply_thinking_level(guard, next_thinking).await?;
 
     Ok(Some((next_entry, next_thinking, is_scoped)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{
+        ContentBlock, ImageContent, TextContent, ThinkingLevel, UserContent, UserMessage,
+    };
+    use crate::provider::{InputType, Model, ModelCost};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    // -----------------------------------------------------------------------
+    // Helper builders
+    // -----------------------------------------------------------------------
+
+    fn dummy_model(id: &str, reasoning: bool) -> Model {
+        Model {
+            id: id.to_string(),
+            name: id.to_string(),
+            api: "anthropic".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            reasoning,
+            input: vec![InputType::Text],
+            cost: ModelCost {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+            },
+            context_window: 200_000,
+            max_tokens: 8192,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn dummy_entry(id: &str, reasoning: bool) -> ModelEntry {
+        ModelEntry {
+            model: dummy_model(id, reasoning),
+            api_key: None,
+            headers: HashMap::new(),
+            auth_header: false,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_queue_mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_queue_mode_all() {
+        assert_eq!(parse_queue_mode(Some("all")), Some(QueueMode::All));
+    }
+
+    #[test]
+    fn parse_queue_mode_one_at_a_time() {
+        assert_eq!(
+            parse_queue_mode(Some("one-at-a-time")),
+            Some(QueueMode::OneAtATime)
+        );
+    }
+
+    #[test]
+    fn parse_queue_mode_none_value() {
+        assert_eq!(parse_queue_mode(None), None);
+    }
+
+    #[test]
+    fn parse_queue_mode_unknown_returns_none() {
+        assert_eq!(parse_queue_mode(Some("batch")), None);
+        assert_eq!(parse_queue_mode(Some("")), None);
+    }
+
+    #[test]
+    fn parse_queue_mode_trims_whitespace() {
+        assert_eq!(parse_queue_mode(Some("  all  ")), Some(QueueMode::All));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_streaming_behavior
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_streaming_behavior_steer() {
+        let val = json!("steer");
+        let result = parse_streaming_behavior(Some(&val)).unwrap();
+        assert_eq!(result, Some(StreamingBehavior::Steer));
+    }
+
+    #[test]
+    fn parse_streaming_behavior_follow_up_hyphenated() {
+        let val = json!("follow-up");
+        let result = parse_streaming_behavior(Some(&val)).unwrap();
+        assert_eq!(result, Some(StreamingBehavior::FollowUp));
+    }
+
+    #[test]
+    fn parse_streaming_behavior_follow_up_camel() {
+        let val = json!("followUp");
+        let result = parse_streaming_behavior(Some(&val)).unwrap();
+        assert_eq!(result, Some(StreamingBehavior::FollowUp));
+    }
+
+    #[test]
+    fn parse_streaming_behavior_none() {
+        let result = parse_streaming_behavior(None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn parse_streaming_behavior_invalid_string() {
+        let val = json!("invalid");
+        assert!(parse_streaming_behavior(Some(&val)).is_err());
+    }
+
+    #[test]
+    fn parse_streaming_behavior_non_string_errors() {
+        let val = json!(42);
+        assert!(parse_streaming_behavior(Some(&val)).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_user_message
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_user_message_text_only() {
+        let msg = build_user_message("hello", &[]);
+        match msg {
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) => assert_eq!(text, "hello"),
+            other => panic!("expected text user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_user_message_with_images() {
+        let images = vec![ImageContent {
+            data: "base64data".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        let msg = build_user_message("look at this", &images);
+        match msg {
+            Message::User(UserMessage {
+                content: UserContent::Blocks(blocks),
+                ..
+            }) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(&blocks[0], ContentBlock::Text(_)));
+                assert!(matches!(&blocks[1], ContentBlock::Image(_)));
+            }
+            other => panic!("expected blocks user message, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // is_extension_command
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_extension_command_slash_unchanged() {
+        assert!(is_extension_command("/mycommand", "/mycommand"));
+    }
+
+    #[test]
+    fn is_extension_command_expanded_returns_false() {
+        // If the resource loader expanded it, the expanded text differs from the original.
+        assert!(!is_extension_command(
+            "/prompt-name",
+            "This is the expanded prompt text."
+        ));
+    }
+
+    #[test]
+    fn is_extension_command_no_slash() {
+        assert!(!is_extension_command("hello", "hello"));
+    }
+
+    #[test]
+    fn is_extension_command_leading_whitespace() {
+        assert!(is_extension_command("  /cmd", "  /cmd"));
+    }
+
+    // -----------------------------------------------------------------------
+    // RpcStateSnapshot::pending_count
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_pending_count() {
+        let snapshot = RpcStateSnapshot {
+            steering_count: 3,
+            follow_up_count: 7,
+            steering_mode: QueueMode::All,
+            follow_up_mode: QueueMode::OneAtATime,
+            auto_compaction_enabled: false,
+            auto_retry_enabled: true,
+        };
+        assert_eq!(snapshot.pending_count(), 10);
+    }
+
+    #[test]
+    fn snapshot_pending_count_zero() {
+        let snapshot = RpcStateSnapshot {
+            steering_count: 0,
+            follow_up_count: 0,
+            steering_mode: QueueMode::All,
+            follow_up_mode: QueueMode::All,
+            auto_compaction_enabled: false,
+            auto_retry_enabled: false,
+        };
+        assert_eq!(snapshot.pending_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // retry_delay_ms
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retry_delay_first_attempt_is_base() {
+        let config = Config::default();
+        // attempt 0 and 1 should both use the base delay (shift = attempt - 1 saturating)
+        assert_eq!(retry_delay_ms(&config, 0), config.retry_base_delay_ms());
+        assert_eq!(retry_delay_ms(&config, 1), config.retry_base_delay_ms());
+    }
+
+    #[test]
+    fn retry_delay_doubles_each_attempt() {
+        let config = Config::default();
+        let base = config.retry_base_delay_ms();
+        // attempt 2: base * 2, attempt 3: base * 4
+        assert_eq!(retry_delay_ms(&config, 2), base * 2);
+        assert_eq!(retry_delay_ms(&config, 3), base * 4);
+    }
+
+    #[test]
+    fn retry_delay_capped_at_max() {
+        let config = Config::default();
+        let max = config.retry_max_delay_ms();
+        // Large attempt number should be capped
+        let delay = retry_delay_ms(&config, 30);
+        assert_eq!(delay, max);
+    }
+
+    #[test]
+    fn retry_delay_saturates_on_overflow() {
+        let config = Config::default();
+        // u32::MAX attempt should not panic
+        let delay = retry_delay_ms(&config, u32::MAX);
+        assert!(delay <= config.retry_max_delay_ms());
+    }
+
+    // -----------------------------------------------------------------------
+    // should_auto_compact
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auto_compact_below_threshold() {
+        // 50k tokens used, 200k window, 40k reserve → threshold = 160k → no compact
+        assert!(!should_auto_compact(50_000, 200_000, 40_000));
+    }
+
+    #[test]
+    fn auto_compact_above_threshold() {
+        // 170k tokens used, 200k window, 40k reserve → threshold = 160k → compact
+        assert!(should_auto_compact(170_000, 200_000, 40_000));
+    }
+
+    #[test]
+    fn auto_compact_exact_threshold() {
+        // Exactly at threshold → not above → no compact
+        assert!(!should_auto_compact(160_000, 200_000, 40_000));
+    }
+
+    #[test]
+    fn auto_compact_reserve_exceeds_window() {
+        // reserve > window → window - reserve saturates to 0 → any tokens > 0 triggers compact
+        assert!(should_auto_compact(1, 100, 200));
+    }
+
+    #[test]
+    fn auto_compact_zero_tokens() {
+        assert!(!should_auto_compact(0, 200_000, 40_000));
+    }
+
+    // -----------------------------------------------------------------------
+    // rpc_flatten_content_blocks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flatten_content_blocks_unwraps_inner_0() {
+        let mut value = json!({
+            "content": [
+                {"0": {"type": "text", "text": "hello"}}
+            ]
+        });
+        rpc_flatten_content_blocks(&mut value);
+        let blocks = value["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "hello");
+        assert!(blocks[0].get("0").is_none());
+    }
+
+    #[test]
+    fn flatten_content_blocks_preserves_non_wrapped() {
+        let mut value = json!({
+            "content": [
+                {"type": "text", "text": "already flat"}
+            ]
+        });
+        rpc_flatten_content_blocks(&mut value);
+        let blocks = value["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "already flat");
+    }
+
+    #[test]
+    fn flatten_content_blocks_no_content_field() {
+        let mut value = json!({"role": "assistant"});
+        rpc_flatten_content_blocks(&mut value); // should not panic
+        assert_eq!(value, json!({"role": "assistant"}));
+    }
+
+    #[test]
+    fn flatten_content_blocks_non_object() {
+        let mut value = json!("just a string");
+        rpc_flatten_content_blocks(&mut value); // should not panic
+    }
+
+    #[test]
+    fn flatten_content_blocks_existing_keys_not_overwritten() {
+        // If a block already has a key that conflicts with inner "0", preserve outer
+        let mut value = json!({
+            "content": [
+                {"type": "existing", "0": {"type": "inner", "extra": "data"}}
+            ]
+        });
+        rpc_flatten_content_blocks(&mut value);
+        let blocks = value["content"].as_array().unwrap();
+        // "type" should keep the outer "existing" value, not be overwritten by inner "inner"
+        assert_eq!(blocks[0]["type"], "existing");
+        // "extra" from inner should be merged in
+        assert_eq!(blocks[0]["extra"], "data");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_prompt_images
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_prompt_images_none() {
+        let images = parse_prompt_images(None).unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn parse_prompt_images_empty_array() {
+        let val = json!([]);
+        let images = parse_prompt_images(Some(&val)).unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn parse_prompt_images_valid() {
+        let val = json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "mediaType": "image/png",
+                "data": "iVBORw0KGgo="
+            }
+        }]);
+        let images = parse_prompt_images(Some(&val)).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn parse_prompt_images_skips_non_image_type() {
+        let val = json!([{
+            "type": "text",
+            "text": "hello"
+        }]);
+        let images = parse_prompt_images(Some(&val)).unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn parse_prompt_images_skips_non_base64_source() {
+        let val = json!([{
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": "https://example.com/img.png"
+            }
+        }]);
+        let images = parse_prompt_images(Some(&val)).unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn parse_prompt_images_not_array_errors() {
+        let val = json!("not-an-array");
+        assert!(parse_prompt_images(Some(&val)).is_err());
+    }
+
+    #[test]
+    fn parse_prompt_images_multiple_valid() {
+        let val = json!([
+            {
+                "type": "image",
+                "source": {"type": "base64", "mediaType": "image/jpeg", "data": "abc"}
+            },
+            {
+                "type": "image",
+                "source": {"type": "base64", "mediaType": "image/webp", "data": "def"}
+            }
+        ]);
+        let images = parse_prompt_images(Some(&val)).unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].mime_type, "image/jpeg");
+        assert_eq!(images[1].mime_type, "image/webp");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_user_text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_user_text_from_text_content() {
+        let content = UserContent::Text("hello world".to_string());
+        assert_eq!(extract_user_text(&content), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn extract_user_text_from_blocks() {
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Image(ImageContent {
+                data: String::new(),
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Text(TextContent::new("found it")),
+        ]);
+        assert_eq!(extract_user_text(&content), Some("found it".to_string()));
+    }
+
+    #[test]
+    fn extract_user_text_blocks_no_text() {
+        let content = UserContent::Blocks(vec![ContentBlock::Image(ImageContent {
+            data: String::new(),
+            mime_type: "image/png".to_string(),
+        })]);
+        assert_eq!(extract_user_text(&content), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_thinking_level
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_thinking_level_all_variants() {
+        assert_eq!(parse_thinking_level("off").unwrap(), ThinkingLevel::Off);
+        assert_eq!(parse_thinking_level("none").unwrap(), ThinkingLevel::Off);
+        assert_eq!(parse_thinking_level("0").unwrap(), ThinkingLevel::Off);
+        assert_eq!(
+            parse_thinking_level("minimal").unwrap(),
+            ThinkingLevel::Minimal
+        );
+        assert_eq!(parse_thinking_level("min").unwrap(), ThinkingLevel::Minimal);
+        assert_eq!(parse_thinking_level("low").unwrap(), ThinkingLevel::Low);
+        assert_eq!(parse_thinking_level("1").unwrap(), ThinkingLevel::Low);
+        assert_eq!(
+            parse_thinking_level("medium").unwrap(),
+            ThinkingLevel::Medium
+        );
+        assert_eq!(parse_thinking_level("med").unwrap(), ThinkingLevel::Medium);
+        assert_eq!(parse_thinking_level("2").unwrap(), ThinkingLevel::Medium);
+        assert_eq!(parse_thinking_level("high").unwrap(), ThinkingLevel::High);
+        assert_eq!(parse_thinking_level("3").unwrap(), ThinkingLevel::High);
+        assert_eq!(parse_thinking_level("xhigh").unwrap(), ThinkingLevel::XHigh);
+        assert_eq!(parse_thinking_level("4").unwrap(), ThinkingLevel::XHigh);
+    }
+
+    #[test]
+    fn parse_thinking_level_case_insensitive() {
+        assert_eq!(parse_thinking_level("HIGH").unwrap(), ThinkingLevel::High);
+        assert_eq!(
+            parse_thinking_level("Medium").unwrap(),
+            ThinkingLevel::Medium
+        );
+        assert_eq!(parse_thinking_level("  Off  ").unwrap(), ThinkingLevel::Off);
+    }
+
+    #[test]
+    fn parse_thinking_level_invalid() {
+        assert!(parse_thinking_level("invalid").is_err());
+        assert!(parse_thinking_level("").is_err());
+        assert!(parse_thinking_level("5").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // supports_xhigh + clamp_thinking_level
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn supports_xhigh_known_models() {
+        assert!(supports_xhigh("gpt-5.1-codex-max"));
+        assert!(supports_xhigh("gpt-5.2"));
+        assert!(supports_xhigh("gpt-5.2-codex"));
+    }
+
+    #[test]
+    fn supports_xhigh_unknown_models() {
+        assert!(!supports_xhigh("claude-opus-4-6"));
+        assert!(!supports_xhigh("gpt-4o"));
+        assert!(!supports_xhigh(""));
+    }
+
+    #[test]
+    fn clamp_thinking_non_reasoning_model() {
+        let entry = dummy_entry("claude-3-haiku", false);
+        assert_eq!(
+            clamp_thinking_level(ThinkingLevel::High, &entry),
+            ThinkingLevel::Off
+        );
+    }
+
+    #[test]
+    fn clamp_thinking_xhigh_without_support() {
+        let entry = dummy_entry("claude-opus-4-6", true);
+        assert_eq!(
+            clamp_thinking_level(ThinkingLevel::XHigh, &entry),
+            ThinkingLevel::High
+        );
+    }
+
+    #[test]
+    fn clamp_thinking_xhigh_with_support() {
+        let entry = dummy_entry("gpt-5.2", true);
+        assert_eq!(
+            clamp_thinking_level(ThinkingLevel::XHigh, &entry),
+            ThinkingLevel::XHigh
+        );
+    }
+
+    #[test]
+    fn clamp_thinking_normal_level_passthrough() {
+        let entry = dummy_entry("claude-opus-4-6", true);
+        assert_eq!(
+            clamp_thinking_level(ThinkingLevel::Medium, &entry),
+            ThinkingLevel::Medium
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // available_thinking_levels
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn available_thinking_levels_non_reasoning() {
+        let entry = dummy_entry("gpt-4o-mini", false);
+        let levels = available_thinking_levels(&entry);
+        assert_eq!(levels, vec![ThinkingLevel::Off]);
+    }
+
+    #[test]
+    fn available_thinking_levels_reasoning_no_xhigh() {
+        let entry = dummy_entry("claude-opus-4-6", true);
+        let levels = available_thinking_levels(&entry);
+        assert_eq!(
+            levels,
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ]
+        );
+    }
+
+    #[test]
+    fn available_thinking_levels_reasoning_with_xhigh() {
+        let entry = dummy_entry("gpt-5.2", true);
+        let levels = available_thinking_levels(&entry);
+        assert_eq!(
+            levels,
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+            ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rpc_model_from_entry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rpc_model_from_entry_basic() {
+        let entry = dummy_entry("claude-opus-4-6", true);
+        let value = rpc_model_from_entry(&entry);
+        assert_eq!(value["id"], "claude-opus-4-6");
+        assert_eq!(value["name"], "claude-opus-4-6");
+        assert_eq!(value["provider"], "anthropic");
+        assert_eq!(value["reasoning"], true);
+        assert_eq!(value["contextWindow"], 200_000);
+        assert_eq!(value["maxTokens"], 8192);
+    }
+
+    #[test]
+    fn rpc_model_from_entry_input_types() {
+        let mut entry = dummy_entry("gpt-4o", false);
+        entry.model.input = vec![InputType::Text, InputType::Image];
+        let value = rpc_model_from_entry(&entry);
+        let input = value["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0], "text");
+        assert_eq!(input[1], "image");
+    }
+
+    #[test]
+    fn rpc_model_from_entry_cost_present() {
+        let entry = dummy_entry("test-model", false);
+        let value = rpc_model_from_entry(&entry);
+        assert!(value.get("cost").is_some());
+        let cost = &value["cost"];
+        assert_eq!(cost["input"], 3.0);
+        assert_eq!(cost["output"], 15.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // error_hints_value
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_hints_value_produces_expected_shape() {
+        let error = Error::validation("test error");
+        let value = error_hints_value(&error);
+        assert!(value.get("summary").is_some());
+        assert!(value.get("hints").is_some());
+        assert!(value.get("contextFields").is_some());
+        assert!(value["hints"].is_array());
+    }
+
+    // -----------------------------------------------------------------------
+    // rpc_parse_extension_ui_response_id edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_ui_response_id_empty_string() {
+        let value = json!({"requestId": ""});
+        assert_eq!(rpc_parse_extension_ui_response_id(&value), None);
+    }
+
+    #[test]
+    fn parse_ui_response_id_whitespace_only() {
+        let value = json!({"requestId": "   "});
+        assert_eq!(rpc_parse_extension_ui_response_id(&value), None);
+    }
+
+    #[test]
+    fn parse_ui_response_id_trims() {
+        let value = json!({"requestId": "  req-1  "});
+        assert_eq!(
+            rpc_parse_extension_ui_response_id(&value),
+            Some("req-1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_ui_response_id_neither_field() {
+        let value = json!({"type": "something"});
+        assert_eq!(rpc_parse_extension_ui_response_id(&value), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // rpc_parse_extension_ui_response edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_editor_response_requires_string() {
+        let active = ExtensionUiRequest::new("req-1", "editor", json!({"title": "t"}));
+        let ok = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "code"});
+        assert!(rpc_parse_extension_ui_response(&ok, &active).is_ok());
+
+        let bad = json!({"type": "extension_ui_response", "requestId": "req-1", "value": 42});
+        assert!(rpc_parse_extension_ui_response(&bad, &active).is_err());
+    }
+
+    #[test]
+    fn parse_notify_response_returns_ack() {
+        let active = ExtensionUiRequest::new("req-1", "notify", json!({"title": "t"}));
+        let val = json!({"type": "extension_ui_response", "requestId": "req-1"});
+        let resp = rpc_parse_extension_ui_response(&val, &active).unwrap();
+        assert!(!resp.cancelled);
+    }
+
+    #[test]
+    fn parse_unknown_method_errors() {
+        let active = ExtensionUiRequest::new("req-1", "unknown_method", json!({}));
+        let val = json!({"type": "extension_ui_response", "requestId": "req-1"});
+        assert!(rpc_parse_extension_ui_response(&val, &active).is_err());
+    }
+
+    #[test]
+    fn parse_select_with_object_options() {
+        let active = ExtensionUiRequest::new(
+            "req-1",
+            "select",
+            json!({"title": "pick", "options": [{"label": "Alpha", "value": "a"}, {"label": "Beta"}]}),
+        );
+        // Selecting by value key
+        let val_a = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "a"});
+        let resp = rpc_parse_extension_ui_response(&val_a, &active).unwrap();
+        assert_eq!(resp.value, Some(json!("a")));
+
+        // Selecting by label fallback (no value key in option)
+        let val_b = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "Beta"});
+        let resp = rpc_parse_extension_ui_response(&val_b, &active).unwrap();
+        assert_eq!(resp.value, Some(json!("Beta")));
+    }
 }
