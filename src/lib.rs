@@ -29,6 +29,10 @@
     clippy::wildcard_imports
 )]
 
+// Allow in-crate tests that include integration test helpers to resolve `pi::...`
+// paths the same way integration tests do.
+extern crate self as pi;
+
 pub mod agent;
 pub mod agent_cx;
 pub mod app;

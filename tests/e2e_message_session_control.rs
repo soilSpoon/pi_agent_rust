@@ -437,6 +437,25 @@ export default function init(pi) {
   pi.registerCommand("label-entry", {
     description: "Label a session entry",
     handler: async (args, ctx) => {
+      // First append a message so a valid entry exists, then label it.
+      await pi.session("appendMessage", {
+        message: { role: "user", content: "test message" }
+      });
+      // Get entries to find the appended entry ID.
+      const entries = await pi.session("getEntries", {});
+      const lastEntry = entries[entries.length - 1];
+      const targetId = lastEntry?.id || lastEntry?.base?.id;
+      if (!targetId) throw new Error("no entry id found");
+      await pi.session("setLabel", {
+        targetId: targetId,
+        label: "important"
+      });
+      return { display: "Label set on " + targetId };
+    }
+  });
+  pi.registerCommand("label-missing", {
+    description: "Label a non-existent entry (should error)",
+    handler: async (args, ctx) => {
       await pi.session("setLabel", {
         targetId: "entry-99",
         label: "important"
@@ -448,17 +467,23 @@ export default function init(pi) {
 "#,
     );
 
+    // Happy path: label an entry that exists.
     let result = common::run_async({
-        let manager = setup.manager;
+        let manager = setup.manager.clone();
         async move { manager.execute_command("label-entry", "", 5000).await }
     });
     assert!(result.is_ok(), "label-entry should succeed: {result:?}");
 
-    // Note: The real Session's add_label verifies target existence. The JS extension
-    // passes "entry-99" which won't exist in a fresh session, so the label entry
-    // won't be created. This tests the real behavior (vs the mock which always succeeded).
-    // We verify the command itself didn't error out (it returns Ok even if the label
-    // target doesn't exist — the session silently skips it).
+    // Error path: labeling a non-existent target returns an error (spec §4 set_label).
+    let result = common::run_async({
+        let manager = setup.manager;
+        async move { manager.execute_command("label-missing", "", 5000).await }
+    });
+    assert!(
+        result.is_err(),
+        "label-missing should error for unknown targetId"
+    );
+
     write_jsonl_artifacts(&harness, test_name);
 }
 

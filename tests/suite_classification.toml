@@ -1,0 +1,99 @@
+# Test Suite Classification
+#
+# Every test file in tests/ must be listed in exactly one suite.
+# CI enforces this via the suite classification guard.
+#
+# Suites:
+#   unit - Pure logic, no mocks/fixtures/VCR/network
+#   vcr  - VCR cassettes, fixture files, or allowlisted stubs
+#   e2e  - Full system: real providers, network, or tmux
+#
+# See docs/testing-policy.md for full definitions and rules.
+
+[suite.unit]
+files = [
+    "model_serialization",
+    "config_precedence",
+    "session_conformance",
+    "error_types",
+    "bench_schema",
+    "compaction",
+    "compaction_bug",
+    "extension_scoring",
+    "mock_spec_validation",
+    "mock_spec_schema",
+    "perf_budgets",
+    "perf_comparison",
+    "performance_comparison",
+]
+
+[suite.vcr]
+files = [
+    "provider_streaming",
+    "agent_loop_vcr",
+    "auth_oauth_refresh_vcr",
+    "provider_error_paths",
+    "error_handling",
+    "http_client",
+    "rpc_mode",
+    "rpc_protocol",
+    "tools_conformance",
+    "conformance_fixtures",
+    "conformance_comparator",
+    "conformance_mock",
+    "conformance_report",
+    "ext_conformance",
+    "ext_conformance_artifacts",
+    "ext_conformance_diff",
+    "ext_conformance_generated",
+    "ext_conformance_guard",
+    "ext_conformance_scenarios",
+    "ext_conformance_fixture_schema",
+    "ext_entry_scan",
+    "ext_proptest",
+    "ext_load_time_benchmark",
+    "extensions_manifest",
+    "extensions_registration",
+    "extensions_event_wiring",
+    "extensions_event_cancellation",
+    "extensions_message_session",
+    "extensions_policy_negative",
+    "extensions_provider_streaming",
+    "extensions_provider_oauth",
+    "extensions_stress",
+    "event_loop_conformance",
+    "event_dispatch_latency",
+    "js_runtime_ordering",
+    "streaming_hostcall",
+    "lab_runtime_extensions",
+    "session_index_tests",
+    "session_sqlite",
+    "session_picker",
+    "model_registry",
+    "package_manager",
+    "provider_factory",
+    "resource_loader",
+    "capability_prompt",
+    "tui_state",
+    "tui_snapshot",
+    "main_cli_selection",
+    "repro_sse_flush",
+    "repro_config_error",
+    "repro_edit_encoding",
+    "sse_strict_compliance",
+    "repro_sse_newline",
+]
+
+[suite.e2e]
+files = [
+    "e2e_cli",
+    "e2e_tui",
+    "e2e_tools",
+    "e2e_provider_streaming",
+    "e2e_library_integration",
+    "e2e_extension_registration",
+    "e2e_message_session_control",
+    "e2e_ts_extension_loading",
+    "e2e_live",
+    "e2e_live_harness",
+]

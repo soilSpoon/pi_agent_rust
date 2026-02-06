@@ -920,6 +920,13 @@ fn sample_usage(input: u64, output: u64) -> Usage {
     }
 }
 
+fn numbered_lines(count: usize) -> String {
+    (1..=count)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn tui_state_escape_does_nothing_when_idle_single_line() {
     // Legacy behavior: Escape when idle (no overlay/autocomplete) does nothing
@@ -1503,6 +1510,319 @@ fn tui_state_tool_update_with_diff_details_appends_diff_block() {
 }
 
 #[test]
+fn tui_state_tool_update_with_large_diff_shows_truncation_indicator() {
+    let harness =
+        TestHarness::new("tui_state_tool_update_with_large_diff_shows_truncation_indicator");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let mut diff_lines = Vec::new();
+    for i in 0..35 {
+        diff_lines.push(format!("- {i} old value {i}"));
+        diff_lines.push(format!("+ {i} new value {i}"));
+    }
+    let diff = diff_lines.join("\n");
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+large-diff)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Successfully replaced text in foo.txt.",
+            ))],
+            details: Some(json!({ "diff": diff })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit)",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+    assert_after_contains(&harness, &step, "collapsed");
+
+    // The large diff auto-collapses; toggle global collapse twice to re-expand.
+    press_ctrlo(&harness, &mut app);
+    let mut step = press_ctrlo(&harness, &mut app);
+
+    assert_after_contains(&harness, &step, "@@ foo.txt @@");
+    if !step.after.contains("diff truncated") {
+        for _ in 0..10 {
+            let next = press_pgdown(&harness, &mut app);
+            if next.after.contains("diff truncated") {
+                step = next;
+                break;
+            }
+            if next.after == step.after {
+                break;
+            }
+            step = next;
+        }
+    }
+    assert_after_contains(&harness, &step, "diff truncated");
+}
+
+#[test]
+fn tui_state_tool_update_with_diff_without_replace_message_uses_generic_header() {
+    let harness = TestHarness::new(
+        "tui_state_tool_update_with_diff_without_replace_message_uses_generic_header",
+    );
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+generic-diff)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("Edit completed."))],
+            details: Some(json!({
+                "diff": "- 1 old text\n+ 1 new text"
+            })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit)",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool edit output:");
+    assert_after_contains(&harness, &step, "Diff:");
+    assert_after_contains(&harness, &step, "+ 1 new text");
+    assert_after_not_contains(&harness, &step, "@@");
+}
+
+#[test]
+fn tui_state_tool_update_with_details_and_no_content_renders_pretty_json() {
+    let harness =
+        TestHarness::new("tui_state_tool_update_with_details_and_no_content_renders_pretty_json");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read+details-only)",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: Vec::new(),
+            details: Some(json!({
+                "matches": 3,
+                "path": "src/main.rs"
+            })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "\"matches\": 3");
+    assert_after_contains(&harness, &step, "\"path\": \"src/main.rs\"");
+}
+
+#[test]
+fn tui_state_tool_output_over_threshold_auto_collapses_with_preview() {
+    let harness =
+        TestHarness::new("tui_state_tool_output_over_threshold_auto_collapses_with_preview");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read) large-output",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(numbered_lines(30)))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "collapsed");
+    assert_after_contains(&harness, &step, "line 1");
+    assert_after_contains(&harness, &step, "line 5");
+    assert_after_not_contains(&harness, &step, "line 6");
+    assert_after_contains(&harness, &step, "25 more lines");
+}
+
+#[test]
+fn tui_state_tool_output_at_threshold_stays_expanded() {
+    let harness = TestHarness::new("tui_state_tool_output_at_threshold_stays_expanded");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read) threshold-output",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(numbered_lines(19)))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_not_contains(&harness, &step, "collapsed");
+    assert_after_contains(&harness, &step, "line 19");
+}
+
+#[test]
+fn tui_state_expand_tools_reexpands_auto_collapsed_blocks() {
+    let harness = TestHarness::new("tui_state_expand_tools_reexpands_auto_collapsed_blocks");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read) large-output",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(numbered_lines(30)))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+    assert_after_contains(&harness, &step, "collapsed");
+
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "collapsed");
+    assert_after_not_contains(&harness, &step, "line 1");
+
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_not_contains(&harness, &step, "collapsed");
+    assert_after_contains(&harness, &step, "line 1");
+    if !step.after.contains("line 30") {
+        let mut current = step;
+        for _ in 0..10 {
+            let next = press_pgdown(&harness, &mut app);
+            if next.after.contains("line 30") {
+                current = next;
+                break;
+            }
+            if next.after == current.after {
+                break;
+            }
+            current = next;
+        }
+        assert_after_contains(&harness, &current, "line 30");
+    }
+}
+
+#[test]
 fn tui_state_expand_tools_toggles_tool_output_visibility() {
     let harness = TestHarness::new("tui_state_expand_tools_toggles_tool_output_visibility");
     let mut app = build_app(&harness, Vec::new());
@@ -1675,6 +1995,119 @@ fn tui_state_terminal_show_images_true_shows_image_placeholders_in_tool_output()
         );
     }
     assert_after_not_contains(&harness, &step, "image(s) hidden");
+}
+
+#[test]
+fn tui_state_terminal_show_images_false_reports_multiple_hidden_images() {
+    let harness =
+        TestHarness::new("tui_state_terminal_show_images_false_reports_multiple_hidden_images");
+    let config = Config {
+        terminal: Some(TerminalSettings {
+            show_images: Some(false),
+            clear_on_shrink: None,
+        }),
+        ..Config::default()
+    };
+    let mut app =
+        build_app_with_session_and_config(&harness, Vec::new(), Session::in_memory(), config);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read) two-images",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("file contents")),
+                ContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+                ContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                }),
+            ],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "2 image(s) hidden");
+    assert_after_not_contains(&harness, &step, "[image:");
+}
+
+#[test]
+fn tui_state_terminal_show_images_false_still_renders_tool_output_when_only_images() {
+    let harness = TestHarness::new(
+        "tui_state_terminal_show_images_false_still_renders_tool_output_when_only_images",
+    );
+    let config = Config {
+        terminal: Some(TerminalSettings {
+            show_images: Some(false),
+            clear_on_shrink: None,
+        }),
+        ..Config::default()
+    };
+    let mut app =
+        build_app_with_session_and_config(&harness, Vec::new(), Session::in_memory(), config);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read) image-only",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Image(ImageContent {
+                data: "aGVsbG8=".to_string(),
+                mime_type: "image/png".to_string(),
+            })],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "1 image(s) hidden");
 }
 
 #[test]
@@ -3121,6 +3554,42 @@ fn tui_state_tool_progress_hidden_under_one_second() {
 }
 
 #[test]
+fn tui_state_tool_update_without_progress_keeps_spinner_without_metrics() {
+    let harness =
+        TestHarness::new("tui_state_tool_update_without_progress_keeps_spinner_without_metrics");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) no-progress",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("still running"))],
+            details: Some(json!({
+                "note": "no progress payload here"
+            })),
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Running bash");
+    assert_after_not_contains(&harness, &step, "lines");
+    assert_after_not_contains(&harness, &step, "timeout");
+}
+
+#[test]
 fn tui_state_tool_progress_reset_on_new_tool_start() {
     let harness = TestHarness::new("tui_state_tool_progress_reset_on_new_tool_start");
     let mut app = build_app(&harness, Vec::new());
@@ -3179,6 +3648,86 @@ fn tui_state_tool_progress_reset_on_new_tool_start() {
     assert_after_contains(&harness, &step, "Running read");
     assert_after_not_contains(&harness, &step, "999 lines");
     assert_after_not_contains(&harness, &step, "10s");
+}
+
+#[test]
+fn tui_state_tool_update_with_progress_shows_bytes_when_lines_missing() {
+    let harness =
+        TestHarness::new("tui_state_tool_update_with_progress_shows_bytes_when_lines_missing");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) byte-only progress",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("byte-only progress"))],
+            details: Some(json!({
+                "progress": {
+                    "elapsedMs": 5000,
+                    "byteCount": 4096
+                }
+            })),
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Running bash");
+    assert_after_contains(&harness, &step, "5s");
+    assert_after_contains(&harness, &step, "bytes");
+    assert_after_not_contains(&harness, &step, "lines");
+}
+
+#[test]
+fn tui_state_tool_update_with_progress_shows_timeout_suffix() {
+    let harness = TestHarness::new("tui_state_tool_update_with_progress_shows_timeout_suffix");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) timeout progress",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("timeout progress"))],
+            details: Some(json!({
+                "progress": {
+                    "elapsedMs": 5000,
+                    "lineCount": 12,
+                    "timeoutMs": 120_000
+                }
+            })),
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Running bash");
+    assert_after_contains(&harness, &step, "5s");
+    assert_after_contains(&harness, &step, "12 lines");
+    assert_after_contains(&harness, &step, "timeout 120s");
 }
 
 // ============================================================================
@@ -3661,6 +4210,48 @@ fn create_two_branch_session() -> (Session, String, String, String) {
     (session, root_id, branch1_leaf, branch2_leaf)
 }
 
+/// Helper: creates a session with many sibling branches that all fork from root.
+fn create_many_branch_session(branch_count: usize) -> Session {
+    assert!(branch_count >= 2, "branch_count must be at least 2");
+    let mut session = Session::in_memory();
+    let root_id = session.append_message(SessionMessage::User {
+        content: UserContent::Text("Root question".to_string()),
+        timestamp: Some(0),
+    });
+
+    for i in 0..branch_count {
+        let i_i64 = i64::try_from(i).expect("branch index fits in i64");
+        session.navigate_to(&root_id);
+        let _assistant_id = session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Answer branch {i}"
+                )))],
+                api: "anthropic".to_string(),
+                provider: "dummy".to_string(),
+                model: "dummy-model".to_string(),
+                usage: Usage {
+                    input: 10,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0,
+                    total_tokens: 15,
+                    cost: Cost::default(),
+                },
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: i_i64 + 1,
+            },
+        });
+        let _leaf_id = session.append_message(SessionMessage::User {
+            content: UserContent::Text(format!("Follow-up on branch {i}")),
+            timestamp: Some(i_i64 + 10),
+        });
+    }
+
+    session
+}
+
 #[test]
 fn tui_grad_branch_indicator_shows_for_multi_branch_session() {
     let harness = TestHarness::new("tui_grad_branch_indicator_shows_for_multi_branch_session");
@@ -3793,4 +4384,956 @@ fn tui_grad_cycle_sibling_backward_with_branches() {
         !msg.contains("No sibling branches"),
         "Expected successful branch cycle, got status: {msg}"
     );
+}
+
+#[test]
+fn tui_grad_branch_picker_handles_fifty_plus_branches() {
+    let harness = TestHarness::new("tui_grad_branch_picker_handles_fifty_plus_branches");
+    let session = create_many_branch_session(60);
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    let start = Instant::now();
+    app.open_branch_picker();
+    assert!(app.has_branch_picker(), "Branch picker should open");
+
+    // Exercise scrolling/wrapping behavior over many rows.
+    for _ in 0..75 {
+        app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Down));
+        assert!(app.has_branch_picker(), "Branch picker should remain open");
+    }
+    for _ in 0..30 {
+        app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Up));
+        assert!(app.has_branch_picker(), "Branch picker should remain open");
+    }
+
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Expected branch picker navigation to stay responsive, took {elapsed:?}"
+    );
+
+    let view = normalize_view(&BubbleteaModel::view(&app));
+    assert!(
+        view.contains("Select a branch"),
+        "Expected branch picker overlay in view"
+    );
+
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Enter));
+    assert!(
+        !app.has_branch_picker(),
+        "Branch picker should close after selecting a branch"
+    );
+}
+
+// ─── TUI Graduation: Inline Diff Rendering ─────────────────────────────────
+
+#[test]
+fn tui_grad_diff_pure_addition_renders_only_plus_lines() {
+    let harness = TestHarness::new("tui_grad_diff_pure_addition_renders_only_plus_lines");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+add-only-diff)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Successfully replaced text in new_feature.rs.",
+            ))],
+            details: Some(json!({
+                "diff": "+use std::io;\n+use std::fs;\n+\n+fn new_feature() {\n+    println!(\"hello\");\n+}"
+            })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit)",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "@@ new_feature.rs @@");
+    assert_after_contains(&harness, &step, "+use std::io;");
+    assert_after_contains(&harness, &step, "+fn new_feature()");
+}
+
+#[test]
+fn tui_grad_diff_pure_removal_renders_only_minus_lines() {
+    let harness = TestHarness::new("tui_grad_diff_pure_removal_renders_only_minus_lines");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+remove-only-diff)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Successfully replaced text in legacy.rs.",
+            ))],
+            details: Some(json!({
+                "diff": "-fn deprecated_fn() {\n-    // old code\n-    todo!()\n-}"
+            })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit)",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "@@ legacy.rs @@");
+    assert_after_contains(&harness, &step, "-fn deprecated_fn()");
+    assert_after_contains(&harness, &step, "-    todo!()");
+}
+
+#[test]
+fn tui_grad_diff_multiline_replacement_preserves_context() {
+    let harness = TestHarness::new("tui_grad_diff_multiline_replacement_preserves_context");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+context-diff)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Successfully replaced text in config.rs.",
+            ))],
+            details: Some(json!({
+                "diff": " fn configure() {\n-    let old_val = 42;\n+    let new_val = 99;\n     ok()\n }"
+            })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit)",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "@@ config.rs @@");
+    assert_after_contains(&harness, &step, "-    let old_val = 42;");
+    assert_after_contains(&harness, &step, "+    let new_val = 99;");
+    assert_after_contains(&harness, &step, "fn configure()");
+}
+
+#[test]
+fn tui_grad_diff_tool_error_omits_diff() {
+    let harness = TestHarness::new("tui_grad_diff_tool_error_omits_diff");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+error)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Error: old_string not found in file.",
+            ))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit) error",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: true,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool edit");
+    assert_after_contains(&harness, &step, "old_string not found");
+    assert_after_not_contains(&harness, &step, "@@");
+    assert_after_not_contains(&harness, &step, "Diff:");
+}
+
+#[test]
+fn tui_grad_diff_no_diff_key_shows_plain_output() {
+    let harness = TestHarness::new("tui_grad_diff_no_diff_key_shows_plain_output");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) plain",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "total 24\ndrwxr-xr-x 3 user user 4096 Jan 1 00:00 src",
+            ))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool bash output:");
+    assert_after_contains(&harness, &step, "total 24");
+    assert_after_not_contains(&harness, &step, "@@");
+    assert_after_not_contains(&harness, &step, "Diff:");
+}
+
+// ─── TUI Graduation: Progress Indicators ────────────────────────────────────
+
+#[test]
+fn tui_grad_progress_shows_metrics_when_elapsed_over_one_second() {
+    let harness = TestHarness::new("tui_grad_progress_shows_metrics_when_elapsed_over_one_second");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(grep)",
+        PiMsg::ToolStart {
+            name: "grep".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(grep) with-progress",
+        PiMsg::ToolUpdate {
+            name: "grep".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("searching..."))],
+            details: Some(json!({
+                "progress": {
+                    "elapsedMs": 5000,
+                    "lineCount": 150,
+                    "byteCount": 8192
+                }
+            })),
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Running grep");
+    assert_after_contains(&harness, &step, "5s");
+    assert_after_contains(&harness, &step, "150 lines");
+}
+
+#[test]
+fn tui_grad_progress_shows_timeout_when_present() {
+    let harness = TestHarness::new("tui_grad_progress_shows_timeout_when_present");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) with-timeout",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("running long command"))],
+            details: Some(json!({
+                "progress": {
+                    "elapsedMs": 3000,
+                    "lineCount": 10,
+                    "byteCount": 500,
+                    "timeoutMs": 120_000
+                }
+            })),
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Running bash");
+    assert_after_contains(&harness, &step, "3s");
+    assert_after_contains(&harness, &step, "timeout 120s");
+}
+
+// ─── TUI Graduation: Collapsible Block Interactions ─────────────────────────
+
+#[test]
+fn tui_grad_collapse_multiple_tools_mixed_sizes() {
+    let harness = TestHarness::new("tui_grad_collapse_multiple_tools_mixed_sizes");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // First tool: small output (should NOT auto-collapse).
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read) small",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("short output"))],
+            details: None,
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    // Second tool: large output (should auto-collapse).
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-2".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) large",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-2".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(numbered_lines(30)))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "tool-2".to_string(),
+            is_error: false,
+        },
+    );
+
+    // Small output should be visible, large output should be collapsed.
+    assert_after_contains(&harness, &step, "short output");
+    assert_after_contains(&harness, &step, "collapsed");
+}
+
+#[test]
+fn tui_grad_collapse_global_toggle_affects_all_tool_blocks() {
+    let harness = TestHarness::new("tui_grad_collapse_global_toggle_affects_all_tool_blocks");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Create two small tool outputs (not auto-collapsed).
+    for i in 1..=2 {
+        apply_pi(
+            &harness,
+            &mut app,
+            &format!("PiMsg::ToolStart(read) tool-{i}"),
+            PiMsg::ToolStart {
+                name: "read".to_string(),
+                tool_id: format!("tool-{i}"),
+            },
+        );
+        apply_pi(
+            &harness,
+            &mut app,
+            &format!("PiMsg::ToolUpdate(read) tool-{i}"),
+            PiMsg::ToolUpdate {
+                name: "read".to_string(),
+                tool_id: format!("tool-{i}"),
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "output from tool {i}"
+                )))],
+                details: None,
+            },
+        );
+        apply_pi(
+            &harness,
+            &mut app,
+            &format!("PiMsg::ToolEnd(read) tool-{i}"),
+            PiMsg::ToolEnd {
+                name: "read".to_string(),
+                tool_id: format!("tool-{i}"),
+                is_error: false,
+            },
+        );
+    }
+
+    // Both should be visible.
+    let view = normalize_view(&BubbleteaModel::view(&app));
+    assert!(
+        view.contains("output from tool 1"),
+        "tool 1 should be visible"
+    );
+    assert!(
+        view.contains("output from tool 2"),
+        "tool 2 should be visible"
+    );
+
+    // Toggle collapse (Ctrl+O).
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_contains(&harness, &step, "collapsed");
+    assert_after_not_contains(&harness, &step, "output from tool 1");
+    assert_after_not_contains(&harness, &step, "output from tool 2");
+
+    // Toggle back.
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_contains(&harness, &step, "output from tool 1");
+    assert_after_contains(&harness, &step, "output from tool 2");
+}
+
+#[test]
+fn tui_grad_collapse_auto_collapsed_shows_preview_line_count() {
+    let harness = TestHarness::new("tui_grad_collapse_auto_collapsed_shows_preview_line_count");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) 25-lines",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(numbered_lines(25)))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "collapsed");
+    assert_after_contains(&harness, &step, "line 1");
+    assert_after_contains(&harness, &step, "line 5");
+    assert_after_not_contains(&harness, &step, "line 6");
+    assert_after_contains(&harness, &step, "more lines");
+}
+
+// ─── TUI Graduation: Image Rendering ────────────────────────────────────────
+
+#[test]
+fn tui_grad_image_default_config_shows_images() {
+    let harness = TestHarness::new("tui_grad_image_default_config_shows_images");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read) with-image",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("screenshot captured")),
+                ContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+            ],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "screenshot captured");
+    assert_after_not_contains(&harness, &step, "image(s) hidden");
+}
+
+#[test]
+fn tui_grad_image_mixed_content_with_show_images_false_preserves_text() {
+    let harness =
+        TestHarness::new("tui_grad_image_mixed_content_with_show_images_false_preserves_text");
+    let config = Config {
+        terminal: Some(TerminalSettings {
+            show_images: Some(false),
+            clear_on_shrink: None,
+        }),
+        ..Config::default()
+    };
+    let mut app =
+        build_app_with_session_and_config(&harness, Vec::new(), Session::in_memory(), config);
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) text+images",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("command output line 1")),
+                ContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+                ContentBlock::Text(TextContent::new("command output line 2")),
+                ContentBlock::Image(ImageContent {
+                    data: "d29ybGQ=".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                }),
+            ],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "command output line 1");
+    assert_after_contains(&harness, &step, "command output line 2");
+    assert_after_contains(&harness, &step, "2 image(s) hidden");
+    assert_after_not_contains(&harness, &step, "[image:");
+}
+
+// ─── TUI Graduation: Integration (cross-feature) ───────────────────────────
+
+#[test]
+fn tui_grad_integration_multiple_tools_in_sequence() {
+    let harness = TestHarness::new("tui_grad_integration_multiple_tools_in_sequence");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Tool 1: read with small output.
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read)",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("fn main() {}"))],
+            details: None,
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    // Tool 2: edit with diff.
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-2".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+diff)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-2".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Successfully replaced text in main.rs.",
+            ))],
+            details: Some(json!({
+                "diff": "-fn main() {}\n+fn main() {\n+    println!(\"hello\");\n+}"
+            })),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit)",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-2".to_string(),
+            is_error: false,
+        },
+    );
+
+    // Tool 3: bash with large output (auto-collapses).
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-3".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) large",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-3".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(numbered_lines(30)))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "tool-3".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "fn main() {}");
+    assert_after_contains(&harness, &step, "@@ main.rs @@");
+    assert_after_contains(&harness, &step, "collapsed");
+}
+
+#[test]
+fn tui_grad_integration_branching_with_tool_diffs() {
+    let harness = TestHarness::new("tui_grad_integration_branching_with_tool_diffs");
+    let (session, _root_id, _branch_a_id, _branch_b_id) = create_two_branch_session();
+
+    let mut app = build_app_with_session(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    // Session was navigated to branch 2 last, so we see branch 2 content.
+    let view = normalize_view(&BubbleteaModel::view(&app));
+    assert!(
+        view.contains("Answer B"),
+        "Should show branch B content (last navigated branch)"
+    );
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+diff)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Successfully replaced text in branch_a.rs.",
+            ))],
+            details: Some(json!({
+                "diff": "-old_branch_a_code\n+new_branch_a_code"
+            })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit)",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "@@ branch_a.rs @@");
+    assert_after_contains(&harness, &step, "+new_branch_a_code");
+}
+
+#[test]
+fn tui_grad_integration_tool_error_then_success_sequence() {
+    let harness = TestHarness::new("tui_grad_integration_tool_error_then_success_sequence");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // First tool call: error.
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit) error-content",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Error: old_string not found in file.",
+            ))],
+            details: None,
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit) error",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: true,
+        },
+    );
+
+    // Second tool call: success with diff.
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-2".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+diff) retry",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-2".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Successfully replaced text in retry.rs.",
+            ))],
+            details: Some(json!({
+                "diff": "-old_value\n+new_value"
+            })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit) success",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-2".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "old_string not found");
+    assert_after_contains(&harness, &step, "@@ retry.rs @@");
+    assert_after_contains(&harness, &step, "+new_value");
+}
+
+#[test]
+fn tui_grad_integration_diff_with_collapse_toggle() {
+    let harness = TestHarness::new("tui_grad_integration_diff_with_collapse_toggle");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+
+    let mut diff_lines = Vec::new();
+    for i in 0..20 {
+        diff_lines.push(format!("-old line {i}"));
+        diff_lines.push(format!("+new line {i}"));
+    }
+    let diff = diff_lines.join("\n");
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+large-diff)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Successfully replaced text in large_file.rs.",
+            ))],
+            details: Some(json!({ "diff": diff })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit)",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "collapsed");
+
+    // Toggle expand (Ctrl+O twice: first collapse globally, second expand all).
+    press_ctrlo(&harness, &mut app);
+    let step = press_ctrlo(&harness, &mut app);
+
+    assert_after_contains(&harness, &step, "@@ large_file.rs @@");
 }

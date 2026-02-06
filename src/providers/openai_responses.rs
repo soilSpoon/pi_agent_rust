@@ -132,10 +132,11 @@ impl Provider for OpenAIResponsesProvider {
 
         let request_body = self.build_request(context, options);
 
+        // Note: Content-Type is set by .json() below; setting it here too
+        // produces a duplicate header that OpenAI's server rejects.
         let mut request = self
             .client
             .post(&self.base_url)
-            .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
 
         if let Some(auth_value) = auth_value {
@@ -886,6 +887,12 @@ mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use futures::stream;
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn test_provider_info() {
@@ -895,67 +902,214 @@ mod tests {
     }
 
     #[test]
+    fn test_build_request_includes_system_tools_and_defaults() {
+        let provider = OpenAIResponsesProvider::new("gpt-4o");
+        let context = Context {
+            system_prompt: Some("System guidance".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![
+                ToolDef {
+                    name: "search".to_string(),
+                    description: "Search docs".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": { "q": { "type": "string" } },
+                        "required": ["q"]
+                    }),
+                },
+                ToolDef {
+                    name: "blank_desc".to_string(),
+                    description: "   ".to_string(),
+                    parameters: json!({ "type": "object" }),
+                },
+            ],
+        };
+        let options = StreamOptions {
+            temperature: Some(0.3),
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["model"], "gpt-4o");
+        let temperature = value["temperature"]
+            .as_f64()
+            .expect("temperature should serialize as number");
+        assert!((temperature - 0.3).abs() < 1e-6);
+        assert_eq!(value["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["input"][0]["role"], "system");
+        assert_eq!(value["input"][0]["content"], "System guidance");
+        assert_eq!(value["input"][1]["role"], "user");
+        assert_eq!(value["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(value["input"][1]["content"][0]["text"], "Ping");
+        assert_eq!(value["tools"][0]["type"], "function");
+        assert_eq!(value["tools"][0]["name"], "search");
+        assert_eq!(value["tools"][0]["description"], "Search docs");
+        assert_eq!(
+            value["tools"][0]["parameters"],
+            json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+                "required": ["q"]
+            })
+        );
+        assert!(value["tools"][1].get("description").is_none());
+    }
+
+    #[test]
     fn test_stream_parses_text_and_tool_call() {
+        let events = vec![
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "Hello"
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 1,
+                "delta": "{\"text\":\"hi\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}",
+                    "status": "completed"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": 3
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(matches!(out.first(), Some(StreamEvent::Start { .. })));
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "Hello"))
+        );
+        assert!(out.iter().any(
+            |e| matches!(e, StreamEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "echo")
+        ));
+        assert!(out.iter().any(|e| matches!(
+            e,
+            StreamEvent::Done {
+                reason: StopReason::ToolUse,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn test_stream_accumulates_function_call_arguments_deltas() {
+        let events = vec![
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": "call_2",
+                    "name": "search",
+                    "arguments": "{\"q\":\"ru"
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_2",
+                "delta": "st\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": "call_2",
+                    "name": "search",
+                    "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let tool_end = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .expect("tool call end");
+        assert_eq!(tool_end.id, "call_2");
+        assert_eq!(tool_end.name, "search");
+        assert_eq!(tool_end.arguments, json!({ "q": "rust" }));
+    }
+
+    #[test]
+    fn test_stream_sets_bearer_auth_header() {
+        let captured = run_stream_and_capture_headers().expect("captured request");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-openai-key")
+        );
+        assert_eq!(
+            captured.headers.get("accept").map(String::as_str),
+            Some("text/event-stream")
+        );
+
+        let body: Value = serde_json::from_str(&captured.body).expect("request body json");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    fn collect_events(events: &[Value]) -> Vec<StreamEvent> {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
-
         runtime.block_on(async move {
-            let events = [
-                serde_json::json!({
-                    "type": "response.output_text.delta",
-                    "item_id": "msg_1",
-                    "content_index": 0,
-                    "delta": "Hello"
-                }),
-                serde_json::json!({
-                    "type": "response.output_item.added",
-                    "output_index": 1,
-                    "item": {
-                        "type": "function_call",
-                        "id": "fc_1",
-                        "call_id": "call_1",
-                        "name": "echo",
-                        "arguments": ""
-                    }
-                }),
-                serde_json::json!({
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": "fc_1",
-                    "output_index": 1,
-                    "delta": "{\"text\":\"hi\"}"
-                }),
-                serde_json::json!({
-                    "type": "response.output_item.done",
-                    "output_index": 1,
-                    "item": {
-                        "type": "function_call",
-                        "id": "fc_1",
-                        "call_id": "call_1",
-                        "name": "echo",
-                        "arguments": "{\"text\":\"hi\"}",
-                        "status": "completed"
-                    }
-                }),
-                serde_json::json!({
-                    "type": "response.completed",
-                    "response": {
-                        "incomplete_details": null,
-                        "usage": {
-                            "input_tokens": 1,
-                            "output_tokens": 2,
-                            "total_tokens": 3
-                        }
-                    }
-                }),
-            ];
-
-            let byte_stream = stream::iter(
-                events
-                    .iter()
-                    .map(|event| format!("data: {}\n\n", serde_json::to_string(event).unwrap()))
-                    .map(|s| Ok(s.into_bytes())),
-            );
+            let byte_stream = stream::iter(events.iter().map(|event| {
+                let data = serde_json::to_string(event).expect("serialize event");
+                Ok(format!("data: {data}\n\n").into_bytes())
+            }));
 
             let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
             let mut state = StreamState::new(
@@ -975,10 +1129,152 @@ mod tests {
                 }
             }
 
-            assert!(matches!(out.first(), Some(StreamEvent::Start { .. })));
-            assert!(out.iter().any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "Hello")));
-            assert!(out.iter().any(|e| matches!(e, StreamEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "echo")));
-            assert!(out.iter().any(|e| matches!(e, StreamEvent::Done { reason: StopReason::ToolUse, .. })));
+            out
+        })
+    }
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        headers: HashMap<String, String>,
+        body: String,
+    }
+
+    fn run_stream_and_capture_headers() -> Option<CapturedRequest> {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIResponsesProvider::new("gpt-4o").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
         });
+
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    fn success_sse_body() -> String {
+        [
+            r#"data: {"type":"response.output_text.delta","item_id":"msg_1","content_index":0,"delta":"ok"}"#,
+            "",
+            r#"data: {"type":"response.completed","response":{"incomplete_details":null,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+            "",
+        ]
+        .join("\n")
+    }
+
+    fn spawn_test_server(
+        status_code: u16,
+        content_type: &str,
+        body: &str,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+        let body = body.to_string();
+        let content_type = content_type.to_string();
+
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read request failed: {err}"),
+                }
+            }
+
+            let header_end = bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request header boundary");
+            let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let headers = parse_headers(&header_text);
+            let mut request_body = bytes[header_end + 4..].to_vec();
+
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while request_body.len() < content_length {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read request body failed: {err}"),
+                }
+            }
+
+            let captured = CapturedRequest {
+                headers,
+                body: String::from_utf8_lossy(&request_body).to_string(),
+            };
+            tx.send(captured).expect("send captured request");
+
+            let reason = match status_code {
+                401 => "Unauthorized",
+                500 => "Internal Server Error",
+                _ => "OK",
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write response");
+            socket.flush().expect("flush response");
+        });
+
+        (format!("http://{addr}/responses"), rx)
+    }
+
+    fn parse_headers(header_text: &str) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        for line in header_text.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        headers
     }
 }

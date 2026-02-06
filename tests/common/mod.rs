@@ -16,7 +16,22 @@ pub mod tmux;
 #[allow(unused_imports)]
 pub use harness::TestHarness;
 #[allow(unused_imports)]
+pub use harness::{
+    LIVE_E2E_GATE_ENV, LIVE_E2E_TIMEOUT, LIVE_SHORT_PROMPT, LiveE2eRegistry, LiveHttpTrace,
+    LiveProviderRun, LiveProviderTarget, LiveStreamSummary, build_live_context,
+    build_live_stream_options, ci_e2e_tests_enabled, create_anthropic_provider,
+    create_deepseek_provider, create_gemini_provider, create_live_provider, create_openai_provider,
+    create_openrouter_provider, create_xai_provider, load_vcr_trace, parse_http_status,
+    run_live_provider_target, write_live_provider_runs_jsonl,
+};
+#[allow(unused_imports)]
 pub use harness::{MockHttpResponse, MockHttpServer, TestEnv};
+#[allow(unused_imports)]
+pub use logging::{
+    CostBudgetOutcome, CostThreshold, JsonlValidationError, check_cost_budget,
+    default_cost_thresholds, find_unredacted_keys, redact_json_value, validate_jsonl,
+    validate_jsonl_line,
+};
 
 /// Runs an async future to completion on an asupersync runtime.
 ///

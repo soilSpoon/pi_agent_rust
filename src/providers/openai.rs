@@ -159,11 +159,11 @@ impl Provider for OpenAIProvider {
 
         let request_body = self.build_request(context, options);
 
-        // Build request with headers
+        // Note: Content-Type is set by .json() below; setting it here too
+        // produces a duplicate header that OpenAI's server rejects.
         let mut request = self
             .client
             .post(&self.base_url)
-            .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
 
         if let Some(auth_value) = auth_value {
@@ -749,8 +749,13 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
-    use serde_json::Value;
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn test_convert_user_text_message() {
@@ -780,6 +785,16 @@ mod tests {
         let converted = convert_tool_to_openai(&tool);
         assert_eq!(converted.r#type, "function");
         assert_eq!(converted.function.name, "test_tool");
+        assert_eq!(converted.function.description, "A test tool");
+        assert_eq!(
+            converted.function.parameters,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "arg": {"type": "string"}
+                }
+            })
+        );
     }
 
     #[test]
@@ -787,6 +802,152 @@ mod tests {
         let provider = OpenAIProvider::new("gpt-4o");
         assert_eq!(provider.name(), "openai");
         assert_eq!(provider.api(), "openai-completions");
+    }
+
+    #[test]
+    fn test_build_request_includes_system_tools_and_stream_options() {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let context = Context {
+            system_prompt: Some("You are concise.".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![ToolDef {
+                name: "search".to_string(),
+                description: "Search docs".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "q": { "type": "string" }
+                    },
+                    "required": ["q"]
+                }),
+            }],
+        };
+        let options = StreamOptions {
+            temperature: Some(0.2),
+            max_tokens: Some(123),
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["model"], "gpt-4o");
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(value["messages"][0]["content"], "You are concise.");
+        assert_eq!(value["messages"][1]["role"], "user");
+        assert_eq!(value["messages"][1]["content"], "Ping");
+        let temperature = value["temperature"]
+            .as_f64()
+            .expect("temperature should serialize as number");
+        assert!((temperature - 0.2).abs() < 1e-6);
+        assert_eq!(value["max_tokens"], 123);
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["stream_options"]["include_usage"], true);
+        assert_eq!(value["tools"][0]["type"], "function");
+        assert_eq!(value["tools"][0]["function"]["name"], "search");
+        assert_eq!(value["tools"][0]["function"]["description"], "Search docs");
+        assert_eq!(
+            value["tools"][0]["function"]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string" }
+                },
+                "required": ["q"]
+            })
+        );
+    }
+
+    #[test]
+    fn test_stream_accumulates_tool_call_argument_deltas() {
+        let events = vec![
+            json!({ "choices": [{ "delta": {} }] }),
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "search",
+                                "arguments": "{\"q\":\"ru"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {
+                                "arguments": "st\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] }),
+            Value::String("[DONE]".to_string()),
+        ];
+
+        let out = collect_events(&events);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+        );
+        assert!(out.iter().any(
+            |e| matches!(e, StreamEvent::ToolCallDelta { delta, .. } if delta == "{\"q\":\"ru")
+        ));
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, StreamEvent::ToolCallDelta { delta, .. } if delta == "st\"}"))
+        );
+        let done = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("done event");
+        let tool_call = done
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolCall(tc) => Some(tc),
+                _ => None,
+            })
+            .expect("assembled tool call content");
+        assert_eq!(tool_call.id, "call_1");
+        assert_eq!(tool_call.name, "search");
+        assert_eq!(tool_call.arguments, json!({ "q": "rust" }));
+        assert!(out.iter().any(|e| matches!(
+            e,
+            StreamEvent::Done {
+                reason: StopReason::ToolUse,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn test_stream_sets_bearer_auth_header() {
+        let captured = run_stream_and_capture_headers().expect("captured request");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-openai-key")
+        );
+        assert_eq!(
+            captured.headers.get("accept").map(String::as_str),
+            Some("text/event-stream")
+        );
+
+        let body: Value = serde_json::from_str(&captured.body).expect("request body json");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
     #[derive(Debug, Deserialize)]
@@ -830,6 +991,153 @@ mod tests {
             .join(file_name);
         let raw = std::fs::read_to_string(path).expect("fixture read");
         serde_json::from_str(&raw).expect("fixture parse")
+    }
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        headers: HashMap<String, String>,
+        body: String,
+    }
+
+    fn run_stream_and_capture_headers() -> Option<CapturedRequest> {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIProvider::new("gpt-4o").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    fn success_sse_body() -> String {
+        [
+            r#"data: {"choices":[{"delta":{}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n")
+    }
+
+    fn spawn_test_server(
+        status_code: u16,
+        content_type: &str,
+        body: &str,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+        let body = body.to_string();
+        let content_type = content_type.to_string();
+
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read request failed: {err}"),
+                }
+            }
+
+            let header_end = bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request header boundary");
+            let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let headers = parse_headers(&header_text);
+            let mut request_body = bytes[header_end + 4..].to_vec();
+
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while request_body.len() < content_length {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read request body failed: {err}"),
+                }
+            }
+
+            let captured = CapturedRequest {
+                headers,
+                body: String::from_utf8_lossy(&request_body).to_string(),
+            };
+            tx.send(captured).expect("send captured request");
+
+            let reason = match status_code {
+                401 => "Unauthorized",
+                500 => "Internal Server Error",
+                _ => "OK",
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write response");
+            socket.flush().expect("flush response");
+        });
+
+        (format!("http://{addr}/chat/completions"), rx)
+    }
+
+    fn parse_headers(header_text: &str) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        for line in header_text.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        headers
     }
 
     fn collect_events(events: &[Value]) -> Vec<StreamEvent> {

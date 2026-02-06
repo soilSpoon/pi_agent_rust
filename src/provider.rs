@@ -305,3 +305,324 @@ impl std::str::FromStr for KnownProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // Api enum: FromStr + Display round-trips
+    // ========================================================================
+
+    #[test]
+    fn api_from_str_known_variants() {
+        let cases = [
+            ("anthropic-messages", Api::AnthropicMessages),
+            ("openai-completions", Api::OpenAICompletions),
+            ("openai-responses", Api::OpenAIResponses),
+            ("azure-openai-responses", Api::AzureOpenAIResponses),
+            ("bedrock-converse-stream", Api::BedrockConverseStream),
+            ("google-generative-ai", Api::GoogleGenerativeAI),
+            ("google-gemini-cli", Api::GoogleGeminiCli),
+            ("google-vertex", Api::GoogleVertex),
+        ];
+        for (input, expected) in &cases {
+            let parsed: Api = input.parse().unwrap();
+            assert_eq!(&parsed, expected, "from_str({input})");
+        }
+    }
+
+    #[test]
+    fn api_display_known_variants() {
+        let cases = [
+            (Api::AnthropicMessages, "anthropic-messages"),
+            (Api::OpenAICompletions, "openai-completions"),
+            (Api::OpenAIResponses, "openai-responses"),
+            (Api::AzureOpenAIResponses, "azure-openai-responses"),
+            (Api::BedrockConverseStream, "bedrock-converse-stream"),
+            (Api::GoogleGenerativeAI, "google-generative-ai"),
+            (Api::GoogleGeminiCli, "google-gemini-cli"),
+            (Api::GoogleVertex, "google-vertex"),
+        ];
+        for (variant, expected) in &cases {
+            assert_eq!(&variant.to_string(), expected, "display for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn api_round_trip_all_known() {
+        let variants = [
+            Api::AnthropicMessages,
+            Api::OpenAICompletions,
+            Api::OpenAIResponses,
+            Api::AzureOpenAIResponses,
+            Api::BedrockConverseStream,
+            Api::GoogleGenerativeAI,
+            Api::GoogleGeminiCli,
+            Api::GoogleVertex,
+        ];
+        for variant in &variants {
+            let s = variant.to_string();
+            let parsed: Api = s.parse().unwrap();
+            assert_eq!(&parsed, variant, "round-trip failed for {variant:?} -> {s}");
+        }
+    }
+
+    #[test]
+    fn api_custom_variant() {
+        let parsed: Api = "my-custom-api".parse().unwrap();
+        assert_eq!(parsed, Api::Custom("my-custom-api".to_string()));
+        assert_eq!(parsed.to_string(), "my-custom-api");
+    }
+
+    #[test]
+    fn api_empty_string_rejected() {
+        let result: Result<Api, _> = "".parse();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "API identifier cannot be empty");
+    }
+
+    // ========================================================================
+    // KnownProvider enum: FromStr + Display round-trips
+    // ========================================================================
+
+    #[test]
+    fn provider_from_str_known_variants() {
+        let cases = [
+            ("anthropic", KnownProvider::Anthropic),
+            ("openai", KnownProvider::OpenAI),
+            ("google", KnownProvider::Google),
+            ("google-vertex", KnownProvider::GoogleVertex),
+            ("amazon-bedrock", KnownProvider::AmazonBedrock),
+            ("azure-openai", KnownProvider::AzureOpenAI),
+            ("github-copilot", KnownProvider::GithubCopilot),
+            ("xai", KnownProvider::XAI),
+            ("groq", KnownProvider::Groq),
+            ("cerebras", KnownProvider::Cerebras),
+            ("openrouter", KnownProvider::OpenRouter),
+            ("mistral", KnownProvider::Mistral),
+        ];
+        for (input, expected) in &cases {
+            let parsed: KnownProvider = input.parse().unwrap();
+            assert_eq!(&parsed, expected, "from_str({input})");
+        }
+    }
+
+    #[test]
+    fn provider_display_known_variants() {
+        let cases = [
+            (KnownProvider::Anthropic, "anthropic"),
+            (KnownProvider::OpenAI, "openai"),
+            (KnownProvider::Google, "google"),
+            (KnownProvider::GoogleVertex, "google-vertex"),
+            (KnownProvider::AmazonBedrock, "amazon-bedrock"),
+            (KnownProvider::AzureOpenAI, "azure-openai"),
+            (KnownProvider::GithubCopilot, "github-copilot"),
+            (KnownProvider::XAI, "xai"),
+            (KnownProvider::Groq, "groq"),
+            (KnownProvider::Cerebras, "cerebras"),
+            (KnownProvider::OpenRouter, "openrouter"),
+            (KnownProvider::Mistral, "mistral"),
+        ];
+        for (variant, expected) in &cases {
+            assert_eq!(&variant.to_string(), expected, "display for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn provider_round_trip_all_known() {
+        let variants = [
+            KnownProvider::Anthropic,
+            KnownProvider::OpenAI,
+            KnownProvider::Google,
+            KnownProvider::GoogleVertex,
+            KnownProvider::AmazonBedrock,
+            KnownProvider::AzureOpenAI,
+            KnownProvider::GithubCopilot,
+            KnownProvider::XAI,
+            KnownProvider::Groq,
+            KnownProvider::Cerebras,
+            KnownProvider::OpenRouter,
+            KnownProvider::Mistral,
+        ];
+        for variant in &variants {
+            let s = variant.to_string();
+            let parsed: KnownProvider = s.parse().unwrap();
+            assert_eq!(&parsed, variant, "round-trip failed for {variant:?} -> {s}");
+        }
+    }
+
+    #[test]
+    fn provider_custom_variant() {
+        let parsed: KnownProvider = "my-custom-provider".parse().unwrap();
+        assert_eq!(
+            parsed,
+            KnownProvider::Custom("my-custom-provider".to_string())
+        );
+        assert_eq!(parsed.to_string(), "my-custom-provider");
+    }
+
+    #[test]
+    fn provider_empty_string_rejected() {
+        let result: Result<KnownProvider, _> = "".parse();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Provider identifier cannot be empty");
+    }
+
+    // ========================================================================
+    // Model::calculate_cost
+    // ========================================================================
+
+    fn test_model() -> Model {
+        Model {
+            id: "test-model".to_string(),
+            name: "Test Model".to_string(),
+            api: "anthropic-messages".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            reasoning: false,
+            input: vec![InputType::Text],
+            cost: ModelCost {
+                input: 3.0,   // $3 per million input tokens
+                output: 15.0, // $15 per million output tokens
+                cache_read: 0.3,
+                cache_write: 3.75,
+            },
+            context_window: 200_000,
+            max_tokens: 8192,
+            headers: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn calculate_cost_basic() {
+        let model = test_model();
+        // 1000 input tokens at $3/M = $0.003
+        // 500 output tokens at $15/M = $0.0075
+        let cost = model.calculate_cost(1000, 500, 0, 0);
+        let expected = (3.0 / 1_000_000.0) * 1000.0 + (15.0 / 1_000_000.0) * 500.0;
+        assert!(
+            (cost - expected).abs() < f64::EPSILON,
+            "expected {expected}, got {cost}"
+        );
+    }
+
+    #[test]
+    fn calculate_cost_with_cache() {
+        let model = test_model();
+        let cost = model.calculate_cost(1000, 500, 2000, 1000);
+        let expected = (3.0 / 1_000_000.0) * 1000.0
+            + (15.0 / 1_000_000.0) * 500.0
+            + (0.3 / 1_000_000.0) * 2000.0
+            + (3.75 / 1_000_000.0) * 1000.0;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "expected {expected}, got {cost}"
+        );
+    }
+
+    #[test]
+    fn calculate_cost_zero_tokens() {
+        let model = test_model();
+        let cost = model.calculate_cost(0, 0, 0, 0);
+        assert!((cost).abs() < f64::EPSILON, "zero tokens should cost $0");
+    }
+
+    #[test]
+    fn calculate_cost_large_token_count() {
+        let model = test_model();
+        // 1 million tokens each
+        let cost = model.calculate_cost(1_000_000, 1_000_000, 0, 0);
+        let expected = 3.0 + 15.0; // $3 input + $15 output
+        assert!(
+            (cost - expected).abs() < 1e-10,
+            "expected {expected}, got {cost}"
+        );
+    }
+
+    // ========================================================================
+    // Default values
+    // ========================================================================
+
+    #[test]
+    fn thinking_budgets_default() {
+        let budgets = ThinkingBudgets::default();
+        assert_eq!(budgets.minimal, 1024);
+        assert_eq!(budgets.low, 2048);
+        assert_eq!(budgets.medium, 8192);
+        assert_eq!(budgets.high, 16384);
+        assert_eq!(budgets.xhigh, 32768);
+    }
+
+    #[test]
+    fn cache_retention_default_is_none() {
+        assert_eq!(CacheRetention::default(), CacheRetention::None);
+    }
+
+    #[test]
+    fn stream_options_default() {
+        let opts = StreamOptions::default();
+        assert!(opts.temperature.is_none());
+        assert!(opts.max_tokens.is_none());
+        assert!(opts.api_key.is_none());
+        assert_eq!(opts.cache_retention, CacheRetention::None);
+        assert!(opts.session_id.is_none());
+        assert!(opts.headers.is_empty());
+        assert!(opts.thinking_level.is_none());
+        assert!(opts.thinking_budgets.is_none());
+    }
+
+    #[test]
+    fn context_default() {
+        let ctx = Context::default();
+        assert!(ctx.system_prompt.is_none());
+        assert!(ctx.messages.is_empty());
+        assert!(ctx.tools.is_empty());
+    }
+
+    // ========================================================================
+    // InputType serde
+    // ========================================================================
+
+    #[test]
+    fn input_type_serialization() {
+        let text_json = serde_json::to_string(&InputType::Text).unwrap();
+        assert_eq!(text_json, "\"text\"");
+
+        let image_json = serde_json::to_string(&InputType::Image).unwrap();
+        assert_eq!(image_json, "\"image\"");
+
+        let text: InputType = serde_json::from_str("\"text\"").unwrap();
+        assert_eq!(text, InputType::Text);
+
+        let image: InputType = serde_json::from_str("\"image\"").unwrap();
+        assert_eq!(image, InputType::Image);
+    }
+
+    // ========================================================================
+    // ModelCost serde
+    // ========================================================================
+
+    #[test]
+    fn model_cost_camel_case_serialization() {
+        let cost = ModelCost {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        };
+        let json = serde_json::to_string(&cost).unwrap();
+        assert!(
+            json.contains("\"cacheRead\""),
+            "should use camelCase: {json}"
+        );
+        assert!(
+            json.contains("\"cacheWrite\""),
+            "should use camelCase: {json}"
+        );
+
+        let parsed: ModelCost = serde_json::from_str(&json).unwrap();
+        assert!((parsed.input - 3.0).abs() < f64::EPSILON);
+        assert!((parsed.cache_read - 0.3).abs() < f64::EPSILON);
+    }
+}

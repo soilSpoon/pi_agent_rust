@@ -405,6 +405,23 @@ fn resolve_value(value: &str) -> Option<String> {
         return resolve_shell(rest);
     }
 
+    if let Some(var_name) = value.strip_prefix("env:") {
+        if var_name.is_empty() {
+            return None;
+        }
+        return std::env::var(var_name).ok().filter(|v| !v.is_empty());
+    }
+
+    if let Some(file_path) = value.strip_prefix("file:") {
+        if file_path.is_empty() {
+            return None;
+        }
+        return std::fs::read_to_string(file_path)
+            .ok()
+            .map(|contents| contents.trim().to_string())
+            .filter(|v| !v.is_empty());
+    }
+
     if let Ok(env_val) = std::env::var(value) {
         if !env_val.is_empty() {
             return Some(env_val);
@@ -631,4 +648,284 @@ pub(crate) fn ad_hoc_model_entry(provider: &str, model_id: &str) -> Option<Model
         compat: None,
         oauth_config: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{AuthCredential, AuthStorage};
+    use tempfile::tempdir;
+
+    fn test_auth_storage() -> (tempfile::TempDir, AuthStorage) {
+        let dir = tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("load auth");
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "anthropic-auth-key".to_string(),
+            },
+        );
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "openai-auth-key".to_string(),
+            },
+        );
+        auth.set(
+            "google",
+            AuthCredential::ApiKey {
+                key: "google-auth-key".to_string(),
+            },
+        );
+        auth.set(
+            "acme",
+            AuthCredential::ApiKey {
+                key: "acme-auth-key".to_string(),
+            },
+        );
+        (dir, auth)
+    }
+
+    fn expected_env_pair() -> (String, String) {
+        let key = ["PATH", "HOME", "PWD"]
+            .iter()
+            .find_map(|k| {
+                std::env::var(k)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| ((*k).to_string(), v))
+            })
+            .expect("expected at least one non-empty environment variable");
+        (key.0, key.1)
+    }
+
+    #[test]
+    fn built_in_models_include_core_provider_entries() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth);
+
+        assert!(
+            models.iter().any(
+                |m| m.model.provider == "anthropic" && m.model.id == "claude-sonnet-4-20250514"
+            )
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.model.provider == "openai" && m.model.id == "gpt-4o")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.model.provider == "google" && m.model.id == "gemini-2.5-pro")
+        );
+
+        let anthropic = models
+            .iter()
+            .find(|m| m.model.provider == "anthropic")
+            .expect("anthropic model");
+        let openai = models
+            .iter()
+            .find(|m| m.model.provider == "openai")
+            .expect("openai model");
+        let google = models
+            .iter()
+            .find(|m| m.model.provider == "google")
+            .expect("google model");
+        assert_eq!(anthropic.api_key.as_deref(), Some("anthropic-auth-key"));
+        assert_eq!(openai.api_key.as_deref(), Some("openai-auth-key"));
+        assert_eq!(google.api_key.as_deref(), Some("google-auth-key"));
+    }
+
+    #[test]
+    fn apply_custom_models_overrides_provider_fields() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = built_in_models(&auth);
+        let (env_key, env_val) = expected_env_pair();
+        let mut provider_headers = HashMap::new();
+        provider_headers.insert("x-provider".to_string(), "provider-header".to_string());
+
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "anthropic".to_string(),
+                ProviderConfig {
+                    base_url: Some("https://proxy.example/v1/messages".to_string()),
+                    api: Some("anthropic-messages".to_string()),
+                    api_key: Some(format!("env:{env_key}")),
+                    headers: Some(provider_headers),
+                    auth_header: Some(true),
+                    compat: Some(CompatConfig {
+                        supports_store: Some(true),
+                        ..CompatConfig::default()
+                    }),
+                    models: None,
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config);
+
+        for entry in models.iter().filter(|m| m.model.provider == "anthropic") {
+            assert_eq!(entry.model.base_url, "https://proxy.example/v1/messages");
+            assert_eq!(entry.model.api, "anthropic-messages");
+            assert_eq!(entry.api_key.as_deref(), Some(env_val.as_str()));
+            assert_eq!(
+                entry.headers.get("x-provider").map(String::as_str),
+                Some("provider-header")
+            );
+            assert!(entry.auth_header);
+            assert_eq!(
+                entry
+                    .compat
+                    .as_ref()
+                    .and_then(|c| c.supports_store)
+                    .unwrap_or(false),
+                true
+            );
+        }
+    }
+
+    #[test]
+    fn model_registry_find_and_find_by_id_work() {
+        let (_dir, auth) = test_auth_storage();
+        let registry = ModelRegistry::load(&auth, None);
+
+        let by_provider_and_id = registry
+            .find("openai", "gpt-4o")
+            .expect("openai/gpt-4o should exist");
+        assert_eq!(by_provider_and_id.model.provider, "openai");
+        assert_eq!(by_provider_and_id.model.id, "gpt-4o");
+
+        let by_id = registry
+            .find_by_id("gemini-2.5-pro")
+            .expect("gemini-2.5-pro should exist");
+        assert_eq!(by_id.model.provider, "google");
+        assert_eq!(by_id.model.id, "gemini-2.5-pro");
+
+        assert!(registry.find("openai", "does-not-exist").is_none());
+        assert!(registry.find_by_id("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn model_registry_merge_entries_deduplicates() {
+        let (_dir, auth) = test_auth_storage();
+        let mut registry = ModelRegistry::load(&auth, None);
+        let before = registry.models().len();
+        let duplicate = registry
+            .find("openai", "gpt-4o")
+            .expect("expected built-in openai model");
+
+        let new_entry = ModelEntry {
+            model: Model {
+                id: "acme-chat".to_string(),
+                name: "Acme Chat".to_string(),
+                api: "openai-completions".to_string(),
+                provider: "acme".to_string(),
+                base_url: "https://acme.example/v1".to_string(),
+                reasoning: true,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 64_000,
+                max_tokens: 4096,
+                headers: HashMap::new(),
+            },
+            api_key: Some("acme-auth-key".to_string()),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        };
+
+        registry.merge_entries(vec![duplicate, new_entry]);
+        assert_eq!(registry.models().len(), before + 1);
+        assert!(registry.find("acme", "acme-chat").is_some());
+    }
+
+    #[test]
+    fn resolve_value_supports_env_and_file_prefixes() {
+        let (env_key, env_val) = expected_env_pair();
+        assert_eq!(
+            resolve_value(&format!("env:{env_key}")).as_deref(),
+            Some(env_val.as_str())
+        );
+        assert_eq!(resolve_value(&env_key).as_deref(), Some(env_val.as_str()));
+
+        let dir = tempdir().expect("tempdir");
+        let key_path = dir.path().join("api_key.txt");
+        std::fs::write(&key_path, "file-key\n").expect("write key file");
+        assert_eq!(
+            resolve_value(&format!("file:{}", key_path.display())).as_deref(),
+            Some("file-key")
+        );
+        assert!(resolve_value("file:/definitely/missing/path").is_none());
+    }
+
+    #[test]
+    fn model_registry_load_reads_models_json_and_applies_config() {
+        let (dir, auth) = test_auth_storage();
+        let models_path = dir.path().join("models.json");
+        let key_path = dir.path().join("custom_key.txt");
+        std::fs::write(&key_path, "acme-file-key\n").expect("write custom key");
+
+        let models_json = serde_json::json!({
+            "providers": {
+                "acme": {
+                    "baseUrl": "https://acme.example/v1",
+                    "api": "openai-completions",
+                    "apiKey": format!("file:{}", key_path.display()),
+                    "headers": {
+                        "x-provider": "provider-level"
+                    },
+                    "authHeader": true,
+                    "models": [
+                        {
+                            "id": "acme-chat",
+                            "name": "Acme Chat",
+                            "input": ["text", "image"],
+                            "reasoning": true,
+                            "contextWindow": 64000,
+                            "maxTokens": 4096,
+                            "headers": {
+                                "x-model": "model-level"
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        std::fs::write(
+            &models_path,
+            serde_json::to_string_pretty(&models_json).expect("serialize models json"),
+        )
+        .expect("write models.json");
+
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        let acme = registry
+            .find("acme", "acme-chat")
+            .expect("custom acme model should load from models.json");
+
+        assert_eq!(acme.model.name, "Acme Chat");
+        assert_eq!(acme.model.api, "openai-completions");
+        assert_eq!(acme.model.base_url, "https://acme.example/v1");
+        assert_eq!(acme.model.context_window, 64_000);
+        assert_eq!(acme.model.max_tokens, 4096);
+        assert_eq!(acme.api_key.as_deref(), Some("acme-file-key"));
+        assert!(acme.auth_header);
+        assert_eq!(
+            acme.headers.get("x-provider").map(String::as_str),
+            Some("provider-level")
+        );
+        assert_eq!(
+            acme.headers.get("x-model").map(String::as_str),
+            Some("model-level")
+        );
+        assert_eq!(acme.model.input, vec![InputType::Text, InputType::Image]);
+    }
 }

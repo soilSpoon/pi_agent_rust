@@ -241,6 +241,114 @@ fn create_provider_for_gemini() {
 }
 
 #[test]
+fn create_provider_for_cohere() {
+    let harness = TestHarness::new("create_provider_for_cohere");
+    let entry = make_model_entry("cohere", "command-r-test", "https://api.cohere.com/v2");
+    let provider = create_provider(&entry, None).expect("create cohere provider");
+    harness
+        .log()
+        .info_ctx("provider", "created provider", |ctx| {
+            ctx.push(("name".to_string(), provider.name().to_string()));
+            ctx.push(("api".to_string(), provider.api().to_string()));
+            ctx.push(("model".to_string(), provider.model_id().to_string()));
+        });
+
+    assert_eq!(provider.name(), "cohere");
+    assert_eq!(provider.api(), "cohere-chat");
+    assert_eq!(provider.model_id(), "command-r-test");
+}
+
+#[test]
+fn create_provider_falls_back_to_api_openai_completions() {
+    let harness = TestHarness::new("create_provider_falls_back_to_api_openai_completions");
+    let mut entry = make_model_entry("custom-openai", "custom-gpt", "https://api.openai.com/v1");
+    entry.model.api = "openai-completions".to_string();
+    let provider = create_provider(&entry, None).expect("create api-fallback openai provider");
+    harness
+        .log()
+        .info_ctx("provider", "fallback provider", |ctx| {
+            ctx.push(("name".to_string(), provider.name().to_string()));
+            ctx.push(("api".to_string(), provider.api().to_string()));
+            ctx.push(("model".to_string(), provider.model_id().to_string()));
+        });
+
+    assert_eq!(provider.name(), "custom-openai");
+    assert_eq!(provider.api(), "openai-completions");
+    assert_eq!(provider.model_id(), "custom-gpt");
+}
+
+#[test]
+fn create_provider_falls_back_to_api_openai_responses() {
+    let harness = TestHarness::new("create_provider_falls_back_to_api_openai_responses");
+    let mut entry = make_model_entry(
+        "custom-openai-responses",
+        "custom-gpt",
+        "https://api.openai.com/v1",
+    );
+    entry.model.api = "openai-responses".to_string();
+    let provider =
+        create_provider(&entry, None).expect("create api-fallback openai responses provider");
+    harness
+        .log()
+        .info_ctx("provider", "fallback provider", |ctx| {
+            ctx.push(("name".to_string(), provider.name().to_string()));
+            ctx.push(("api".to_string(), provider.api().to_string()));
+            ctx.push(("model".to_string(), provider.model_id().to_string()));
+        });
+
+    assert_eq!(provider.name(), "custom-openai-responses");
+    assert_eq!(provider.api(), "openai-responses");
+    assert_eq!(provider.model_id(), "custom-gpt");
+}
+
+#[test]
+fn create_provider_falls_back_to_api_cohere_chat() {
+    let harness = TestHarness::new("create_provider_falls_back_to_api_cohere_chat");
+    let mut entry = make_model_entry(
+        "custom-cohere",
+        "command-r-test",
+        "https://api.cohere.com/v2",
+    );
+    entry.model.api = "cohere-chat".to_string();
+    let provider = create_provider(&entry, None).expect("create api-fallback cohere provider");
+    harness
+        .log()
+        .info_ctx("provider", "fallback provider", |ctx| {
+            ctx.push(("name".to_string(), provider.name().to_string()));
+            ctx.push(("api".to_string(), provider.api().to_string()));
+            ctx.push(("model".to_string(), provider.model_id().to_string()));
+        });
+
+    assert_eq!(provider.name(), "custom-cohere");
+    assert_eq!(provider.api(), "cohere-chat");
+    assert_eq!(provider.model_id(), "command-r-test");
+}
+
+#[test]
+fn create_provider_falls_back_to_api_anthropic_messages() {
+    let harness = TestHarness::new("create_provider_falls_back_to_api_anthropic_messages");
+    let mut entry = make_model_entry(
+        "custom-anthropic",
+        "claude-test",
+        "https://api.anthropic.com/v1/messages",
+    );
+    entry.model.api = "anthropic-messages".to_string();
+    let provider = create_provider(&entry, None).expect("create api-fallback anthropic provider");
+    harness
+        .log()
+        .info_ctx("provider", "fallback provider", |ctx| {
+            ctx.push(("name".to_string(), provider.name().to_string()));
+            ctx.push(("api".to_string(), provider.api().to_string()));
+            ctx.push(("model".to_string(), provider.model_id().to_string()));
+        });
+
+    // Anthropic provider has a fixed provider name at the implementation layer.
+    assert_eq!(provider.name(), "anthropic");
+    assert_eq!(provider.api(), "anthropic-messages");
+    assert_eq!(provider.model_id(), "claude-test");
+}
+
+#[test]
 fn create_provider_rejects_azure_without_deployment() {
     let harness = TestHarness::new("create_provider_rejects_azure_without_deployment");
     let entry = make_model_entry("azure-openai", "gpt-4o", "https://example.openai.azure.com");
@@ -314,6 +422,19 @@ fn api_from_str_empty_rejected() {
         ctx.push(("error".to_string(), err.clone()));
     });
     assert!(err.contains("empty"));
+}
+
+#[test]
+fn api_from_str_noncanonical_values_become_custom() {
+    let harness = TestHarness::new("api_from_str_noncanonical_values_become_custom");
+    for input in ["cohere-v2", "google-generativeai"] {
+        let parsed = Api::from_str(input).expect("parse as custom api");
+        harness.log().info_ctx("api", "noncanonical parse", |ctx| {
+            ctx.push(("input".to_string(), input.to_string()));
+            ctx.push(("parsed".to_string(), parsed.to_string()));
+        });
+        assert_eq!(parsed, Api::Custom(input.to_string()));
+    }
 }
 
 #[test]
@@ -438,4 +559,17 @@ fn stream_options_default_is_empty_and_safe() {
     assert!(options.thinking_budgets.is_none());
     assert!(options.headers.is_empty());
     assert_eq!(options.cache_retention, CacheRetention::None);
+}
+
+#[test]
+fn input_type_rejects_unknown_values() {
+    let harness = TestHarness::new("input_type_rejects_unknown_values");
+    let err = serde_json::from_str::<InputType>("\"audio\"")
+        .expect_err("expected unknown input type to fail");
+    harness
+        .log()
+        .info_ctx("input_type", "invalid variant", |ctx| {
+            ctx.push(("error".to_string(), err.to_string()));
+        });
+    assert!(err.to_string().contains("unknown variant"));
 }

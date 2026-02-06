@@ -346,6 +346,7 @@ mod tests {
     use futures::StreamExt;
     use futures::stream;
     use proptest::prelude::*;
+    use std::fmt::Write as _;
 
     #[derive(Debug, Clone)]
     struct GeneratedEvent {
@@ -538,6 +539,13 @@ mod tests {
     }
 
     #[test]
+    fn test_keep_alive_comment_does_not_emit_event() {
+        let mut parser = SseParser::new();
+        let events = parser.feed(": keepalive\n\n");
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn test_crlf_handling() {
         let mut parser = SseParser::new();
         let events = parser.feed("data: hello\r\n\r\n");
@@ -556,6 +564,91 @@ mod tests {
         let event = parser.flush();
         assert!(event.is_some());
         assert_eq!(event.unwrap().data, "incomplete");
+    }
+
+    #[test]
+    fn test_event_without_data_is_ignored() {
+        let mut parser = SseParser::new();
+        let events = parser.feed("event: ping\n\n");
+        assert!(
+            events.is_empty(),
+            "event block without data should not emit an event"
+        );
+    }
+
+    #[test]
+    fn test_unknown_field_is_ignored() {
+        let mut parser = SseParser::new();
+        let events = parser.feed("foo: bar\ndata: hello\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "hello");
+        assert_eq!(events[0].event, "message");
+    }
+
+    #[test]
+    fn test_error_event_parsing() {
+        let mut parser = SseParser::new();
+        let events = parser.feed("event: error\ndata: {\"message\":\"boom\"}\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data, "{\"message\":\"boom\"}");
+    }
+
+    #[test]
+    fn test_large_payload_event() {
+        let mut parser = SseParser::new();
+        let payload = "x".repeat(128 * 1024);
+        let input = format!("data: {payload}\n\n");
+        let events = parser.feed(&input);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data.len(), payload.len());
+        assert_eq!(events[0].data, payload);
+    }
+
+    #[test]
+    fn test_rapid_sequential_events() {
+        let mut parser = SseParser::new();
+        let mut input = String::new();
+        for i in 0..200 {
+            let _ = write!(&mut input, "event: e{i}\ndata: payload{i}\n\n");
+        }
+        let events = parser.feed(&input);
+        assert_eq!(events.len(), 200);
+        assert_eq!(events[0].event, "e0");
+        assert_eq!(events[0].data, "payload0");
+        assert_eq!(events[199].event, "e199");
+        assert_eq!(events[199].data, "payload199");
+    }
+
+    #[test]
+    fn test_stream_event_name_matrix() {
+        let names = [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+            "message",
+            "error",
+            "ping",
+            "response.created",
+            "response.output_text.delta",
+            "response.completed",
+        ];
+
+        let mut parser = SseParser::new();
+        let mut input = String::new();
+        for name in names {
+            let _ = write!(&mut input, "event: {name}\ndata: {{}}\n\n");
+        }
+
+        let events = parser.feed(&input);
+        assert_eq!(events.len(), names.len());
+        for (idx, name) in names.iter().enumerate() {
+            assert_eq!(events[idx].event, *name);
+            assert_eq!(events[idx].data, "{}");
+        }
     }
 
     #[test]

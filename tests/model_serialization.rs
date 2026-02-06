@@ -60,6 +60,23 @@ fn make_assistant_message(content: Vec<ContentBlock>) -> AssistantMessage {
     }
 }
 
+const fn assistant_event_kind(event: &AssistantMessageEvent) -> &'static str {
+    match event {
+        AssistantMessageEvent::Start { .. } => "start",
+        AssistantMessageEvent::TextStart { .. } => "text_start",
+        AssistantMessageEvent::TextDelta { .. } => "text_delta",
+        AssistantMessageEvent::TextEnd { .. } => "text_end",
+        AssistantMessageEvent::ThinkingStart { .. } => "thinking_start",
+        AssistantMessageEvent::ThinkingDelta { .. } => "thinking_delta",
+        AssistantMessageEvent::ThinkingEnd { .. } => "thinking_end",
+        AssistantMessageEvent::ToolCallStart { .. } => "toolcall_start",
+        AssistantMessageEvent::ToolCallDelta { .. } => "toolcall_delta",
+        AssistantMessageEvent::ToolCallEnd { .. } => "toolcall_end",
+        AssistantMessageEvent::Done { .. } => "done",
+        AssistantMessageEvent::Error { .. } => "error",
+    }
+}
+
 // ============================================================================
 // Message Round-Trip Tests
 // ============================================================================
@@ -275,6 +292,89 @@ fn test_tool_result_error() {
         assert!(result.is_error);
     } else {
         unreachable!("Expected ToolResult message");
+    }
+}
+
+#[test]
+fn test_tool_result_details_omitted_when_none() {
+    let harness = TestHarness::new("tool_result_details_omitted_when_none");
+
+    let msg = Message::ToolResult(ToolResultMessage {
+        tool_call_id: "call_no_details".to_string(),
+        tool_name: "ls".to_string(),
+        content: vec![ContentBlock::Text(TextContent::new("ok"))],
+        details: None,
+        is_error: false,
+        timestamp: 1_700_000_000,
+    });
+
+    let json = serde_json::to_string(&msg).unwrap();
+    harness.log().info("serialize", format!("JSON: {json}"));
+    assert!(
+        !json.contains("\"details\""),
+        "details should be omitted when None"
+    );
+
+    let parsed: Message = serde_json::from_str(&json).unwrap();
+    if let Message::ToolResult(result) = parsed {
+        assert!(result.details.is_none());
+    } else {
+        unreachable!("Expected ToolResult message");
+    }
+}
+
+#[test]
+fn test_custom_message_round_trip() {
+    let harness = TestHarness::new("custom_message_round_trip");
+
+    let msg = Message::Custom(pi::model::CustomMessage {
+        content: "Host-injected status update".to_string(),
+        custom_type: "status".to_string(),
+        display: true,
+        details: Some(json!({
+            "source": "runtime",
+            "level": "info"
+        })),
+        timestamp: 1_700_000_000,
+    });
+
+    let json = serde_json::to_string(&msg).unwrap();
+    harness.log().info("serialize", format!("JSON: {json}"));
+    assert_json_contains(&harness, "custom", &json, "\"role\":\"custom\"");
+    assert_json_contains(&harness, "custom", &json, "\"customType\":\"status\"");
+
+    let parsed: Message = serde_json::from_str(&json).unwrap();
+    if let Message::Custom(custom) = parsed {
+        assert_eq!(custom.content, "Host-injected status update");
+        assert_eq!(custom.custom_type, "status");
+        assert!(custom.display);
+        assert!(custom.details.is_some());
+    } else {
+        unreachable!("Expected Custom message");
+    }
+}
+
+#[test]
+fn test_custom_message_defaults_on_missing_optional_fields() {
+    let harness = TestHarness::new("custom_message_defaults_on_missing_optional_fields");
+
+    let json = r#"{
+        "role": "custom",
+        "content": "inline note",
+        "customType": "note",
+        "timestamp": 1700000000
+    }"#;
+
+    let parsed: Message = serde_json::from_str(json).unwrap();
+    harness.log().info("deserialize", "Parsed custom message");
+
+    if let Message::Custom(custom) = parsed {
+        assert_eq!(custom.content, "inline note");
+        assert_eq!(custom.custom_type, "note");
+        assert!(!custom.display, "display should default to false");
+        assert!(custom.details.is_none(), "details should default to None");
+    } else {
+        unreachable!("Expected Custom message");
     }
 }
 
@@ -758,6 +858,98 @@ fn test_assistant_message_event_tool_call_end() {
         "\"type\":\"toolcall_end\"",
     );
     assert_json_contains(&harness, "tool_call_end", &json, "\"toolCall\"");
+}
+
+#[test]
+fn test_assistant_message_event_all_variants_round_trip() {
+    let harness = TestHarness::new("assistant_message_event_all_variants_round_trip");
+
+    let base = make_assistant_message(vec![ContentBlock::Text(TextContent::new("partial"))]);
+    let tool_call = ToolCall {
+        id: "call_roundtrip".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "Cargo.toml" }),
+        thought_signature: Some("sig".to_string()),
+    };
+
+    let events = vec![
+        AssistantMessageEvent::Start {
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "hello".to_string(),
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::TextEnd {
+            content_index: 0,
+            content: "hello".to_string(),
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::ThinkingStart {
+            content_index: 0,
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::ThinkingDelta {
+            content_index: 0,
+            delta: "thinking".to_string(),
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::ThinkingEnd {
+            content_index: 0,
+            content: "thinking".to_string(),
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::ToolCallStart {
+            content_index: 0,
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::ToolCallDelta {
+            content_index: 0,
+            delta: "{\"path\":\"Cargo.toml\"}".to_string(),
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::ToolCallEnd {
+            content_index: 0,
+            tool_call,
+            partial: base.clone(),
+        },
+        AssistantMessageEvent::Done {
+            reason: StopReason::Stop,
+            message: base.clone(),
+        },
+        AssistantMessageEvent::Error {
+            reason: StopReason::Error,
+            error: base,
+        },
+    ];
+
+    for event in events {
+        let kind = assistant_event_kind(&event);
+        let json = serde_json::to_string(&event).unwrap();
+        harness.log().info_ctx("serialize", "Event", |ctx| {
+            ctx.push(("kind".into(), kind.to_string()));
+            ctx.push(("json".into(), json.clone()));
+        });
+
+        assert_json_contains(
+            &harness,
+            "event_variant",
+            &json,
+            &format!("\"type\":\"{kind}\""),
+        );
+
+        let parsed: AssistantMessageEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            assistant_event_kind(&parsed),
+            kind,
+            "event variant did not round-trip"
+        );
+    }
 }
 
 // ============================================================================

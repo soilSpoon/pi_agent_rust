@@ -87,6 +87,66 @@ jobs:
             exit 1
           fi
 
+      - name: Suite classification guard
+        run: |
+          set -euo pipefail
+          # Every tests/*.rs file must appear in tests/suite_classification.toml.
+          # Subdirectories (common/, provider_streaming/, conformance/, ext_conformance/) are excluded.
+          classification="tests/suite_classification.toml"
+          if [ ! -f "$classification" ]; then
+            echo "Missing $classification — see docs/testing-policy.md"
+            exit 1
+          fi
+
+          missing=0
+          for f in tests/*.rs; do
+            stem="$(basename "$f" .rs)"
+            if ! rg -q --fixed-strings "\"$stem\"" "$classification"; then
+              echo "UNCLASSIFIED: $f is not listed in $classification"
+              missing=$((missing + 1))
+            fi
+          done
+
+          if [ "$missing" -gt 0 ]; then
+            echo
+            echo "Suite classification violation: $missing test file(s) missing from $classification."
+            echo "Add each file to [suite.unit], [suite.vcr], or [suite.e2e]. See docs/testing-policy.md."
+            exit 1
+          fi
+          echo "All test files classified."
+
+      - name: VCR leak guard (unit suite)
+        run: |
+          set -euo pipefail
+          classification="tests/suite_classification.toml"
+
+          # Extract unit suite file names.
+          unit_files="$(sed -n '/\[suite\.unit\]/,/\[suite\./{ /^files/,/\]/p }' "$classification" \
+            | rg -o '"([^"]+)"' -r '$1' || true)"
+
+          if [ -z "$unit_files" ]; then
+            echo "No unit suite files found; skipping VCR leak check."
+            exit 0
+          fi
+
+          violations=0
+          for stem in $unit_files; do
+            f="tests/${stem}.rs"
+            [ -f "$f" ] || continue
+            if rg -q 'VcrRecorder|VcrMode|cassette_root|cassette_dir|fixtures/vcr' "$f"; then
+              echo "VCR LEAK: $f is in suite.unit but references VCR infrastructure."
+              violations=$((violations + 1))
+            fi
+          done
+
+          if [ "$violations" -gt 0 ]; then
+            echo
+            echo "VCR leak violation: $violations unit-suite file(s) reference VCR."
+            echo "Move to [suite.vcr] or remove VCR usage. See docs/testing-policy.md."
+            exit 1
+          fi
+          echo "No VCR leaks in unit suite."
+
       - name: cargo fmt
         run: cargo fmt --check
 

@@ -150,11 +150,10 @@ impl Provider for AnthropicProvider {
 
         let request_body = self.build_request(context, options);
 
-        // Build request with headers
+        // Build request with headers (Content-Type set by .json() below)
         let mut request = self
             .client
             .post(&self.base_url)
-            .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .header("X-API-Key", &auth_value)
             .header("anthropic-version", ANTHROPIC_API_VERSION);
@@ -764,7 +763,12 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn test_convert_user_text_message() {
@@ -784,6 +788,280 @@ mod tests {
         assert_eq!(ThinkingLevel::Low.default_budget(), 2048);
         assert_eq!(ThinkingLevel::Medium.default_budget(), 8192);
         assert_eq!(ThinkingLevel::High.default_budget(), 16384);
+    }
+
+    #[test]
+    fn test_build_request_includes_system_tools_and_thinking() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context {
+            system_prompt: Some("System prompt".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![ToolDef {
+                name: "echo".to_string(),
+                description: "Echo a string.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string" }
+                    },
+                    "required": ["text"]
+                }),
+            }],
+        };
+        let options = StreamOptions {
+            max_tokens: Some(128),
+            temperature: Some(0.2),
+            thinking_level: Some(ThinkingLevel::Medium),
+            thinking_budgets: Some(crate::provider::ThinkingBudgets {
+                minimal: 1024,
+                low: 2048,
+                medium: 9000,
+                high: 16384,
+                xhigh: 32768,
+            }),
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        assert_eq!(request.model, "claude-test");
+        assert_eq!(request.system.as_deref(), Some("System prompt"));
+        assert_eq!(request.temperature, Some(0.2));
+        assert!(request.stream);
+        assert_eq!(request.max_tokens, 13_096);
+
+        let thinking = request.thinking.expect("thinking config");
+        assert_eq!(thinking.r#type, "enabled");
+        assert_eq!(thinking.budget_tokens, 9000);
+
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].role, "user");
+        assert_eq!(request.messages[0].content.len(), 1);
+        match &request.messages[0].content[0] {
+            AnthropicContent::Text { text } => assert_eq!(text, "Ping"),
+            other => panic!("expected text content, got {other:?}"),
+        }
+
+        let tools = request.tools.expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].description, "Echo a string.");
+        assert_eq!(
+            tools[0].input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"]
+            })
+        );
+    }
+
+    #[test]
+    fn test_build_request_omits_optional_fields_by_default() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context::default();
+        let options = StreamOptions::default();
+
+        let request = provider.build_request(&context, &options);
+        assert_eq!(request.model, "claude-test");
+        assert_eq!(request.system, None);
+        assert!(request.tools.is_none());
+        assert!(request.thinking.is_none());
+        assert_eq!(request.max_tokens, DEFAULT_MAX_TOKENS);
+        assert!(request.stream);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_stream_parses_thinking_and_tool_call_events() {
+        let events = vec![
+            json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 3 } }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "thinking" }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "step 1" }
+            }),
+            json!({
+                "type": "content_block_stop",
+                "index": 0
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": { "type": "tool_use", "id": "tool_123", "name": "search" }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": { "type": "input_json_delta", "partial_json": "{\"q\":\"ru" }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": { "type": "input_json_delta", "partial_json": "st\"}" }
+            }),
+            json!({
+                "type": "content_block_stop",
+                "index": 1
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": { "type": "text" }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": { "type": "text_delta", "text": "done" }
+            }),
+            json!({
+                "type": "content_block_stop",
+                "index": 2
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "tool_use" },
+                "usage": { "output_tokens": 5 }
+            }),
+            json!({
+                "type": "message_stop"
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert_eq!(out.len(), 12, "expected full stream event sequence");
+
+        assert!(matches!(&out[0], StreamEvent::Start { .. }));
+        assert!(matches!(
+            &out[1],
+            StreamEvent::ThinkingStart {
+                content_index: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &out[2],
+            StreamEvent::ThinkingDelta {
+                content_index: 0,
+                delta,
+                ..
+            } if delta == "step 1"
+        ));
+        assert!(matches!(
+            &out[3],
+            StreamEvent::ThinkingEnd {
+                content_index: 0,
+                content,
+                ..
+            } if content == "step 1"
+        ));
+        assert!(matches!(
+            &out[4],
+            StreamEvent::ToolCallStart {
+                content_index: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &out[5],
+            StreamEvent::ToolCallDelta {
+                content_index: 1,
+                delta,
+                ..
+            } if delta == "{\"q\":\"ru"
+        ));
+        assert!(matches!(
+            &out[6],
+            StreamEvent::ToolCallDelta {
+                content_index: 1,
+                delta,
+                ..
+            } if delta == "st\"}"
+        ));
+        if let StreamEvent::ToolCallEnd {
+            content_index,
+            tool_call,
+            ..
+        } = &out[7]
+        {
+            assert_eq!(*content_index, 1);
+            assert_eq!(tool_call.id, "tool_123");
+            assert_eq!(tool_call.name, "search");
+            assert_eq!(tool_call.arguments, json!({ "q": "rust" }));
+        } else {
+            panic!("expected ToolCallEnd event, got {:?}", out[7]);
+        }
+        assert!(matches!(
+            &out[8],
+            StreamEvent::TextStart {
+                content_index: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &out[9],
+            StreamEvent::TextDelta {
+                content_index: 2,
+                delta,
+                ..
+            } if delta == "done"
+        ));
+        assert!(matches!(
+            &out[10],
+            StreamEvent::TextEnd {
+                content_index: 2,
+                content,
+                ..
+            } if content == "done"
+        ));
+        if let StreamEvent::Done { reason, message } = &out[11] {
+            assert_eq!(*reason, StopReason::ToolUse);
+            assert_eq!(message.stop_reason, StopReason::ToolUse);
+        } else {
+            panic!("expected Done event, got {:?}", out[11]);
+        }
+    }
+
+    #[test]
+    fn test_message_delta_sets_length_stop_reason_and_usage() {
+        let events = vec![
+            json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 5 } }
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "max_tokens" },
+                "usage": { "output_tokens": 7 }
+            }),
+            json!({
+                "type": "message_stop"
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert_eq!(out.len(), 2);
+        if let StreamEvent::Done { reason, message } = &out[1] {
+            assert_eq!(*reason, StopReason::Length);
+            assert_eq!(message.stop_reason, StopReason::Length);
+            assert_eq!(message.usage.input, 5);
+            assert_eq!(message.usage.output, 7);
+            assert_eq!(message.usage.total_tokens, 12);
+        } else {
+            panic!("expected Done event, got {:?}", out[1]);
+        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -840,6 +1118,216 @@ mod tests {
             assert_eq!(error.stop_reason, StopReason::Error);
             assert_eq!(error.error_message.as_deref(), Some("nope"));
         }
+    }
+
+    #[test]
+    fn test_stream_sets_required_headers() {
+        let captured = run_stream_and_capture_headers(CacheRetention::None)
+            .expect("captured request for required headers");
+        assert_eq!(
+            captured.headers.get("x-api-key").map(String::as_str),
+            Some("test-key")
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("anthropic-version")
+                .map(String::as_str),
+            Some(ANTHROPIC_API_VERSION)
+        );
+        assert!(!captured.headers.contains_key("anthropic-beta"));
+        assert!(captured.body.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn test_stream_adds_prompt_caching_beta_header_when_enabled() {
+        let captured = run_stream_and_capture_headers(CacheRetention::Short)
+            .expect("captured request for beta header");
+        assert_eq!(
+            captured.headers.get("anthropic-beta").map(String::as_str),
+            Some("prompt-caching-2024-07-31")
+        );
+    }
+
+    #[test]
+    fn test_stream_http_error_includes_status_and_body_message() {
+        let (base_url, _rx) = spawn_test_server(
+            401,
+            "application/json",
+            r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid API key"}}"#,
+        );
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let result = runtime.block_on(async { provider.stream(&context, &options).await });
+        let Err(err) = result else {
+            panic!("expected HTTP error");
+        };
+        let message = err.to_string();
+        assert!(message.contains("Anthropic API error (HTTP 401)"));
+        assert!(message.contains("Invalid API key"));
+    }
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        headers: HashMap<String, String>,
+        body: String,
+    }
+
+    fn run_stream_and_capture_headers(cache_retention: CacheRetention) -> Option<CapturedRequest> {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: Some("test system".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some("test-key".to_string()),
+            cache_retention,
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    fn success_sse_body() -> String {
+        [
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+            "",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+            "",
+            r#"data: {"type":"message_stop"}"#,
+            "",
+        ]
+        .join("\n")
+    }
+
+    fn spawn_test_server(
+        status_code: u16,
+        content_type: &str,
+        body: &str,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+        let body = body.to_string();
+        let content_type = content_type.to_string();
+
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read request failed: {err}"),
+                }
+            }
+
+            let header_end = bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request header boundary");
+            let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let headers = parse_headers(&header_text);
+            let mut request_body = bytes[header_end + 4..].to_vec();
+
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while request_body.len() < content_length {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read request body failed: {err}"),
+                }
+            }
+
+            let captured = CapturedRequest {
+                headers,
+                body: String::from_utf8_lossy(&request_body).to_string(),
+            };
+            tx.send(captured).expect("send captured request");
+
+            let reason = match status_code {
+                401 => "Unauthorized",
+                500 => "Internal Server Error",
+                _ => "OK",
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write response");
+            socket.flush().expect("flush response");
+        });
+
+        (format!("http://{addr}/messages"), rx)
+    }
+
+    fn parse_headers(header_text: &str) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        for line in header_text.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        headers
     }
 
     fn load_fixture(file_name: &str) -> ProviderFixture {

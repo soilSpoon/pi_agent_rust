@@ -29,7 +29,22 @@
 #![allow(dead_code)]
 
 use super::logging::{LogLevel, TestLogger};
+use futures::{FutureExt, StreamExt, pin_mut};
+use pi::auth::AuthStorage;
+use pi::config::Config;
+use pi::http::client::Client;
+use pi::model::{Message, StreamEvent, ThinkingLevel, Usage, UserContent, UserMessage};
+use pi::models::{ModelEntry, ModelRegistry, default_models_path};
+use pi::provider::{Context, Provider, StreamOptions};
+use pi::providers::anthropic::AnthropicProvider;
+use pi::providers::gemini::GeminiProvider;
+use pi::providers::openai::OpenAIProvider;
+use pi::providers::openai_responses::OpenAIResponsesProvider;
+use pi::providers::{normalize_openai_base, normalize_openai_responses_base};
+use pi::vcr::{Cassette, VcrMode, VcrRecorder};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -39,6 +54,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Test harness providing temp directories, logging, and cleanup.
@@ -853,6 +869,607 @@ fn write_response(stream: &mut TcpStream, response: &MockHttpResponse) -> std::i
     stream.write_all(&response.body)?;
     stream.flush()?;
     Ok(())
+}
+
+// ============================================================================
+// Live Provider E2E Harness Helpers
+// ============================================================================
+
+pub const LIVE_E2E_GATE_ENV: &str = "CI_E2E_TESTS";
+pub const LIVE_E2E_TIMEOUT: Duration = Duration::from_secs(30);
+pub const LIVE_SHORT_PROMPT: &str = "Say just the word hello.";
+
+#[derive(Debug, Clone, Copy)]
+pub struct LiveProviderTarget {
+    pub provider: &'static str,
+    pub model_env_var: &'static str,
+    pub preferred_models: &'static [&'static str],
+    pub prompt: &'static str,
+}
+
+impl LiveProviderTarget {
+    #[must_use]
+    pub const fn new(
+        provider: &'static str,
+        model_env_var: &'static str,
+        preferred_models: &'static [&'static str],
+        prompt: &'static str,
+    ) -> Self {
+        Self {
+            provider,
+            model_env_var,
+            preferred_models,
+            prompt,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveE2eRegistry {
+    pub agent_dir: PathBuf,
+    pub models_path: PathBuf,
+    pub auth_path: PathBuf,
+    pub auth: AuthStorage,
+    pub registry: ModelRegistry,
+}
+
+impl LiveE2eRegistry {
+    pub fn load(logger: &TestLogger) -> Result<Self, String> {
+        let agent_dir = Config::global_dir();
+        let models_path = default_models_path(&agent_dir);
+        let auth_path = Config::auth_path();
+        let auth = AuthStorage::load(auth_path.clone())
+            .map_err(|err| format!("load auth storage {}: {err}", auth_path.display()))?;
+        let registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+
+        logger.info_ctx("live_e2e", "Loaded live provider registry", |ctx| {
+            ctx.push(("agent_dir".into(), agent_dir.display().to_string()));
+            ctx.push(("models_path".into(), models_path.display().to_string()));
+            ctx.push(("auth_path".into(), auth_path.display().to_string()));
+            ctx.push(("models".into(), registry.models().len().to_string()));
+            ctx.push((
+                "available".into(),
+                registry.get_available().len().to_string(),
+            ));
+        });
+
+        if let Some(err) = registry.error() {
+            logger.warn("live_e2e", format!("models.json load warning: {err}"));
+        }
+
+        Ok(Self {
+            agent_dir,
+            models_path,
+            auth_path,
+            auth,
+            registry,
+        })
+    }
+
+    #[must_use]
+    pub fn resolve_api_key(&self, entry: &ModelEntry) -> Option<String> {
+        self.auth
+            .resolve_api_key(&entry.model.provider, None)
+            .or_else(|| entry.api_key.clone())
+    }
+
+    #[must_use]
+    pub fn select_entry(
+        &self,
+        target: &LiveProviderTarget,
+        requested_model: Option<&str>,
+    ) -> Option<ModelEntry> {
+        if let Some(model_id) = requested_model {
+            let model_id = model_id.trim();
+            if !model_id.is_empty() {
+                if let Some(entry) = self.registry.find(target.provider, model_id) {
+                    if self.resolve_api_key(&entry).is_some() {
+                        return Some(entry);
+                    }
+                }
+                return None;
+            }
+        }
+
+        for model_id in target.preferred_models {
+            if let Some(entry) = self.registry.find(target.provider, model_id) {
+                if self.resolve_api_key(&entry).is_some() {
+                    return Some(entry);
+                }
+            }
+        }
+
+        self.registry
+            .get_available()
+            .into_iter()
+            .find(|entry| entry.model.provider == target.provider)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LiveHttpTrace {
+    pub request_url: Option<String>,
+    pub request_headers: Vec<(String, String)>,
+    pub request_body_bytes: Option<usize>,
+    pub response_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LiveStreamSummary {
+    pub event_count: usize,
+    pub text_chars: usize,
+    pub thinking_chars: usize,
+    pub tool_calls: usize,
+    pub stop_reason: Option<String>,
+    pub usage: Usage,
+    pub stream_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveProviderRun {
+    pub provider: String,
+    pub model: Option<String>,
+    pub api: Option<String>,
+    pub status: String,
+    pub skip_reason: Option<String>,
+    pub error: Option<String>,
+    pub elapsed_ms: u64,
+    pub response_status: Option<u16>,
+    pub request_url: Option<String>,
+    pub request_headers: Vec<(String, String)>,
+    pub request_body_bytes: Option<usize>,
+    pub event_count: usize,
+    pub text_chars: usize,
+    pub thinking_chars: usize,
+    pub tool_calls: usize,
+    pub stop_reason: Option<String>,
+    pub usage: Usage,
+}
+
+#[must_use]
+pub fn ci_e2e_tests_enabled() -> bool {
+    env::var(LIVE_E2E_GATE_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
+#[must_use]
+pub fn parse_http_status(error_message: &str) -> Option<u16> {
+    let marker = "HTTP ";
+    let start = error_message.find(marker)? + marker.len();
+    let mut digits = String::new();
+    for ch in error_message[start..].chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u16>().ok()
+}
+
+pub fn create_anthropic_provider(entry: &ModelEntry, client: Client) -> Arc<dyn Provider> {
+    Arc::new(
+        AnthropicProvider::new(entry.model.id.clone())
+            .with_base_url(entry.model.base_url.clone())
+            .with_client(client),
+    )
+}
+
+fn create_openai_completions_provider(entry: &ModelEntry, client: Client) -> Arc<dyn Provider> {
+    Arc::new(
+        OpenAIProvider::new(entry.model.id.clone())
+            .with_provider_name(entry.model.provider.clone())
+            .with_base_url(normalize_openai_base(&entry.model.base_url))
+            .with_client(client),
+    )
+}
+
+fn create_openai_responses_provider(entry: &ModelEntry, client: Client) -> Arc<dyn Provider> {
+    Arc::new(
+        OpenAIResponsesProvider::new(entry.model.id.clone())
+            .with_provider_name(entry.model.provider.clone())
+            .with_base_url(normalize_openai_responses_base(&entry.model.base_url))
+            .with_client(client),
+    )
+}
+
+pub fn create_openai_provider(
+    entry: &ModelEntry,
+    client: Client,
+) -> pi::PiResult<Arc<dyn Provider>> {
+    match entry.model.api.as_str() {
+        "openai-completions" => Ok(create_openai_completions_provider(entry, client)),
+        "openai-responses" => Ok(create_openai_responses_provider(entry, client)),
+        other => Err(pi::Error::provider(
+            &entry.model.provider,
+            format!("Unsupported OpenAI-compatible API for live harness: {other}"),
+        )),
+    }
+}
+
+pub fn create_gemini_provider(entry: &ModelEntry, client: Client) -> Arc<dyn Provider> {
+    Arc::new(
+        GeminiProvider::new(entry.model.id.clone())
+            .with_base_url(entry.model.base_url.clone())
+            .with_client(client),
+    )
+}
+
+pub fn create_openrouter_provider(
+    entry: &ModelEntry,
+    client: Client,
+) -> pi::PiResult<Arc<dyn Provider>> {
+    create_openai_provider(entry, client)
+}
+
+pub fn create_xai_provider(entry: &ModelEntry, client: Client) -> pi::PiResult<Arc<dyn Provider>> {
+    create_openai_provider(entry, client)
+}
+
+pub fn create_deepseek_provider(
+    entry: &ModelEntry,
+    client: Client,
+) -> pi::PiResult<Arc<dyn Provider>> {
+    create_openai_provider(entry, client)
+}
+
+pub fn create_live_provider(entry: &ModelEntry, client: Client) -> pi::PiResult<Arc<dyn Provider>> {
+    match entry.model.provider.as_str() {
+        "anthropic" => Ok(create_anthropic_provider(entry, client)),
+        "openai" => create_openai_provider(entry, client),
+        "google" => Ok(create_gemini_provider(entry, client)),
+        "openrouter" => create_openrouter_provider(entry, client),
+        "xai" => create_xai_provider(entry, client),
+        "deepseek" => create_deepseek_provider(entry, client),
+        _ => match entry.model.api.as_str() {
+            "anthropic-messages" => Ok(create_anthropic_provider(entry, client)),
+            "openai-completions" | "openai-responses" => create_openai_provider(entry, client),
+            "google-generative-ai" => Ok(create_gemini_provider(entry, client)),
+            other => Err(pi::Error::provider(
+                &entry.model.provider,
+                format!("Provider not implemented for live harness (api: {other})"),
+            )),
+        },
+    }
+}
+
+#[must_use]
+pub fn build_live_context(prompt: &str) -> Context {
+    Context {
+        system_prompt: Some(
+            "You are a deterministic test harness model. Follow the user instruction exactly."
+                .to_string(),
+        ),
+        messages: vec![Message::User(UserMessage {
+            content: UserContent::Text(prompt.to_string()),
+            timestamp: 0,
+        })],
+        tools: Vec::new(),
+    }
+}
+
+#[must_use]
+pub fn build_live_stream_options(entry: &ModelEntry, api_key: String) -> StreamOptions {
+    let headers: HashMap<String, String> = entry.headers.clone();
+    StreamOptions {
+        api_key: Some(api_key),
+        headers,
+        max_tokens: Some(64),
+        temperature: Some(0.0),
+        thinking_level: Some(ThinkingLevel::Off),
+        ..Default::default()
+    }
+}
+
+#[must_use]
+pub fn load_vcr_trace(cassette_path: &Path) -> Option<LiveHttpTrace> {
+    let content = std::fs::read_to_string(cassette_path).ok()?;
+    let cassette: Cassette = serde_json::from_str(&content).ok()?;
+    let interaction = cassette.interactions.last()?;
+    let request_body_bytes = interaction
+        .request
+        .body
+        .as_ref()
+        .and_then(|value| serde_json::to_vec(value).ok().map(|v| v.len()))
+        .or_else(|| interaction.request.body_text.as_ref().map(String::len));
+
+    Some(LiveHttpTrace {
+        request_url: Some(interaction.request.url.clone()),
+        request_headers: interaction.request.headers.clone(),
+        request_body_bytes,
+        response_status: Some(interaction.response.status),
+    })
+}
+
+async fn collect_live_stream_summary(
+    provider: Arc<dyn Provider>,
+    context: Context,
+    options: StreamOptions,
+    timeout: Duration,
+) -> Result<LiveStreamSummary, String> {
+    let now = asupersync::Cx::current()
+        .and_then(|cx| cx.timer_driver())
+        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+    let timeout_fut = asupersync::time::sleep(now, timeout).fuse();
+    let run_fut = async move {
+        let stream = provider
+            .stream(&context, &options)
+            .await
+            .map_err(|err| err.to_string())?;
+
+        let mut summary = LiveStreamSummary::default();
+        let mut stream = std::pin::pin!(stream);
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(event) => {
+                    summary.event_count = summary.event_count.saturating_add(1);
+                    let terminal =
+                        matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+
+                    match event {
+                        StreamEvent::TextDelta { delta, .. } => {
+                            summary.text_chars =
+                                summary.text_chars.saturating_add(delta.chars().count());
+                        }
+                        StreamEvent::TextEnd { content, .. } => {
+                            summary.text_chars = content.chars().count();
+                        }
+                        StreamEvent::ThinkingDelta { delta, .. } => {
+                            summary.thinking_chars =
+                                summary.thinking_chars.saturating_add(delta.chars().count());
+                        }
+                        StreamEvent::ThinkingEnd { content, .. } => {
+                            summary.thinking_chars = content.chars().count();
+                        }
+                        StreamEvent::ToolCallEnd { .. } => {
+                            summary.tool_calls = summary.tool_calls.saturating_add(1);
+                        }
+                        StreamEvent::Done { reason, message } => {
+                            summary.stop_reason = Some(format!("{reason:?}"));
+                            summary.usage = message.usage;
+                        }
+                        StreamEvent::Error { reason, error } => {
+                            summary.stop_reason = Some(format!("{reason:?}"));
+                            summary.usage = error.usage;
+                            summary.stream_error = error
+                                .error_message
+                                .or_else(|| Some("provider emitted error event".to_string()));
+                        }
+                        StreamEvent::Start { .. }
+                        | StreamEvent::TextStart { .. }
+                        | StreamEvent::ThinkingStart { .. }
+                        | StreamEvent::ToolCallStart { .. }
+                        | StreamEvent::ToolCallDelta { .. } => {}
+                    }
+
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    summary.stream_error = Some(err.to_string());
+                    break;
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+    .fuse();
+
+    pin_mut!(timeout_fut, run_fut);
+    match futures::future::select(run_fut, timeout_fut).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(_) => {
+            Err(format!("request timed out after {}s", timeout.as_secs()))
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn run_live_provider_target(
+    harness: &TestHarness,
+    registry: &LiveE2eRegistry,
+    target: &LiveProviderTarget,
+    vcr_dir: &Path,
+) -> LiveProviderRun {
+    let start = Instant::now();
+    let requested_model = env::var(target.model_env_var)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let Some(entry) = registry.select_entry(target, requested_model.as_deref()) else {
+        return LiveProviderRun {
+            provider: target.provider.to_string(),
+            model: requested_model,
+            api: None,
+            status: "skipped".to_string(),
+            skip_reason: Some(format!(
+                "no model with API key for provider '{}'",
+                target.provider
+            )),
+            error: None,
+            elapsed_ms: 0,
+            response_status: None,
+            request_url: None,
+            request_headers: Vec::new(),
+            request_body_bytes: None,
+            event_count: 0,
+            text_chars: 0,
+            thinking_chars: 0,
+            tool_calls: 0,
+            stop_reason: None,
+            usage: Usage::default(),
+        };
+    };
+
+    let Some(api_key) = registry.resolve_api_key(&entry) else {
+        return LiveProviderRun {
+            provider: target.provider.to_string(),
+            model: Some(entry.model.id.clone()),
+            api: Some(entry.model.api.clone()),
+            status: "skipped".to_string(),
+            skip_reason: Some("API key missing".to_string()),
+            error: None,
+            elapsed_ms: 0,
+            response_status: None,
+            request_url: None,
+            request_headers: Vec::new(),
+            request_body_bytes: None,
+            event_count: 0,
+            text_chars: 0,
+            thinking_chars: 0,
+            tool_calls: 0,
+            stop_reason: None,
+            usage: Usage::default(),
+        };
+    };
+
+    let cassette_name = format!("live-e2e-{}-{}", entry.model.provider, entry.model.id);
+    let recorder = VcrRecorder::new_with(&cassette_name, VcrMode::Record, vcr_dir);
+    let cassette_path = recorder.cassette_path().to_path_buf();
+    let client = Client::new().with_vcr(recorder);
+
+    harness
+        .log()
+        .info_ctx("live_e2e", "Invoking live provider call", |ctx| {
+            ctx.push(("provider".into(), entry.model.provider.clone()));
+            ctx.push(("model".into(), entry.model.id.clone()));
+            ctx.push(("api".into(), entry.model.api.clone()));
+            ctx.push(("timeout_s".into(), LIVE_E2E_TIMEOUT.as_secs().to_string()));
+            ctx.push(("prompt".into(), target.prompt.to_string()));
+            ctx.push(("vcr_path".into(), cassette_path.display().to_string()));
+        });
+
+    let provider = match create_live_provider(&entry, client) {
+        Ok(provider) => provider,
+        Err(err) => {
+            return LiveProviderRun {
+                provider: entry.model.provider.clone(),
+                model: Some(entry.model.id.clone()),
+                api: Some(entry.model.api.clone()),
+                status: "failed".to_string(),
+                skip_reason: None,
+                error: Some(format!("provider construction failed: {err}")),
+                elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                response_status: None,
+                request_url: None,
+                request_headers: Vec::new(),
+                request_body_bytes: None,
+                event_count: 0,
+                text_chars: 0,
+                thinking_chars: 0,
+                tool_calls: 0,
+                stop_reason: None,
+                usage: Usage::default(),
+            };
+        }
+    };
+
+    let context = build_live_context(target.prompt);
+    let options = build_live_stream_options(&entry, api_key);
+    let summary_result =
+        collect_live_stream_summary(provider, context, options, LIVE_E2E_TIMEOUT).await;
+    let trace = load_vcr_trace(&cassette_path).unwrap_or_default();
+
+    let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let response_status = trace.response_status.or_else(|| {
+        summary_result
+            .as_ref()
+            .err()
+            .and_then(|message| parse_http_status(message))
+    });
+    let summary = summary_result.clone().unwrap_or_default();
+    let summary_error = summary_result
+        .err()
+        .or_else(|| summary.stream_error.clone());
+    let http_failure = response_status.is_some_and(|status| !(200..300).contains(&status));
+    let has_failure = summary_error.is_some() || http_failure;
+
+    harness
+        .log()
+        .info_ctx("live_e2e", "Provider call completed", |ctx| {
+            ctx.push(("provider".into(), entry.model.provider.clone()));
+            ctx.push(("model".into(), entry.model.id.clone()));
+            ctx.push((
+                "status".into(),
+                if has_failure { "failed" } else { "passed" }.to_string(),
+            ));
+            ctx.push(("elapsed_ms".into(), elapsed_ms.to_string()));
+            if let Some(status) = response_status {
+                ctx.push(("response_status".into(), status.to_string()));
+            }
+            if let Some(url) = &trace.request_url {
+                ctx.push(("request_url".into(), url.clone()));
+            }
+            if let Some(bytes) = trace.request_body_bytes {
+                ctx.push(("request_body_bytes".into(), bytes.to_string()));
+            }
+            ctx.push(("events".into(), summary.event_count.to_string()));
+            ctx.push(("tool_calls".into(), summary.tool_calls.to_string()));
+            ctx.push(("text_chars".into(), summary.text_chars.to_string()));
+            ctx.push(("thinking_chars".into(), summary.thinking_chars.to_string()));
+            ctx.push(("usage_input".into(), summary.usage.input.to_string()));
+            ctx.push(("usage_output".into(), summary.usage.output.to_string()));
+            ctx.push(("usage_total".into(), summary.usage.total_tokens.to_string()));
+            if let Some(reason) = &summary.stop_reason {
+                ctx.push(("stop_reason".into(), reason.clone()));
+            }
+            if let Some(error) = &summary_error {
+                ctx.push(("error".into(), error.clone()));
+            }
+        });
+
+    LiveProviderRun {
+        provider: entry.model.provider.clone(),
+        model: Some(entry.model.id.clone()),
+        api: Some(entry.model.api.clone()),
+        status: if has_failure {
+            "failed".to_string()
+        } else {
+            "passed".to_string()
+        },
+        skip_reason: None,
+        error: summary_error,
+        elapsed_ms,
+        response_status,
+        request_url: trace.request_url,
+        request_headers: trace.request_headers,
+        request_body_bytes: trace.request_body_bytes,
+        event_count: summary.event_count,
+        text_chars: summary.text_chars,
+        thinking_chars: summary.thinking_chars,
+        tool_calls: summary.tool_calls,
+        stop_reason: summary.stop_reason,
+        usage: summary.usage,
+    }
+}
+
+pub fn write_live_provider_runs_jsonl(
+    harness: &TestHarness,
+    file_name: &str,
+    runs: &[LiveProviderRun],
+) -> std::io::Result<PathBuf> {
+    let path = harness.temp_path(file_name);
+    let mut content = String::new();
+    for run in runs {
+        let line = serde_json::to_string(run)
+            .unwrap_or_else(|_| "{\"status\":\"serialization_error\"}".to_string());
+        content.push_str(&line);
+        content.push('\n');
+    }
+    std::fs::write(&path, content)?;
+    harness.record_artifact(file_name.to_string(), &path);
+    Ok(path)
 }
 
 #[cfg(test)]

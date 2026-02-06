@@ -858,6 +858,331 @@ fn write_string_to_path(path: &Path, contents: &str) -> std::io::Result<()> {
     fs::write(path, contents)
 }
 
+// ============================================================================
+// JSONL Schema Validation
+// ============================================================================
+
+/// Required fields for a `pi.test.log.v1` JSONL record.
+const LOG_RECORD_REQUIRED_FIELDS: [&str; 8] = [
+    "schema", "type", "seq", "ts", "t_ms", "level", "category", "message",
+];
+
+/// Required fields for a `pi.test.artifact.v1` JSONL record.
+const ARTIFACT_RECORD_REQUIRED_FIELDS: [&str; 7] =
+    ["schema", "type", "seq", "ts", "t_ms", "name", "path"];
+
+/// Validation error for a single JSONL record.
+#[derive(Debug, Clone)]
+pub struct JsonlValidationError {
+    /// 1-based line number in the JSONL output.
+    pub line: usize,
+    /// The field that failed validation (or `<parse>` / `<root>`).
+    pub field: String,
+    /// Human-readable description of the problem.
+    pub message: String,
+}
+
+impl std::fmt::Display for JsonlValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "line {}: field '{}': {}",
+            self.line, self.field, self.message
+        )
+    }
+}
+
+/// Validate a single JSONL line against the appropriate schema.
+///
+/// Returns `Ok(())` if the record has all required fields with correct types,
+/// or an error describing the first problem found.
+pub fn validate_jsonl_line(line: &str, line_number: usize) -> Result<(), JsonlValidationError> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|err| JsonlValidationError {
+            line: line_number,
+            field: "<parse>".to_string(),
+            message: format!("invalid JSON: {err}"),
+        })?;
+
+    let obj = value.as_object().ok_or_else(|| JsonlValidationError {
+        line: line_number,
+        field: "<root>".to_string(),
+        message: "expected JSON object".to_string(),
+    })?;
+
+    let schema = obj.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+    let required: &[&str] = match schema {
+        "pi.test.log.v1" => &LOG_RECORD_REQUIRED_FIELDS,
+        "pi.test.artifact.v1" => &ARTIFACT_RECORD_REQUIRED_FIELDS,
+        _ => {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "schema".to_string(),
+                message: format!("unknown schema: {schema:?}"),
+            });
+        }
+    };
+
+    for &field in required {
+        if !obj.contains_key(field) {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: field.to_string(),
+                message: "required field missing".to_string(),
+            });
+        }
+    }
+
+    // Type checks for numeric/string fields.
+    if let Some(seq) = obj.get("seq") {
+        if !seq.is_number() {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "seq".to_string(),
+                message: format!("expected number, got {seq}"),
+            });
+        }
+    }
+    if let Some(ts) = obj.get("ts") {
+        if !ts.is_string() {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "ts".to_string(),
+                message: format!("expected string, got {ts}"),
+            });
+        }
+    }
+    if let Some(t_ms) = obj.get("t_ms") {
+        if !t_ms.is_number() {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "t_ms".to_string(),
+                message: format!("expected number, got {t_ms}"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate every non-empty line in a JSONL string.
+///
+/// Returns a (possibly empty) list of validation errors.
+pub fn validate_jsonl(content: &str) -> Vec<JsonlValidationError> {
+    let mut errors = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Err(err) = validate_jsonl_line(trimmed, i + 1) {
+            errors.push(err);
+        }
+    }
+    errors
+}
+
+// ============================================================================
+// Deep JSON Redaction
+// ============================================================================
+
+/// Recursively redact sensitive keys inside a JSON value at any depth.
+///
+/// This is useful for sanitizing request/response bodies that may contain
+/// API keys, bearer tokens, or credentials nested inside JSON payloads.
+pub fn redact_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if is_sensitive_key(key) {
+                    *val = serde_json::Value::String(REDACTED_VALUE.to_string());
+                } else {
+                    redact_json_value(val);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for val in arr.iter_mut() {
+                redact_json_value(val);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scan a JSON value and return paths to any sensitive keys whose values
+/// are not the redaction placeholder.
+///
+/// Useful as a test assertion: `assert!(find_unredacted_keys(&val).is_empty())`.
+pub fn find_unredacted_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut unredacted = Vec::new();
+    find_unredacted_keys_inner(value, "", &mut unredacted);
+    unredacted
+}
+
+fn find_unredacted_keys_inner(
+    value: &serde_json::Value,
+    path: &str,
+    unredacted: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                let field_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if is_sensitive_key(key) {
+                    if val.as_str() != Some(REDACTED_VALUE) {
+                        unredacted.push(field_path);
+                    }
+                } else {
+                    find_unredacted_keys_inner(val, &field_path, unredacted);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, val) in arr.iter().enumerate() {
+                let field_path = format!("{path}[{i}]");
+                find_unredacted_keys_inner(val, &field_path, unredacted);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
+// Cost-Budget Telemetry
+// ============================================================================
+
+/// Per-provider cost threshold (in US dollars).
+#[derive(Debug, Clone)]
+pub struct CostThreshold {
+    /// Provider name (e.g., `"anthropic"`, `"openai"`).
+    pub provider: String,
+    /// Soft limit: log a warning when exceeded.
+    pub warn_dollars: f64,
+    /// Hard limit: fail the test when exceeded.
+    pub fail_dollars: f64,
+}
+
+/// Outcome of a cost-budget check.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CostBudgetOutcome {
+    /// Cost is within budget.
+    Ok,
+    /// Cost exceeded the warning threshold but not the failure threshold.
+    Warn {
+        provider: String,
+        cost: f64,
+        threshold: f64,
+    },
+    /// Cost exceeded the hard failure threshold.
+    Fail {
+        provider: String,
+        cost: f64,
+        threshold: f64,
+    },
+}
+
+impl std::fmt::Display for CostBudgetOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => write!(f, "cost within budget"),
+            Self::Warn {
+                provider,
+                cost,
+                threshold,
+            } => write!(
+                f,
+                "WARNING: {provider} cost ${cost:.6} exceeds warn threshold ${threshold:.6}"
+            ),
+            Self::Fail {
+                provider,
+                cost,
+                threshold,
+            } => write!(
+                f,
+                "FAIL: {provider} cost ${cost:.6} exceeds fail threshold ${threshold:.6}"
+            ),
+        }
+    }
+}
+
+/// Default per-call cost thresholds for live E2E tests.
+///
+/// These are conservative: a single "say hello" prompt with `max_tokens=64`
+/// should cost well under $0.01.
+#[must_use]
+pub fn default_cost_thresholds() -> Vec<CostThreshold> {
+    vec![
+        CostThreshold {
+            provider: "anthropic".to_string(),
+            warn_dollars: 0.05,
+            fail_dollars: 0.25,
+        },
+        CostThreshold {
+            provider: "openai".to_string(),
+            warn_dollars: 0.05,
+            fail_dollars: 0.25,
+        },
+        CostThreshold {
+            provider: "google".to_string(),
+            warn_dollars: 0.05,
+            fail_dollars: 0.25,
+        },
+        CostThreshold {
+            provider: "openrouter".to_string(),
+            warn_dollars: 0.10,
+            fail_dollars: 0.50,
+        },
+        CostThreshold {
+            provider: "xai".to_string(),
+            warn_dollars: 0.05,
+            fail_dollars: 0.25,
+        },
+        CostThreshold {
+            provider: "deepseek".to_string(),
+            warn_dollars: 0.05,
+            fail_dollars: 0.25,
+        },
+    ]
+}
+
+/// Check a provider run's total cost against budget thresholds.
+///
+/// Returns [`CostBudgetOutcome::Ok`] if `total_cost` is under both limits,
+/// [`CostBudgetOutcome::Warn`] if it exceeds the soft limit, or
+/// [`CostBudgetOutcome::Fail`] if it exceeds the hard limit.
+///
+/// If no threshold is configured for the given provider, returns `Ok`.
+#[must_use]
+pub fn check_cost_budget(
+    provider: &str,
+    total_cost: f64,
+    thresholds: &[CostThreshold],
+) -> CostBudgetOutcome {
+    let Some(threshold) = thresholds.iter().find(|t| t.provider == provider) else {
+        return CostBudgetOutcome::Ok;
+    };
+    if total_cost >= threshold.fail_dollars {
+        CostBudgetOutcome::Fail {
+            provider: provider.to_string(),
+            cost: total_cost,
+            threshold: threshold.fail_dollars,
+        }
+    } else if total_cost >= threshold.warn_dollars {
+        CostBudgetOutcome::Warn {
+            provider: provider.to_string(),
+            cost: total_cost,
+            threshold: threshold.warn_dollars,
+        }
+    } else {
+        CostBudgetOutcome::Ok
+    }
+}
+
 /// Macro for logging with automatic context capture.
 ///
 /// # Example
@@ -1008,5 +1333,391 @@ mod tests {
         assert_eq!(first["ts"], PLACEHOLDER_TIMESTAMP);
         assert_eq!(second["ts"], PLACEHOLDER_TIMESTAMP);
         assert!(jsonl.contains(PLACEHOLDER_TEST_ROOT));
+    }
+
+    // ====================================================================
+    // JSONL Schema Validation
+    // ====================================================================
+
+    #[test]
+    fn validate_jsonl_valid_log_record() {
+        let record = r#"{"schema":"pi.test.log.v1","type":"log","seq":1,"ts":"2026-01-01T00:00:00.000Z","t_ms":0,"level":"info","category":"setup","message":"hello"}"#;
+        assert!(validate_jsonl_line(record, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_jsonl_valid_artifact_record() {
+        let record = r#"{"schema":"pi.test.artifact.v1","type":"artifact","seq":2,"ts":"2026-01-01T00:00:00.000Z","t_ms":0,"name":"trace","path":"/tmp/trace.json"}"#;
+        assert!(validate_jsonl_line(record, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_jsonl_rejects_unknown_schema() {
+        let record = r#"{"schema":"pi.test.unknown.v2","type":"log","seq":1,"ts":"x","t_ms":0}"#;
+        let err = validate_jsonl_line(record, 1).unwrap_err();
+        assert_eq!(err.field, "schema");
+        assert!(err.message.contains("unknown schema"));
+    }
+
+    #[test]
+    fn validate_jsonl_rejects_missing_required_field() {
+        // Missing "message" field for a log record.
+        let record = r#"{"schema":"pi.test.log.v1","type":"log","seq":1,"ts":"x","t_ms":0,"level":"info","category":"setup"}"#;
+        let err = validate_jsonl_line(record, 1).unwrap_err();
+        assert_eq!(err.field, "message");
+        assert!(err.message.contains("required field missing"));
+    }
+
+    #[test]
+    fn validate_jsonl_rejects_wrong_type_for_seq() {
+        let record = r#"{"schema":"pi.test.log.v1","type":"log","seq":"not-a-number","ts":"x","t_ms":0,"level":"info","category":"setup","message":"hi"}"#;
+        let err = validate_jsonl_line(record, 1).unwrap_err();
+        assert_eq!(err.field, "seq");
+        assert!(err.message.contains("expected number"));
+    }
+
+    #[test]
+    fn validate_jsonl_rejects_invalid_json() {
+        let err = validate_jsonl_line("{broken", 1).unwrap_err();
+        assert_eq!(err.field, "<parse>");
+    }
+
+    #[test]
+    fn validate_jsonl_rejects_non_object() {
+        let err = validate_jsonl_line("[1,2,3]", 1).unwrap_err();
+        assert_eq!(err.field, "<root>");
+    }
+
+    #[test]
+    fn validate_jsonl_full_output_from_logger() {
+        let logger = TestLogger::new();
+        logger.info("setup", "test started");
+        logger.warn("check", "something suspicious");
+        logger.record_artifact("trace", "/tmp/trace.json");
+
+        let jsonl = logger.dump_jsonl();
+        let errors = validate_jsonl(&jsonl);
+        assert!(
+            errors.is_empty(),
+            "logger output failed validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_jsonl_normalized_output_from_logger() {
+        let logger = TestLogger::new();
+        logger.set_normalization_root("/tmp/norm-root");
+        logger.info("setup", "testing in /tmp/norm-root/workspace");
+        logger.record_artifact("log", "/tmp/norm-root/run.log");
+
+        let jsonl = logger.dump_jsonl_normalized();
+        let errors = validate_jsonl(&jsonl);
+        assert!(
+            errors.is_empty(),
+            "normalized logger output failed validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_jsonl_batch_collects_all_errors() {
+        let bad_content = "{broken}\n[1,2]\n{\"schema\":\"pi.test.log.v1\",\"type\":\"log\",\"seq\":1,\"ts\":\"x\",\"t_ms\":0,\"level\":\"info\",\"category\":\"c\",\"message\":\"m\"}\n";
+        let errors = validate_jsonl(bad_content);
+        // First two lines are bad, third is valid.
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].line, 1);
+        assert_eq!(errors[1].line, 2);
+    }
+
+    // ====================================================================
+    // Deep JSON Redaction
+    // ====================================================================
+
+    #[test]
+    fn redact_json_value_flat_object() {
+        let mut val: serde_json::Value = serde_json::json!({
+            "api_key": "sk-abc123",
+            "model": "gpt-4",
+            "authorization": "Bearer tok"
+        });
+        redact_json_value(&mut val);
+
+        assert_eq!(val["api_key"], REDACTED_VALUE);
+        assert_eq!(val["authorization"], REDACTED_VALUE);
+        assert_eq!(val["model"], "gpt-4");
+    }
+
+    #[test]
+    fn redact_json_value_nested_object() {
+        let mut val: serde_json::Value = serde_json::json!({
+            "request": {
+                "headers": {
+                    "Authorization": "Bearer secret-value",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "config": {
+                        "api_key": "sk-live-nested-key",
+                        "temperature": 0.7
+                    }
+                }
+            }
+        });
+        redact_json_value(&mut val);
+
+        assert_eq!(val["request"]["headers"]["Authorization"], REDACTED_VALUE);
+        assert_eq!(
+            val["request"]["headers"]["Content-Type"],
+            "application/json"
+        );
+        assert_eq!(val["request"]["body"]["config"]["api_key"], REDACTED_VALUE);
+        assert_eq!(val["request"]["body"]["config"]["temperature"], 0.7);
+    }
+
+    #[test]
+    fn redact_json_value_array_with_nested_secrets() {
+        let mut val: serde_json::Value = serde_json::json!([
+            {"provider": "openai", "api_key": "sk-111"},
+            {"provider": "anthropic", "api_key": "sk-222"},
+            {"provider": "google", "token": "tok-333"}
+        ]);
+        redact_json_value(&mut val);
+
+        assert_eq!(val[0]["api_key"], REDACTED_VALUE);
+        assert_eq!(val[1]["api_key"], REDACTED_VALUE);
+        assert_eq!(val[2]["token"], REDACTED_VALUE);
+        assert_eq!(val[0]["provider"], "openai");
+    }
+
+    #[test]
+    fn redact_json_value_all_sensitive_key_patterns() {
+        let mut val: serde_json::Value = serde_json::json!({
+            "api_key": "v1",
+            "api-key": "v2",
+            "authorization": "v3",
+            "bearer": "v4",
+            "cookie": "v5",
+            "credential": "v6",
+            "password": "v7",
+            "private_key": "v8",
+            "secret": "v9",
+            "token": "v10"
+        });
+        redact_json_value(&mut val);
+
+        for key in &REDACTION_KEYS {
+            assert_eq!(
+                val[key].as_str().unwrap(),
+                REDACTED_VALUE,
+                "key '{key}' was not redacted"
+            );
+        }
+    }
+
+    #[test]
+    fn find_unredacted_keys_detects_leaks() {
+        let val: serde_json::Value = serde_json::json!({
+            "request": {
+                "headers": {
+                    "Authorization": "Bearer sk-live-leaked",
+                    "Host": "api.openai.com"
+                },
+                "body": {
+                    "api_key": "sk-also-leaked"
+                }
+            }
+        });
+        let leaks = find_unredacted_keys(&val);
+        assert_eq!(leaks.len(), 2);
+        assert!(leaks.iter().any(|p| p.contains("Authorization")));
+        assert!(leaks.iter().any(|p| p.contains("api_key")));
+    }
+
+    #[test]
+    fn find_unredacted_keys_empty_when_redacted() {
+        let val: serde_json::Value = serde_json::json!({
+            "api_key": REDACTED_VALUE,
+            "authorization": REDACTED_VALUE,
+            "model": "claude-3.5-sonnet"
+        });
+        assert!(find_unredacted_keys(&val).is_empty());
+    }
+
+    #[test]
+    fn find_unredacted_keys_in_arrays() {
+        let val: serde_json::Value = serde_json::json!({
+            "items": [
+                {"name": "a", "secret": "exposed"},
+                {"name": "b", "secret": REDACTED_VALUE}
+            ]
+        });
+        let leaks = find_unredacted_keys(&val);
+        assert_eq!(leaks.len(), 1);
+        assert!(leaks[0].contains("[0]"));
+    }
+
+    // ====================================================================
+    // Cost-Budget Telemetry
+    // ====================================================================
+
+    #[test]
+    fn cost_budget_ok_when_under_threshold() {
+        let thresholds = default_cost_thresholds();
+        let outcome = check_cost_budget("anthropic", 0.001, &thresholds);
+        assert_eq!(outcome, CostBudgetOutcome::Ok);
+    }
+
+    #[test]
+    fn cost_budget_warn_when_above_soft_limit() {
+        let thresholds = default_cost_thresholds();
+        let outcome = check_cost_budget("anthropic", 0.06, &thresholds);
+        assert!(
+            matches!(outcome, CostBudgetOutcome::Warn { .. }),
+            "expected Warn, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn cost_budget_fail_when_above_hard_limit() {
+        let thresholds = default_cost_thresholds();
+        let outcome = check_cost_budget("anthropic", 0.30, &thresholds);
+        assert!(
+            matches!(outcome, CostBudgetOutcome::Fail { .. }),
+            "expected Fail, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn cost_budget_ok_for_unknown_provider() {
+        let thresholds = default_cost_thresholds();
+        let outcome = check_cost_budget("some-unknown-provider", 999.0, &thresholds);
+        assert_eq!(outcome, CostBudgetOutcome::Ok);
+    }
+
+    #[test]
+    fn cost_budget_openrouter_has_higher_threshold() {
+        let thresholds = default_cost_thresholds();
+        // $0.08 is under openrouter's warn ($0.10) but above anthropic's ($0.05).
+        let openrouter = check_cost_budget("openrouter", 0.08, &thresholds);
+        let anthropic = check_cost_budget("anthropic", 0.08, &thresholds);
+        assert_eq!(openrouter, CostBudgetOutcome::Ok);
+        assert!(matches!(anthropic, CostBudgetOutcome::Warn { .. }));
+    }
+
+    #[test]
+    fn cost_budget_exactly_at_warn_triggers_warn() {
+        let thresholds = default_cost_thresholds();
+        let outcome = check_cost_budget("openai", 0.05, &thresholds);
+        assert!(
+            matches!(outcome, CostBudgetOutcome::Warn { .. }),
+            "expected Warn at exact threshold, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn cost_budget_exactly_at_fail_triggers_fail() {
+        let thresholds = default_cost_thresholds();
+        let outcome = check_cost_budget("openai", 0.25, &thresholds);
+        assert!(
+            matches!(outcome, CostBudgetOutcome::Fail { .. }),
+            "expected Fail at exact threshold, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn cost_budget_zero_cost_ok() {
+        let thresholds = default_cost_thresholds();
+        let outcome = check_cost_budget("anthropic", 0.0, &thresholds);
+        assert_eq!(outcome, CostBudgetOutcome::Ok);
+    }
+
+    #[test]
+    fn cost_budget_display_format() {
+        assert_eq!(CostBudgetOutcome::Ok.to_string(), "cost within budget");
+
+        let warn = CostBudgetOutcome::Warn {
+            provider: "openai".to_string(),
+            cost: 0.06,
+            threshold: 0.05,
+        };
+        let warn_str = warn.to_string();
+        assert!(warn_str.contains("WARNING"));
+        assert!(warn_str.contains("openai"));
+
+        let fail = CostBudgetOutcome::Fail {
+            provider: "anthropic".to_string(),
+            cost: 0.30,
+            threshold: 0.25,
+        };
+        let fail_str = fail.to_string();
+        assert!(fail_str.contains("FAIL"));
+        assert!(fail_str.contains("anthropic"));
+    }
+
+    #[test]
+    fn cost_budget_custom_thresholds() {
+        let custom = vec![CostThreshold {
+            provider: "custom".to_string(),
+            warn_dollars: 0.001,
+            fail_dollars: 0.002,
+        }];
+        assert_eq!(
+            check_cost_budget("custom", 0.0005, &custom),
+            CostBudgetOutcome::Ok
+        );
+        assert!(matches!(
+            check_cost_budget("custom", 0.0015, &custom),
+            CostBudgetOutcome::Warn { .. }
+        ));
+        assert!(matches!(
+            check_cost_budget("custom", 0.003, &custom),
+            CostBudgetOutcome::Fail { .. }
+        ));
+    }
+
+    #[test]
+    fn default_cost_thresholds_covers_all_live_providers() {
+        let thresholds = default_cost_thresholds();
+        let expected = ["anthropic", "openai", "google", "openrouter", "xai", "deepseek"];
+        for provider in &expected {
+            assert!(
+                thresholds.iter().any(|t| t.provider == *provider),
+                "missing threshold for provider '{provider}'"
+            );
+        }
+    }
+
+    // ====================================================================
+    // Redaction + Context (existing context-level) additional coverage
+    // ====================================================================
+
+    #[test]
+    fn redaction_case_insensitive_key_matching() {
+        let logger = TestLogger::new();
+        logger.info_ctx("auth", "Case test", |ctx| {
+            ctx.push(("API_KEY".into(), "sk-123".into()));
+            ctx.push(("Api-Key".into(), "sk-456".into()));
+            ctx.push(("AUTHORIZATION".into(), "Bearer tok".into()));
+            ctx.push(("Token".into(), "abc".into()));
+        });
+        let dump = logger.dump();
+        assert!(dump.contains("API_KEY = [REDACTED]"));
+        assert!(dump.contains("Api-Key = [REDACTED]"));
+        assert!(dump.contains("AUTHORIZATION = [REDACTED]"));
+        assert!(dump.contains("Token = [REDACTED]"));
+    }
+
+    #[test]
+    fn redaction_partial_key_match() {
+        // Keys that *contain* a sensitive pattern should also redact.
+        let logger = TestLogger::new();
+        logger.info_ctx("auth", "Partial match", |ctx| {
+            ctx.push(("x-api-key-header".into(), "value".into()));
+            ctx.push(("my_secret_value".into(), "value".into()));
+            ctx.push(("safe_key".into(), "visible".into()));
+        });
+        let dump = logger.dump();
+        assert!(dump.contains("x-api-key-header = [REDACTED]"));
+        assert!(dump.contains("my_secret_value = [REDACTED]"));
+        assert!(dump.contains("safe_key = visible"));
     }
 }

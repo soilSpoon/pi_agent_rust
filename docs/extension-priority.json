@@ -1,6 +1,131 @@
 {
-  "schema": "pi.ext.priority.v1",
-  "generated_at": "2026-02-05T06:38:00Z",
+  "schema": "pi.ext.priority.v2",
+  "generated_at": "2026-02-06T17:20:00Z",
+  "as_of": "2026-02-06T00:00:00Z",
+  "selection_status": "provisional",
+  "selection_status_notes": "Scoring rubric, tier policy, and coverage quotas are now machine-consumable; full-corpus ranking awaits completion of popularity snapshot ingestion and normalized scoring input generation.",
+  "source_manifests": {
+    "candidate_pool": "docs/extension-candidate-pool.json",
+    "individual_enumeration": "docs/extension-individual-enumeration.json",
+    "popularity_criteria": "docs/EXTENSION_POPULARITY_CRITERIA.md",
+    "sampling_matrix": "docs/EXTENSION_SAMPLING_MATRIX.md"
+  },
+  "candidate_pool_total": 215,
+  "individual_extension_total": 214,
+  "tier_policy": {
+    "tier_0": {
+      "description": "Official baseline coverage set (pi-mono examples).",
+      "target_min": 60,
+      "source_tiers": [
+        "official-pi-mono"
+      ]
+    },
+    "tier_1": {
+      "description": "Must-pass corpus for CI.",
+      "target_min": 200,
+      "score_threshold": 70
+    },
+    "tier_2": {
+      "description": "Stretch corpus for additional long-tail coverage.",
+      "score_threshold": 50
+    },
+    "excluded": {
+      "description": "Fails at least one hard gate or scores below tier-2 threshold."
+    }
+  },
+  "scoring_contract": {
+    "schema": "pi.ext.scoring.v1",
+    "implementation": {
+      "module": "src/extension_scoring.rs",
+      "cli": "src/bin/ext_score_candidates.rs"
+    },
+    "weights": {
+      "popularity": 30,
+      "adoption": 15,
+      "coverage": 20,
+      "activity": 15,
+      "compatibility": 20,
+      "risk_penalty_max": 15
+    },
+    "tier_thresholds": {
+      "tier_1_min": 70,
+      "tier_2_min": 50
+    },
+    "tie_breakers": [
+      "higher_coverage",
+      "higher_popularity",
+      "more_recent",
+      "lexicographic_id"
+    ],
+    "missing_signal_policy": "Unknown metrics are preserved as null in source data, contribute 0 to arithmetic score components, and are emitted in missingSignals for auditability."
+  },
+  "coverage_targets": {
+    "mode": "ratio_with_availability_cap",
+    "tier_1_target": 200,
+    "formula": "required(bucket)=min(available(bucket),ceil(tier_1_target*ratio(bucket)))",
+    "source_tier_minimums": [
+      {
+        "source_tier": "official-pi-mono",
+        "available": 60,
+        "min_required": 60
+      },
+      {
+        "source_tier": "community",
+        "available": 55,
+        "min_required": 50
+      },
+      {
+        "source_tier": "third-party-github",
+        "available": 59,
+        "min_required": 50
+      },
+      {
+        "source_tier": "npm-registry",
+        "available": 37,
+        "min_required": 37
+      },
+      {
+        "source_tier": "agents-mikeastock",
+        "available": 3,
+        "min_required": 3
+      }
+    ],
+    "behavior_bucket_ratios": {
+      "event_hook": 0.4,
+      "registerTool": 0.25,
+      "registerShortcut": 0.07,
+      "registerFlag": 0.04,
+      "registerProvider": 0.02,
+      "exec_api": 0.12,
+      "session_api": 0.05,
+      "ui_combined": 0.25
+    },
+    "availability_snapshot": {
+      "source_tier": {
+        "agents-mikeastock": 3,
+        "community": 55,
+        "npm-registry": 37,
+        "official-pi-mono": 60,
+        "third-party-github": 59
+      },
+      "capabilities": {
+        "ExtensionAPI_import": 212,
+        "event_hook": 91,
+        "exec_api": 26,
+        "events_api": 12,
+        "export_default": 214,
+        "registerFlag": 9,
+        "registerProvider": 4,
+        "registerShortcut": 17,
+        "registerTool": 52,
+        "session_api": 12,
+        "streamSimple": 3,
+        "ui_header": 55,
+        "ui_overlay": 19
+      }
+    }
+  },
+  "legacy_rankings_scope": "rankings[] below are the legacy baseline ordering for the official 60-extension tranche and are retained for continuity until full-corpus scoring output is generated.",
   "total": 60,
   "first_25_summary": "Testable with minimal infrastructure (simple tools, event hooks, slash commands)",
   "last_25_summary": "Requires advanced mocks, UI overlays, provider shims, or npm dependencies",

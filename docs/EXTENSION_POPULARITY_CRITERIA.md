@@ -18,8 +18,9 @@ Non-goals:
 
 - **Candidate**: an extension artifact (single file, directory, package) plus provenance metadata.
 - **Corpus**: the tiered set we aim to support **unmodified**.
-  - **Tier-1**: must-pass, always run in CI.
-  - **Tier-2**: stretch; run in CI on a schedule or as an opt-in job.
+  - **Tier-0**: official baseline (pi-mono examples); always included in coverage.
+  - **Tier-1**: must-pass, always run in CI (**target size: >= 200**).
+  - **Tier-2**: stretch; additional long-tail coverage run in CI on a schedule or opt-in job.
 - **Signals**: objective measures like stars/downloads/official listings.
 - **Coverage**: how much *new* extension surface area this exercises (runtime tier, interaction
   model, hostcall mix).
@@ -94,8 +95,9 @@ The inventory should store **all inputs** used to compute the score and a short 
 
 ### 2.1 Popularity (0–30)
 
-Add up the following components (cap at 30). Missing metrics score **0** and
-are recorded as “missing”, but do **not** exclude the candidate.
+Add up the following components (cap at 30). Missing metrics remain explicit `null` in source
+data, score **0** for arithmetic, and are recorded in `missingSignals` so unknown data is
+auditable and does **not** silently masquerade as known zero.
 
 1) **Official / first‑party visibility (0–10)** (take the **max**, not sum)
 - Listed on `buildwithpi.ai/packages` (or official docs): +10
@@ -129,8 +131,8 @@ links. (The inventory must capture URLs.)
 
 ### 2.2 Adoption (0–15)
 
-Pick the best available signals for the source type; store raw numbers. Missing
-metrics score **0** and are recorded as “missing”.
+Pick the best available signals for the source type; store raw numbers. Missing metrics remain
+`null` in source data, score **0** for arithmetic, and are recorded in `missingSignals`.
 
 1) **npm downloads (0–8)** (if published on npm)
 - ≥ 50k / month: +8
@@ -267,6 +269,36 @@ Tie-breakers (when selecting a fixed-size set):
 2) then higher **Popularity**
 3) then more recent
 
+### 3.1 Corpus Size Policy (Normative)
+
+- **Tier-0 baseline**: keep all official pi-mono extensions in coverage.
+- **Tier-1 must-pass corpus**: **>= 200** extensions.
+- **Tier-2 stretch corpus**: all additional eligible extensions after Tier-1 selection.
+
+If Tier-1 falls below 200 due to gate failures (license, deterministic scenario, pinned
+provenance, unmodified compatibility), emit a machine-readable shortfall report with:
+`required`, `selected`, `missing`, and per-gate reason counts.
+
+### 3.2 Executable Scoring Contract
+
+Normative implementation:
+- `src/extension_scoring.rs`
+- `src/bin/ext_score_candidates.rs`
+
+Example run:
+
+```bash
+cargo run --bin ext_score_candidates -- \
+  --input docs/extension-scoring-input.json \
+  --out docs/extension-priority.json \
+  --summary-out docs/extension-priority-summary.json \
+  --as-of 2026-02-06T00:00:00Z \
+  --generated-at 2026-02-06T00:00:00Z
+```
+
+Expected report schema: `pi.ext.scoring.v1`, including deterministic rank ordering and explicit
+`gates`, `missingSignals`, and per-criterion score breakdown.
+
 ---
 
 ## 4) Inventory Fields (schema guidance for bd-1o8j / bd-hhzv / bd-34io)
@@ -307,7 +339,7 @@ The candidate inventory should be representable as JSON objects with these field
   },
   "recency": { "updated_at": "2026-01-31T00:00:00Z" },
   "compat": {
-    "status": "unmodified|required_shims|runtime_gap|blocked",
+    "status": "unmodified|requires_shims|runtime_gap|blocked",
     "unmodified_required": true,
     "blocked_reasons": [],
     "required_shims": ["pi:node/fs", "pi:node/path"]

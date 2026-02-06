@@ -148,11 +148,10 @@ impl Provider for GeminiProvider {
         let request_body = self.build_request(context, options);
         let url = self.streaming_url(&auth_value);
 
-        // Build request
+        // Build request (Content-Type set by .json() below)
         let mut request = self
             .client
             .post(&url)
-            .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
 
         for (key, value) in &options.headers {
@@ -848,5 +847,453 @@ mod tests {
             StopReason::Aborted => "aborted",
         }
         .to_string()
+    }
+
+    // ─── Request body format tests ──────────────────────────────────────
+
+    #[test]
+    fn test_build_request_basic_text() {
+        let provider = GeminiProvider::new("gemini-2.0-flash");
+        let context = Context {
+            system_prompt: Some("You are helpful.".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("What is Rust?".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![],
+        };
+        let options = crate::provider::StreamOptions {
+            max_tokens: Some(1024),
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+
+        let req = provider.build_request(&context, &options);
+        let json = serde_json::to_value(&req).expect("serialize");
+
+        // Contents should have exactly one user message.
+        let contents = json["contents"].as_array().expect("contents array");
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "What is Rust?");
+
+        // System instruction should be present.
+        assert_eq!(
+            json["systemInstruction"]["parts"][0]["text"],
+            "You are helpful."
+        );
+
+        // No tools should be present.
+        assert!(json.get("tools").is_none() || json["tools"].is_null());
+
+        // Generation config should match.
+        assert_eq!(json["generationConfig"]["maxOutputTokens"], 1024);
+        assert!((json["generationConfig"]["temperature"].as_f64().unwrap() - 0.7).abs() < 0.01);
+        assert_eq!(json["generationConfig"]["candidateCount"], 1);
+    }
+
+    #[test]
+    fn test_build_request_with_tools() {
+        let provider = GeminiProvider::new("gemini-2.0-flash");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Read a file".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![
+                ToolDef {
+                    name: "read".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }),
+                },
+                ToolDef {
+                    name: "write".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        }
+                    }),
+                },
+            ],
+        };
+        let options = crate::provider::StreamOptions::default();
+
+        let req = provider.build_request(&context, &options);
+        let json = serde_json::to_value(&req).expect("serialize");
+
+        // System instruction should be absent.
+        assert!(json.get("systemInstruction").is_none() || json["systemInstruction"].is_null());
+
+        // Tools should be present as a single GeminiTool with function_declarations array.
+        let tools = json["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        let declarations = tools[0]["functionDeclarations"]
+            .as_array()
+            .expect("declarations");
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations[0]["name"], "read");
+        assert_eq!(declarations[1]["name"], "write");
+        assert_eq!(declarations[0]["description"], "Read a file");
+
+        // Tool config should be AUTO mode.
+        assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+    }
+
+    #[test]
+    fn test_build_request_default_max_tokens() {
+        let provider = GeminiProvider::new("gemini-2.0-flash");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![],
+        };
+        let options = crate::provider::StreamOptions::default();
+
+        let req = provider.build_request(&context, &options);
+        let json = serde_json::to_value(&req).expect("serialize");
+
+        // Default max tokens should be DEFAULT_MAX_TOKENS (8192).
+        assert_eq!(
+            json["generationConfig"]["maxOutputTokens"],
+            DEFAULT_MAX_TOKENS
+        );
+    }
+
+    // ─── API key as query parameter tests ───────────────────────────────
+
+    #[test]
+    fn test_streaming_url_includes_key_as_query_param() {
+        let provider = GeminiProvider::new("gemini-2.0-flash");
+        let url = provider.streaming_url("my-secret-key");
+
+        // API key must be in the query string, not as a header.
+        assert!(
+            url.contains("key=my-secret-key"),
+            "API key should be in query param"
+        );
+        assert!(url.contains("alt=sse"), "alt=sse should be present");
+        assert!(
+            url.contains("streamGenerateContent"),
+            "should use streaming endpoint"
+        );
+    }
+
+    #[test]
+    fn test_streaming_url_custom_base() {
+        let provider =
+            GeminiProvider::new("gemini-pro").with_base_url("https://custom.example.com/v1");
+        let url = provider.streaming_url("key123");
+
+        assert!(url.starts_with("https://custom.example.com/v1/models/gemini-pro"));
+        assert!(url.contains("key=key123"));
+    }
+
+    // ─── Content part mapping tests ─────────────────────────────────────
+
+    #[test]
+    fn test_convert_user_text_to_gemini_parts() {
+        let parts = convert_user_content_to_parts(&UserContent::Text("hello world".to_string()));
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            GeminiPart::Text { text } => assert_eq!(text, "hello world"),
+            _ => panic!("expected text part"),
+        }
+    }
+
+    #[test]
+    fn test_convert_user_blocks_with_image_to_gemini_parts() {
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("describe this")),
+            ContentBlock::Image(crate::model::ImageContent {
+                data: "aGVsbG8=".to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+        ]);
+
+        let parts = convert_user_content_to_parts(&content);
+        assert_eq!(parts.len(), 2);
+        match &parts[0] {
+            GeminiPart::Text { text } => assert_eq!(text, "describe this"),
+            _ => panic!("expected text part"),
+        }
+        match &parts[1] {
+            GeminiPart::InlineData { inline_data } => {
+                assert_eq!(inline_data.mime_type, "image/png");
+                assert_eq!(inline_data.data, "aGVsbG8=");
+            }
+            _ => panic!("expected inline_data part"),
+        }
+    }
+
+    #[test]
+    fn test_convert_assistant_message_with_tool_call() {
+        let message = Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Text(TextContent::new("Let me read that file.")),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_123".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "/tmp/test.txt"}),
+                    thought_signature: None,
+                }),
+            ],
+            api: "google".to_string(),
+            provider: "google".to_string(),
+            model: "gemini-2.0-flash".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 0,
+        });
+
+        let converted = convert_message_to_gemini(&message);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, Some("model".to_string()));
+        assert_eq!(converted[0].parts.len(), 2);
+
+        match &converted[0].parts[0] {
+            GeminiPart::Text { text } => assert_eq!(text, "Let me read that file."),
+            _ => panic!("expected text part"),
+        }
+        match &converted[0].parts[1] {
+            GeminiPart::FunctionCall { function_call } => {
+                assert_eq!(function_call.name, "read");
+                assert_eq!(function_call.args["path"], "/tmp/test.txt");
+            }
+            _ => panic!("expected function_call part"),
+        }
+    }
+
+    #[test]
+    fn test_convert_assistant_empty_content_returns_empty() {
+        let message = Message::Assistant(AssistantMessage {
+            content: vec![],
+            api: "google".to_string(),
+            provider: "google".to_string(),
+            model: "gemini-2.0-flash".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        });
+
+        let converted = convert_message_to_gemini(&message);
+        assert!(converted.is_empty());
+    }
+
+    #[test]
+    fn test_convert_tool_result_success() {
+        let message = Message::ToolResult(crate::model::ToolResultMessage {
+            tool_call_id: "call_123".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("file contents here"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+
+        let converted = convert_message_to_gemini(&message);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, Some("user".to_string()));
+
+        match &converted[0].parts[0] {
+            GeminiPart::FunctionResponse { function_response } => {
+                assert_eq!(function_response.name, "read");
+                assert_eq!(function_response.response["result"], "file contents here");
+                assert!(function_response.response.get("error").is_none());
+            }
+            _ => panic!("expected function_response part"),
+        }
+    }
+
+    #[test]
+    fn test_convert_tool_result_error() {
+        let message = Message::ToolResult(crate::model::ToolResultMessage {
+            tool_call_id: "call_456".to_string(),
+            tool_name: "bash".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("command not found"))],
+            details: None,
+            is_error: true,
+            timestamp: 0,
+        });
+
+        let converted = convert_message_to_gemini(&message);
+        assert_eq!(converted.len(), 1);
+
+        match &converted[0].parts[0] {
+            GeminiPart::FunctionResponse { function_response } => {
+                assert_eq!(function_response.name, "bash");
+                assert_eq!(function_response.response["error"], "command not found");
+                assert!(function_response.response.get("result").is_none());
+            }
+            _ => panic!("expected function_response part"),
+        }
+    }
+
+    #[test]
+    fn test_convert_custom_message() {
+        let message = Message::Custom(crate::model::CustomMessage {
+            custom_type: "system_note".to_string(),
+            content: "Context window approaching limit.".to_string(),
+            display: false,
+            details: None,
+            timestamp: 0,
+        });
+
+        let converted = convert_message_to_gemini(&message);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, Some("user".to_string()));
+        match &converted[0].parts[0] {
+            GeminiPart::Text { text } => {
+                assert_eq!(text, "Context window approaching limit.");
+            }
+            _ => panic!("expected text part"),
+        }
+    }
+
+    // ─── Response parsing / stop reason tests ───────────────────────────
+
+    #[test]
+    fn test_stop_reason_mapping() {
+        // Test all finish reason strings map correctly.
+        let test_cases = vec![
+            ("STOP", StopReason::Stop),
+            ("MAX_TOKENS", StopReason::Length),
+            ("SAFETY", StopReason::Error),
+            ("RECITATION", StopReason::Error),
+            ("OTHER", StopReason::Error),
+            ("UNKNOWN_REASON", StopReason::Stop), // unknown defaults to Stop
+        ];
+
+        for (reason_str, expected) in test_cases {
+            let candidate = GeminiCandidate {
+                content: None,
+                finish_reason: Some(reason_str.to_string()),
+            };
+
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let byte_stream = stream::empty::<std::result::Result<Vec<u8>, std::io::Error>>();
+                let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
+                let mut state = StreamState::new(
+                    event_source,
+                    "test".to_string(),
+                    "test".to_string(),
+                    "test".to_string(),
+                );
+                state.process_candidate(candidate).unwrap();
+                assert_eq!(
+                    state.partial.stop_reason, expected,
+                    "finish_reason '{reason_str}' should map to {expected:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_usage_metadata_parsing() {
+        let data = r#"{
+            "usageMetadata": {
+                "promptTokenCount": 42,
+                "candidatesTokenCount": 100,
+                "totalTokenCount": 142
+            }
+        }"#;
+
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let byte_stream = stream::empty::<std::result::Result<Vec<u8>, std::io::Error>>();
+            let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
+            let mut state = StreamState::new(
+                event_source,
+                "test".to_string(),
+                "test".to_string(),
+                "test".to_string(),
+            );
+            state.process_event(data).unwrap();
+            assert_eq!(state.partial.usage.input, 42);
+            assert_eq!(state.partial.usage.output, 100);
+            assert_eq!(state.partial.usage.total_tokens, 142);
+        });
+    }
+
+    // ─── Full conversation round-trip tests ─────────────────────────────
+
+    #[test]
+    fn test_build_request_full_conversation() {
+        let provider = GeminiProvider::new("gemini-2.0-flash");
+        let context = Context {
+            system_prompt: Some("Be concise.".to_string()),
+            messages: vec![
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Read /tmp/a.txt".to_string()),
+                    timestamp: 0,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "/tmp/a.txt"}),
+                        thought_signature: None,
+                    })],
+                    api: "google".to_string(),
+                    provider: "google".to_string(),
+                    model: "gemini-2.0-flash".to_string(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 1,
+                }),
+                Message::ToolResult(crate::model::ToolResultMessage {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ContentBlock::Text(TextContent::new("file contents"))],
+                    details: None,
+                    is_error: false,
+                    timestamp: 2,
+                }),
+            ],
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+        };
+        let options = crate::provider::StreamOptions::default();
+
+        let req = provider.build_request(&context, &options);
+        let json = serde_json::to_value(&req).expect("serialize");
+
+        let contents = json["contents"].as_array().expect("contents");
+        assert_eq!(contents.len(), 3); // user, model, user (tool result)
+
+        // First: user message
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "Read /tmp/a.txt");
+
+        // Second: model with function call
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"][0]["functionCall"]["name"], "read");
+
+        // Third: function response (sent as user role)
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "read");
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["response"]["result"],
+            "file contents"
+        );
     }
 }

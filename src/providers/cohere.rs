@@ -123,10 +123,10 @@ impl Provider for CohereProvider {
 
         let request_body = self.build_request(context, options);
 
+        // Content-Type set by .json() below
         let mut request = self
             .client
             .post(&self.base_url)
-            .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
 
         if let Some(auth_value) = auth_value {
@@ -840,12 +840,94 @@ mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use futures::stream;
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn test_provider_info() {
         let provider = CohereProvider::new("command-r");
         assert_eq!(provider.name(), "cohere");
         assert_eq!(provider.api(), "cohere-chat");
+    }
+
+    #[test]
+    fn test_build_request_includes_system_tools_and_v2_shape() {
+        let provider = CohereProvider::new("command-r");
+        let context = Context {
+            system_prompt: Some("You are concise.".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![ToolDef {
+                name: "search".to_string(),
+                description: "Search docs".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "q": { "type": "string" }
+                    },
+                    "required": ["q"]
+                }),
+            }],
+        };
+        let options = StreamOptions {
+            temperature: Some(0.2),
+            max_tokens: Some(123),
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let value = serde_json::to_value(&request).expect("serialize request");
+
+        assert_eq!(value["model"], "command-r");
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(value["messages"][0]["content"], "You are concise.");
+        assert_eq!(value["messages"][1]["role"], "user");
+        assert_eq!(value["messages"][1]["content"], "Ping");
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["max_tokens"], 123);
+        let temperature = value["temperature"]
+            .as_f64()
+            .expect("temperature should be numeric");
+        assert!((temperature - 0.2).abs() < 1e-6);
+        assert_eq!(value["tools"][0]["type"], "function");
+        assert_eq!(value["tools"][0]["function"]["name"], "search");
+        assert_eq!(value["tools"][0]["function"]["description"], "Search docs");
+        assert_eq!(
+            value["tools"][0]["function"]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string" }
+                },
+                "required": ["q"]
+            })
+        );
+    }
+
+    #[test]
+    fn test_convert_tool_to_cohere_omits_empty_description() {
+        let tool = ToolDef {
+            name: "echo".to_string(),
+            description: "   ".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                }
+            }),
+        };
+
+        let converted = convert_tool_to_cohere(&tool);
+        let value = serde_json::to_value(converted).expect("serialize converted tool");
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["function"]["name"], "echo");
+        assert!(value["function"].get("description").is_none());
     }
 
     #[test]
@@ -909,5 +991,597 @@ mod tests {
             assert!(out.iter().any(|e| matches!(e, StreamEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "echo")));
             assert!(out.iter().any(|e| matches!(e, StreamEvent::Done { reason: StopReason::ToolUse, .. })));
         });
+    }
+
+    #[test]
+    fn test_stream_parses_thinking_and_max_tokens_stop_reason() {
+        let events = vec![
+            json!({ "type": "message-start", "id": "msg_1" }),
+            json!({
+                "type": "content-start",
+                "index": 0,
+                "delta": { "message": { "content": { "type": "thinking", "thinking": "Plan" } } }
+            }),
+            json!({
+                "type": "content-delta",
+                "index": 0,
+                "delta": { "message": { "content": { "thinking": " more" } } }
+            }),
+            json!({ "type": "content-end", "index": 0 }),
+            json!({
+                "type": "message-end",
+                "delta": { "finish_reason": "MAX_TOKENS", "usage": { "tokens": { "input_tokens": 2, "output_tokens": 3 } } }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, StreamEvent::ThinkingStart { .. }))
+        );
+        assert!(out.iter().any(
+            |e| matches!(e, StreamEvent::ThinkingDelta { delta, .. } if delta.contains("Plan"))
+        ));
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, StreamEvent::ThinkingEnd { content, .. } if content.contains("Plan more")))
+        );
+        assert!(out.iter().any(|e| matches!(
+            e,
+            StreamEvent::Done {
+                reason: StopReason::Length,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn test_stream_sets_bearer_auth_header() {
+        let captured = run_stream_and_capture_headers(Some("test-cohere-key"), HashMap::new())
+            .expect("captured request");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-cohere-key")
+        );
+        assert_eq!(
+            captured.headers.get("accept").map(String::as_str),
+            Some("text/event-stream")
+        );
+
+        let body: Value = serde_json::from_str(&captured.body).expect("body json");
+        assert_eq!(body["model"], "command-r");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn test_stream_uses_existing_authorization_header_without_api_key() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer from-custom-header".to_string(),
+        );
+        headers.insert("X-Test".to_string(), "1".to_string());
+
+        let captured = run_stream_and_capture_headers(None, headers).expect("captured request");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer from-custom-header")
+        );
+        assert_eq!(
+            captured.headers.get("x-test").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    fn collect_events(events: &[Value]) -> Vec<StreamEvent> {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let byte_stream = stream::iter(
+                events
+                    .iter()
+                    .map(|event| {
+                        format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(event).expect("serialize event")
+                        )
+                    })
+                    .map(|s| Ok(s.into_bytes())),
+            );
+
+            let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
+            let mut state = StreamState::new(
+                event_source,
+                "command-r".to_string(),
+                "cohere-chat".to_string(),
+                "cohere".to_string(),
+            );
+
+            let mut out = Vec::new();
+            while let Some(item) = state.event_source.next().await {
+                let msg = item.expect("SSE event");
+                state.process_event(&msg.data).expect("process_event");
+                out.extend(state.pending_events.drain(..));
+                if state.finished {
+                    break;
+                }
+            }
+            out
+        })
+    }
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        headers: HashMap<String, String>,
+        body: String,
+    }
+
+    fn run_stream_and_capture_headers(
+        api_key: Option<&str>,
+        extra_headers: HashMap<String, String>,
+    ) -> Option<CapturedRequest> {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = CohereProvider::new("command-r").with_base_url(base_url);
+        let context = Context {
+            system_prompt: Some("system".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: api_key.map(str::to_string),
+            headers: extra_headers,
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    fn success_sse_body() -> String {
+        [
+            r#"data: {"type":"message-start","id":"msg_1"}"#,
+            "",
+            r#"data: {"type":"message-end","delta":{"finish_reason":"COMPLETE","usage":{"tokens":{"input_tokens":1,"output_tokens":1}}}}"#,
+            "",
+        ]
+        .join("\n")
+    }
+
+    fn spawn_test_server(
+        status_code: u16,
+        content_type: &str,
+        body: &str,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+        let body = body.to_string();
+        let content_type = content_type.to_string();
+
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read request failed: {err}"),
+                }
+            }
+
+            let header_end = bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request header boundary");
+            let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let headers = parse_headers(&header_text);
+            let mut request_body = bytes[header_end + 4..].to_vec();
+
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while request_body.len() < content_length {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read request body failed: {err}"),
+                }
+            }
+
+            let captured = CapturedRequest {
+                headers,
+                body: String::from_utf8_lossy(&request_body).to_string(),
+            };
+            tx.send(captured).expect("send captured request");
+
+            let reason = match status_code {
+                401 => "Unauthorized",
+                500 => "Internal Server Error",
+                _ => "OK",
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write response");
+            socket.flush().expect("flush response");
+        });
+
+        (format!("http://{addr}"), rx)
+    }
+
+    fn parse_headers(header_text: &str) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        for line in header_text.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        headers
+    }
+
+    // ─── Request body format tests ──────────────────────────────────────
+
+    #[test]
+    fn test_build_request_no_system_prompt() {
+        let provider = CohereProvider::new("command-r-plus");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Hi".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![],
+        };
+        let options = StreamOptions::default();
+
+        let req = provider.build_request(&context, &options);
+        let value = serde_json::to_value(&req).expect("serialize");
+
+        // First message should be user, no system message.
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][0]["content"], "Hi");
+        // No system role message at all.
+        let msgs = value["messages"].as_array().unwrap();
+        assert!(
+            !msgs.iter().any(|m| m["role"] == "system"),
+            "No system message should be present"
+        );
+    }
+
+    #[test]
+    fn test_build_request_default_max_tokens() {
+        let provider = CohereProvider::new("command-r");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("test".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![],
+        };
+        let options = StreamOptions::default();
+
+        let req = provider.build_request(&context, &options);
+        let value = serde_json::to_value(&req).expect("serialize");
+
+        assert_eq!(value["max_tokens"], DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn test_build_request_no_tools_omits_tools_field() {
+        let provider = CohereProvider::new("command-r");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("test".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![],
+        };
+        let options = StreamOptions::default();
+
+        let req = provider.build_request(&context, &options);
+        let value = serde_json::to_value(&req).expect("serialize");
+
+        assert!(
+            value.get("tools").is_none() || value["tools"].is_null(),
+            "tools field should be omitted when empty"
+        );
+    }
+
+    #[test]
+    fn test_build_request_full_conversation_with_tool_call_and_result() {
+        let provider = CohereProvider::new("command-r");
+        let context = Context {
+            system_prompt: Some("Be concise.".to_string()),
+            messages: vec![
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Read /tmp/a.txt".to_string()),
+                    timestamp: 0,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "/tmp/a.txt"}),
+                        thought_signature: None,
+                    })],
+                    api: "cohere-chat".to_string(),
+                    provider: "cohere".to_string(),
+                    model: "command-r".to_string(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 1,
+                }),
+                Message::ToolResult(crate::model::ToolResultMessage {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ContentBlock::Text(TextContent::new("file contents"))],
+                    details: None,
+                    is_error: false,
+                    timestamp: 2,
+                }),
+            ],
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({"type": "object"}),
+            }],
+        };
+        let options = StreamOptions::default();
+
+        let req = provider.build_request(&context, &options);
+        let value = serde_json::to_value(&req).expect("serialize");
+
+        let msgs = value["messages"].as_array().unwrap();
+        // system, user, assistant, tool
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[3]["role"], "tool");
+
+        // Assistant message should have tool_calls, not content text.
+        assert!(msgs[2].get("content").is_none() || msgs[2]["content"].is_null());
+        let tool_calls = msgs[2]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call_1");
+        assert_eq!(tool_calls[0]["type"], "function");
+        assert_eq!(tool_calls[0]["function"]["name"], "read");
+
+        // Tool result should reference the tool_call_id.
+        assert_eq!(msgs[3]["tool_call_id"], "call_1");
+        assert_eq!(msgs[3]["content"], "file contents");
+    }
+
+    #[test]
+    fn test_convert_custom_message_to_cohere() {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::Custom(crate::model::CustomMessage {
+                custom_type: "extension_note".to_string(),
+                content: "Important context.".to_string(),
+                display: false,
+                details: None,
+                timestamp: 0,
+            })],
+            tools: vec![],
+        };
+
+        let msgs = build_cohere_messages(&context);
+        assert_eq!(msgs.len(), 1);
+        let value = serde_json::to_value(&msgs[0]).expect("serialize");
+        assert_eq!(value["role"], "user");
+        assert_eq!(value["content"], "Important context.");
+    }
+
+    #[test]
+    fn test_convert_user_blocks_extracts_text_only() {
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("part 1")),
+            ContentBlock::Image(crate::model::ImageContent {
+                data: "aGVsbG8=".to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Text(TextContent::new("part 2")),
+        ]);
+
+        let text = extract_text_user_content(&content);
+        assert_eq!(text, "part 1part 2");
+    }
+
+    // ─── Provider builder tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_custom_provider_name() {
+        let provider = CohereProvider::new("command-r").with_provider_name("my-proxy");
+        assert_eq!(provider.name(), "my-proxy");
+        assert_eq!(provider.api(), "cohere-chat");
+    }
+
+    #[test]
+    fn test_custom_base_url() {
+        let provider =
+            CohereProvider::new("command-r").with_base_url("https://proxy.example.com/v2/chat");
+        assert_eq!(provider.base_url, "https://proxy.example.com/v2/chat");
+    }
+
+    // ─── Stream event parsing tests ─────────────────────────────────────
+
+    #[test]
+    fn test_stream_complete_finish_reason_maps_to_stop() {
+        let events = vec![
+            json!({ "type": "message-start", "id": "msg_1" }),
+            json!({
+                "type": "message-end",
+                "delta": {
+                    "finish_reason": "COMPLETE",
+                    "usage": { "tokens": { "input_tokens": 5, "output_tokens": 10 } }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(out.iter().any(|e| matches!(
+            e,
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+                ..
+            } if message.usage.input == 5 && message.usage.output == 10
+        )));
+    }
+
+    #[test]
+    fn test_stream_error_finish_reason_maps_to_error() {
+        let events = vec![
+            json!({ "type": "message-start", "id": "msg_1" }),
+            json!({
+                "type": "message-end",
+                "delta": {
+                    "finish_reason": "ERROR",
+                    "usage": { "tokens": { "input_tokens": 1, "output_tokens": 0 } }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(out.iter().any(|e| matches!(
+            e,
+            StreamEvent::Done {
+                reason: StopReason::Error,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn test_stream_tool_call_with_streamed_arguments() {
+        let events = vec![
+            json!({ "type": "message-start", "id": "msg_1" }),
+            json!({
+                "type": "tool-call-start",
+                "delta": {
+                    "message": {
+                        "tool_calls": {
+                            "id": "call_42",
+                            "type": "function",
+                            "function": { "name": "bash", "arguments": "{\"co" }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "tool-call-delta",
+                "delta": {
+                    "message": {
+                        "tool_calls": {
+                            "function": { "arguments": "mmand\"" }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "tool-call-delta",
+                "delta": {
+                    "message": {
+                        "tool_calls": {
+                            "function": { "arguments": ": \"ls -la\"}" }
+                        }
+                    }
+                }
+            }),
+            json!({ "type": "tool-call-end" }),
+            json!({
+                "type": "message-end",
+                "delta": {
+                    "finish_reason": "TOOL_CALL",
+                    "usage": { "tokens": { "input_tokens": 10, "output_tokens": 20 } }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+
+        // Should have ToolCallEnd with properly assembled arguments.
+        let tool_end = out.iter().find(|e| matches!(e, StreamEvent::ToolCallEnd { .. }));
+        assert!(tool_end.is_some(), "Expected ToolCallEnd event");
+        if let Some(StreamEvent::ToolCallEnd { tool_call, .. }) = tool_end {
+            assert_eq!(tool_call.name, "bash");
+            assert_eq!(tool_call.id, "call_42");
+            assert_eq!(tool_call.arguments["command"], "ls -la");
+        }
+    }
+
+    #[test]
+    fn test_stream_unknown_event_type_ignored() {
+        let events = vec![
+            json!({ "type": "message-start", "id": "msg_1" }),
+            json!({ "type": "some-future-event", "data": "ignored" }),
+            json!({
+                "type": "content-start",
+                "index": 0,
+                "delta": { "message": { "content": { "type": "text", "text": "OK" } } }
+            }),
+            json!({ "type": "content-end", "index": 0 }),
+            json!({
+                "type": "message-end",
+                "delta": {
+                    "finish_reason": "COMPLETE",
+                    "usage": { "tokens": { "input_tokens": 1, "output_tokens": 1 } }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        // Should complete successfully despite unknown event.
+        assert!(out.iter().any(|e| matches!(e, StreamEvent::Done { .. })));
+        assert!(out.iter().any(|e| matches!(
+            e,
+            StreamEvent::TextStart { content_index: 0, .. }
+        )));
     }
 }

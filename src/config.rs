@@ -162,15 +162,7 @@ impl Config {
 
     /// Get the global configuration directory.
     pub fn global_dir() -> PathBuf {
-        std::env::var("PI_CODING_AGENT_DIR").map_or_else(
-            |_| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".pi")
-                    .join("agent")
-            },
-            PathBuf::from,
-        )
+        global_dir_from_env(env_lookup)
     }
 
     /// Get the project configuration directory.
@@ -180,18 +172,14 @@ impl Config {
 
     /// Get the sessions directory.
     pub fn sessions_dir() -> PathBuf {
-        if let Ok(path) = std::env::var("PI_SESSIONS_DIR") {
-            return PathBuf::from(path);
-        }
-        Self::global_dir().join("sessions")
+        let global_dir = Self::global_dir();
+        sessions_dir_from_env(env_lookup, &global_dir)
     }
 
     /// Get the package directory.
     pub fn package_dir() -> PathBuf {
-        if let Ok(path) = std::env::var("PI_PACKAGE_DIR") {
-            return PathBuf::from(path);
-        }
-        Self::global_dir().join("packages")
+        let global_dir = Self::global_dir();
+        package_dir_from_env(env_lookup, &global_dir)
     }
 
     /// Get the auth file path.
@@ -438,6 +426,43 @@ impl Config {
     }
 }
 
+fn env_lookup(var: &str) -> Option<String> {
+    std::env::var(var).ok()
+}
+
+fn global_dir_from_env<F>(get_env: F) -> PathBuf
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env("PI_CODING_AGENT_DIR").map_or_else(
+        || {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".pi")
+                .join("agent")
+        },
+        PathBuf::from,
+    )
+}
+
+fn sessions_dir_from_env<F>(get_env: F, global_dir: &Path) -> PathBuf
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env("PI_SESSIONS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| global_dir.join("sessions"))
+}
+
+fn package_dir_from_env<F>(get_env: F, global_dir: &Path) -> PathBuf
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env("PI_PACKAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| global_dir.join("packages"))
+}
+
 fn parse_queue_mode(mode: Option<&str>) -> Option<QueueMode> {
     match mode.map(str::trim) {
         Some("all") => Some(QueueMode::All),
@@ -645,10 +670,13 @@ fn patch_settings_file(path: &Path, patch: Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
-    use super::SettingsScope;
+    use super::{
+        Config, SettingsScope, global_dir_from_env, package_dir_from_env, sessions_dir_from_env,
+    };
     use crate::agent::QueueMode;
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn write_file(path: &std::path::Path, contents: &str) {
@@ -734,6 +762,87 @@ mod tests {
         assert!(!config.compaction_enabled());
         assert_eq!(config.compaction_reserve_tokens(), 1234);
         assert_eq!(config.compaction_keep_recent_tokens(), 5678);
+    }
+
+    #[test]
+    fn load_parses_retry_images_terminal_and_shell_fields() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{
+                "compaction": { "enabled": false, "reserve_tokens": 4444, "keep_recent_tokens": 5555 },
+                "retry": { "enabled": false, "max_retries": 9, "base_delay_ms": 101, "max_delay_ms": 202 },
+                "images": { "auto_resize": false, "block_images": true },
+                "terminal": { "show_images": false, "clear_on_shrink": true },
+                "shell_path": "/bin/zsh",
+                "shell_command_prefix": "set -euo pipefail"
+            }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        assert!(!config.compaction_enabled());
+        assert_eq!(config.compaction_reserve_tokens(), 4444);
+        assert_eq!(config.compaction_keep_recent_tokens(), 5555);
+        assert!(!config.retry_enabled());
+        assert_eq!(config.retry_max_retries(), 9);
+        assert_eq!(config.retry_base_delay_ms(), 101);
+        assert_eq!(config.retry_max_delay_ms(), 202);
+        assert!(!config.image_auto_resize());
+        assert!(!config.terminal_show_images());
+        assert!(config.terminal_clear_on_shrink());
+        assert_eq!(config.shell_path.as_deref(), Some("/bin/zsh"));
+        assert_eq!(
+            config.shell_command_prefix.as_deref(),
+            Some("set -euo pipefail")
+        );
+    }
+
+    #[test]
+    fn accessors_use_expected_defaults() {
+        let config = Config::default();
+        assert!(config.compaction_enabled());
+        assert_eq!(config.compaction_reserve_tokens(), 16384);
+        assert_eq!(config.compaction_keep_recent_tokens(), 20000);
+        assert!(config.retry_enabled());
+        assert_eq!(config.retry_max_retries(), 3);
+        assert_eq!(config.retry_base_delay_ms(), 2000);
+        assert_eq!(config.retry_max_delay_ms(), 60000);
+        assert!(config.image_auto_resize());
+        assert!(config.terminal_show_images());
+        assert!(!config.terminal_clear_on_shrink());
+        assert!(config.shell_path.is_none());
+        assert!(config.shell_command_prefix.is_none());
+    }
+
+    #[test]
+    fn directory_helpers_honor_environment_overrides() {
+        let env = HashMap::from([
+            ("PI_CODING_AGENT_DIR".to_string(), "env-root".to_string()),
+            ("PI_SESSIONS_DIR".to_string(), "env-sessions".to_string()),
+            ("PI_PACKAGE_DIR".to_string(), "env-packages".to_string()),
+        ]);
+
+        let global = global_dir_from_env(|key| env.get(key).cloned());
+        let sessions = sessions_dir_from_env(|key| env.get(key).cloned(), &global);
+        let package = package_dir_from_env(|key| env.get(key).cloned(), &global);
+
+        assert_eq!(global, PathBuf::from("env-root"));
+        assert_eq!(sessions, PathBuf::from("env-sessions"));
+        assert_eq!(package, PathBuf::from("env-packages"));
+    }
+
+    #[test]
+    fn directory_helpers_fall_back_to_global_subdirs_when_unset() {
+        let env = HashMap::from([("PI_CODING_AGENT_DIR".to_string(), "root-dir".to_string())]);
+        let global = global_dir_from_env(|key| env.get(key).cloned());
+        let sessions = sessions_dir_from_env(|key| env.get(key).cloned(), &global);
+        let package = package_dir_from_env(|key| env.get(key).cloned(), &global);
+
+        assert_eq!(global, PathBuf::from("root-dir"));
+        assert_eq!(sessions, PathBuf::from("root-dir").join("sessions"));
+        assert_eq!(package, PathBuf::from("root-dir").join("packages"));
     }
 
     #[test]

@@ -42,19 +42,46 @@ impl ExtensionSession for SessionHandle {
         let cx = Cx::for_request();
         let Ok(session) = self.0.lock(&cx).await else {
             return serde_json::json!({
-                "sessionFile": "",
-                "sessionName": "",
+                "model": null,
+                "thinkingLevel": "off",
+                "isStreaming": false,
+                "isCompacting": false,
+                "steeringMode": "one-at-a-time",
+                "followUpMode": "one-at-a-time",
+                "sessionFile": null,
+                "sessionId": "",
+                "sessionName": null,
+                "autoCompactionEnabled": false,
+                "messageCount": 0,
+                "pendingMessageCount": 0,
             });
         };
-        let path = session
-            .path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let name = session.get_name().unwrap_or_default();
+        let session_file = session.path.as_ref().map(|p| p.display().to_string());
+        let session_id = session.header.id.clone();
+        let session_name = session.get_name();
+        let thinking_level = session
+            .header
+            .thinking_level
+            .clone()
+            .unwrap_or_else(|| "off".to_string());
+        let message_count = session
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+            .count();
         serde_json::json!({
-            "sessionFile": path,
-            "sessionName": name,
+            "model": null,
+            "thinkingLevel": thinking_level,
+            "isStreaming": false,
+            "isCompacting": false,
+            "steeringMode": "one-at-a-time",
+            "followUpMode": "one-at-a-time",
+            "sessionFile": session_file,
+            "sessionId": session_id,
+            "sessionName": session_name,
+            "autoCompactionEnabled": false,
+            "messageCount": message_count,
+            "pendingMessageCount": 0,
         })
     }
 
@@ -63,19 +90,21 @@ impl ExtensionSession for SessionHandle {
         let Ok(session) = self.0.lock(&cx).await else {
             return Vec::new();
         };
-        // Convert model messages back to session messages?
-        // Or just return session entries that are messages?
-        // The trait expects SessionMessage.
-        // Session entries store SessionMessage.
+        // Return messages for the current branch only, filtered to
+        // user/assistant/toolResult/bashExecution/custom per spec §3.3.
         session
-            .entries
+            .entries_for_current_path()
             .iter()
-            .filter_map(|e| {
-                if let SessionEntry::Message(m) = e {
-                    Some(m.message.clone())
-                } else {
-                    None
-                }
+            .filter_map(|entry| match entry {
+                SessionEntry::Message(msg) => match msg.message {
+                    SessionMessage::User { .. }
+                    | SessionMessage::Assistant { .. }
+                    | SessionMessage::ToolResult { .. }
+                    | SessionMessage::BashExecution { .. }
+                    | SessionMessage::Custom { .. } => Some(msg.message.clone()),
+                    _ => None,
+                },
+                _ => None,
             })
             .collect()
     }
@@ -112,8 +141,9 @@ impl ExtensionSession for SessionHandle {
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.set_name(&name);
-        // We should probably save? But ExtensionSession trait doesn't imply save.
-        // It modifies in-memory state. Agent loop handles saving.
+        if session.path.is_some() {
+            session.save().await?;
+        }
         Ok(())
     }
 
@@ -125,6 +155,9 @@ impl ExtensionSession for SessionHandle {
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.append_message(message);
+        if session.path.is_some() {
+            session.save().await?;
+        }
         Ok(())
     }
 
@@ -135,7 +168,13 @@ impl ExtensionSession for SessionHandle {
             .lock(&cx)
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
+        if custom_type.trim().is_empty() {
+            return Err(Error::session("customType must not be empty"));
+        }
         session.append_custom_entry(custom_type, data);
+        if session.path.is_some() {
+            session.save().await?;
+        }
         Ok(())
     }
 
@@ -148,6 +187,9 @@ impl ExtensionSession for SessionHandle {
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.append_model_change(provider.clone(), model_id.clone());
         session.set_model_header(Some(provider), Some(model_id), None);
+        if session.path.is_some() {
+            session.save().await?;
+        }
         Ok(())
     }
 
@@ -171,6 +213,9 @@ impl ExtensionSession for SessionHandle {
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.append_thinking_level_change(level.clone());
         session.set_model_header(None, None, Some(level));
+        if session.path.is_some() {
+            session.save().await?;
+        }
         Ok(())
     }
 
@@ -189,7 +234,14 @@ impl ExtensionSession for SessionHandle {
             .lock(&cx)
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        session.add_label(&target_id, label);
+        if session.add_label(&target_id, label).is_none() {
+            return Err(Error::session(format!(
+                "target entry '{target_id}' not found in session"
+            )));
+        }
+        if session.path.is_some() {
+            session.save().await?;
+        }
         Ok(())
     }
 }

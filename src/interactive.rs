@@ -4945,6 +4945,20 @@ impl ExtensionSession for InteractiveExtensionSession {
     }
 
     async fn get_entries(&self) -> Vec<Value> {
+        // Spec §3.1: return ALL session entries (entire session file), append order.
+        let cx = Cx::for_request();
+        let Ok(guard) = self.session.lock(&cx).await else {
+            return Vec::new();
+        };
+        guard
+            .entries
+            .iter()
+            .filter_map(|entry| serde_json::to_value(entry).ok())
+            .collect()
+    }
+
+    async fn get_branch(&self) -> Vec<Value> {
+        // Spec §3.2: return current path from root to leaf.
         let cx = Cx::for_request();
         let Ok(guard) = self.session.lock(&cx).await else {
             return Vec::new();
@@ -4954,11 +4968,6 @@ impl ExtensionSession for InteractiveExtensionSession {
             .iter()
             .filter_map(|entry| serde_json::to_value(*entry).ok())
             .collect()
-    }
-
-    async fn get_branch(&self) -> Vec<Value> {
-        // For now, treat the current path as the active branch (pi-mono semantics).
-        self.get_entries().await
     }
 
     async fn set_name(&self, name: String) -> crate::error::Result<()> {
@@ -4992,6 +5001,9 @@ impl ExtensionSession for InteractiveExtensionSession {
         custom_type: String,
         data: Option<Value>,
     ) -> crate::error::Result<()> {
+        if custom_type.trim().is_empty() {
+            return Err(crate::error::Error::session("customType must not be empty"));
+        }
         let cx = Cx::for_request();
         let mut guard =
             self.session.lock(&cx).await.map_err(|err| {
@@ -5058,7 +5070,11 @@ impl ExtensionSession for InteractiveExtensionSession {
             self.session.lock(&cx).await.map_err(|err| {
                 crate::error::Error::session(format!("session lock failed: {err}"))
             })?;
-        guard.add_label(&target_id, label);
+        if guard.add_label(&target_id, label).is_none() {
+            return Err(crate::error::Error::session(format!(
+                "target entry '{target_id}' not found in session"
+            )));
+        }
         if self.save_enabled {
             guard.save().await?;
         }

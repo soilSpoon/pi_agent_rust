@@ -170,11 +170,10 @@ impl Provider for AzureOpenAIProvider {
 
         let endpoint_url = self.endpoint_url();
 
-        // Build request with Azure-specific headers
+        // Build request with Azure-specific headers (Content-Type set by .json() below)
         let mut request = self
             .client
             .post(&endpoint_url)
-            .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .header("api-key", &auth_value); // Azure uses api-key header, not Authorization
 
@@ -731,10 +730,12 @@ fn convert_tool_to_azure(tool: &ToolDef) -> AzureTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{TextContent, ToolCall, UserMessage};
+    use crate::provider::ToolDef;
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::path::PathBuf;
 
     #[test]
@@ -742,6 +743,12 @@ mod tests {
         let provider = AzureOpenAIProvider::new("my-resource", "gpt-4");
         assert_eq!(provider.name(), "azure");
         assert_eq!(provider.api(), "azure-openai");
+    }
+
+    #[test]
+    fn test_azure_model_id_uses_deployment() {
+        let provider = AzureOpenAIProvider::new("my-resource", "gpt-4o-mini");
+        assert_eq!(provider.model_id(), "gpt-4o-mini");
     }
 
     #[test]
@@ -761,9 +768,109 @@ mod tests {
     }
 
     #[test]
-    fn test_azure_message_conversion() {
-        use crate::model::UserMessage;
+    fn test_azure_endpoint_url_exact_default_shape() {
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o");
+        let url = provider.endpoint_url();
+        assert_eq!(
+            url,
+            "https://contoso.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview"
+        );
+    }
 
+    #[test]
+    fn test_azure_endpoint_url_override_takes_precedence() {
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o")
+            .with_api_version("2025-01-01")
+            .with_endpoint_url("http://127.0.0.1:1234/mock-endpoint");
+        let url = provider.endpoint_url();
+        assert_eq!(url, "http://127.0.0.1:1234/mock-endpoint");
+    }
+
+    #[test]
+    fn test_azure_build_request_includes_system_messages_and_tools() {
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o");
+        let context = Context {
+            system_prompt: Some("You are deterministic.".to_string()),
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Hello".to_string()),
+                    timestamp: 0,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![
+                        ContentBlock::Text(TextContent::new("Need tool output")),
+                        ContentBlock::ToolCall(ToolCall {
+                            id: "tool_1".to_string(),
+                            name: "echo".to_string(),
+                            arguments: json!({"text":"ping"}),
+                            thought_signature: None,
+                        }),
+                    ],
+                    api: "azure-openai".to_string(),
+                    provider: "azure".to_string(),
+                    model: "gpt-4o".to_string(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 0,
+                }),
+            ],
+            tools: vec![ToolDef {
+                name: "echo".to_string(),
+                description: "Echo text".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {"type":"string"}
+                    },
+                    "required": ["text"]
+                }),
+            }],
+        };
+        let options = StreamOptions {
+            max_tokens: Some(512),
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let request_json = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(request_json["max_tokens"], json!(512));
+        assert_eq!(request_json["temperature"], json!(0.0));
+        assert_eq!(request_json["stream"], json!(true));
+        assert_eq!(request_json["messages"][0]["role"], json!("system"));
+        assert_eq!(
+            request_json["messages"][0]["content"],
+            json!("You are deterministic.")
+        );
+        assert_eq!(request_json["messages"][1]["role"], json!("user"));
+        assert_eq!(request_json["messages"][2]["role"], json!("assistant"));
+        assert_eq!(request_json["tools"][0]["type"], json!("function"));
+        assert_eq!(request_json["tools"][0]["function"]["name"], json!("echo"));
+    }
+
+    #[test]
+    fn test_azure_build_request_defaults_max_tokens() {
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("Hello".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions::default();
+
+        let request = provider.build_request(&context, &options);
+        let request_json = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(request_json["max_tokens"], json!(DEFAULT_MAX_TOKENS));
+        assert_eq!(request_json["stream"], json!(true));
+        assert!(request_json.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_azure_message_conversion() {
         let message = Message::User(UserMessage {
             content: UserContent::Text("Hello".to_string()),
             timestamp: chrono::Utc::now().timestamp_millis(),
