@@ -1344,7 +1344,12 @@ pub(crate) async fn run_bash_command(
             }
         }
 
-        sleep(wall_now(), tick).await;
+        // Use the runtime's timer driver when available (virtual/lab time),
+        // otherwise fall back to wall clock.
+        let now = asupersync::Cx::current()
+            .and_then(|cx| cx.timer_driver())
+            .map_or_else(wall_now, |timer| timer.now());
+        sleep(now, tick).await;
     }
 
     let drain_deadline = Instant::now() + Duration::from_secs(2);
@@ -1355,7 +1360,10 @@ pub(crate) async fn run_bash_command(
                 if Instant::now() >= drain_deadline {
                     break;
                 }
-                sleep(wall_now(), tick).await;
+                let now = asupersync::Cx::current()
+                    .and_then(|cx| cx.timer_driver())
+                    .map_or_else(wall_now, |timer| timer.now());
+                sleep(now, tick).await;
             }
             Err(mpsc::TryRecvError::Disconnected) => break,
         }
@@ -2452,7 +2460,10 @@ impl Tool for GrepTool {
             match guard.child.as_mut().unwrap().try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
-                    sleep(wall_now(), tick).await;
+                    let now = asupersync::Cx::current()
+                        .and_then(|cx| cx.timer_driver())
+                        .map_or_else(wall_now, |timer| timer.now());
+                    sleep(now, tick).await;
                 }
                 Err(e) => return Err(Error::tool("grep", e.to_string())),
             }
@@ -2791,7 +2802,10 @@ impl Tool for FindTool {
             match guard.child.as_mut().unwrap().try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
-                    sleep(wall_now(), tick).await;
+                    let now = asupersync::Cx::current()
+                        .and_then(|cx| cx.timer_driver())
+                        .map_or_else(wall_now, |timer| timer.now());
+                    sleep(now, tick).await;
                 }
                 Err(e) => return Err(Error::tool("find", e.to_string())),
             }

@@ -15,6 +15,7 @@ use crate::extensions_js::{
 use crate::permissions::PermissionStore;
 use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
+use crate::sse::SseStream;
 use crate::tools::ToolRegistry;
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeBuilder;
@@ -24,6 +25,7 @@ use asupersync::time::{sleep, timeout, wall_now};
 use asupersync::{Budget, Cx};
 use async_trait::async_trait;
 use base64::Engine as _;
+use futures::{FutureExt as _, StreamExt as _};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -4422,6 +4424,132 @@ pub trait HostcallInterceptor: Send + Sync {
     fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome>;
 }
 
+// =============================================================================
+// Streaming exec hostcalls (bd-2tl1.3)
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecStreamSource {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug)]
+enum ExecStreamMessage {
+    Data {
+        source: ExecStreamSource,
+        bytes: Vec<u8>,
+    },
+    Exit {
+        code: i32,
+        killed: bool,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+struct ExecStreamLogContext {
+    runtime: &'static str,
+    call_id: String,
+    extension_id: Option<String>,
+    capability: String,
+    method: String,
+    params_hash: String,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct RunningExecStream {
+    rx: std::sync::mpsc::Receiver<ExecStreamMessage>,
+    abort_tx: std::sync::mpsc::Sender<()>,
+    next_sequence: u64,
+    log: ExecStreamLogContext,
+}
+
+#[derive(Debug, Default)]
+struct ExecStreamRegistry {
+    streams: HashMap<String, RunningExecStream>,
+}
+
+// =============================================================================
+// Streaming HTTP hostcalls (bd-2tl1.4)
+// =============================================================================
+
+enum HttpStreamBody {
+    Sse(SseStream<HttpByteStream>),
+    Text {
+        stream: HttpByteStream,
+        utf8_buffer: Vec<u8>,
+    },
+    Bytes {
+        stream: HttpByteStream,
+    },
+}
+
+type HttpByteStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
+
+struct HttpStreamLogContext {
+    runtime: &'static str,
+    call_id: String,
+    extension_id: Option<String>,
+    capability: String,
+    method: String,
+    params_hash: String,
+    started_at: Instant,
+}
+
+struct RunningHttpStream {
+    body: HttpStreamBody,
+    head_pending: Option<Value>,
+    next_sequence: u64,
+    log: HttpStreamLogContext,
+}
+
+#[derive(Default)]
+struct HttpStreamRegistry {
+    streams: HashMap<String, RunningHttpStream>,
+}
+
+fn connectors_result_into_shared(
+    result: crate::connectors::HostResultPayload,
+) -> HostResultPayload {
+    let error = result.error.map(|err| {
+        let code = match err.code {
+            crate::connectors::HostCallErrorCode::Timeout => HostCallErrorCode::Timeout,
+            crate::connectors::HostCallErrorCode::Denied => HostCallErrorCode::Denied,
+            crate::connectors::HostCallErrorCode::Io => HostCallErrorCode::Io,
+            crate::connectors::HostCallErrorCode::InvalidRequest => {
+                HostCallErrorCode::InvalidRequest
+            }
+            crate::connectors::HostCallErrorCode::Internal => HostCallErrorCode::Internal,
+        };
+        HostCallError {
+            code,
+            message: err.message,
+            details: err.details,
+            retryable: err.retryable,
+        }
+    });
+
+    let chunk = result.chunk.map(|chunk| HostStreamChunk {
+        index: chunk.index,
+        is_last: chunk.is_last,
+        backpressure: None,
+    });
+
+    HostResultPayload {
+        call_id: result.call_id,
+        output: result.output,
+        is_error: result.is_error,
+        error,
+        chunk,
+    }
+}
+
 #[derive(Clone)]
 struct JsRuntimeHost {
     tools: Arc<ToolRegistry>,
@@ -4432,6 +4560,8 @@ struct JsRuntimeHost {
     http: Arc<HttpConnector>,
     policy: ExtensionPolicy,
     interceptor: Option<Arc<dyn HostcallInterceptor>>,
+    exec_streams: Arc<Mutex<ExecStreamRegistry>>,
+    http_streams: Arc<Mutex<HttpStreamRegistry>>,
 }
 
 impl JsRuntimeHost {
@@ -4573,6 +4703,8 @@ impl JsExtensionRuntimeHandle {
             http: Arc::new(HttpConnector::with_defaults()),
             policy: ExtensionPolicy::default(),
             interceptor,
+            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         thread::spawn(move || {
@@ -4596,7 +4728,10 @@ impl JsExtensionRuntimeHandle {
 
                 while let Ok(cmd) = rx.recv(&cx).await {
                     match cmd {
-                        JsRuntimeCommand::Shutdown => break,
+                        JsRuntimeCommand::Shutdown => {
+                            abort_all_exec_streams(&host.exec_streams);
+                            break;
+                        }
                         JsRuntimeCommand::LoadExtensions { specs, reply } => {
                             let result = load_all_extensions(&js_runtime, &host, &specs).await;
                             let _ = reply.send(&cx, result);
@@ -5547,13 +5682,37 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     ) {
         while let Some(req) = pending.pop_front() {
             let call_id = req.call_id.clone();
+            if is_streaming_exec_request(&req) {
+                match dispatch_streaming_exec_start(host, req).await {
+                    Ok(()) => {}
+                    Err(outcome) => runtime.complete_hostcall(call_id, outcome),
+                }
+                continue;
+            }
+
+            if is_streaming_http_request(&req) {
+                match dispatch_streaming_http_start(host, req).await {
+                    Ok(()) => {}
+                    Err(outcome) => runtime.complete_hostcall(call_id, outcome),
+                }
+                continue;
+            }
+
             let outcome = dispatch_hostcall(host, req).await;
             runtime.complete_hostcall(call_id, outcome);
         }
     }
 
+    // Deliver any pending streaming hostcall output that arrived since the last pump.
+    flush_streaming_exec(runtime, host);
+    flush_streaming_http(runtime, host);
+
     // Process any hostcalls already queued before we advance the event loop.
     dispatch_requests(runtime, host, drain_requests(runtime)).await;
+
+    // Streaming hostcalls might have produced output while we were dispatching other hostcalls.
+    flush_streaming_exec(runtime, host);
+    flush_streaming_http(runtime, host);
 
     // Advance the event loop (may schedule hostcalls while running a task's microtasks).
     let _ = runtime.tick().await?;
@@ -5564,6 +5723,8 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     let after_tick = drain_requests(runtime);
     let has_after_tick = !after_tick.is_empty();
     dispatch_requests(runtime, host, after_tick).await;
+    flush_streaming_exec(runtime, host);
+    flush_streaming_http(runtime, host);
 
     // If we dispatched any hostcalls, run another tick so their completions are delivered and
     // microtasks reach a fixpoint before the caller observes the outcome.
@@ -5573,6 +5734,1151 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     }
 
     Ok(runtime.has_pending())
+}
+
+fn is_streaming_exec_request(request: &HostcallRequest) -> bool {
+    if !matches!(request.kind, HostcallKind::Exec { .. }) {
+        return false;
+    }
+
+    let options = request
+        .payload
+        .get("options")
+        .or_else(|| request.payload.get("opts"));
+    options
+        .and_then(Value::as_object)
+        .and_then(|map| map.get("stream"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn is_streaming_http_request(request: &HostcallRequest) -> bool {
+    matches!(request.kind, HostcallKind::Http)
+        && request
+            .payload
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+#[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_lines)]
+async fn dispatch_streaming_exec_start(
+    host: &JsRuntimeHost,
+    request: HostcallRequest,
+) -> std::result::Result<(), HostcallOutcome> {
+    // Test interceptor: short-circuit before streaming logic.
+    if let Some(ref interceptor) = host.interceptor {
+        if let Some(outcome) = interceptor.intercept(&request) {
+            return Err(outcome);
+        }
+    }
+
+    let payload = hostcall_request_to_payload(&request);
+    let call_id = payload.call_id.clone();
+    let started_at = Instant::now();
+
+    // Validate payload (method/capability/params shape).
+    if let Err(err) = validate_host_call(&payload) {
+        let result =
+            shared_result_err(&call_id, HostCallErrorCode::InvalidRequest, err.to_string());
+        log_shared_hostcall_end(
+            "js",
+            &call_id,
+            request.extension_id.as_deref(),
+            "exec",
+            payload.method.as_str(),
+            &shared_params_hash(payload.method.as_str(), &payload.params),
+            0,
+            &result,
+        );
+        return Err(HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: err.to_string(),
+        });
+    }
+
+    let Some(required) = required_capability_for_host_call(&payload) else {
+        return Err(HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: "Unable to derive required capability".to_string(),
+        });
+    };
+
+    let method = payload.method.trim().to_ascii_lowercase();
+    let params_hash = shared_params_hash(&method, &payload.params);
+    let call_timeout_ms = payload.timeout_ms.filter(|ms| *ms > 0);
+    let extension_id = request.extension_id.clone();
+
+    // Build execution context from JsRuntimeHost.
+    let manager = host.manager();
+    let ctx = HostCallContext {
+        runtime: "js",
+        extension_id: extension_id.as_deref(),
+        policy: &host.policy,
+        tools: &host.tools,
+        http: &host.http,
+        fs: None,
+        env_allowlist: None,
+        manager: manager.as_ref(),
+    };
+
+    log_shared_hostcall_start(
+        ctx.runtime,
+        &call_id,
+        ctx.extension_id,
+        &required,
+        &method,
+        &params_hash,
+        call_timeout_ms,
+    );
+
+    let (decision, reason, capability) = resolve_shared_policy_decision(&ctx, &required).await;
+    log_shared_policy_decision(
+        ctx.runtime,
+        &call_id,
+        ctx.extension_id,
+        &capability,
+        &decision,
+        &reason,
+        &params_hash,
+    );
+
+    if decision != PolicyDecision::Allow {
+        let result = shared_result_err_with_details(
+            &call_id,
+            HostCallErrorCode::Denied,
+            format!("Capability '{capability}' denied by policy ({reason})"),
+            json!({
+                "capability": capability,
+                "decision": format!("{decision:?}"),
+                "reason": reason,
+            }),
+            None,
+        );
+        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        log_shared_hostcall_end(
+            ctx.runtime,
+            &call_id,
+            ctx.extension_id,
+            &required,
+            &method,
+            &params_hash,
+            duration_ms,
+            &result,
+        );
+        return Err(HostcallOutcome::Error {
+            code: "denied".to_string(),
+            message: result
+                .error
+                .as_ref()
+                .map_or_else(|| "Denied by policy".to_string(), |e| e.message.clone()),
+        });
+    }
+
+    let HostcallKind::Exec { cmd } = request.kind else {
+        unreachable!("checked by is_streaming_exec_request");
+    };
+
+    let args_value = payload.params.get("args").cloned().unwrap_or(Value::Null);
+    let args_array = match args_value {
+        Value::Null => Vec::new(),
+        Value::Array(items) => items,
+        _ => {
+            let result = shared_result_err(
+                &call_id,
+                HostCallErrorCode::InvalidRequest,
+                "exec args must be an array",
+            );
+            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            log_shared_hostcall_end(
+                ctx.runtime,
+                &call_id,
+                ctx.extension_id,
+                &required,
+                &method,
+                &params_hash,
+                duration_ms,
+                &result,
+            );
+            return Err(HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message: "exec args must be an array".to_string(),
+            });
+        }
+    };
+
+    let args = args_array
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map_or_else(|| value.to_string(), ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+
+    let options = payload
+        .params
+        .get("options")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let cwd = options
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+
+    let (stream_tx, stream_rx) = std::sync::mpsc::sync_channel::<ExecStreamMessage>(128);
+    let (abort_tx, abort_rx) = std::sync::mpsc::channel::<()>();
+
+    // Spawn the process and streaming pumps on a dedicated thread (keep JS runtime responsive).
+    let call_id_for_thread = call_id.clone();
+    thread::spawn(move || {
+        let mut command = Command::new(&cmd);
+        command
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Some(cwd) = cwd.as_ref() {
+            command.current_dir(cwd);
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = stream_tx.send(ExecStreamMessage::Error {
+                    code: "io".to_string(),
+                    message: err.to_string(),
+                });
+                return;
+            }
+        };
+
+        let pid = child.id();
+        let Some(stdout) = child.stdout.take() else {
+            let _ = stream_tx.send(ExecStreamMessage::Error {
+                code: "internal".to_string(),
+                message: "Missing stdout pipe".to_string(),
+            });
+            return;
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = stream_tx.send(ExecStreamMessage::Error {
+                code: "internal".to_string(),
+                message: "Missing stderr pipe".to_string(),
+            });
+            return;
+        };
+
+        let stdout_tx = stream_tx.clone();
+        let stderr_tx = stream_tx.clone();
+
+        let stdout_handle = thread::spawn(move || {
+            pump_exec_stream(stdout, ExecStreamSource::Stdout, &stdout_tx);
+        });
+        let stderr_handle = thread::spawn(move || {
+            pump_exec_stream(stderr, ExecStreamSource::Stderr, &stderr_tx);
+        });
+
+        let start = Instant::now();
+        let mut killed = false;
+        let mut cancelled = false;
+
+        let status = loop {
+            if abort_rx.try_recv().is_ok() {
+                cancelled = true;
+                crate::tools::kill_process_tree(Some(pid));
+                let _ = child.kill();
+                break child.wait();
+            }
+
+            if let Ok(Some(status)) = child.try_wait() {
+                break Ok(status);
+            }
+
+            if let Some(timeout_ms) = call_timeout_ms {
+                if start.elapsed() >= Duration::from_millis(timeout_ms) {
+                    killed = true;
+                    crate::tools::kill_process_tree(Some(pid));
+                    let _ = child.kill();
+                    break child.wait();
+                }
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let _ = stdout_handle.join();
+        let _ = stderr_handle.join();
+
+        match status {
+            Ok(status) => {
+                if killed {
+                    let timeout_ms = call_timeout_ms.unwrap_or(0);
+                    let _ = stream_tx.send(ExecStreamMessage::Error {
+                        code: "timeout".to_string(),
+                        message: format!("exec timed out after {timeout_ms}ms"),
+                    });
+                } else if cancelled {
+                    let _ = stream_tx.send(ExecStreamMessage::Error {
+                        code: "cancelled".to_string(),
+                        message: "exec cancelled".to_string(),
+                    });
+                } else {
+                    let code = status.code().unwrap_or(-1);
+                    let _ = stream_tx.send(ExecStreamMessage::Exit {
+                        code,
+                        killed: false,
+                    });
+                }
+            }
+            Err(err) => {
+                let _ = stream_tx.send(ExecStreamMessage::Error {
+                    code: "io".to_string(),
+                    message: err.to_string(),
+                });
+            }
+        }
+
+        tracing::trace!(
+            event = "host_call.exec_stream.thread_exit",
+            call_id = %call_id_for_thread,
+            pid,
+            killed,
+            cancelled,
+            "Exec stream thread exited"
+        );
+    });
+
+    // Track stream state for subsequent pump() calls.
+    let log = ExecStreamLogContext {
+        runtime: "js",
+        call_id: call_id.clone(),
+        extension_id,
+        capability: required.clone(),
+        method: method.clone(),
+        params_hash,
+        started_at,
+    };
+
+    {
+        let mut guard = host
+            .exec_streams
+            .lock()
+            .expect("exec_streams mutex poisoned");
+        guard.streams.insert(
+            call_id.clone(),
+            RunningExecStream {
+                rx: stream_rx,
+                abort_tx,
+                next_sequence: 0,
+                log,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_lines)]
+async fn dispatch_streaming_http_start(
+    host: &JsRuntimeHost,
+    request: HostcallRequest,
+) -> std::result::Result<(), HostcallOutcome> {
+    // Test interceptor: short-circuit before streaming logic.
+    if let Some(ref interceptor) = host.interceptor {
+        if let Some(outcome) = interceptor.intercept(&request) {
+            return Err(outcome);
+        }
+    }
+
+    let extension_id = request.extension_id.clone();
+    let payload = hostcall_request_to_payload(&request);
+    let call_id = payload.call_id.clone();
+    let started_at = Instant::now();
+
+    // Validate payload (method/capability/params shape).
+    if let Err(err) = validate_host_call(&payload) {
+        let result =
+            shared_result_err(&call_id, HostCallErrorCode::InvalidRequest, err.to_string());
+        log_shared_hostcall_end(
+            "js",
+            &call_id,
+            request.extension_id.as_deref(),
+            "http",
+            payload.method.as_str(),
+            &shared_params_hash(payload.method.as_str(), &payload.params),
+            0,
+            &result,
+        );
+        return Err(HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: err.to_string(),
+        });
+    }
+
+    let Some(required) = required_capability_for_host_call(&payload) else {
+        return Err(HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: "Unable to derive required capability".to_string(),
+        });
+    };
+
+    let method = payload.method.trim().to_ascii_lowercase();
+    let params_hash = shared_params_hash(&method, &payload.params);
+    let call_timeout_ms = payload.timeout_ms.filter(|ms| *ms > 0);
+
+    // Build execution context from JsRuntimeHost.
+    let manager = host.manager();
+    let ctx = HostCallContext {
+        runtime: "js",
+        extension_id: request.extension_id.as_deref(),
+        policy: &host.policy,
+        tools: &host.tools,
+        http: &host.http,
+        fs: None,
+        env_allowlist: None,
+        manager: manager.as_ref(),
+    };
+
+    log_shared_hostcall_start(
+        ctx.runtime,
+        &call_id,
+        ctx.extension_id,
+        &required,
+        &method,
+        &params_hash,
+        call_timeout_ms,
+    );
+
+    let (decision, reason, capability) = resolve_shared_policy_decision(&ctx, &required).await;
+    log_shared_policy_decision(
+        ctx.runtime,
+        &call_id,
+        ctx.extension_id,
+        &capability,
+        &decision,
+        &reason,
+        &params_hash,
+    );
+
+    if decision != PolicyDecision::Allow {
+        let result = shared_result_err_with_details(
+            &call_id,
+            HostCallErrorCode::Denied,
+            format!("Capability '{capability}' denied by policy ({reason})"),
+            json!({
+                "capability": capability,
+                "decision": format!("{decision:?}"),
+                "reason": reason,
+            }),
+            None,
+        );
+        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        log_shared_hostcall_end(
+            ctx.runtime,
+            &call_id,
+            ctx.extension_id,
+            &required,
+            &method,
+            &params_hash,
+            duration_ms,
+            &result,
+        );
+        return Err(HostcallOutcome::Error {
+            code: "denied".to_string(),
+            message: result
+                .error
+                .as_ref()
+                .map_or_else(|| "Denied by policy".to_string(), |e| e.message.clone()),
+        });
+    }
+
+    let connector_call = crate::connectors::HostCallPayload {
+        call_id: payload.call_id.clone(),
+        capability: payload.capability.clone(),
+        method: payload.method.clone(),
+        params: payload.params.clone(),
+        timeout_ms: payload.timeout_ms,
+        cancel_token: payload.cancel_token.clone(),
+        context: payload.context.clone(),
+    };
+
+    let response = match host.http.dispatch_streaming(&connector_call).await {
+        Ok(response) => response,
+        Err(payload) => {
+            let shared_payload = connectors_result_into_shared(payload);
+            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            log_shared_hostcall_end(
+                ctx.runtime,
+                &call_id,
+                ctx.extension_id,
+                &required,
+                &method,
+                &params_hash,
+                duration_ms,
+                &shared_payload,
+            );
+            return Err(host_result_to_outcome(&shared_payload));
+        }
+    };
+
+    let content_type_header = response
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone());
+    let content_type = content_type_header.as_deref().and_then(|value| {
+        let (value, _) = value.split_once(';').unwrap_or((value, ""));
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_ascii_lowercase())
+        }
+    });
+
+    let head = if let Some(ref ct) = content_type {
+        json!({
+            "kind": "head",
+            "status": response.status,
+            "headers": response.headers,
+            "contentType": ct,
+        })
+    } else {
+        json!({
+            "kind": "head",
+            "status": response.status,
+            "headers": response.headers,
+        })
+    };
+
+    let is_sse = content_type.as_deref() == Some("text/event-stream");
+    let is_text = !is_sse
+        && content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("text/") || ct.contains("json"));
+
+    let body = if is_sse {
+        HttpStreamBody::Sse(SseStream::new(response.stream))
+    } else if is_text {
+        HttpStreamBody::Text {
+            stream: response.stream,
+            utf8_buffer: Vec::new(),
+        }
+    } else {
+        HttpStreamBody::Bytes {
+            stream: response.stream,
+        }
+    };
+
+    let log = HttpStreamLogContext {
+        runtime: "js",
+        call_id: call_id.clone(),
+        extension_id,
+        capability: required.clone(),
+        method: method.clone(),
+        params_hash,
+        started_at,
+    };
+
+    {
+        let mut guard = host
+            .http_streams
+            .lock()
+            .expect("http_streams mutex poisoned");
+        guard.streams.insert(
+            call_id.clone(),
+            RunningHttpStream {
+                body,
+                head_pending: Some(head),
+                next_sequence: 0,
+                log,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn flush_streaming_exec(runtime: &PiJsRuntime, host: &JsRuntimeHost) {
+    const MAX_CHUNKS_PER_PUMP: usize = 128;
+
+    let mut produced = 0usize;
+    let mut finished: Vec<(String, HostResultPayload)> = Vec::new();
+    let mut errored: Vec<(String, HostcallOutcome, HostResultPayload)> = Vec::new();
+    let mut cancelled: Vec<(String, HostResultPayload)> = Vec::new();
+
+    let mut guard = host
+        .exec_streams
+        .lock()
+        .expect("exec_streams mutex poisoned");
+
+    let keys = guard.streams.keys().cloned().collect::<Vec<_>>();
+    for call_id in keys {
+        if produced >= MAX_CHUNKS_PER_PUMP {
+            break;
+        }
+
+        // If the JS-side promise has already resolved/rejected (timeout/cancel), stop producing
+        // and kill the underlying process promptly to avoid zombies.
+        if !runtime.is_hostcall_pending(&call_id) {
+            if let Some(stream) = guard.streams.get(&call_id) {
+                let _ = stream.abort_tx.send(());
+            }
+            cancelled.push((
+                call_id.clone(),
+                shared_result_err(
+                    &call_id,
+                    HostCallErrorCode::Timeout,
+                    "Hostcall no longer pending",
+                ),
+            ));
+            continue;
+        }
+
+        let Some(stream) = guard.streams.get_mut(&call_id) else {
+            continue;
+        };
+
+        loop {
+            if produced >= MAX_CHUNKS_PER_PUMP {
+                break;
+            }
+            match stream.rx.try_recv() {
+                Ok(ExecStreamMessage::Data { source, bytes }) => {
+                    let chunk = exec_stream_bytes_to_chunk(source, &bytes);
+                    let outcome = HostcallOutcome::StreamChunk {
+                        sequence: stream.next_sequence,
+                        chunk,
+                        is_final: false,
+                    };
+                    stream.next_sequence = stream.next_sequence.saturating_add(1);
+                    runtime.complete_hostcall(call_id.clone(), outcome);
+                    produced += 1;
+                }
+                Ok(ExecStreamMessage::Exit { code, killed }) => {
+                    let chunk = json!({ "code": code, "killed": killed });
+                    let outcome = HostcallOutcome::StreamChunk {
+                        sequence: stream.next_sequence,
+                        chunk: chunk.clone(),
+                        is_final: true,
+                    };
+                    stream.next_sequence = stream.next_sequence.saturating_add(1);
+                    runtime.complete_hostcall(call_id.clone(), outcome);
+                    produced += 1;
+
+                    finished.push((call_id.clone(), shared_result_ok(&call_id, chunk)));
+                    break;
+                }
+                Ok(ExecStreamMessage::Error { code, message }) => {
+                    let outcome = HostcallOutcome::Error {
+                        code: code.clone(),
+                        message: message.clone(),
+                    };
+                    runtime.complete_hostcall(call_id.clone(), outcome.clone());
+                    produced += 1;
+
+                    let result = match code.as_str() {
+                        "timeout" => {
+                            shared_result_err(&call_id, HostCallErrorCode::Timeout, message)
+                        }
+                        "denied" => shared_result_err(&call_id, HostCallErrorCode::Denied, message),
+                        "invalid_request" => {
+                            shared_result_err(&call_id, HostCallErrorCode::InvalidRequest, message)
+                        }
+                        "internal" => {
+                            shared_result_err(&call_id, HostCallErrorCode::Internal, message)
+                        }
+                        _ => shared_result_err(&call_id, HostCallErrorCode::Io, message),
+                    };
+                    errored.push((call_id.clone(), outcome, result));
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let outcome = HostcallOutcome::Error {
+                        code: "internal".to_string(),
+                        message: "exec stream disconnected".to_string(),
+                    };
+                    runtime.complete_hostcall(call_id.clone(), outcome.clone());
+                    produced += 1;
+                    let result = shared_result_err(
+                        &call_id,
+                        HostCallErrorCode::Internal,
+                        "exec stream disconnected",
+                    );
+                    errored.push((call_id.clone(), outcome, result));
+                    break;
+                }
+            }
+        }
+    }
+
+    for (call_id, result) in cancelled {
+        if let Some(stream) = guard.streams.remove(&call_id) {
+            let duration_ms =
+                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            log_shared_hostcall_end(
+                stream.log.runtime,
+                &call_id,
+                stream.log.extension_id.as_deref(),
+                &stream.log.capability,
+                &stream.log.method,
+                &stream.log.params_hash,
+                duration_ms,
+                &result,
+            );
+        }
+    }
+
+    for (call_id, result) in finished {
+        if let Some(stream) = guard.streams.remove(&call_id) {
+            let duration_ms =
+                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            log_shared_hostcall_end(
+                stream.log.runtime,
+                &call_id,
+                stream.log.extension_id.as_deref(),
+                &stream.log.capability,
+                &stream.log.method,
+                &stream.log.params_hash,
+                duration_ms,
+                &result,
+            );
+        }
+    }
+
+    for (call_id, _outcome, result) in errored {
+        if let Some(stream) = guard.streams.remove(&call_id) {
+            let duration_ms =
+                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            log_shared_hostcall_end(
+                stream.log.runtime,
+                &call_id,
+                stream.log.extension_id.as_deref(),
+                &stream.log.capability,
+                &stream.log.method,
+                &stream.log.params_hash,
+                duration_ms,
+                &result,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn flush_streaming_http(runtime: &PiJsRuntime, host: &JsRuntimeHost) {
+    const MAX_CHUNKS_PER_PUMP: usize = 128;
+
+    let mut produced = 0usize;
+    let mut finished: Vec<(String, HostResultPayload)> = Vec::new();
+    let mut errored: Vec<(String, HostcallOutcome, HostResultPayload)> = Vec::new();
+    let mut cancelled: Vec<(String, HostResultPayload)> = Vec::new();
+
+    let mut guard = host
+        .http_streams
+        .lock()
+        .expect("http_streams mutex poisoned");
+
+    let keys = guard.streams.keys().cloned().collect::<Vec<_>>();
+    for call_id in keys {
+        if produced >= MAX_CHUNKS_PER_PUMP {
+            break;
+        }
+
+        if !runtime.is_hostcall_pending(&call_id) {
+            cancelled.push((
+                call_id.clone(),
+                shared_result_err(
+                    &call_id,
+                    HostCallErrorCode::Timeout,
+                    "Hostcall no longer pending",
+                ),
+            ));
+            continue;
+        }
+
+        let Some(stream) = guard.streams.get_mut(&call_id) else {
+            continue;
+        };
+
+        if produced < MAX_CHUNKS_PER_PUMP {
+            if let Some(head) = stream.head_pending.take() {
+                let outcome = HostcallOutcome::StreamChunk {
+                    sequence: stream.next_sequence,
+                    chunk: head,
+                    is_final: false,
+                };
+                stream.next_sequence = stream.next_sequence.saturating_add(1);
+                runtime.complete_hostcall(call_id.clone(), outcome);
+                produced += 1;
+            }
+        }
+
+        loop {
+            if produced >= MAX_CHUNKS_PER_PUMP {
+                break;
+            }
+
+            match &mut stream.body {
+                HttpStreamBody::Sse(sse_stream) => match sse_stream.next().now_or_never() {
+                    None => break,
+                    Some(Some(Ok(event))) => {
+                        let chunk = json!({
+                            "kind": "sse",
+                            "event": event.event,
+                            "data": event.data,
+                            "id": event.id,
+                            "retry": event.retry,
+                        });
+                        let outcome = HostcallOutcome::StreamChunk {
+                            sequence: stream.next_sequence,
+                            chunk,
+                            is_final: false,
+                        };
+                        stream.next_sequence = stream.next_sequence.saturating_add(1);
+                        runtime.complete_hostcall(call_id.clone(), outcome);
+                        produced += 1;
+                    }
+                    Some(Some(Err(err))) => {
+                        let outcome = HostcallOutcome::Error {
+                            code: "io".to_string(),
+                            message: err.to_string(),
+                        };
+                        runtime.complete_hostcall(call_id.clone(), outcome.clone());
+                        produced += 1;
+                        let result =
+                            shared_result_err(&call_id, HostCallErrorCode::Io, err.to_string());
+                        errored.push((call_id.clone(), outcome, result));
+                        break;
+                    }
+                    Some(None) => {
+                        let outcome = HostcallOutcome::StreamChunk {
+                            sequence: stream.next_sequence,
+                            chunk: Value::Null,
+                            is_final: true,
+                        };
+                        stream.next_sequence = stream.next_sequence.saturating_add(1);
+                        runtime.complete_hostcall(call_id.clone(), outcome);
+                        produced += 1;
+
+                        finished.push((call_id.clone(), shared_result_ok(&call_id, Value::Null)));
+                        break;
+                    }
+                },
+                HttpStreamBody::Bytes {
+                    stream: body_stream,
+                } => {
+                    let next = body_stream.next().now_or_never();
+                    let Some(next) = next else {
+                        break;
+                    };
+                    match next {
+                        Some(Ok(bytes)) => {
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            let chunk = json!({
+                                "kind": "bytes",
+                                "encoding": "base64",
+                                "data": data,
+                            });
+                            let outcome = HostcallOutcome::StreamChunk {
+                                sequence: stream.next_sequence,
+                                chunk,
+                                is_final: false,
+                            };
+                            stream.next_sequence = stream.next_sequence.saturating_add(1);
+                            runtime.complete_hostcall(call_id.clone(), outcome);
+                            produced += 1;
+                        }
+                        Some(Err(err)) => {
+                            let outcome = HostcallOutcome::Error {
+                                code: "io".to_string(),
+                                message: err.to_string(),
+                            };
+                            runtime.complete_hostcall(call_id.clone(), outcome.clone());
+                            produced += 1;
+                            let result =
+                                shared_result_err(&call_id, HostCallErrorCode::Io, err.to_string());
+                            errored.push((call_id.clone(), outcome, result));
+                            break;
+                        }
+                        None => {
+                            let outcome = HostcallOutcome::StreamChunk {
+                                sequence: stream.next_sequence,
+                                chunk: Value::Null,
+                                is_final: true,
+                            };
+                            stream.next_sequence = stream.next_sequence.saturating_add(1);
+                            runtime.complete_hostcall(call_id.clone(), outcome);
+                            produced += 1;
+
+                            finished
+                                .push((call_id.clone(), shared_result_ok(&call_id, Value::Null)));
+                            break;
+                        }
+                    }
+                }
+                HttpStreamBody::Text {
+                    stream: body_stream,
+                    utf8_buffer,
+                } => {
+                    let next = body_stream.next().now_or_never();
+                    let Some(next) = next else {
+                        break;
+                    };
+                    match next {
+                        Some(Ok(bytes)) => {
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            utf8_buffer.extend_from_slice(&bytes);
+
+                            let parsed = match std::str::from_utf8(utf8_buffer) {
+                                Ok(s) => {
+                                    let out = s.to_string();
+                                    utf8_buffer.clear();
+                                    Some(out)
+                                }
+                                Err(e) => {
+                                    if e.error_len().is_some() {
+                                        let outcome = HostcallOutcome::Error {
+                                            code: "io".to_string(),
+                                            message: "Invalid UTF-8 in text HTTP stream"
+                                                .to_string(),
+                                        };
+                                        runtime.complete_hostcall(call_id.clone(), outcome.clone());
+                                        produced += 1;
+                                        let result = shared_result_err(
+                                            &call_id,
+                                            HostCallErrorCode::Io,
+                                            "Invalid UTF-8 in text HTTP stream",
+                                        );
+                                        errored.push((call_id.clone(), outcome, result));
+                                        break;
+                                    }
+
+                                    let valid_len = e.valid_up_to();
+                                    if valid_len == 0 {
+                                        None
+                                    } else {
+                                        let s =
+                                            std::str::from_utf8(&utf8_buffer[..valid_len]).unwrap();
+                                        let out = s.to_string();
+                                        utf8_buffer.drain(..valid_len);
+                                        Some(out)
+                                    }
+                                }
+                            };
+
+                            let Some(text) = parsed else {
+                                continue;
+                            };
+                            if text.is_empty() {
+                                continue;
+                            }
+
+                            let chunk = json!({
+                                "kind": "text",
+                                "text": text,
+                            });
+                            let outcome = HostcallOutcome::StreamChunk {
+                                sequence: stream.next_sequence,
+                                chunk,
+                                is_final: false,
+                            };
+                            stream.next_sequence = stream.next_sequence.saturating_add(1);
+                            runtime.complete_hostcall(call_id.clone(), outcome);
+                            produced += 1;
+                        }
+                        Some(Err(err)) => {
+                            let outcome = HostcallOutcome::Error {
+                                code: "io".to_string(),
+                                message: err.to_string(),
+                            };
+                            runtime.complete_hostcall(call_id.clone(), outcome.clone());
+                            produced += 1;
+                            let result =
+                                shared_result_err(&call_id, HostCallErrorCode::Io, err.to_string());
+                            errored.push((call_id.clone(), outcome, result));
+                            break;
+                        }
+                        None => {
+                            if !utf8_buffer.is_empty() {
+                                let outcome = HostcallOutcome::Error {
+                                    code: "io".to_string(),
+                                    message: "HTTP stream ended with incomplete UTF-8 sequence"
+                                        .to_string(),
+                                };
+                                runtime.complete_hostcall(call_id.clone(), outcome.clone());
+                                produced += 1;
+                                let result = shared_result_err(
+                                    &call_id,
+                                    HostCallErrorCode::Io,
+                                    "HTTP stream ended with incomplete UTF-8 sequence",
+                                );
+                                errored.push((call_id.clone(), outcome, result));
+                                break;
+                            }
+
+                            let outcome = HostcallOutcome::StreamChunk {
+                                sequence: stream.next_sequence,
+                                chunk: Value::Null,
+                                is_final: true,
+                            };
+                            stream.next_sequence = stream.next_sequence.saturating_add(1);
+                            runtime.complete_hostcall(call_id.clone(), outcome);
+                            produced += 1;
+
+                            finished
+                                .push((call_id.clone(), shared_result_ok(&call_id, Value::Null)));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (call_id, result) in cancelled {
+        if let Some(stream) = guard.streams.remove(&call_id) {
+            let duration_ms =
+                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            log_shared_hostcall_end(
+                stream.log.runtime,
+                &call_id,
+                stream.log.extension_id.as_deref(),
+                &stream.log.capability,
+                &stream.log.method,
+                &stream.log.params_hash,
+                duration_ms,
+                &result,
+            );
+        }
+    }
+
+    for (call_id, result) in finished {
+        if let Some(stream) = guard.streams.remove(&call_id) {
+            let duration_ms =
+                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            log_shared_hostcall_end(
+                stream.log.runtime,
+                &call_id,
+                stream.log.extension_id.as_deref(),
+                &stream.log.capability,
+                &stream.log.method,
+                &stream.log.params_hash,
+                duration_ms,
+                &result,
+            );
+        }
+    }
+
+    for (call_id, _outcome, result) in errored {
+        if let Some(stream) = guard.streams.remove(&call_id) {
+            let duration_ms =
+                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            log_shared_hostcall_end(
+                stream.log.runtime,
+                &call_id,
+                stream.log.extension_id.as_deref(),
+                &stream.log.capability,
+                &stream.log.method,
+                &stream.log.params_hash,
+                duration_ms,
+                &result,
+            );
+        }
+    }
+}
+
+fn exec_stream_bytes_to_chunk(source: ExecStreamSource, bytes: &[u8]) -> Value {
+    let (key_text, key_b64) = match source {
+        ExecStreamSource::Stdout => ("stdout", "stdoutBase64"),
+        ExecStreamSource::Stderr => ("stderr", "stderrBase64"),
+    };
+
+    std::str::from_utf8(bytes).map_or_else(
+        |_| {
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let mut map = serde_json::Map::new();
+            map.insert("encoding".to_string(), Value::String("base64".to_string()));
+            map.insert(key_b64.to_string(), Value::String(data));
+            Value::Object(map)
+        },
+        |text| {
+            let mut map = serde_json::Map::new();
+            map.insert(key_text.to_string(), Value::String(text.to_string()));
+            Value::Object(map)
+        },
+    )
+}
+
+fn pump_exec_stream<R: std::io::Read>(
+    mut reader: R,
+    source: ExecStreamSource,
+    tx: &std::sync::mpsc::SyncSender<ExecStreamMessage>,
+) {
+    const MAX_CHUNK_BYTES: usize = 4096;
+    let mut buf = [0u8; 4096];
+    let mut acc: Vec<u8> = Vec::new();
+
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+
+        acc.extend_from_slice(&buf[..n]);
+        loop {
+            if let Some(pos) = acc.iter().position(|b| *b == b'\n') {
+                let chunk: Vec<u8> = acc.drain(..=pos).collect();
+                if tx
+                    .send(ExecStreamMessage::Data {
+                        source,
+                        bytes: chunk,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            if acc.len() >= MAX_CHUNK_BYTES {
+                let chunk: Vec<u8> = acc.drain(..MAX_CHUNK_BYTES).collect();
+                if tx
+                    .send(ExecStreamMessage::Data {
+                        source,
+                        bytes: chunk,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            break;
+        }
+    }
+
+    if !acc.is_empty() {
+        let _ = tx.send(ExecStreamMessage::Data { source, bytes: acc });
+    }
+}
+
+fn abort_all_exec_streams(exec_streams: &Arc<Mutex<ExecStreamRegistry>>) {
+    let guard = exec_streams.lock().expect("exec_streams mutex poisoned");
+    for stream in guard.streams.values() {
+        let _ = stream.abort_tx.send(());
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -9222,6 +10528,8 @@ mod tests {
                     deny_caps: Vec::new(),
                 },
                 interceptor: None,
+                exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+                http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
             };
 
             let request = HostcallRequest {
@@ -9938,6 +11246,8 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
+            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let request = crate::extensions_js::HostcallRequest {
@@ -10069,6 +11379,8 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
+            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let request = crate::extensions_js::HostcallRequest {
@@ -10214,6 +11526,8 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
+            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let strict_cases = vec![
@@ -10302,6 +11616,8 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
+            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let prompt_cases = strict_cases
@@ -10377,6 +11693,8 @@ mod tests {
                 deny_caps: vec!["http".to_string()],
             },
             interceptor: None,
+            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let perm_case = DenyCase {
@@ -10423,6 +11741,8 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
+            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let write_request = crate::extensions_js::HostcallRequest {
@@ -10496,6 +11816,380 @@ mod tests {
                     .is_some_and(|value| value.contains("default_caps"))
             );
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn js_streaming_exec_emits_stdout_chunks_and_final_exit() {
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Recorder {
+            seen: Arc<Mutex<Vec<(String, Value)>>>,
+        }
+
+        impl HostcallInterceptor for Recorder {
+            fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome> {
+                match &request.kind {
+                    HostcallKind::Tool { name } if name == "__report" || name == "__done" => {
+                        self.seen
+                            .lock()
+                            .expect("seen mutex poisoned")
+                            .push((name.clone(), request.payload.clone()));
+                        Some(HostcallOutcome::Success(Value::Null))
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        fn normalized_stdout(payload: &Value) -> Option<String> {
+            payload
+                .get("chunk")
+                .and_then(|v| v.get("stdout"))
+                .and_then(Value::as_str)
+                .map(|s| s.replace("\r\n", "\n"))
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Arc::new(Recorder {
+                seen: Arc::clone(&seen),
+            });
+
+            let host = JsRuntimeHost {
+                tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+                manager_ref: Arc::downgrade(&manager.inner),
+                http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+                policy: ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    max_memory_mb: 256,
+                    default_caps: Vec::new(),
+                    deny_caps: Vec::new(),
+                },
+                interceptor: Some(recorder),
+                exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+                http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
+            };
+
+            let runtime = PiJsRuntime::new().await.expect("create runtime");
+
+            let (cmd, args) = if cfg!(windows) {
+                // `powershell` is available on GitHub Actions Windows runners.
+                (
+                    "powershell",
+                    vec![
+                        "-NoProfile",
+                        "-Command",
+                        "Write-Output 'one'; Start-Sleep -Milliseconds 200; Write-Output 'two'",
+                    ],
+                )
+            } else {
+                (
+                    "sh",
+                    vec!["-c", "printf 'one\\n'; sleep 0.2; printf 'two\\n'"],
+                )
+            };
+            let cmd_json = serde_json::to_string(cmd).expect("serialize cmd");
+            let args_json = serde_json::to_string(&args).expect("serialize args");
+
+            runtime
+                .eval(&format!(
+                    r#"
+globalThis.__done = false;
+(async () => {{
+  try {{
+    await pi.exec({cmd_json}, {args_json}, {{
+      stream: true,
+      onChunk: (chunk, isFinal) => {{ pi.tool("__report", {{ chunk, isFinal }}); }},
+    }});
+    await pi.tool("__done", {{ ok: true }});
+  }} catch (e) {{
+    await pi.tool("__done", {{ ok: false, message: e.message, code: e.code ?? null }});
+  }}
+  globalThis.__done = true;
+}})();
+"#,
+                ))
+                .await
+                .expect("eval");
+
+            let start = Instant::now();
+            loop {
+                assert!(
+                    start.elapsed() <= Duration::from_secs(5),
+                    "timed out waiting for streaming exec to finish"
+                );
+
+                let _ = super::pump_js_runtime_once(&runtime, &host)
+                    .await
+                    .expect("pump_js_runtime_once");
+
+                let done = runtime
+                    .get_global_json("__done")
+                    .await
+                    .expect("get_global_json");
+                if done.as_bool() == Some(true) {
+                    break;
+                }
+
+                sleep(wall_now(), Duration::from_millis(1)).await;
+            }
+
+            let observed = {
+                let guard = seen.lock().expect("seen mutex poisoned");
+                guard.clone()
+            };
+
+            let reports = observed
+                .iter()
+                .filter(|(name, _)| name == "__report")
+                .map(|(_, payload)| payload.clone())
+                .collect::<Vec<_>>();
+
+            assert!(
+                reports.iter().all(|payload| payload.get("chunk").is_some()),
+                "sanity: chunk should be present in __report payloads"
+            );
+
+            let saw_one = reports.iter().any(|payload| {
+                payload.get("isFinal").and_then(Value::as_bool) == Some(false)
+                    && normalized_stdout(payload).as_deref() == Some("one\n")
+            });
+            let saw_two = reports.iter().any(|payload| {
+                payload.get("isFinal").and_then(Value::as_bool) == Some(false)
+                    && normalized_stdout(payload).as_deref() == Some("two\n")
+            });
+            let saw_final = reports.iter().any(|payload| {
+                payload.get("isFinal").and_then(Value::as_bool) == Some(true)
+                    && payload
+                        .get("chunk")
+                        .and_then(|v| v.get("code"))
+                        .and_then(Value::as_i64)
+                        == Some(0)
+            });
+
+            assert!(saw_one, "missing stdout chunk for first line: {reports:#?}");
+            assert!(
+                saw_two,
+                "missing stdout chunk for second line: {reports:#?}"
+            );
+            assert!(saw_final, "missing final exit chunk: {reports:#?}");
+
+            let done_payload = observed
+                .iter()
+                .find_map(|(name, payload)| (name == "__done").then(|| payload.clone()));
+            let done_payload = done_payload.expect("missing __done tool call");
+            assert_eq!(done_payload.get("ok").and_then(Value::as_bool), Some(true));
+        });
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn js_streaming_http_sse_emits_head_and_events() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Recorder {
+            seen: Arc<Mutex<Vec<(String, Value)>>>,
+        }
+
+        impl HostcallInterceptor for Recorder {
+            fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome> {
+                match &request.kind {
+                    HostcallKind::Tool { name } if name == "__report" || name == "__done" => {
+                        self.seen
+                            .lock()
+                            .expect("seen mutex poisoned")
+                            .push((name.clone(), request.payload.clone()));
+                        Some(HostcallOutcome::Success(Value::Null))
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let join = thread::spawn(move || {
+            let (mut stream, _peer) = listener.accept().expect("accept");
+            let body = "event: message\ndata: one\n\nevent: message\ndata: two\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        asupersync::test_utils::run_test(|| async move {
+            let manager = ExtensionManager::new();
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Arc::new(Recorder {
+                seen: Arc::clone(&seen),
+            });
+
+            let host = JsRuntimeHost {
+                tools: Arc::new(crate::tools::ToolRegistry::new(
+                    &["__report", "__done"],
+                    &cwd,
+                    None,
+                )),
+                manager_ref: Arc::downgrade(&manager.inner),
+                http: Arc::new(crate::connectors::http::HttpConnector::new(
+                    crate::connectors::http::HttpConnectorConfig {
+                        require_tls: false,
+                        ..Default::default()
+                    },
+                )),
+                policy: ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    max_memory_mb: 256,
+                    default_caps: Vec::new(),
+                    deny_caps: Vec::new(),
+                },
+                interceptor: Some(recorder),
+                exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
+                http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
+            };
+
+            let runtime = PiJsRuntime::new().await.expect("create runtime");
+            let url = format!("http://{addr}/");
+            let url_json = serde_json::to_string(&url).expect("serialize url");
+
+            runtime
+                .eval(&format!(
+                    r#"
+globalThis.__done = false;
+(async () => {{
+  try {{
+    await pi.http({{
+      url: {url_json},
+      stream: true,
+      onChunk: (chunk, isFinal) => {{ pi.tool("__report", {{ chunk, isFinal }}); }},
+    }});
+    await pi.tool("__done", {{ ok: true }});
+  }} catch (e) {{
+    await pi.tool("__done", {{ ok: false, message: e.message, code: e.code ?? null }});
+  }}
+  globalThis.__done = true;
+}})();
+"#,
+                ))
+                .await
+                .expect("eval");
+
+            let start = Instant::now();
+            loop {
+                assert!(
+                    start.elapsed() <= Duration::from_secs(5),
+                    "timed out waiting for streaming http to finish"
+                );
+
+                let _ = super::pump_js_runtime_once(&runtime, &host)
+                    .await
+                    .expect("pump_js_runtime_once");
+
+                let done = runtime
+                    .get_global_json("__done")
+                    .await
+                    .expect("get_global_json");
+                if done.as_bool() == Some(true) {
+                    break;
+                }
+
+                sleep(wall_now(), Duration::from_millis(1)).await;
+            }
+
+            let observed = {
+                let guard = seen.lock().expect("seen mutex poisoned");
+                guard.clone()
+            };
+
+            let reports = observed
+                .iter()
+                .filter(|(name, _)| name == "__report")
+                .map(|(_, payload)| payload.clone())
+                .collect::<Vec<_>>();
+
+            assert!(
+                reports.iter().any(|payload| {
+                    payload.get("isFinal").and_then(Value::as_bool) == Some(false)
+                        && payload
+                            .get("chunk")
+                            .and_then(|v| v.get("kind"))
+                            .and_then(Value::as_str)
+                            == Some("head")
+                        && payload
+                            .get("chunk")
+                            .and_then(|v| v.get("status"))
+                            .and_then(Value::as_i64)
+                            == Some(200)
+                }),
+                "missing head chunk: {reports:#?}"
+            );
+
+            assert!(
+                reports.iter().any(|payload| {
+                    payload.get("isFinal").and_then(Value::as_bool) == Some(false)
+                        && payload
+                            .get("chunk")
+                            .and_then(|v| v.get("kind"))
+                            .and_then(Value::as_str)
+                            == Some("sse")
+                        && payload
+                            .get("chunk")
+                            .and_then(|v| v.get("data"))
+                            .and_then(Value::as_str)
+                            == Some("one")
+                }),
+                "missing first sse event: {reports:#?}"
+            );
+
+            assert!(
+                reports.iter().any(|payload| {
+                    payload.get("isFinal").and_then(Value::as_bool) == Some(false)
+                        && payload
+                            .get("chunk")
+                            .and_then(|v| v.get("kind"))
+                            .and_then(Value::as_str)
+                            == Some("sse")
+                        && payload
+                            .get("chunk")
+                            .and_then(|v| v.get("data"))
+                            .and_then(Value::as_str)
+                            == Some("two")
+                }),
+                "missing second sse event: {reports:#?}"
+            );
+
+            assert!(
+                reports.iter().any(|payload| {
+                    payload.get("isFinal").and_then(Value::as_bool) == Some(true)
+                        && payload.get("chunk").is_some_and(Value::is_null)
+                }),
+                "missing final null chunk: {reports:#?}"
+            );
+
+            let done_payload = observed
+                .iter()
+                .find_map(|(name, payload)| (name == "__done").then(|| payload.clone()));
+            let done_payload = done_payload.expect("missing __done tool call");
+            assert_eq!(done_payload.get("ok").and_then(Value::as_bool), Some(true));
+        });
+
+        let _ = join.join();
     }
 
     #[test]

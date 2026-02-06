@@ -119,7 +119,10 @@ pub struct AgentTime<'a> {
 
 impl AgentTime<'_> {
     pub async fn sleep(&self, duration: Duration) {
-        asupersync::time::sleep(asupersync::time::wall_now(), duration).await;
+        let now = asupersync::Cx::current()
+            .and_then(|cx| cx.timer_driver())
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        asupersync::time::sleep(now, duration).await;
     }
 }
 

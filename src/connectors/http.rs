@@ -14,10 +14,12 @@ use crate::error::Result;
 use crate::http::client::Client;
 use asupersync::time::{timeout, wall_now};
 use async_trait::async_trait;
+use futures::Stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -134,6 +136,17 @@ pub struct HttpResponse {
 
     /// Request duration in milliseconds
     pub duration_ms: u64,
+}
+
+/// Streaming HTTP response returned to the host dispatcher.
+///
+/// This intentionally returns only the response head plus a byte stream. The caller
+/// is responsible for chunking/decoding (UTF-8/base64), SSE parsing, idle timeouts,
+/// and delivering `StreamChunk` outcomes to the extension runtime.
+pub struct StreamingHttpResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub stream: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>,
 }
 
 /// HTTP connector for extension hostcalls.
@@ -503,6 +516,238 @@ impl HttpConnector {
                 )
             }
         }
+    }
+
+    /// Dispatch an HTTP request but return a streaming response body instead of buffering it.
+    ///
+    /// Errors are returned as a `HostResultPayload` (taxonomy-correct) so the caller can
+    /// convert into `HostcallOutcome::Error` deterministically.
+    pub async fn dispatch_streaming(
+        &self,
+        call: &HostCallPayload,
+    ) -> std::result::Result<StreamingHttpResponse, HostResultPayload> {
+        let call_id = &call.call_id;
+        let method = call.method.to_ascii_lowercase();
+
+        if method != "http" {
+            warn!(
+                call_id = %call_id,
+                method = %method,
+                "HTTP connector: unsupported method (streaming)"
+            );
+            return Err(host_result_err(
+                call_id,
+                HostCallErrorCode::InvalidRequest,
+                format!("Unsupported HTTP connector method: '{method}'. Use 'http'."),
+                None,
+            ));
+        }
+
+        let mut request = match self.parse_request(&call.params) {
+            Ok(req) => req,
+            Err((code, message)) => {
+                warn!(
+                    call_id = %call_id,
+                    error = %message,
+                    "HTTP connector: invalid request (streaming)"
+                );
+                return Err(host_result_err(call_id, code, message, None));
+            }
+        };
+
+        // Prefer explicit per-request timeout in params, otherwise fall back to host_call.timeout_ms.
+        if request.timeout_ms.is_none() {
+            request.timeout_ms = call.timeout_ms.filter(|ms| *ms > 0);
+        }
+
+        let log_url = Self::redact_url_for_log(&request.url);
+        if let Err((code, message)) = self.validate_url(&request.url) {
+            info!(
+                call_id = %call_id,
+                url = %log_url,
+                error = %message,
+                "HTTP connector: policy denied (streaming)"
+            );
+            return Err(host_result_err(call_id, code, message, None));
+        }
+
+        debug!(
+            call_id = %call_id,
+            url = %log_url,
+            method = %request.method,
+            "HTTP connector: executing request (streaming)"
+        );
+
+        let timeout_ms = request.timeout_ms.unwrap_or(self.config.default_timeout_ms);
+        let (response, duration_ms) = match self
+            .dispatch_request_streaming_head(call_id, &request, timeout_ms, &log_url)
+            .await
+        {
+            Ok(res) => res,
+            Err(payload) => return Err(payload),
+        };
+
+        let status = response.status();
+        let response_headers: Vec<(String, String)> = response.headers().to_vec();
+
+        let mut headers_map = HashMap::new();
+        for (key, value) in response_headers {
+            headers_map.insert(key, value);
+        }
+
+        info!(
+            call_id = %call_id,
+            url = %log_url,
+            status = status,
+            duration_ms = duration_ms,
+            "HTTP connector: streaming response head received"
+        );
+
+        Ok(StreamingHttpResponse {
+            status,
+            headers: headers_map,
+            stream: response.bytes_stream(),
+        })
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_request_streaming_head(
+        &self,
+        call_id: &str,
+        request: &HttpRequest,
+        timeout_ms: u64,
+        log_url: &str,
+    ) -> std::result::Result<(crate::http::client::Response, u64), HostResultPayload> {
+        let start = Instant::now();
+        let builder = match self.build_streaming_request_builder(call_id, request, timeout_ms) {
+            Ok(builder) => builder,
+            Err(payload) => return Err(*payload),
+        };
+        let send_fut = builder.send();
+        let result = if timeout_ms == 0 {
+            Ok(send_fut.await)
+        } else {
+            timeout(
+                wall_now(),
+                Duration::from_millis(timeout_ms),
+                Box::pin(send_fut),
+            )
+            .await
+        };
+
+        match result {
+            Ok(Ok(response)) => {
+                let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                Ok((response, duration_ms))
+            }
+            Ok(Err(err)) => {
+                if timeout_ms > 0 && start.elapsed() >= Duration::from_millis(timeout_ms) {
+                    let message = format!("Request timeout after {timeout_ms}ms");
+                    warn!(
+                        call_id = %call_id,
+                        url = %log_url,
+                        error = %message,
+                        "HTTP connector: request timed out (streaming)"
+                    );
+
+                    return Err(host_result_err_with_details(
+                        call_id,
+                        HostCallErrorCode::Timeout,
+                        &message,
+                        Self::request_details(request, timeout_ms),
+                        Some(true),
+                    ));
+                }
+
+                let message = err.to_string();
+                let code = match err {
+                    crate::error::Error::Validation(_) => HostCallErrorCode::InvalidRequest,
+                    _ => HostCallErrorCode::Io,
+                };
+
+                warn!(
+                    call_id = %call_id,
+                    url = %log_url,
+                    error = %message,
+                    "HTTP connector: request failed (streaming)"
+                );
+
+                Err(host_result_err_with_details(
+                    call_id,
+                    code,
+                    &message,
+                    Self::request_details(request, timeout_ms),
+                    Some(false),
+                ))
+            }
+            Err(_) => {
+                let message = format!("Request timeout after {timeout_ms}ms");
+                warn!(
+                    call_id = %call_id,
+                    url = %log_url,
+                    error = %message,
+                    "HTTP connector: request timed out (streaming)"
+                );
+
+                Err(host_result_err_with_details(
+                    call_id,
+                    HostCallErrorCode::Timeout,
+                    &message,
+                    Self::request_details(request, timeout_ms),
+                    Some(true),
+                ))
+            }
+        }
+    }
+
+    fn build_streaming_request_builder<'a>(
+        &'a self,
+        call_id: &str,
+        request: &HttpRequest,
+        timeout_ms: u64,
+    ) -> std::result::Result<crate::http::client::RequestBuilder<'a>, Box<HostResultPayload>> {
+        let method_upper = request.method.to_ascii_uppercase();
+        let mut builder = match method_upper.as_str() {
+            "GET" => self.client.get(&request.url),
+            "POST" => self.client.post(&request.url),
+            _ => {
+                return Err(Box::new(host_result_err_with_details(
+                    call_id,
+                    HostCallErrorCode::InvalidRequest,
+                    format!(
+                        "Invalid HTTP method: '{}'. Supported methods: GET, POST.",
+                        request.method
+                    ),
+                    Self::request_details(request, timeout_ms),
+                    Some(false),
+                )));
+            }
+        };
+
+        for (key, value) in &request.headers {
+            builder = builder.header(key, value);
+        }
+
+        if let Some(body) = &request.body {
+            builder = builder.body(body.as_bytes().to_vec());
+        } else if let Some(body_bytes) = &request.body_bytes {
+            use base64::Engine;
+            let decoded = match base64::engine::general_purpose::STANDARD.decode(body_bytes) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    return Err(Box::new(host_result_err_with_details(
+                        call_id,
+                        HostCallErrorCode::InvalidRequest,
+                        format!("Invalid base64 body: {err}"),
+                        Self::request_details(request, timeout_ms),
+                        Some(false),
+                    )));
+                }
+            };
+            builder = builder.body(decoded);
+        }
+
+        Ok(builder)
     }
 }
 
@@ -967,6 +1212,75 @@ mod tests {
             result.output.get("body").and_then(Value::as_str),
             Some("hello")
         );
+
+        let _ = join.join();
+    }
+
+    #[test]
+    fn test_dispatch_streaming_returns_status_headers_and_body_stream() {
+        use futures::StreamExt as _;
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let join = thread::spawn(move || {
+            let (mut stream, _peer) = listener.accept().expect("accept");
+            let body = "hello-stream";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let connector = HttpConnector::new(HttpConnectorConfig {
+            require_tls: false,
+            default_timeout_ms: 5000,
+            ..Default::default()
+        });
+
+        let call = HostCallPayload {
+            call_id: "call-1".to_string(),
+            capability: "http".to_string(),
+            method: "http".to_string(),
+            params: json!({
+                "url": format!("http://{addr}/"),
+                "method": "GET",
+                "timeout_ms": 1000,
+            }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let (status, headers, body) = run_async(async move {
+            let response = connector
+                .dispatch_streaming(&call)
+                .await
+                .expect("dispatch_streaming ok");
+
+            let mut bytes = Vec::new();
+            let mut stream = response.stream;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.expect("stream chunk");
+                bytes.extend_from_slice(&chunk);
+            }
+
+            (response.status, response.headers, bytes)
+        });
+
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers
+                .get("Content-Type")
+                .or_else(|| headers.get("content-type"))
+                .map(String::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(String::from_utf8_lossy(&body), "hello-stream");
 
         let _ = join.join();
     }

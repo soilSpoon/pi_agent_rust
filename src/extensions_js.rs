@@ -4192,6 +4192,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.hostcall_tracker.borrow().pending_count()
     }
 
+    /// Check whether a given hostcall is still pending.
+    ///
+    /// This is useful for streaming hostcalls that need to stop polling/reading once the JS side
+    /// has timed out or otherwise completed the call.
+    pub fn is_hostcall_pending(&self, call_id: &str) -> bool {
+        self.hostcall_tracker.borrow().is_pending(call_id)
+    }
+
     /// Get all tools registered by loaded JS extensions.
     pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
         self.interrupt_budget.reset();

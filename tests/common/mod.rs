@@ -32,6 +32,10 @@ where
     static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
     let runtime = RT.get_or_init(|| {
         asupersync::runtime::RuntimeBuilder::new()
+            // Work around an asupersync 0.1.0 scheduler parking bug where due timers can
+            // livelock the idle backoff loop (prevents `sleep()` wakeups).
+            .enable_parking(false)
+            .worker_threads(1)
             .blocking_threads(1, 8)
             .build()
             .expect("build asupersync runtime")
