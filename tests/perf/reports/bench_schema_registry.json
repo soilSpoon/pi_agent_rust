@@ -1,0 +1,71 @@
+{
+  "env_fingerprint_fields": [
+    {
+      "description": "Operating system name and version",
+      "field": "os"
+    },
+    {
+      "description": "CPU architecture (x86_64, aarch64)",
+      "field": "arch"
+    },
+    {
+      "description": "CPU model string from /proc/cpuinfo or sysinfo",
+      "field": "cpu_model"
+    },
+    {
+      "description": "Logical CPU core count",
+      "field": "cpu_cores"
+    },
+    {
+      "description": "Total system memory in megabytes",
+      "field": "mem_total_mb"
+    },
+    {
+      "description": "Cargo build profile: debug or release",
+      "field": "build_profile"
+    },
+    {
+      "description": "Short git commit hash of the build",
+      "field": "git_commit"
+    },
+    {
+      "description": "Active Cargo feature flags",
+      "field": "features"
+    },
+    {
+      "description": "SHA-256 of env fields for dedup",
+      "field": "config_hash"
+    }
+  ],
+  "schema": "pi.bench.schema_registry.v1",
+  "schemas": [
+    {
+      "description": "Rust QuickJS extension benchmark event (load, tool call, event hook)",
+      "name": "pi.ext.rust_bench.v1"
+    },
+    {
+      "description": "Legacy pi-mono (Node.js) extension benchmark event",
+      "name": "pi.ext.legacy_bench.v1"
+    },
+    {
+      "description": "PiJS workload harness output (tool call throughput)",
+      "name": "pi.perf.workload.v1"
+    },
+    {
+      "description": "Performance budget check result",
+      "name": "pi.perf.budget.v1"
+    },
+    {
+      "description": "Aggregate budget summary with pass/fail counts",
+      "name": "pi.perf.budget_summary.v1"
+    },
+    {
+      "description": "Per-extension conformance report event",
+      "name": "pi.ext.conformance_report.v2"
+    },
+    {
+      "description": "Aggregate conformance summary with per-tier breakdowns",
+      "name": "pi.ext.conformance_summary.v2"
+    }
+  ]
+}

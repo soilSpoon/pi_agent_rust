@@ -1,7 +1,8 @@
-{"rss_kb":54403072,"schema":"pi.ext.stress_rss.v1","t_s":0,"ts":"2026-02-06T01:17:39.414Z"}
-{"rss_kb":54542336,"schema":"pi.ext.stress_rss.v1","t_s":5,"ts":"2026-02-06T01:17:39.415Z"}
-{"rss_kb":53170176,"schema":"pi.ext.stress_rss.v1","t_s":10,"ts":"2026-02-06T01:17:39.415Z"}
-{"rss_kb":53116928,"schema":"pi.ext.stress_rss.v1","t_s":15,"ts":"2026-02-06T01:17:39.415Z"}
-{"rss_kb":53178368,"schema":"pi.ext.stress_rss.v1","t_s":20,"ts":"2026-02-06T01:17:39.415Z"}
-{"rss_kb":53182464,"schema":"pi.ext.stress_rss.v1","t_s":25,"ts":"2026-02-06T01:17:39.415Z"}
-{"duration_secs":30,"error_count":0,"event_count":1121,"extensions_loaded":15,"initial_rss_kb":54403072,"latency_ok":true,"latency_summary":{"count":1121,"max":162504,"mean":20553,"min":15303,"p50":17184,"p95":40633,"p99":90410},"max_rss_kb":54542336,"p99_first_us":24761,"p99_last_us":17373,"rss_growth_pct":0.0025598554434573106,"rss_ok":true,"schema":"pi.ext.stress_summary.v1","ts":"2026-02-06T01:17:39.415Z"}
+{"rss_kb":58707968,"schema":"pi.ext.stress_rss.v1","t_s":0,"ts":"2026-02-06T01:29:10.436Z"}
+{"rss_kb":57413632,"schema":"pi.ext.stress_rss.v1","t_s":5,"ts":"2026-02-06T01:29:10.436Z"}
+{"rss_kb":56471552,"schema":"pi.ext.stress_rss.v1","t_s":10,"ts":"2026-02-06T01:29:10.436Z"}
+{"rss_kb":56483840,"schema":"pi.ext.stress_rss.v1","t_s":15,"ts":"2026-02-06T01:29:10.436Z"}
+{"rss_kb":56483840,"schema":"pi.ext.stress_rss.v1","t_s":20,"ts":"2026-02-06T01:29:10.436Z"}
+{"rss_kb":56475648,"schema":"pi.ext.stress_rss.v1","t_s":25,"ts":"2026-02-06T01:29:10.436Z"}
+{"rss_kb":56475648,"schema":"pi.ext.stress_rss.v1","t_s":30,"ts":"2026-02-06T01:29:10.436Z"}
+{"duration_secs":30,"error_count":0,"event_count":1350,"extensions_loaded":15,"initial_rss_kb":58707968,"latency_ok":true,"latency_summary":{"count":1350,"max":35995,"mean":17929,"min":11379,"p50":17415,"p95":21190,"p99":26540},"max_rss_kb":58707968,"p99_first_us":29788,"p99_last_us":20266,"rss_growth_pct":0.0,"rss_ok":true,"schema":"pi.ext.stress_summary.v1","ts":"2026-02-06T01:29:10.436Z"}

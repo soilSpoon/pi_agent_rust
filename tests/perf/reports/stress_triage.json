@@ -21,30 +21,30 @@
     ],
     "rss_interval_secs": 5
   },
-  "generated_at": "2026-02-06T01:17:39Z",
+  "generated_at": "2026-02-06T01:29:10Z",
   "pass": true,
   "results": {
     "error_count": 0,
-    "event_count": 1121,
+    "event_count": 1350,
     "extensions_loaded": 15,
     "latency": {
       "ok": true,
-      "p99_first_us": 24761,
-      "p99_last_us": 17373,
+      "p99_first_us": 29788,
+      "p99_last_us": 20266,
       "summary": {
-        "count": 1121,
-        "max": 162504,
-        "mean": 20553,
-        "min": 15303,
-        "p50": 17184,
-        "p95": 40633,
-        "p99": 90410
+        "count": 1350,
+        "max": 35995,
+        "mean": 17929,
+        "min": 11379,
+        "p50": 17415,
+        "p95": 21190,
+        "p99": 26540
       }
     },
     "rss": {
-      "growth_pct": 0.0025598554434573106,
-      "initial_kb": 54403072,
-      "max_kb": 54542336,
+      "growth_pct": 0.0,
+      "initial_kb": 58707968,
+      "max_kb": 58707968,
       "ok": true
     },
     "sample_errors": []

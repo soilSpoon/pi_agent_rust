@@ -145,7 +145,9 @@ fn artifacts_dir() -> PathBuf {
 }
 
 fn report_dir() -> PathBuf {
-    project_root().join("tests/perf/reports")
+    // Write stress artifacts under `target/` so `cargo test` remains side-effect free
+    // with respect to tracked repository files.
+    project_root().join("target/perf")
 }
 
 /// Collect entry paths for official-pi-mono extensions that are single-file

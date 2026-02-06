@@ -11,6 +11,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -23,6 +24,11 @@ fn reports_dir() -> PathBuf {
 fn read_json_file(path: &Path) -> Option<Value> {
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+fn reports_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn write_atomic(path: &Path, content: &str) {
@@ -223,6 +229,10 @@ fn generate_comparison_markdown(comparisons: &[LoadComparison]) -> String {
 
 #[test]
 fn generate_performance_comparison() {
+    let _guard = reports_lock()
+        .lock()
+        .expect("lock performance comparison reports");
+
     let reports = reports_dir();
     let _ = std::fs::create_dir_all(&reports);
 
@@ -241,7 +251,8 @@ fn generate_performance_comparison() {
     let json_path = reports.join("performance_comparison.json");
     write_atomic(
         &json_path,
-        &serde_json::to_string_pretty(&comparison_json).unwrap_or_default(),
+        &serde_json::to_string_pretty(&comparison_json)
+            .expect("serialize performance_comparison.json"),
     );
 
     // 2. Write JSONL events
@@ -313,6 +324,10 @@ fn comparison_data_is_valid() {
 
 #[test]
 fn comparison_json_has_analysis() {
+    let _guard = reports_lock()
+        .lock()
+        .expect("lock performance comparison reports");
+
     let json_path = reports_dir().join("performance_comparison.json");
     if !json_path.exists() {
         eprintln!("No performance_comparison.json — skipping");
@@ -353,6 +368,10 @@ fn comparison_json_has_analysis() {
 
 #[test]
 fn comparison_events_complete() {
+    let _guard = reports_lock()
+        .lock()
+        .expect("lock performance comparison reports");
+
     let events_path = reports_dir().join("performance_events.jsonl");
     if !events_path.exists() {
         eprintln!("No performance_events.jsonl — skipping");
