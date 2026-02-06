@@ -826,11 +826,7 @@ impl MockSpecInterceptor {
         let ui_responses = spec
             .pointer("/ui/responses")
             .and_then(Value::as_object)
-            .map(|obj| {
-                obj.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            })
+            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
 
         let ui_confirm_default = spec
@@ -1015,7 +1011,9 @@ impl HostcallInterceptor for MockSpecInterceptor {
                 }
             }
             // Session, Events, Tool → pass through to real dispatch
-            HostcallKind::Session { .. } | HostcallKind::Events { .. } | HostcallKind::Tool { .. } => None,
+            HostcallKind::Session { .. }
+            | HostcallKind::Events { .. }
+            | HostcallKind::Tool { .. } => None,
         }
     }
 }
@@ -1170,11 +1168,7 @@ impl ExtensionSession for ConformanceSession {
         self.thinking_level.lock().unwrap().clone()
     }
 
-    async fn set_label(
-        &self,
-        target_id: String,
-        label: Option<String>,
-    ) -> pi::error::Result<()> {
+    async fn set_label(&self, target_id: String, label: Option<String>) -> pi::error::Result<()> {
         self.labels.lock().unwrap().push((target_id, label));
         Ok(())
     }
@@ -1215,22 +1209,6 @@ fn load_extension_with_mocks(
     // Build conformance session
     let session = Arc::new(ConformanceSession::from_spec(default_spec, setup));
     manager.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
-
-    // Pre-seed flags from setup
-    if let Some(flags) = setup.and_then(|s| s.get("flags")).and_then(Value::as_object) {
-        for (flag_name, flag_value) in flags {
-            let str_value = match flag_value {
-                Value::Bool(b) => b.to_string(),
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            // We cannot call async set_flag_value here directly; instead record
-            // flags as pre-seeded state in the manager inner.
-            // The manager exposes set_flag_value but it needs the JS runtime.
-            // For now, skip flag pre-seeding and handle it in ctx payload.
-            let _ = (flag_name, str_value);
-        }
-    }
 
     let mut env = HashMap::new();
     env.insert(
@@ -1286,26 +1264,20 @@ fn load_extension_with_mocks(
     })?;
 
     // Pre-seed flags via JS runtime (after extension is loaded)
-    if let Some(flags) = setup.and_then(|s| s.get("flags")).and_then(Value::as_object) {
+    if let Some(flags) = setup
+        .and_then(|s| s.get("flags"))
+        .and_then(Value::as_object)
+    {
+        let ext_id = spec.extension_id.clone();
         for (flag_name, flag_value) in flags {
-            let str_value = match flag_value {
-                Value::Bool(b) => b.to_string(),
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            let ext_id = manager
-                .extension_tool_defs()
-                .first()
-                .and_then(|t| t.get("extension_id").and_then(Value::as_str))
-                .map(String::from)
-                .unwrap_or_else(|| "unknown".to_string());
             common::run_async({
                 let manager = manager.clone();
                 let flag_name = flag_name.clone();
+                let flag_value = flag_value.clone();
                 let ext_id = ext_id.clone();
                 async move {
                     let _ = manager
-                        .set_flag_value(&ext_id, &flag_name, &str_value)
+                        .set_flag_value(&ext_id, &flag_name, flag_value)
                         .await;
                 }
             });
@@ -1403,10 +1375,7 @@ fn needs_unsupported_setup(scenario: &Scenario) -> Option<String> {
         // mock_http with "vcr_or_stub" mode requires actual HTTP stubbing
         // beyond our simple rule matching
         if let Some(mock_http) = setup.get("mock_http") {
-            let mode = mock_http
-                .get("mode")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let mode = mock_http.get("mode").and_then(Value::as_str).unwrap_or("");
             if mode == "vcr_or_stub" {
                 return Some("requires vcr_or_stub HTTP mock mode".to_string());
             }

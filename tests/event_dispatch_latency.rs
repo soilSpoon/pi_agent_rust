@@ -193,7 +193,7 @@ struct LatencyResult {
 fn measure_event_latency(
     manager: &ExtensionManager,
     event: ExtensionEventName,
-    payload: &Option<Value>,
+    payload: Option<&Value>,
     iterations: u64,
     warmup: u64,
 ) -> LatencyResult {
@@ -201,7 +201,7 @@ fn measure_event_latency(
     for _ in 0..warmup {
         let _ = common::run_async({
             let manager = manager.clone();
-            let payload = payload.clone();
+            let payload = payload.cloned();
             async move { manager.dispatch_event(event, payload).await }
         });
     }
@@ -212,7 +212,7 @@ fn measure_event_latency(
         let start = Instant::now();
         let _ = common::run_async({
             let manager = manager.clone();
-            let payload = payload.clone();
+            let payload = payload.cloned();
             async move { manager.dispatch_event(event, payload).await }
         });
         let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -280,7 +280,7 @@ fn event_type_latency_single_extension() {
     for (i, event) in event_enums.iter().enumerate() {
         let payload = json!({ "systemPrompt": "test", "index": i });
         let mut result =
-            measure_event_latency(&loaded.manager, *event, &Some(payload), ITERATIONS, WARMUP);
+            measure_event_latency(&loaded.manager, *event, Some(&payload), ITERATIONS, WARMUP);
         result.extensions = 1;
 
         let summary = summarize_us(&result.latencies_us);
@@ -357,7 +357,7 @@ fn event_dispatch_scaling() {
 
         let payload = json!({ "systemPrompt": "test" });
         let mut result =
-            measure_event_latency(&loaded.manager, event, &Some(payload), ITERATIONS, WARMUP);
+            measure_event_latency(&loaded.manager, event, Some(&payload), ITERATIONS, WARMUP);
         result.extensions = count;
 
         let summary = summarize_us(&result.latencies_us);
@@ -418,7 +418,7 @@ fn hostcall_roundtrip_latency() {
     let payload = json!({ "systemPrompt": "test" });
 
     let mut result =
-        measure_event_latency(&loaded.manager, event, &Some(payload), ITERATIONS, WARMUP);
+        measure_event_latency(&loaded.manager, event, Some(&payload), ITERATIONS, WARMUP);
     result.extensions = 1;
 
     let summary = summarize_us(&result.latencies_us);
@@ -471,7 +471,7 @@ fn no_handler_dispatch_overhead() {
     let payload = json!({ "turnIndex": 1 });
 
     let mut result =
-        measure_event_latency(&loaded.manager, event, &Some(payload), ITERATIONS, WARMUP);
+        measure_event_latency(&loaded.manager, event, Some(&payload), ITERATIONS, WARMUP);
     result.extensions = 1;
 
     let summary = summarize_us(&result.latencies_us);
@@ -593,7 +593,8 @@ fn real_extension_dispatch_latency() {
 
     for (event, label) in &events_to_test {
         let payload = json!({ "systemPrompt": "test" });
-        let mut result = measure_event_latency(&manager, *event, &Some(payload), ITERATIONS, WARMUP);
+        let mut result =
+            measure_event_latency(&manager, *event, Some(&payload), ITERATIONS, WARMUP);
         result.extensions = ext_count;
 
         let summary = summarize_us(&result.latencies_us);
