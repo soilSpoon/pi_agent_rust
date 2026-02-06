@@ -233,4 +233,117 @@ mod tests {
         selector.select_next();
         assert_eq!(selector.selected_item().unwrap().full_id(), "openai/gpt-4o");
     }
+
+    #[test]
+    fn new_from_keys_sorts_provider_then_id() {
+        let selector = selector(&[
+            ("openai", "gpt-4o-mini"),
+            ("anthropic", "claude-sonnet-4"),
+            ("openai", "gpt-4o"),
+        ]);
+        let ids = (0..selector.filtered_len())
+            .map(|idx| selector.item_at(idx).unwrap().full_id())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "anthropic/claude-sonnet-4",
+                "openai/gpt-4o",
+                "openai/gpt-4o-mini"
+            ]
+        );
+    }
+
+    #[test]
+    fn page_navigation_respects_window_and_bounds() {
+        let mut selector = selector(&[
+            ("openai", "a"),
+            ("openai", "b"),
+            ("openai", "c"),
+            ("openai", "d"),
+            ("openai", "e"),
+        ]);
+        selector.set_max_visible(3);
+        assert_eq!(selector.max_visible(), 3);
+        assert_eq!(selector.selected_index(), 0);
+        assert_eq!(selector.scroll_offset(), 0);
+
+        selector.select_page_down();
+        assert_eq!(selector.selected_index(), 2);
+        assert_eq!(selector.scroll_offset(), 0);
+
+        selector.select_page_down();
+        assert_eq!(selector.selected_index(), 4);
+        assert_eq!(selector.scroll_offset(), 2);
+
+        selector.select_page_down();
+        assert_eq!(selector.selected_index(), 4);
+
+        selector.select_page_up();
+        assert_eq!(selector.selected_index(), 2);
+        assert_eq!(selector.scroll_offset(), 0);
+
+        selector.select_page_up();
+        assert_eq!(selector.selected_index(), 0);
+    }
+
+    #[test]
+    fn set_max_visible_clamps_to_one() {
+        let mut selector = selector(&[("openai", "a"), ("openai", "b"), ("openai", "c")]);
+        selector.set_max_visible(0);
+        assert_eq!(selector.max_visible(), 1);
+
+        selector.select_page_down();
+        assert_eq!(selector.selected_index(), 1);
+        selector.select_page_down();
+        assert_eq!(selector.selected_index(), 2);
+    }
+
+    #[test]
+    fn query_input_ignores_control_chars_and_pop_refreshes() {
+        let mut selector = selector(&[("openai", "gpt-4o"), ("openai", "o1")]);
+        selector.push_chars("o1\n\t".chars());
+        assert_eq!(selector.query(), "o1");
+        assert_eq!(selector.filtered_len(), 1);
+        assert_eq!(selector.selected_item().unwrap().full_id(), "openai/o1");
+
+        selector.pop_char();
+        assert_eq!(selector.query(), "o");
+        assert_eq!(selector.filtered_len(), 2);
+    }
+
+    #[test]
+    fn clear_query_noop_when_empty_and_reset_when_non_empty() {
+        let mut selector = selector(&[("openai", "gpt-4o"), ("openai", "o1")]);
+
+        selector.select_next();
+        assert_eq!(selector.selected_index(), 1);
+        selector.clear_query();
+        assert_eq!(selector.selected_index(), 1);
+
+        selector.push_chars("1".chars());
+        assert_eq!(selector.filtered_len(), 1);
+        selector.clear_query();
+        assert_eq!(selector.query(), "");
+        assert_eq!(selector.filtered_len(), 2);
+        assert_eq!(selector.selected_index(), 0);
+    }
+
+    #[test]
+    fn no_match_has_no_selected_item_and_navigation_is_stable() {
+        let mut selector = selector(&[("openai", "gpt-4o"), ("openai", "o1")]);
+        selector.push_chars("zzz".chars());
+
+        assert_eq!(selector.filtered_len(), 0);
+        assert!(selector.selected_item().is_none());
+        assert!(selector.item_at(0).is_none());
+
+        selector.select_next();
+        selector.select_prev();
+        selector.select_page_down();
+        selector.select_page_up();
+
+        assert_eq!(selector.selected_index(), 0);
+        assert_eq!(selector.scroll_offset(), 0);
+    }
 }

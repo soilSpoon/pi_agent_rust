@@ -113,7 +113,7 @@ fn shared_tool_schema() -> Vec<ToolDef> {
     }]
 }
 
-fn event_kind(event: &StreamEvent) -> &'static str {
+const fn event_kind(event: &StreamEvent) -> &'static str {
     match event {
         StreamEvent::Start { .. } => "Start",
         StreamEvent::TextStart { .. } => "TextStart",
@@ -297,7 +297,7 @@ fn write_markdown_report(path: &Path, records: &[ParityRecord]) -> std::io::Resu
         "streaming_event_parity",
         "error_handling_parity",
     ] {
-        markdown.push_str(&format!("## {check}\n\n"));
+        let _ = write!(markdown, "## {check}\n\n");
         markdown.push_str(
             "| provider | status | elapsed_ms | total_tokens | text_chars | tool_calls | stop_reason | http_status | error_kind | sequence_valid |\n",
         );
@@ -376,7 +376,7 @@ async fn collect_stream_events(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_parity_case(
     registry: &LiveE2eRegistry,
     target: &LiveProviderTarget,
@@ -485,7 +485,7 @@ async fn run_parity_case(
     let started = Instant::now();
     match collect_stream_events(provider, context, options).await {
         Ok(events) => {
-            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let sequence: Vec<String> = events
                 .iter()
                 .map(|event| event_kind(event).to_string())
@@ -526,7 +526,7 @@ async fn run_parity_case(
             }
         }
         Err(err) => {
-            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let http_status = parse_http_status(&err);
             ParityRecord {
                 check: check.to_string(),
@@ -727,8 +727,7 @@ fn e2e_cross_provider_parity() {
             for (provider, kind) in &observed_kinds {
                 assert_eq!(
                     kind, first_kind,
-                    "error parity mismatch for {}: expected {}, got {}",
-                    provider, first_kind, kind
+                    "error parity mismatch for {provider}: expected {first_kind}, got {kind}"
                 );
             }
 

@@ -399,7 +399,6 @@ fn provider_preferred_models(provider: &str) -> &'static [&'static str] {
             "claude-sonnet-4-5",
         ],
         "openai" => &["gpt-4o-mini", "gpt-4o", "gpt-5.1-codex"],
-        "azure-openai" => &[],
         "google" => &["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"],
         "openrouter" => &["anthropic/claude-sonnet-4", "deepseek/deepseek-chat"],
         "xai" => &["grok-3-mini", "grok-2-1212"],
@@ -413,6 +412,8 @@ enum ModelSelection {
     RequestedModelMissing(String),
     NoModels,
 }
+
+type StreamingSummaryRow = (String, String, bool, bool, bool, u64, u64, usize, u128);
 
 fn select_model_entry_for_provider(registry: &ModelRegistry, provider: &str) -> ModelSelection {
     if let Some(override_var) = provider_model_override_var(provider) {
@@ -1049,12 +1050,8 @@ mod azure_openai {
                 _ => None,
             });
             assert!(
-                matches!(
-                    done_reason,
-                    Some(StopReason::ToolUse) | Some(StopReason::Stop)
-                ),
-                "Expected done reason to be ToolUse or Stop, got {:?}",
-                done_reason
+                matches!(done_reason, Some(StopReason::ToolUse | StopReason::Stop)),
+                "Expected done reason to be ToolUse or Stop, got {done_reason:?}"
             );
         });
     }
@@ -1297,10 +1294,11 @@ mod cross_provider {
         });
     }
 
-    /// Verify all providers emit compatible StreamEvent sequences:
+    /// Verify all providers emit compatible `StreamEvent` sequences:
     /// Start → (TextDelta|ThinkingDelta|TextEnd)+ → Done
     /// Logs a comparison table of timing, token usage, and response lengths.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn streaming_event_parity() {
         skip_unless_e2e!();
         let harness = TestHarness::new("e2e_cross_provider_streaming_parity");
@@ -1309,8 +1307,7 @@ mod cross_provider {
 
         common::run_async(async move {
             let prompt = "Say just the word hello";
-            let mut summary: Vec<(String, String, bool, bool, bool, u64, u64, usize, u128)> =
-                Vec::new();
+            let mut summary: Vec<StreamingSummaryRow> = Vec::new();
 
             for provider_name in LIVE_PROVIDER_ORDER {
                 let Some(config) = discovery.configs.get(provider_name).cloned() else {
@@ -1355,11 +1352,6 @@ mod cross_provider {
                     _ => false,
                 });
                 let has_content = has_delta_content || done_has_text;
-
-                let _text_deltas = events
-                    .iter()
-                    .filter(|e| matches!(e, StreamEvent::TextDelta { .. }))
-                    .count() as u32;
 
                 // Extract token usage and text length from Done event
                 let (input_tok, output_tok, text_len) = events
@@ -1475,13 +1467,16 @@ mod cross_provider {
                     .any(|e| matches!(e, StreamEvent::Error { .. }));
                 let got_error = has_stream_error || has_error_event;
 
-                let error_desc = if let Some(err) = &stream_error {
-                    format!("stream_error: {}", &err[..err.len().min(120)])
-                } else if has_error_event {
-                    "Error event in stream".to_string()
-                } else {
-                    "no error (unexpected success)".to_string()
-                };
+                let error_desc = stream_error.as_ref().map_or_else(
+                    || {
+                        if has_error_event {
+                            "Error event in stream".to_string()
+                        } else {
+                            "no error (unexpected success)".to_string()
+                        }
+                    },
+                    |err| format!("stream_error: {}", &err[..err.len().min(120)]),
+                );
 
                 harness.log().info_ctx(
                     "error_parity",

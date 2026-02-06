@@ -7,9 +7,10 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::http::client::Client;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,6 +19,10 @@ use tempfile::NamedTempFile;
 pub const EXTENSION_INDEX_SCHEMA: &str = "pi.ext.index.v1";
 pub const EXTENSION_INDEX_VERSION: u32 = 1;
 pub const DEFAULT_INDEX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24);
+const DEFAULT_NPM_QUERY: &str = "keywords:pi-extension";
+const DEFAULT_GITHUB_QUERY: &str = "topic:pi-extension";
+const DEFAULT_REMOTE_LIMIT: usize = 100;
+const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -227,6 +232,14 @@ pub struct ExtensionSearchHit {
     pub score: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ExtensionIndexRefreshStats {
+    pub npm_entries: usize,
+    pub github_entries: usize,
+    pub merged_entries: usize,
+    pub refreshed: bool,
+}
+
 fn score_entry(entry: &ExtensionIndexEntry, tokens: &[String]) -> i64 {
     let name = entry.name.to_ascii_lowercase();
     let id = entry.id.to_ascii_lowercase();
@@ -331,6 +344,321 @@ impl ExtensionIndexStore {
     pub fn resolve_install_source(&self, query: &str) -> Result<Option<String>> {
         let index = self.load_or_seed()?;
         Ok(index.resolve_install_source(query))
+    }
+
+    pub async fn load_or_refresh_best_effort(
+        &self,
+        client: &Client,
+        max_age: Duration,
+    ) -> Result<ExtensionIndex> {
+        let current = self.load_or_seed()?;
+        if current.is_stale(Utc::now(), max_age) {
+            let (refreshed, _) = self.refresh_best_effort(client).await?;
+            return Ok(refreshed);
+        }
+        Ok(current)
+    }
+
+    pub async fn refresh_best_effort(
+        &self,
+        client: &Client,
+    ) -> Result<(ExtensionIndex, ExtensionIndexRefreshStats)> {
+        let mut current = self.load_or_seed()?;
+
+        let npm_entries = match fetch_npm_entries(client, DEFAULT_REMOTE_LIMIT).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!("npm extension index refresh failed: {err}");
+                Vec::new()
+            }
+        };
+        let github_entries = match fetch_github_entries(client, DEFAULT_REMOTE_LIMIT).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!("github extension index refresh failed: {err}");
+                Vec::new()
+            }
+        };
+
+        let npm_count = npm_entries.len();
+        let github_count = github_entries.len();
+        if npm_count == 0 && github_count == 0 {
+            return Ok((
+                current,
+                ExtensionIndexRefreshStats {
+                    npm_entries: 0,
+                    github_entries: 0,
+                    merged_entries: 0,
+                    refreshed: false,
+                },
+            ));
+        }
+
+        current.entries = merge_entries(current.entries, npm_entries, github_entries);
+        current.last_refreshed_at = Some(Utc::now().to_rfc3339());
+        if let Err(err) = self.save(&current) {
+            tracing::warn!("failed to persist refreshed extension index cache: {err}");
+        }
+
+        Ok((
+            current.clone(),
+            ExtensionIndexRefreshStats {
+                npm_entries: npm_count,
+                github_entries: github_count,
+                merged_entries: current.entries.len(),
+                refreshed: true,
+            },
+        ))
+    }
+}
+
+fn merge_entries(
+    existing: Vec<ExtensionIndexEntry>,
+    npm_entries: Vec<ExtensionIndexEntry>,
+    github_entries: Vec<ExtensionIndexEntry>,
+) -> Vec<ExtensionIndexEntry> {
+    let mut by_id = BTreeMap::<String, ExtensionIndexEntry>::new();
+    for entry in existing {
+        by_id.insert(entry.id.to_ascii_lowercase(), entry);
+    }
+
+    for incoming in npm_entries.into_iter().chain(github_entries) {
+        let key = incoming.id.to_ascii_lowercase();
+        if let Some(entry) = by_id.get_mut(&key) {
+            merge_entry(entry, incoming);
+        } else {
+            by_id.insert(key, incoming);
+        }
+    }
+
+    let mut entries = by_id.into_values().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.id.to_ascii_lowercase());
+    entries
+}
+
+fn merge_entry(existing: &mut ExtensionIndexEntry, incoming: ExtensionIndexEntry) {
+    if !incoming.name.trim().is_empty() {
+        existing.name = incoming.name;
+    }
+    if incoming.description.is_some() {
+        existing.description = incoming.description;
+    }
+    if incoming.license.is_some() {
+        existing.license = incoming.license;
+    }
+    if incoming.source.is_some() {
+        existing.source = incoming.source;
+    }
+    if incoming.install_source.is_some() {
+        existing.install_source = incoming.install_source;
+    }
+    existing.tags = merge_tags(existing.tags.iter().cloned(), incoming.tags);
+}
+
+fn merge_tags(
+    left: impl IntoIterator<Item = String>,
+    right: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut tags = BTreeSet::new();
+    for tag in left.into_iter().chain(right) {
+        let trimmed = tag.trim();
+        if !trimmed.is_empty() {
+            tags.insert(trimmed.to_string());
+        }
+    }
+    tags.into_iter().collect()
+}
+
+async fn fetch_npm_entries(client: &Client, limit: usize) -> Result<Vec<ExtensionIndexEntry>> {
+    let query =
+        url::form_urlencoded::byte_serialize(DEFAULT_NPM_QUERY.as_bytes()).collect::<String>();
+    let size = limit.clamp(1, DEFAULT_REMOTE_LIMIT);
+    let url = format!("https://registry.npmjs.org/-/v1/search?text={query}&size={size}");
+    let response = client
+        .get(&url)
+        .timeout(REMOTE_REQUEST_TIMEOUT)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status != 200 {
+        return Err(Error::api(format!(
+            "npm extension search failed with status {status}"
+        )));
+    }
+
+    parse_npm_search_entries(&body)
+}
+
+async fn fetch_github_entries(client: &Client, limit: usize) -> Result<Vec<ExtensionIndexEntry>> {
+    let query =
+        url::form_urlencoded::byte_serialize(DEFAULT_GITHUB_QUERY.as_bytes()).collect::<String>();
+    let per_page = limit.clamp(1, DEFAULT_REMOTE_LIMIT);
+    let url = format!(
+        "https://api.github.com/search/repositories?q={query}&sort=updated&order=desc&per_page={per_page}"
+    );
+    let response = client
+        .get(&url)
+        .timeout(REMOTE_REQUEST_TIMEOUT)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status != 200 {
+        return Err(Error::api(format!(
+            "GitHub extension search failed with status {status}"
+        )));
+    }
+
+    parse_github_search_entries(&body)
+}
+
+fn parse_npm_search_entries(body: &str) -> Result<Vec<ExtensionIndexEntry>> {
+    #[derive(Debug, Deserialize)]
+    struct NpmSearchResponse {
+        #[serde(default)]
+        objects: Vec<NpmSearchObject>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NpmSearchObject {
+        package: NpmPackage,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NpmPackage {
+        name: String,
+        #[serde(default)]
+        version: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        keywords: Vec<String>,
+        #[serde(default)]
+        license: Option<String>,
+        #[serde(default)]
+        links: NpmLinks,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct NpmLinks {
+        #[serde(default)]
+        npm: Option<String>,
+    }
+
+    let parsed: NpmSearchResponse = serde_json::from_str(body)
+        .map_err(|err| Error::api(format!("npm search response parse error: {err}")))?;
+
+    let mut entries = Vec::with_capacity(parsed.objects.len());
+    for object in parsed.objects {
+        let package = object.package;
+        let version = package.version.as_deref().and_then(non_empty);
+        let install_spec = version.as_ref().map_or_else(
+            || package.name.clone(),
+            |ver| format!("{}@{ver}", package.name),
+        );
+        let license = normalize_license(package.license.as_deref());
+        let description = package.description.as_deref().and_then(non_empty);
+        let tags = merge_tags(
+            vec!["npm".to_string(), "extension".to_string()],
+            package
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.to_ascii_lowercase()),
+        );
+
+        entries.push(ExtensionIndexEntry {
+            id: format!("npm/{}", package.name),
+            name: package.name.clone(),
+            description,
+            tags,
+            license,
+            source: Some(ExtensionIndexSource::Npm {
+                package: package.name.clone(),
+                version,
+                url: package.links.npm.clone(),
+            }),
+            install_source: Some(format!("npm:{install_spec}")),
+        });
+    }
+
+    Ok(entries)
+}
+
+fn parse_github_search_entries(body: &str) -> Result<Vec<ExtensionIndexEntry>> {
+    #[derive(Debug, Deserialize)]
+    struct GitHubSearchResponse {
+        #[serde(default)]
+        items: Vec<GitHubRepo>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GitHubRepo {
+        full_name: String,
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        topics: Vec<String>,
+        #[serde(default)]
+        license: Option<GitHubLicense>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GitHubLicense {
+        #[serde(default)]
+        spdx_id: Option<String>,
+    }
+
+    let parsed: GitHubSearchResponse = serde_json::from_str(body)
+        .map_err(|err| Error::api(format!("GitHub search response parse error: {err}")))?;
+
+    let mut entries = Vec::with_capacity(parsed.items.len());
+    for item in parsed.items {
+        let spdx_id = item.license.and_then(|value| value.spdx_id);
+        let license = spdx_id
+            .as_deref()
+            .and_then(non_empty)
+            .filter(|value| !value.eq_ignore_ascii_case("NOASSERTION"));
+        let tags = merge_tags(
+            vec!["git".to_string(), "extension".to_string()],
+            item.topics
+                .into_iter()
+                .map(|topic| topic.to_ascii_lowercase()),
+        );
+
+        entries.push(ExtensionIndexEntry {
+            id: format!("git/{}", item.full_name),
+            name: item.name,
+            description: item.description.as_deref().and_then(non_empty),
+            tags,
+            license,
+            source: Some(ExtensionIndexSource::Git {
+                repo: item.full_name.clone(),
+                path: None,
+                r#ref: None,
+            }),
+            install_source: Some(format!("git:{}", item.full_name)),
+        });
+    }
+
+    Ok(entries)
+}
+
+fn normalize_license(value: Option<&str>) -> Option<String> {
+    value
+        .and_then(non_empty)
+        .filter(|license| !license.eq_ignore_ascii_case("unknown"))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -453,7 +781,10 @@ pub fn seed_index() -> Result<ExtensionIndex> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtensionIndex, ExtensionIndexEntry, ExtensionIndexStore, seed_index};
+    use super::{
+        ExtensionIndex, ExtensionIndexEntry, ExtensionIndexSource, ExtensionIndexStore,
+        merge_entries, parse_github_search_entries, parse_npm_search_entries, seed_index,
+    };
 
     #[test]
     fn seed_index_parses_and_has_entries() {
@@ -503,5 +834,96 @@ mod tests {
         let resolved = store.resolve_install_source("checkpoint-pi");
         // The exact seed contents can change; the important part is "no error".
         assert!(resolved.is_ok());
+    }
+
+    #[test]
+    fn parse_npm_search_entries_maps_install_sources() {
+        let body = r#"{
+          "objects": [
+            {
+              "package": {
+                "name": "checkpoint-pi",
+                "version": "1.2.3",
+                "description": "checkpoint helper",
+                "keywords": ["pi-extension", "checkpoint"],
+                "license": "MIT",
+                "links": { "npm": "https://www.npmjs.com/package/checkpoint-pi" }
+              }
+            }
+          ]
+        }"#;
+
+        let entries = parse_npm_search_entries(body).expect("parse npm search");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.id, "npm/checkpoint-pi");
+        assert_eq!(
+            entry.install_source.as_deref(),
+            Some("npm:checkpoint-pi@1.2.3")
+        );
+        assert!(entry.tags.iter().any(|tag| tag == "checkpoint"));
+    }
+
+    #[test]
+    fn parse_github_search_entries_maps_git_install_sources() {
+        let body = r#"{
+          "items": [
+            {
+              "full_name": "org/pi-cool-ext",
+              "name": "pi-cool-ext",
+              "description": "cool extension",
+              "topics": ["pi-extension", "automation"],
+              "license": { "spdx_id": "Apache-2.0" }
+            }
+          ]
+        }"#;
+
+        let entries = parse_github_search_entries(body).expect("parse github search");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.id, "git/org/pi-cool-ext");
+        assert_eq!(entry.install_source.as_deref(), Some("git:org/pi-cool-ext"));
+        assert!(entry.tags.iter().any(|tag| tag == "automation"));
+        assert!(matches!(
+            entry.source,
+            Some(ExtensionIndexSource::Git { .. })
+        ));
+    }
+
+    #[test]
+    fn merge_entries_preserves_existing_fields_when_incoming_missing() {
+        let existing = vec![ExtensionIndexEntry {
+            id: "npm/checkpoint-pi".to_string(),
+            name: "checkpoint-pi".to_string(),
+            description: Some("existing description".to_string()),
+            tags: vec!["npm".to_string()],
+            license: Some("MIT".to_string()),
+            source: Some(ExtensionIndexSource::Npm {
+                package: "checkpoint-pi".to_string(),
+                version: Some("1.0.0".to_string()),
+                url: None,
+            }),
+            install_source: Some("npm:checkpoint-pi@1.0.0".to_string()),
+        }];
+        let incoming = vec![ExtensionIndexEntry {
+            id: "npm/checkpoint-pi".to_string(),
+            name: "checkpoint-pi".to_string(),
+            description: None,
+            tags: vec!["extension".to_string()],
+            license: None,
+            source: None,
+            install_source: None,
+        }];
+
+        let merged = merge_entries(existing, incoming, Vec::new());
+        assert_eq!(merged.len(), 1);
+        let entry = &merged[0];
+        assert_eq!(entry.description.as_deref(), Some("existing description"));
+        assert_eq!(
+            entry.install_source.as_deref(),
+            Some("npm:checkpoint-pi@1.0.0")
+        );
+        assert!(entry.tags.iter().any(|tag| tag == "npm"));
+        assert!(entry.tags.iter().any(|tag| tag == "extension"));
     }
 }

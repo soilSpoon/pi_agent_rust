@@ -18,6 +18,33 @@ pub struct ModelEntry {
     pub oauth_config: Option<OAuthConfig>,
 }
 
+impl ModelEntry {
+    /// Whether this model supports xhigh thinking level.
+    pub fn supports_xhigh(&self) -> bool {
+        matches!(
+            self.model.id.as_str(),
+            "gpt-5.1-codex-max" | "gpt-5.2" | "gpt-5.2-codex"
+        )
+    }
+
+    /// Clamp a requested thinking level to the model's capabilities.
+    ///
+    /// Non-reasoning models always return `Off`. Models without xhigh support
+    /// downgrade `XHigh` to `High`. All other levels pass through unchanged.
+    pub fn clamp_thinking_level(
+        &self,
+        thinking: crate::model::ThinkingLevel,
+    ) -> crate::model::ThinkingLevel {
+        if !self.model.reasoning {
+            return crate::model::ThinkingLevel::Off;
+        }
+        if thinking == crate::model::ThinkingLevel::XHigh && !self.supports_xhigh() {
+            return crate::model::ThinkingLevel::High;
+        }
+        thinking
+    }
+}
+
 /// OAuth configuration for extension-registered providers.
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
@@ -775,13 +802,12 @@ mod tests {
                 Some("provider-header")
             );
             assert!(entry.auth_header);
-            assert_eq!(
+            assert!(
                 entry
                     .compat
                     .as_ref()
                     .and_then(|c| c.supports_store)
-                    .unwrap_or(false),
-                true
+                    .unwrap_or(false)
             );
         }
     }

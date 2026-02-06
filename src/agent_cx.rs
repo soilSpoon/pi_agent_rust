@@ -214,6 +214,8 @@ mod tests {
     #[test]
     fn agent_cx_is_clone() {
         let cx = AgentCx::for_testing();
-        let _cx2 = cx.clone();
+        let cx2 = cx.clone();
+        let _ = cx.cx();
+        let _ = cx2.cx();
     }
 }

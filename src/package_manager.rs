@@ -9,6 +9,7 @@
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::extension_index::ExtensionIndexStore;
 use crate::extensions::{CompatibilityScanner, load_extension_manifest};
 use asupersync::Cx;
 use asupersync::channel::oneshot;
@@ -110,6 +111,14 @@ pub struct PackageManager {
 impl PackageManager {
     pub const fn new(cwd: PathBuf) -> Self {
         Self { cwd }
+    }
+
+    /// Resolve a shorthand source (`id`/`name`) via the local extension index when possible.
+    ///
+    /// Returns the original source when no unique alias mapping exists.
+    pub fn resolve_install_source_alias(&self, source: &str) -> String {
+        let source = source.trim();
+        resolve_install_source_alias(source, &self.cwd).unwrap_or_else(|| source.to_string())
     }
 
     /// Get a stable identity for a package source, ignoring version/ref.
@@ -2113,8 +2122,34 @@ fn parse_source(source: &str, cwd: &Path) -> ParsedSource {
         return parse_git_source(source, cwd);
     }
 
+    if let Some(resolved) = resolve_install_source_alias(source, cwd) {
+        return parse_source(&resolved, cwd);
+    }
+
     ParsedSource::Local {
         path: resolve_local_path(source, cwd),
+    }
+}
+
+fn resolve_install_source_alias(source: &str, cwd: &Path) -> Option<String> {
+    if source.is_empty() || looks_like_local_path(source) {
+        return None;
+    }
+
+    // Preserve local-path behavior for existing relative paths like `foo/bar`.
+    if resolve_local_path(source, cwd).exists() {
+        return None;
+    }
+
+    match ExtensionIndexStore::default_store().resolve_install_source(source) {
+        Ok(Some(resolved)) if resolved != source => Some(resolved),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::debug!(
+                "failed to resolve install source alias via extension index (using source as-is): {err}"
+            );
+            None
+        }
     }
 }
 
@@ -2655,6 +2690,18 @@ mod tests {
         let identity = manager.package_identity("./foo/../bar");
         let expected_suffix = format!("{}/bar", dir.path().display());
         assert!(identity.ends_with(&expected_suffix), "{identity}");
+    }
+
+    #[test]
+    fn parse_source_prefers_existing_local_paths_over_index_aliases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local = dir.path().join("checkpoint-pi");
+        fs::create_dir_all(&local).expect("create local path");
+
+        match parse_source("checkpoint-pi", dir.path()) {
+            ParsedSource::Local { path } => assert_eq!(path, local),
+            other => panic!("expected local source, got {other:?}"),
+        }
     }
 
     #[test]

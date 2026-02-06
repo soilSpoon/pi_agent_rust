@@ -500,7 +500,9 @@ mod tests {
         // 1000 input tokens at $3/M = $0.003
         // 500 output tokens at $15/M = $0.0075
         let cost = model.calculate_cost(1000, 500, 0, 0);
-        let expected = (3.0 / 1_000_000.0) * 1000.0 + (15.0 / 1_000_000.0) * 500.0;
+        let input_expected = (3.0 / 1_000_000.0) * 1000.0;
+        let output_expected = (15.0 / 1_000_000.0) * 500.0;
+        let expected = input_expected + output_expected;
         assert!(
             (cost - expected).abs() < f64::EPSILON,
             "expected {expected}, got {cost}"
@@ -511,10 +513,12 @@ mod tests {
     fn calculate_cost_with_cache() {
         let model = test_model();
         let cost = model.calculate_cost(1000, 500, 2000, 1000);
-        let expected = (3.0 / 1_000_000.0) * 1000.0
-            + (15.0 / 1_000_000.0) * 500.0
-            + (0.3 / 1_000_000.0) * 2000.0
-            + (3.75 / 1_000_000.0) * 1000.0;
+        let input_expected = (3.0 / 1_000_000.0) * 1000.0;
+        let output_expected = (15.0 / 1_000_000.0) * 500.0;
+        let cache_read_expected = (0.3 / 1_000_000.0) * 2000.0;
+        let cache_write_expected = (3.75 / 1_000_000.0) * 1000.0;
+        let expected =
+            input_expected + output_expected + cache_read_expected + cache_write_expected;
         assert!(
             (cost - expected).abs() < 1e-12,
             "expected {expected}, got {cost}"

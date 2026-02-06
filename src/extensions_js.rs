@@ -246,6 +246,45 @@ fn hostcall_params_hash(method: &str, params: &serde_json::Value) -> String {
     sha256_hex(&json)
 }
 
+fn canonical_exec_params(cmd: &str, payload: &serde_json::Value) -> serde_json::Value {
+    let mut obj = match payload {
+        serde_json::Value::Object(map) => {
+            let mut out = map.clone();
+            out.remove("command");
+            out
+        }
+        serde_json::Value::Null => serde_json::Map::new(),
+        other => {
+            let mut out = serde_json::Map::new();
+            out.insert("payload".to_string(), other.clone());
+            out
+        }
+    };
+
+    obj.insert(
+        "cmd".to_string(),
+        serde_json::Value::String(cmd.to_string()),
+    );
+    serde_json::Value::Object(obj)
+}
+
+fn canonical_op_params(op: &str, payload: &serde_json::Value) -> serde_json::Value {
+    let mut obj = match payload {
+        serde_json::Value::Object(map) => map.clone(),
+        serde_json::Value::Null => serde_json::Map::new(),
+        other => {
+            let mut out = serde_json::Map::new();
+            // Reserved key for non-object args to avoid dropping semantics.
+            out.insert("payload".to_string(), other.clone());
+            out
+        }
+    };
+
+    // Explicit op from hostcall kind always wins.
+    obj.insert("op".to_string(), serde_json::Value::String(op.to_string()));
+    serde_json::Value::Object(obj)
+}
+
 impl HostcallRequest {
     #[must_use]
     pub const fn method(&self) -> &'static str {
@@ -283,36 +322,20 @@ impl HostcallRequest {
     /// - `exec`:  `{ "cmd": <string>, ...payload_fields }`
     /// - `http`:  payload passthrough
     /// - `session/ui/events`:  `{ "op": <string>, ...payload_fields }` (flattened)
+    ///
+    /// For non-object args to `session/ui/events`, payload is preserved under
+    /// a reserved `"payload"` key (e.g. `{ "op": "set_status", "payload": "ready" }`).
     #[must_use]
     pub fn params_for_hash(&self) -> serde_json::Value {
         match &self.kind {
             HostcallKind::Tool { name } => {
                 serde_json::json!({ "name": name, "input": self.payload.clone() })
             }
-            HostcallKind::Exec { cmd } => {
-                let mut obj = match &self.payload {
-                    serde_json::Value::Object(map) => {
-                        let mut m = map.clone();
-                        m.remove("command"); // normalize legacy alias
-                        m
-                    }
-                    _ => serde_json::Map::new(),
-                };
-                obj.insert("cmd".to_string(), serde_json::Value::String(cmd.clone()));
-                serde_json::Value::Object(obj)
-            }
+            HostcallKind::Exec { cmd } => canonical_exec_params(cmd, &self.payload),
             HostcallKind::Http => self.payload.clone(),
             HostcallKind::Session { op }
             | HostcallKind::Ui { op }
-            | HostcallKind::Events { op } => {
-                // Flattened: { "op": "op_name", ...payload_fields }
-                let mut obj = match &self.payload {
-                    serde_json::Value::Object(map) => map.clone(),
-                    _ => serde_json::Map::new(),
-                };
-                obj.insert("op".to_string(), serde_json::Value::String(op.clone()));
-                serde_json::Value::Object(obj)
-            }
+            | HostcallKind::Events { op } => canonical_op_params(op, &self.payload),
         }
     }
 
@@ -2883,43 +2906,235 @@ export function spawn(command, args = [], options = {}) {
   return child;
 }
 
-export function spawnSync() {
-  throw new Error("node:child_process.spawnSync is not available in PiJS; use spawn()");
+function __parseExecSyncResult(raw, command) {
+  const result = JSON.parse(raw);
+  if (result.error) {
+    const err = new Error(`Command failed: ${command}\n${result.error}`);
+    err.status = null;
+    err.stdout = result.stdout || "";
+    err.stderr = result.stderr || "";
+    err.pid = result.pid || 0;
+    err.signal = null;
+    throw err;
+  }
+  if (result.killed) {
+    const err = new Error(`Command timed out: ${command}`);
+    err.killed = true;
+    err.status = result.status;
+    err.stdout = result.stdout || "";
+    err.stderr = result.stderr || "";
+    err.pid = result.pid || 0;
+    err.signal = "SIGTERM";
+    throw err;
+  }
+  return result;
 }
 
-export function execSync() {
-  throw new Error("node:child_process.execSync is not available in PiJS");
+export function spawnSync(command, argsInput, options) {
+  const cmd = String(command ?? "").trim();
+  if (!cmd) {
+    throw new Error("node:child_process.spawnSync: command is required");
+  }
+  const args = Array.isArray(argsInput) ? argsInput.map(String) : [];
+  const opts = (typeof argsInput === "object" && !Array.isArray(argsInput))
+    ? argsInput
+    : (options || {});
+  const cwd = typeof opts.cwd === "string" ? opts.cwd : "";
+  const timeout = typeof opts.timeout === "number" ? opts.timeout : 0;
+
+  let result;
+  try {
+    const raw = __pi_exec_sync_native(cmd, JSON.stringify(args), cwd, timeout);
+    result = JSON.parse(raw);
+  } catch (e) {
+    return {
+      pid: 0,
+      output: [null, "", e.message || ""],
+      stdout: "",
+      stderr: e.message || "",
+      status: null,
+      signal: null,
+      error: e,
+    };
+  }
+
+  if (result.error) {
+    const err = new Error(result.error);
+    return {
+      pid: result.pid || 0,
+      output: [null, result.stdout || "", result.stderr || ""],
+      stdout: result.stdout || "",
+      stderr: result.stderr || "",
+      status: null,
+      signal: null,
+      error: err,
+    };
+  }
+
+  return {
+    pid: result.pid || 0,
+    output: [null, result.stdout || "", result.stderr || ""],
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+    status: result.status ?? 0,
+    signal: result.killed ? "SIGTERM" : null,
+    error: undefined,
+  };
 }
 
-export function exec(_cmd, _opts, callback) {
-  if (typeof callback === "function") {
-    setTimeout(
-      () =>
+export function execSync(command, options) {
+  const cmdStr = String(command ?? "").trim();
+  if (!cmdStr) {
+    throw new Error("node:child_process.execSync: command is required");
+  }
+  const opts = options || {};
+  const cwd = typeof opts.cwd === "string" ? opts.cwd : "";
+  const timeout = typeof opts.timeout === "number" ? opts.timeout : 0;
+  const maxBuffer = typeof opts.maxBuffer === "number" ? opts.maxBuffer : 1024 * 1024;
+
+  // execSync runs through a shell, so pass via sh -c
+  const raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout);
+  const result = __parseExecSyncResult(raw, cmdStr);
+
+  if (result.status !== 0 && result.status !== null) {
+    const err = new Error(
+      `Command failed: ${cmdStr}\n${result.stderr || ""}`,
+    );
+    err.status = result.status;
+    err.stdout = result.stdout || "";
+    err.stderr = result.stderr || "";
+    err.pid = result.pid || 0;
+    err.signal = null;
+    throw err;
+  }
+
+  const stdout = result.stdout || "";
+  if (stdout.length > maxBuffer) {
+    const err = new Error(`stdout maxBuffer length exceeded`);
+    err.stdout = stdout.slice(0, maxBuffer);
+    err.stderr = result.stderr || "";
+    throw err;
+  }
+
+  const encoding = opts.encoding;
+  if (encoding === "buffer" || encoding === null) {
+    // Return a "buffer-like" string (QuickJS doesn't have real Buffer)
+    return stdout;
+  }
+  return stdout;
+}
+
+export function exec(command, optionsOrCallback, callbackArg) {
+  const opts = typeof optionsOrCallback === "object" ? optionsOrCallback : {};
+  const callback = typeof optionsOrCallback === "function"
+    ? optionsOrCallback
+    : callbackArg;
+  const cmdStr = String(command ?? "").trim();
+  const cwd = opts && typeof opts.cwd === "string" ? opts.cwd : undefined;
+
+  // Use pi.exec via shell
+  pi.exec("sh", ["-c", cmdStr], { cwd }).then(
+    (result) => {
+      const stdout = String(result.stdout || "");
+      const stderr = String(result.stderr || "");
+      if (typeof callback === "function") {
+        if (result.code !== 0 && result.code !== undefined && result.code !== null) {
+          const err = new Error(`Command failed: ${cmdStr}`);
+          err.code = result.code;
+          err.killed = Boolean(result.killed);
+          callback(err, stdout, stderr);
+        } else {
+          callback(null, stdout, stderr);
+        }
+      }
+    },
+    (error) => {
+      if (typeof callback === "function") {
         callback(
-          new Error("node:child_process.exec is not available in PiJS"),
+          error instanceof Error ? error : new Error(String(error)),
           "",
           "",
-        ),
-      0,
-    );
-  } else if (typeof _opts === "function") {
-    setTimeout(
-      () =>
-        _opts(new Error("node:child_process.exec is not available in PiJS"), "", ""),
-      0,
-    );
-  }
+        );
+      }
+    },
+  );
 }
 
-export function execFileSync(_file, _args, _opts) {
-  throw new Error("node:child_process.execFileSync is not available in PiJS");
+export function execFileSync(file, argsInput, options) {
+  const fileStr = String(file ?? "").trim();
+  if (!fileStr) {
+    throw new Error("node:child_process.execFileSync: file is required");
+  }
+  const args = Array.isArray(argsInput) ? argsInput.map(String) : [];
+  const opts = (typeof argsInput === "object" && !Array.isArray(argsInput))
+    ? argsInput
+    : (options || {});
+  const cwd = typeof opts.cwd === "string" ? opts.cwd : "";
+  const timeout = typeof opts.timeout === "number" ? opts.timeout : 0;
+
+  const raw = __pi_exec_sync_native(fileStr, JSON.stringify(args), cwd, timeout);
+  const result = __parseExecSyncResult(raw, fileStr);
+
+  if (result.status !== 0 && result.status !== null) {
+    const err = new Error(
+      `Command failed: ${fileStr}\n${result.stderr || ""}`,
+    );
+    err.status = result.status;
+    err.stdout = result.stdout || "";
+    err.stderr = result.stderr || "";
+    err.pid = result.pid || 0;
+    throw err;
+  }
+
+  return result.stdout || "";
 }
 
-export function execFile(_file, _args, _opts, callback) {
-  const cb = typeof _opts === "function" ? _opts : (typeof _args === "function" ? _args : callback);
-  if (typeof cb === "function") {
-    setTimeout(() => cb(new Error("node:child_process.execFile is not available in PiJS"), "", ""), 0);
+export function execFile(file, argsOrOptsOrCb, optsOrCb, callbackArg) {
+  const fileStr = String(file ?? "").trim();
+  let args = [];
+  let opts = {};
+  let callback;
+  if (typeof argsOrOptsOrCb === "function") {
+    callback = argsOrOptsOrCb;
+  } else if (Array.isArray(argsOrOptsOrCb)) {
+    args = argsOrOptsOrCb.map(String);
+    if (typeof optsOrCb === "function") {
+      callback = optsOrCb;
+    } else {
+      opts = optsOrCb || {};
+      callback = callbackArg;
+    }
+  } else if (typeof argsOrOptsOrCb === "object") {
+    opts = argsOrOptsOrCb || {};
+    callback = typeof optsOrCb === "function" ? optsOrCb : callbackArg;
   }
+
+  const cwd = opts && typeof opts.cwd === "string" ? opts.cwd : undefined;
+
+  pi.exec(fileStr, args, { cwd }).then(
+    (result) => {
+      const stdout = String(result.stdout || "");
+      const stderr = String(result.stderr || "");
+      if (typeof callback === "function") {
+        if (result.code !== 0 && result.code !== undefined && result.code !== null) {
+          const err = new Error(`Command failed: ${fileStr}`);
+          err.code = result.code;
+          callback(err, stdout, stderr);
+        } else {
+          callback(null, stdout, stderr);
+        }
+      }
+    },
+    (error) => {
+      if (typeof callback === "function") {
+        callback(
+          error instanceof Error ? error : new Error(String(error)),
+          "",
+          "",
+        );
+      }
+    },
+  );
 }
 
 export function fork(_modulePath, _args, _opts) {
@@ -5025,6 +5240,120 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         std::fs::read_to_string(&path).map_err(|err| {
                             rquickjs::Error::new_loading_message(&path, format!("host read: {err}"))
                         })
+                    }),
+                )?;
+
+                // __pi_exec_sync_native(cmd, args_json, cwd, timeout_ms) -> JSON string
+                // Synchronous subprocess execution for node:child_process execSync/spawnSync.
+                // Runs std::process::Command directly (no hostcall queue).
+                global.set(
+                    "__pi_exec_sync_native",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        move |_ctx: Ctx<'_>,
+                              cmd: String,
+                              args_json: String,
+                              cwd: Opt<String>,
+                              timeout_ms: Opt<f64>|
+                              -> rquickjs::Result<String> {
+                            use std::io::Read as _;
+                            use std::process::{Command, Stdio};
+                            use std::time::{Duration, Instant};
+
+                            tracing::debug!(
+                                event = "pijs.exec_sync",
+                                cmd = %cmd,
+                                "exec_sync"
+                            );
+
+                            let args: Vec<String> =
+                                serde_json::from_str(&args_json).unwrap_or_default();
+
+                            let working_dir = cwd
+                                .0
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| process_cwd.clone());
+
+                            let timeout = timeout_ms
+                                .0
+                                .filter(|ms| ms.is_finite() && *ms > 0.0)
+                                .map(|ms| Duration::from_secs_f64(ms / 1000.0));
+
+                            let result: std::result::Result<serde_json::Value, String> = (|| {
+                                let mut command = Command::new(&cmd);
+                                command
+                                    .args(&args)
+                                    .current_dir(&working_dir)
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::piped())
+                                    .stderr(Stdio::piped());
+
+                                let mut child = command.spawn().map_err(|e| e.to_string())?;
+                                let pid = child.id();
+
+                                let mut stdout_pipe =
+                                    child.stdout.take().ok_or("Missing stdout pipe")?;
+                                let mut stderr_pipe =
+                                    child.stderr.take().ok_or("Missing stderr pipe")?;
+
+                                let stdout_handle = std::thread::spawn(move || {
+                                    let mut buf = Vec::new();
+                                    let _ = stdout_pipe.read_to_end(&mut buf);
+                                    buf
+                                });
+                                let stderr_handle = std::thread::spawn(move || {
+                                    let mut buf = Vec::new();
+                                    let _ = stderr_pipe.read_to_end(&mut buf);
+                                    buf
+                                });
+
+                                let start = Instant::now();
+                                let mut killed = false;
+                                let status = loop {
+                                    if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+                                        break st;
+                                    }
+                                    if let Some(t) = timeout {
+                                        if start.elapsed() >= t {
+                                            killed = true;
+                                            crate::tools::kill_process_tree(Some(pid));
+                                            let _ = child.kill();
+                                            break child.wait().map_err(|e| e.to_string())?;
+                                        }
+                                    }
+                                    std::thread::sleep(Duration::from_millis(5));
+                                };
+
+                                let stdout_bytes = stdout_handle.join().unwrap_or_default();
+                                let stderr_bytes = stderr_handle.join().unwrap_or_default();
+
+                                let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+                                let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+                                let code = status.code();
+
+                                Ok(serde_json::json!({
+                                    "stdout": stdout,
+                                    "stderr": stderr,
+                                    "status": code,
+                                    "killed": killed,
+                                    "pid": pid,
+                                }))
+                            })(
+                            );
+
+                            let json = match result {
+                                Ok(v) => v,
+                                Err(e) => serde_json::json!({
+                                    "stdout": "",
+                                    "stderr": "",
+                                    "status": null,
+                                    "error": e,
+                                    "killed": false,
+                                    "pid": 0,
+                                }),
+                            };
+                            Ok(json.to_string())
+                        }
                     }),
                 )?;
 
@@ -7706,6 +8035,152 @@ mod tests {
     }
 
     #[test]
+    fn hostcall_request_params_for_hash_uses_canonical_shapes() {
+        let cases = vec![
+            (
+                HostcallRequest {
+                    call_id: "tool-case".to_string(),
+                    kind: HostcallKind::Tool {
+                        name: "read".to_string(),
+                    },
+                    payload: serde_json::json!({ "path": "README.md" }),
+                    trace_id: 0,
+                    extension_id: None,
+                },
+                serde_json::json!({ "name": "read", "input": { "path": "README.md" } }),
+            ),
+            (
+                HostcallRequest {
+                    call_id: "exec-case".to_string(),
+                    kind: HostcallKind::Exec {
+                        cmd: "echo".to_string(),
+                    },
+                    payload: serde_json::json!({
+                        "command": "legacy alias should be dropped",
+                        "args": ["hello"],
+                        "options": { "timeout": 1000 }
+                    }),
+                    trace_id: 0,
+                    extension_id: None,
+                },
+                serde_json::json!({
+                    "cmd": "echo",
+                    "args": ["hello"],
+                    "options": { "timeout": 1000 }
+                }),
+            ),
+            (
+                HostcallRequest {
+                    call_id: "session-object".to_string(),
+                    kind: HostcallKind::Session {
+                        op: "set_model".to_string(),
+                    },
+                    payload: serde_json::json!({
+                        "provider": "openai",
+                        "modelId": "gpt-4o"
+                    }),
+                    trace_id: 0,
+                    extension_id: None,
+                },
+                serde_json::json!({
+                    "op": "set_model",
+                    "provider": "openai",
+                    "modelId": "gpt-4o"
+                }),
+            ),
+            (
+                HostcallRequest {
+                    call_id: "ui-non-object".to_string(),
+                    kind: HostcallKind::Ui {
+                        op: "set_status".to_string(),
+                    },
+                    payload: serde_json::json!("ready"),
+                    trace_id: 0,
+                    extension_id: None,
+                },
+                serde_json::json!({ "op": "set_status", "payload": "ready" }),
+            ),
+            (
+                HostcallRequest {
+                    call_id: "events-non-object".to_string(),
+                    kind: HostcallKind::Events {
+                        op: "emit".to_string(),
+                    },
+                    payload: serde_json::json!(42),
+                    trace_id: 0,
+                    extension_id: None,
+                },
+                serde_json::json!({ "op": "emit", "payload": 42 }),
+            ),
+            (
+                HostcallRequest {
+                    call_id: "session-null".to_string(),
+                    kind: HostcallKind::Session {
+                        op: "get_state".to_string(),
+                    },
+                    payload: serde_json::Value::Null,
+                    trace_id: 0,
+                    extension_id: None,
+                },
+                serde_json::json!({ "op": "get_state" }),
+            ),
+        ];
+
+        for (request, expected) in cases {
+            assert_eq!(
+                request.params_for_hash(),
+                expected,
+                "canonical params mismatch for {}",
+                request.call_id
+            );
+        }
+    }
+
+    #[test]
+    fn hostcall_request_params_hash_matches_wasm_contract_for_canonical_requests() {
+        let requests = vec![
+            HostcallRequest {
+                call_id: "hash-session".to_string(),
+                kind: HostcallKind::Session {
+                    op: "set_model".to_string(),
+                },
+                payload: serde_json::json!({
+                    "modelId": "gpt-4o",
+                    "provider": "openai"
+                }),
+                trace_id: 0,
+                extension_id: Some("ext.test".to_string()),
+            },
+            HostcallRequest {
+                call_id: "hash-ui".to_string(),
+                kind: HostcallKind::Ui {
+                    op: "set_status".to_string(),
+                },
+                payload: serde_json::json!("thinking"),
+                trace_id: 0,
+                extension_id: Some("ext.test".to_string()),
+            },
+        ];
+
+        for request in requests {
+            let params = request.params_for_hash();
+            let js_hash = request.params_hash();
+
+            let canonical = canonicalize_json(
+                &serde_json::json!({ "method": request.method(), "params": params }),
+            );
+            let encoded = serde_json::to_string(&canonical).expect("serialize canonical request");
+            let wasm_contract_hash = sha256_hex(&encoded);
+
+            assert_eq!(
+                js_hash, wasm_contract_hash,
+                "hash parity mismatch for {}",
+                request.call_id
+            );
+        }
+    }
+
+    #[test]
     fn pijs_runtime_multiple_hostcalls() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
@@ -10341,6 +10816,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn pijs_stream_concurrent_exec_calls_have_independent_lifecycle() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
@@ -10509,6 +10985,387 @@ mod tests {
 
             let result = get_global_json(&runtime, "result").await;
             assert_eq!(result["content"], serde_json::json!("done"));
+        });
+    }
+
+    // ── node:child_process sync tests ──────────────────────────────────
+
+    #[test]
+    fn pijs_exec_sync_runs_command_and_returns_stdout() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.syncResult = {};
+                    import('node:child_process').then(({ execSync }) => {
+                        try {
+                            const output = execSync('echo hello-sync');
+                            globalThis.syncResult.stdout = output.trim();
+                            globalThis.syncResult.done = true;
+                        } catch (e) {
+                            globalThis.syncResult.error = String(e);
+                            globalThis.syncResult.stack = e.stack || '';
+                            globalThis.syncResult.done = false;
+                        }
+                    }).catch(e => {
+                        globalThis.syncResult.promiseError = String(e);
+                    });
+                    ",
+                )
+                .await
+                .expect("eval execSync test");
+
+            let r = get_global_json(&runtime, "syncResult").await;
+            assert!(
+                r["done"] == serde_json::json!(true),
+                "execSync test failed: error={}, stack={}, promiseError={}",
+                r["error"],
+                r["stack"],
+                r["promiseError"]
+            );
+            assert_eq!(r["stdout"], serde_json::json!("hello-sync"));
+        });
+    }
+
+    #[test]
+    fn pijs_exec_sync_throws_on_nonzero_exit() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.syncErr = {};
+                    import('node:child_process').then(({ execSync }) => {
+                        try {
+                            execSync('exit 42');
+                            globalThis.syncErr.threw = false;
+                        } catch (e) {
+                            globalThis.syncErr.threw = true;
+                            globalThis.syncErr.status = e.status;
+                            globalThis.syncErr.hasStderr = typeof e.stderr === 'string';
+                        }
+                        globalThis.syncErr.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval execSync nonzero");
+
+            let r = get_global_json(&runtime, "syncErr").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["threw"], serde_json::json!(true));
+            // Status is a JS number (always f64 in QuickJS), so compare as f64
+            assert_eq!(r["status"].as_f64(), Some(42.0));
+            assert_eq!(r["hasStderr"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_exec_sync_empty_command_throws() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.emptyResult = {};
+                    import('node:child_process').then(({ execSync }) => {
+                        try {
+                            execSync('');
+                            globalThis.emptyResult.threw = false;
+                        } catch (e) {
+                            globalThis.emptyResult.threw = true;
+                            globalThis.emptyResult.msg = e.message;
+                        }
+                        globalThis.emptyResult.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval execSync empty");
+
+            let r = get_global_json(&runtime, "emptyResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["threw"], serde_json::json!(true));
+            assert!(
+                r["msg"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("command is required")
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_spawn_sync_returns_result_object() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.spawnSyncResult = {};
+                    import('node:child_process').then(({ spawnSync }) => {
+                        const r = spawnSync('echo', ['spawn-test']);
+                        globalThis.spawnSyncResult.stdout = r.stdout.trim();
+                        globalThis.spawnSyncResult.status = r.status;
+                        globalThis.spawnSyncResult.hasOutput = Array.isArray(r.output);
+                        globalThis.spawnSyncResult.noError = r.error === undefined;
+                        globalThis.spawnSyncResult.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval spawnSync test");
+
+            let r = get_global_json(&runtime, "spawnSyncResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["stdout"], serde_json::json!("spawn-test"));
+            assert_eq!(r["status"], serde_json::json!(0));
+            assert_eq!(r["hasOutput"], serde_json::json!(true));
+            assert_eq!(r["noError"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_spawn_sync_captures_nonzero_exit() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.spawnSyncFail = {};
+                    import('node:child_process').then(({ spawnSync }) => {
+                        const r = spawnSync('sh', ['-c', 'exit 7']);
+                        globalThis.spawnSyncFail.status = r.status;
+                        globalThis.spawnSyncFail.signal = r.signal;
+                        globalThis.spawnSyncFail.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval spawnSync fail");
+
+            let r = get_global_json(&runtime, "spawnSyncFail").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["status"], serde_json::json!(7));
+            assert_eq!(r["signal"], serde_json::json!(null));
+        });
+    }
+
+    #[test]
+    fn pijs_spawn_sync_bad_command_returns_error() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.badCmd = {};
+                    import('node:child_process').then(({ spawnSync }) => {
+                        const r = spawnSync('__nonexistent_binary_xyzzy__');
+                        globalThis.badCmd.hasError = r.error !== undefined;
+                        globalThis.badCmd.statusNull = r.status === null;
+                        globalThis.badCmd.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval spawnSync bad cmd");
+
+            let r = get_global_json(&runtime, "badCmd").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["hasError"], serde_json::json!(true));
+            assert_eq!(r["statusNull"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_exec_file_sync_runs_binary_directly() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.execFileResult = {};
+                    import('node:child_process').then(({ execFileSync }) => {
+                        const output = execFileSync('echo', ['file-sync-test']);
+                        globalThis.execFileResult.stdout = output.trim();
+                        globalThis.execFileResult.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval execFileSync test");
+
+            let r = get_global_json(&runtime, "execFileResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["stdout"], serde_json::json!("file-sync-test"));
+        });
+    }
+
+    #[test]
+    fn pijs_exec_sync_captures_stderr() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.stderrResult = {};
+                    import('node:child_process').then(({ execSync }) => {
+                        try {
+                            execSync('echo err-msg >&2 && exit 1');
+                            globalThis.stderrResult.threw = false;
+                        } catch (e) {
+                            globalThis.stderrResult.threw = true;
+                            globalThis.stderrResult.stderr = e.stderr.trim();
+                        }
+                        globalThis.stderrResult.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval execSync stderr");
+
+            let r = get_global_json(&runtime, "stderrResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["threw"], serde_json::json!(true));
+            assert_eq!(r["stderr"], serde_json::json!("err-msg"));
+        });
+    }
+
+    #[test]
+    fn pijs_exec_sync_with_cwd_option() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.cwdResult = {};
+                    import('node:child_process').then(({ execSync }) => {
+                        const output = execSync('pwd', { cwd: '/tmp' });
+                        globalThis.cwdResult.dir = output.trim();
+                        globalThis.cwdResult.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval execSync cwd");
+
+            let r = get_global_json(&runtime, "cwdResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            // /tmp may resolve to /private/tmp on macOS
+            let dir = r["dir"].as_str().unwrap_or("");
+            assert!(
+                dir == "/tmp" || dir.ends_with("/tmp"),
+                "expected /tmp, got: {dir}"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_spawn_sync_empty_command_throws() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.emptySpawn = {};
+                    import('node:child_process').then(({ spawnSync }) => {
+                        try {
+                            spawnSync('');
+                            globalThis.emptySpawn.threw = false;
+                        } catch (e) {
+                            globalThis.emptySpawn.threw = true;
+                            globalThis.emptySpawn.msg = e.message;
+                        }
+                        globalThis.emptySpawn.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval spawnSync empty");
+
+            let r = get_global_json(&runtime, "emptySpawn").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["threw"], serde_json::json!(true));
+            assert!(
+                r["msg"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("command is required")
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_spawn_sync_options_as_second_arg() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            // spawnSync(cmd, options) with no args array — options is 2nd param
+            runtime
+                .eval(
+                    r"
+                    globalThis.optsResult = {};
+                    import('node:child_process').then(({ spawnSync }) => {
+                        const r = spawnSync('pwd', { cwd: '/tmp' });
+                        globalThis.optsResult.stdout = r.stdout.trim();
+                        globalThis.optsResult.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval spawnSync opts as 2nd arg");
+
+            let r = get_global_json(&runtime, "optsResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            let stdout = r["stdout"].as_str().unwrap_or("");
+            assert!(
+                stdout == "/tmp" || stdout.ends_with("/tmp"),
+                "expected /tmp, got: {stdout}"
+            );
         });
     }
 }

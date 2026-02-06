@@ -270,6 +270,50 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
 
+    async fn setup_js_tool(
+        source: &str,
+        tool_name: &str,
+    ) -> (
+        tempfile::TempDir,
+        ExtensionManager,
+        JsExtensionRuntimeHandle,
+        ExtensionToolDef,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let entry_path = temp_dir.path().join("ext.mjs");
+        std::fs::write(&entry_path, source).expect("write extension entry");
+
+        let manager = ExtensionManager::new();
+        let tools = Arc::new(ToolRegistry::new(&[], temp_dir.path(), None));
+        let js_runtime = JsExtensionRuntimeHandle::start(
+            PiJsRuntimeConfig {
+                cwd: temp_dir.path().display().to_string(),
+                ..Default::default()
+            },
+            Arc::clone(&tools),
+            manager.clone(),
+        )
+        .await
+        .expect("start js runtime");
+        manager.set_js_runtime(js_runtime.clone());
+
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("spec");
+        manager
+            .load_js_extensions(vec![spec])
+            .await
+            .expect("load js extensions");
+
+        let def = js_runtime
+            .get_registered_tools()
+            .await
+            .expect("get registered tools")
+            .into_iter()
+            .find(|tool| tool.name == tool_name)
+            .expect("tool registered");
+
+        (temp_dir, manager, js_runtime, def)
+    }
+
     #[test]
     fn extension_tool_wrapper_executes_registered_tool() {
         let runtime = RuntimeBuilder::current_thread()
@@ -361,6 +405,87 @@ mod tests {
                 details.get("cwd").and_then(Value::as_str),
                 Some(cwd.as_str())
             );
+        });
+    }
+
+    #[test]
+    fn extension_tool_wrapper_metadata_and_timeout_clamp() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "meta_tool",
+                    label: "Meta Tool",
+                    description: "metadata test tool",
+                    parameters: { type: "object", properties: { x: { type: "number" } } },
+                    execute: async (_callId, _input, _onUpdate, _abort, _ctx) => ({
+                      content: [{ type: "text", text: "ok" }],
+                      isError: false
+                    })
+                  });
+                }
+                "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "meta_tool").await;
+
+            let wrapper = ExtensionToolWrapper::new(def.clone(), js_runtime.clone())
+                .with_timeout_ms(0)
+                .with_ctx_payload(json!({"cwd": "/tmp"}));
+            assert_eq!(wrapper.timeout_ms, 1);
+            assert_eq!(wrapper.name(), "meta_tool");
+            assert_eq!(wrapper.label(), "Meta Tool");
+            assert_eq!(wrapper.description(), "metadata test tool");
+            assert_eq!(
+                wrapper.parameters(),
+                json!({ "type": "object", "properties": { "x": { "type": "number" } } })
+            );
+
+            let mut no_label = def;
+            no_label.label = None;
+            let fallback = ExtensionToolWrapper::new(no_label, js_runtime).with_timeout_ms(25);
+            assert_eq!(fallback.timeout_ms, 25);
+            assert_eq!(fallback.label(), "meta_tool");
+        });
+    }
+
+    #[test]
+    fn extension_tool_wrapper_maps_invalid_output_to_tool_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "broken_tool",
+                    label: "broken_tool",
+                    description: "returns invalid output payload",
+                    parameters: { type: "object", properties: {} },
+                    execute: async (_callId, _input, _onUpdate, _abort, _ctx) => ({
+                      nope: true
+                    })
+                  });
+                }
+                "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "broken_tool").await;
+
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime);
+            let err = wrapper
+                .execute("call-1", json!({}), None)
+                .await
+                .expect_err("invalid tool output should fail");
+
+            match err {
+                Error::Tool { tool, message } => {
+                    assert_eq!(tool, "broken_tool");
+                    assert!(message.contains("Invalid extension tool output"));
+                }
+                other => panic!("expected tool error, got {other:?}"),
+            }
         });
     }
 

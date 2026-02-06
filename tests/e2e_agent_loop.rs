@@ -49,7 +49,7 @@ struct ScriptedProvider {
 }
 
 impl ScriptedProvider {
-    fn new(scenario: Scenario) -> Self {
+    const fn new(scenario: Scenario) -> Self {
         Self {
             scenario,
             stream_calls: AtomicUsize::new(0),
@@ -106,6 +106,7 @@ impl ScriptedProvider {
 
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
+#[allow(clippy::too_many_lines)]
 impl Provider for ScriptedProvider {
     fn name(&self) -> &str {
         "scripted-provider"
@@ -167,7 +168,7 @@ impl Provider for ScriptedProvider {
                     else {
                         return Err(Error::api("tool_round_trip expected read-1 tool result"));
                     };
-                    let content = result
+                    let response_content = result
                         .content
                         .iter()
                         .filter_map(|block| match block {
@@ -175,7 +176,7 @@ impl Provider for ScriptedProvider {
                             _ => None,
                         })
                         .collect::<String>();
-                    if !content.contains(expected_fragment) {
+                    if !response_content.contains(expected_fragment) {
                         return Err(Error::api("tool_round_trip missing expected read output"));
                     }
                     return Ok(self.stream_done(self.assistant_message(
@@ -377,7 +378,7 @@ struct RunOutcome {
     total_tokens: u64,
 }
 
-fn event_label(event: &AgentEvent) -> &'static str {
+const fn event_label(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::AgentStart { .. } => "agent_start",
         AgentEvent::AgentEnd { .. } => "agent_end",
@@ -403,7 +404,7 @@ fn assistant_text(message: &AssistantMessage) -> String {
         .collect::<String>()
 }
 
-fn tool_names() -> [&'static str; 7] {
+const fn tool_names() -> [&'static str; 7] {
     ["read", "write", "edit", "bash", "grep", "find", "ls"]
 }
 
@@ -510,6 +511,7 @@ fn run_scenario(
                     "event": event_label(&event),
                     "elapsedMs": elapsed_ms,
                 }));
+                drop(guard);
             })
             .await
             .expect("run agent scenario");

@@ -94,13 +94,7 @@ impl RpcStateSnapshot {
     }
 }
 
-fn parse_queue_mode(mode: Option<&str>) -> Option<QueueMode> {
-    match mode.map(str::trim) {
-        Some("all") => Some(QueueMode::All),
-        Some("one-at-a-time") => Some(QueueMode::OneAtATime),
-        _ => None,
-    }
-}
+use crate::config::parse_queue_mode;
 
 fn parse_streaming_behavior(value: Option<&Value>) -> Result<Option<StreamingBehavior>> {
     let Some(value) = value else {
@@ -779,7 +773,7 @@ pub async fn run(
                         .stream_options()
                         .thinking_level
                         .unwrap_or_default();
-                    let clamped = clamp_thinking_level(current_thinking, &entry);
+                    let clamped = entry.clamp_thinking_level(current_thinking);
                     if clamped != current_thinking {
                         apply_thinking_level(&mut guard, clamped).await?;
                     }
@@ -845,7 +839,7 @@ pub async fn run(
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
                         current_model_entry(&inner_session, &options)
-                            .map_or(level, |entry| clamp_thinking_level(level, entry))
+                            .map_or(level, |entry| entry.clamp_thinking_level(level))
                     };
                     if let Err(err) = apply_thinking_level(&mut guard, level).await {
                         let _ = out_tx.send(response_error_with_hints(
@@ -2859,23 +2853,6 @@ fn current_model_entry<'a>(
         .find(|m| m.model.provider == provider && m.model.id == model_id)
 }
 
-fn clamp_thinking_level(
-    thinking: crate::model::ThinkingLevel,
-    model_entry: &ModelEntry,
-) -> crate::model::ThinkingLevel {
-    if !model_entry.model.reasoning {
-        return crate::model::ThinkingLevel::Off;
-    }
-    if thinking == crate::model::ThinkingLevel::XHigh && !supports_xhigh(&model_entry.model.id) {
-        return crate::model::ThinkingLevel::High;
-    }
-    thinking
-}
-
-fn supports_xhigh(model_id: &str) -> bool {
-    matches!(model_id, "gpt-5.1-codex-max" | "gpt-5.2" | "gpt-5.2-codex")
-}
-
 async fn apply_thinking_level(
     guard: &mut AgentSession,
     level: crate::model::ThinkingLevel,
@@ -3030,7 +3007,7 @@ fn available_thinking_levels(entry: &ModelEntry) -> Vec<crate::model::ThinkingLe
             ThinkingLevel::Medium,
             ThinkingLevel::High,
         ];
-        if supports_xhigh(&entry.model.id) {
+        if entry.supports_xhigh() {
             levels.push(ThinkingLevel::XHigh);
         }
         levels
@@ -3119,7 +3096,7 @@ async fn cycle_model_for_rpc(
             .unwrap_or_default()
     };
 
-    let next_thinking = clamp_thinking_level(desired_thinking, &next_entry);
+    let next_thinking = next_entry.clamp_thinking_level(desired_thinking);
     apply_thinking_level(guard, next_thinking).await?;
 
     Ok(Some((next_entry, next_thinking, is_scoped)))
@@ -3634,23 +3611,23 @@ mod tests {
 
     #[test]
     fn supports_xhigh_known_models() {
-        assert!(supports_xhigh("gpt-5.1-codex-max"));
-        assert!(supports_xhigh("gpt-5.2"));
-        assert!(supports_xhigh("gpt-5.2-codex"));
+        assert!(dummy_entry("gpt-5.1-codex-max", true).supports_xhigh());
+        assert!(dummy_entry("gpt-5.2", true).supports_xhigh());
+        assert!(dummy_entry("gpt-5.2-codex", true).supports_xhigh());
     }
 
     #[test]
     fn supports_xhigh_unknown_models() {
-        assert!(!supports_xhigh("claude-opus-4-6"));
-        assert!(!supports_xhigh("gpt-4o"));
-        assert!(!supports_xhigh(""));
+        assert!(!dummy_entry("claude-opus-4-6", true).supports_xhigh());
+        assert!(!dummy_entry("gpt-4o", true).supports_xhigh());
+        assert!(!dummy_entry("", true).supports_xhigh());
     }
 
     #[test]
     fn clamp_thinking_non_reasoning_model() {
         let entry = dummy_entry("claude-3-haiku", false);
         assert_eq!(
-            clamp_thinking_level(ThinkingLevel::High, &entry),
+            entry.clamp_thinking_level(ThinkingLevel::High),
             ThinkingLevel::Off
         );
     }
@@ -3659,7 +3636,7 @@ mod tests {
     fn clamp_thinking_xhigh_without_support() {
         let entry = dummy_entry("claude-opus-4-6", true);
         assert_eq!(
-            clamp_thinking_level(ThinkingLevel::XHigh, &entry),
+            entry.clamp_thinking_level(ThinkingLevel::XHigh),
             ThinkingLevel::High
         );
     }
@@ -3668,7 +3645,7 @@ mod tests {
     fn clamp_thinking_xhigh_with_support() {
         let entry = dummy_entry("gpt-5.2", true);
         assert_eq!(
-            clamp_thinking_level(ThinkingLevel::XHigh, &entry),
+            entry.clamp_thinking_level(ThinkingLevel::XHigh),
             ThinkingLevel::XHigh
         );
     }
@@ -3677,7 +3654,7 @@ mod tests {
     fn clamp_thinking_normal_level_passthrough() {
         let entry = dummy_entry("claude-opus-4-6", true);
         assert_eq!(
-            clamp_thinking_level(ThinkingLevel::Medium, &entry),
+            entry.clamp_thinking_level(ThinkingLevel::Medium),
             ThinkingLevel::Medium
         );
     }

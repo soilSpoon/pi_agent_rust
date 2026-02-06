@@ -1,7 +1,5 @@
 pub mod client;
-pub mod sse {
-    pub use crate::sse::{SseEvent, SseParser, SseStream};
-}
+pub mod sse;
 
 // Test modules - only compile when asupersync is working
 // #[cfg(test)]

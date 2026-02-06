@@ -11583,13 +11583,12 @@ mod tests {
 
     #[test]
     fn split_content_blocks_text_and_images() {
-        let img = crate::model::ImageContent {
-            data: "base64data".to_string(),
-            mime_type: "image/png".to_string(),
-        };
         let blocks = vec![
             ContentBlock::Text(TextContent::new("hello")),
-            ContentBlock::Image(img.clone()),
+            ContentBlock::Image(crate::model::ImageContent {
+                data: "base64data".to_string(),
+                mime_type: "image/png".to_string(),
+            }),
             ContentBlock::Thinking(crate::model::ThinkingContent {
                 thinking: "ignored".to_string(),
                 thinking_signature: None,

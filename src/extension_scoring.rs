@@ -764,3 +764,975 @@ fn build_histogram(items: &[ScoredCandidate]) -> Vec<ScoreHistogramBucket> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn empty_signals() -> Signals {
+        Signals::default()
+    }
+
+    fn empty_tags() -> Tags {
+        Tags::default()
+    }
+
+    fn minimal_candidate(id: &str) -> CandidateInput {
+        CandidateInput {
+            id: id.to_string(),
+            name: None,
+            source_tier: None,
+            signals: Signals::default(),
+            tags: Tags::default(),
+            recency: Recency::default(),
+            compat: Compatibility::default(),
+            license: LicenseInfo::default(),
+            gates: Gates::default(),
+            risk: RiskInfo::default(),
+            manual_override: None,
+        }
+    }
+
+    // =========================================================================
+    // score_github_stars
+    // =========================================================================
+
+    #[test]
+    fn github_stars_none_returns_zero_and_records_missing() {
+        let mut missing = BTreeSet::new();
+        let signals = empty_signals();
+        assert_eq!(score_github_stars(&signals, &mut missing), 0);
+        assert!(missing.contains("signals.github_stars"));
+    }
+
+    #[test]
+    fn github_stars_tiers() {
+        let cases = [
+            (0, 0),
+            (49, 0),
+            (50, 2),
+            (199, 2),
+            (200, 4),
+            (499, 4),
+            (500, 6),
+            (999, 6),
+            (1_000, 8),
+            (1_999, 8),
+            (2_000, 9),
+            (4_999, 9),
+            (5_000, 10),
+            (100_000, 10),
+        ];
+        for (stars, expected) in cases {
+            let mut missing = BTreeSet::new();
+            let signals = Signals {
+                github_stars: Some(stars),
+                ..Default::default()
+            };
+            assert_eq!(
+                score_github_stars(&signals, &mut missing),
+                expected,
+                "stars={stars}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // score_npm_downloads
+    // =========================================================================
+
+    #[test]
+    fn npm_downloads_none_returns_zero() {
+        let mut missing = BTreeSet::new();
+        assert_eq!(score_npm_downloads(&empty_signals(), &mut missing), 0);
+        assert!(missing.contains("signals.npm_downloads_month"));
+    }
+
+    #[test]
+    fn npm_downloads_tiers() {
+        let cases = [
+            (0, 0),
+            (499, 0),
+            (500, 2),
+            (2_000, 4),
+            (10_000, 6),
+            (50_000, 8),
+        ];
+        for (dl, expected) in cases {
+            let mut missing = BTreeSet::new();
+            let signals = Signals {
+                npm_downloads_month: Some(dl),
+                ..Default::default()
+            };
+            assert_eq!(
+                score_npm_downloads(&signals, &mut missing),
+                expected,
+                "downloads={dl}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // score_marketplace_installs
+    // =========================================================================
+
+    #[test]
+    fn marketplace_installs_no_marketplace_records_missing() {
+        let mut missing = BTreeSet::new();
+        assert_eq!(
+            score_marketplace_installs(&empty_signals(), &mut missing),
+            0
+        );
+        assert!(missing.contains("signals.marketplace.installs_month"));
+    }
+
+    #[test]
+    fn marketplace_installs_none_records_missing() {
+        let mut missing = BTreeSet::new();
+        let signals = Signals {
+            marketplace: Some(MarketplaceSignals::default()),
+            ..Default::default()
+        };
+        assert_eq!(score_marketplace_installs(&signals, &mut missing), 0);
+        assert!(missing.contains("signals.marketplace.installs_month"));
+    }
+
+    #[test]
+    fn marketplace_installs_tiers() {
+        let cases = [(0, 0), (99, 0), (100, 1), (500, 2), (2_000, 4), (10_000, 5)];
+        for (installs, expected) in cases {
+            let mut missing = BTreeSet::new();
+            let signals = Signals {
+                marketplace: Some(MarketplaceSignals {
+                    installs_month: Some(installs),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                score_marketplace_installs(&signals, &mut missing),
+                expected,
+                "installs={installs}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // score_forks
+    // =========================================================================
+
+    #[test]
+    fn forks_none_returns_zero() {
+        let mut missing = BTreeSet::new();
+        assert_eq!(score_forks(&empty_signals(), &mut missing), 0);
+        assert!(missing.contains("signals.github_forks"));
+    }
+
+    #[test]
+    fn forks_tiers() {
+        let cases = [(0, 0), (49, 0), (50, 1), (200, 1), (500, 2), (10_000, 2)];
+        for (f, expected) in cases {
+            let mut missing = BTreeSet::new();
+            let signals = Signals {
+                github_forks: Some(f),
+                ..Default::default()
+            };
+            assert_eq!(score_forks(&signals, &mut missing), expected, "forks={f}");
+        }
+    }
+
+    // =========================================================================
+    // score_references
+    // =========================================================================
+
+    #[test]
+    fn references_empty() {
+        let signals = empty_signals();
+        assert_eq!(score_references(&signals), 0);
+    }
+
+    #[test]
+    fn references_deduplicates_trimmed() {
+        let signals = Signals {
+            references: vec![" ref1 ".to_string(), "ref1".to_string(), "ref2".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(score_references(&signals), 2); // 2 unique => score 2
+    }
+
+    #[test]
+    fn references_tiers() {
+        let make = |n: usize| -> Signals {
+            Signals {
+                references: (0..n).map(|i| format!("ref-{i}")).collect(),
+                ..Default::default()
+            }
+        };
+        assert_eq!(score_references(&make(1)), 0);
+        assert_eq!(score_references(&make(2)), 2);
+        assert_eq!(score_references(&make(5)), 3);
+        assert_eq!(score_references(&make(10)), 4);
+        assert_eq!(score_references(&make(20)), 4);
+    }
+
+    #[test]
+    fn references_ignores_empty_and_whitespace() {
+        let signals = Signals {
+            references: vec![String::new(), "  ".to_string(), "real".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(score_references(&signals), 0); // 1 unique => 0
+    }
+
+    // =========================================================================
+    // score_official_visibility
+    // =========================================================================
+
+    #[test]
+    fn official_visibility_all_none_records_missing() {
+        let mut missing = BTreeSet::new();
+        assert_eq!(score_official_visibility(&empty_signals(), &mut missing), 0);
+        assert!(missing.contains("signals.official_visibility"));
+    }
+
+    #[test]
+    fn official_visibility_listing_highest() {
+        let mut missing = BTreeSet::new();
+        let signals = Signals {
+            official_listing: Some(true),
+            pi_mono_example: Some(true),
+            badlogic_gist: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(score_official_visibility(&signals, &mut missing), 10);
+    }
+
+    #[test]
+    fn official_visibility_example_mid() {
+        let mut missing = BTreeSet::new();
+        let signals = Signals {
+            pi_mono_example: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(score_official_visibility(&signals, &mut missing), 8);
+    }
+
+    #[test]
+    fn official_visibility_gist_lowest() {
+        let mut missing = BTreeSet::new();
+        let signals = Signals {
+            badlogic_gist: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(score_official_visibility(&signals, &mut missing), 6);
+    }
+
+    // =========================================================================
+    // score_marketplace_visibility
+    // =========================================================================
+
+    #[test]
+    fn marketplace_visibility_no_marketplace() {
+        let mut missing = BTreeSet::new();
+        assert_eq!(
+            score_marketplace_visibility(&empty_signals(), &mut missing),
+            0
+        );
+        assert!(missing.contains("signals.marketplace.rank"));
+        assert!(missing.contains("signals.marketplace.featured"));
+    }
+
+    #[test]
+    fn marketplace_visibility_rank_tiers() {
+        let cases = [
+            (5, 6),
+            (10, 6),
+            (30, 4),
+            (50, 4),
+            (80, 2),
+            (100, 2),
+            (200, 0),
+        ];
+        for (rank, expected) in cases {
+            let mut missing = BTreeSet::new();
+            let signals = Signals {
+                marketplace: Some(MarketplaceSignals {
+                    rank: Some(rank),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                score_marketplace_visibility(&signals, &mut missing),
+                expected,
+                "rank={rank}"
+            );
+        }
+    }
+
+    #[test]
+    fn marketplace_visibility_featured_adds_2_capped_at_6() {
+        let mut missing = BTreeSet::new();
+        let signals = Signals {
+            marketplace: Some(MarketplaceSignals {
+                rank: Some(5),
+                featured: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // rank=5 -> 6, featured -> +2, capped at 6
+        assert_eq!(score_marketplace_visibility(&signals, &mut missing), 6);
+    }
+
+    // =========================================================================
+    // score_runtime_tier
+    // =========================================================================
+
+    #[test]
+    fn runtime_tier_values() {
+        let cases = [
+            (None, 0),
+            (Some("pkg-with-deps"), 6),
+            (Some("provider-ext"), 6),
+            (Some("multi-file"), 4),
+            (Some("legacy-js"), 2),
+            (Some("unknown-tier"), 0),
+        ];
+        for (runtime, expected) in cases {
+            let tags = Tags {
+                runtime: runtime.map(String::from),
+                ..Default::default()
+            };
+            assert_eq!(score_runtime_tier(&tags), expected, "runtime={runtime:?}");
+        }
+    }
+
+    // =========================================================================
+    // score_interaction
+    // =========================================================================
+
+    #[test]
+    fn interaction_empty() {
+        assert_eq!(score_interaction(&empty_tags()), 0);
+    }
+
+    #[test]
+    fn interaction_all_tags() {
+        let tags = Tags {
+            interaction: vec![
+                "provider".to_string(),
+                "ui_integration".to_string(),
+                "event_hook".to_string(),
+                "slash_command".to_string(),
+                "tool_only".to_string(),
+            ],
+            ..Default::default()
+        };
+        // 3+2+2+1+1 = 9, capped at 8
+        assert_eq!(score_interaction(&tags), 8);
+    }
+
+    #[test]
+    fn interaction_single_provider() {
+        let tags = Tags {
+            interaction: vec!["provider".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(score_interaction(&tags), 3);
+    }
+
+    // =========================================================================
+    // score_hostcalls
+    // =========================================================================
+
+    #[test]
+    fn hostcalls_empty() {
+        assert_eq!(score_hostcalls(&empty_tags()), 0);
+    }
+
+    #[test]
+    fn hostcalls_all_capabilities() {
+        let tags = Tags {
+            capabilities: vec![
+                "exec".to_string(),
+                "http".to_string(),
+                "read".to_string(),
+                "ui".to_string(),
+                "session".to_string(),
+            ],
+            ..Default::default()
+        };
+        // 2+2+1+1+1 = 7, capped at 6
+        assert_eq!(score_hostcalls(&tags), 6);
+    }
+
+    #[test]
+    fn hostcalls_write_and_edit_count_as_one() {
+        let tags = Tags {
+            capabilities: vec!["write".to_string(), "edit".to_string()],
+            ..Default::default()
+        };
+        // write matches the read|write|edit arm => 1, edit also matches => still 1
+        assert_eq!(score_hostcalls(&tags), 1);
+    }
+
+    // =========================================================================
+    // score_activity
+    // =========================================================================
+
+    #[test]
+    fn activity_none_returns_zero() {
+        let mut missing = BTreeSet::new();
+        let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(score_activity(&Recency::default(), as_of, &mut missing), 0);
+        assert!(missing.contains("recency.updated_at"));
+    }
+
+    #[test]
+    fn activity_recent_gets_max() {
+        let mut missing = BTreeSet::new();
+        let as_of = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+        let recency = Recency {
+            updated_at: Some("2026-01-15T00:00:00Z".to_string()),
+        };
+        assert_eq!(score_activity(&recency, as_of, &mut missing), 15);
+    }
+
+    #[test]
+    fn activity_tiers() {
+        let as_of = Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap();
+        let cases = [
+            ("2026-06-15T00:00:00Z", 15), // 16 days
+            ("2026-04-15T00:00:00Z", 12), // ~77 days
+            ("2026-02-01T00:00:00Z", 9),  // ~150 days
+            ("2025-10-01T00:00:00Z", 6),  // ~273 days
+            ("2025-01-01T00:00:00Z", 3),  // ~547 days
+            ("2023-01-01T00:00:00Z", 0),  // >730 days
+        ];
+        for (date, expected) in cases {
+            let mut missing = BTreeSet::new();
+            let recency = Recency {
+                updated_at: Some(date.to_string()),
+            };
+            assert_eq!(
+                score_activity(&recency, as_of, &mut missing),
+                expected,
+                "date={date}"
+            );
+        }
+    }
+
+    #[test]
+    fn activity_invalid_date_returns_zero() {
+        let mut missing = BTreeSet::new();
+        let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let recency = Recency {
+            updated_at: Some("not-a-date".to_string()),
+        };
+        assert_eq!(score_activity(&recency, as_of, &mut missing), 0);
+        assert!(missing.contains("recency.updated_at"));
+    }
+
+    // =========================================================================
+    // score_compatibility
+    // =========================================================================
+
+    #[test]
+    fn compatibility_unmodified_is_max() {
+        let compat = Compatibility {
+            status: Some(CompatStatus::Unmodified),
+            ..Default::default()
+        };
+        assert_eq!(score_compatibility(&compat), 20);
+    }
+
+    #[test]
+    fn compatibility_requires_shims() {
+        let compat = Compatibility {
+            status: Some(CompatStatus::RequiresShims),
+            ..Default::default()
+        };
+        assert_eq!(score_compatibility(&compat), 15);
+    }
+
+    #[test]
+    fn compatibility_runtime_gap() {
+        let compat = Compatibility {
+            status: Some(CompatStatus::RuntimeGap),
+            ..Default::default()
+        };
+        assert_eq!(score_compatibility(&compat), 10);
+    }
+
+    #[test]
+    fn compatibility_blocked_is_zero() {
+        let compat = Compatibility {
+            status: Some(CompatStatus::Blocked),
+            ..Default::default()
+        };
+        assert_eq!(score_compatibility(&compat), 0);
+    }
+
+    #[test]
+    fn compatibility_adjustment_positive() {
+        let compat = Compatibility {
+            status: Some(CompatStatus::RequiresShims),
+            adjustment: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(score_compatibility(&compat), 18);
+    }
+
+    #[test]
+    fn compatibility_adjustment_negative_clamped() {
+        let compat = Compatibility {
+            status: Some(CompatStatus::RuntimeGap),
+            adjustment: Some(-15),
+            ..Default::default()
+        };
+        // 10 + (-15) = -5, clamped to 0
+        assert_eq!(score_compatibility(&compat), 0);
+    }
+
+    #[test]
+    fn compatibility_adjustment_capped_at_20() {
+        let compat = Compatibility {
+            status: Some(CompatStatus::Unmodified),
+            adjustment: Some(10),
+            ..Default::default()
+        };
+        // 20 + 10 = 30, capped at 20
+        assert_eq!(score_compatibility(&compat), 20);
+    }
+
+    // =========================================================================
+    // score_risk
+    // =========================================================================
+
+    #[test]
+    fn risk_none_is_zero() {
+        assert_eq!(score_risk(&RiskInfo::default()), 0);
+    }
+
+    #[test]
+    fn risk_penalty_override() {
+        let risk = RiskInfo {
+            penalty: Some(7),
+            level: Some(RiskLevel::Critical),
+            ..Default::default()
+        };
+        // Explicit penalty overrides level
+        assert_eq!(score_risk(&risk), 7);
+    }
+
+    #[test]
+    fn risk_penalty_capped_at_15() {
+        let risk = RiskInfo {
+            penalty: Some(50),
+            ..Default::default()
+        };
+        assert_eq!(score_risk(&risk), 15);
+    }
+
+    #[test]
+    fn risk_level_tiers() {
+        let cases = [
+            (RiskLevel::Low, 0),
+            (RiskLevel::Moderate, 5),
+            (RiskLevel::High, 10),
+            (RiskLevel::Critical, 15),
+        ];
+        for (level, expected) in cases {
+            let risk = RiskInfo {
+                level: Some(level),
+                ..Default::default()
+            };
+            assert_eq!(score_risk(&risk), expected, "level={level:?}");
+        }
+    }
+
+    // =========================================================================
+    // compute_gates
+    // =========================================================================
+
+    #[test]
+    fn gates_all_false_by_default() {
+        let candidate = minimal_candidate("test");
+        let gates = compute_gates(&candidate);
+        assert!(!gates.provenance_pinned);
+        assert!(!gates.license_ok);
+        assert!(!gates.deterministic);
+        assert!(!gates.unmodified); // Unknown status -> not unmodified
+        assert!(!gates.passes);
+    }
+
+    #[test]
+    fn gates_all_pass() {
+        let mut candidate = minimal_candidate("test");
+        candidate.gates.provenance_pinned = Some(true);
+        candidate.gates.deterministic = Some(true);
+        candidate.license.redistribution = Some(Redistribution::Ok);
+        candidate.compat.status = Some(CompatStatus::Unmodified);
+        let gates = compute_gates(&candidate);
+        assert!(gates.passes);
+    }
+
+    #[test]
+    fn gates_license_restricted_counts_as_ok() {
+        let mut candidate = minimal_candidate("test");
+        candidate.gates.provenance_pinned = Some(true);
+        candidate.gates.deterministic = Some(true);
+        candidate.license.redistribution = Some(Redistribution::Restricted);
+        candidate.compat.status = Some(CompatStatus::RequiresShims);
+        let gates = compute_gates(&candidate);
+        assert!(gates.license_ok);
+        assert!(gates.passes);
+    }
+
+    #[test]
+    fn gates_license_exclude_fails() {
+        let mut candidate = minimal_candidate("test");
+        candidate.license.redistribution = Some(Redistribution::Exclude);
+        let gates = compute_gates(&candidate);
+        assert!(!gates.license_ok);
+    }
+
+    #[test]
+    fn gates_unmodified_includes_requires_shims_and_runtime_gap() {
+        for status in [
+            CompatStatus::Unmodified,
+            CompatStatus::RequiresShims,
+            CompatStatus::RuntimeGap,
+        ] {
+            let mut candidate = minimal_candidate("test");
+            candidate.compat.status = Some(status);
+            let gates = compute_gates(&candidate);
+            assert!(gates.unmodified, "status={status:?} should be unmodified");
+        }
+    }
+
+    // =========================================================================
+    // compute_tier
+    // =========================================================================
+
+    #[test]
+    fn tier_official_is_tier_0() {
+        let mut candidate = minimal_candidate("test");
+        candidate.signals.pi_mono_example = Some(true);
+        let gates = compute_gates(&candidate);
+        assert_eq!(compute_tier(&candidate, &gates, 0), "tier-0");
+    }
+
+    #[test]
+    fn tier_official_source_tier_is_tier_0() {
+        let mut candidate = minimal_candidate("test");
+        candidate.source_tier = Some("official-pi-mono".to_string());
+        let gates = compute_gates(&candidate);
+        assert_eq!(compute_tier(&candidate, &gates, 0), "tier-0");
+    }
+
+    #[test]
+    fn tier_manual_override_on_official() {
+        let mut candidate = minimal_candidate("test");
+        candidate.signals.pi_mono_example = Some(true);
+        candidate.manual_override = Some(ManualOverride {
+            reason: "special".to_string(),
+            tier: Some("tier-1".to_string()),
+        });
+        let gates = compute_gates(&candidate);
+        assert_eq!(compute_tier(&candidate, &gates, 0), "tier-1");
+    }
+
+    #[test]
+    fn tier_excluded_when_gates_fail() {
+        let candidate = minimal_candidate("test");
+        let gates = compute_gates(&candidate); // gates fail
+        assert_eq!(compute_tier(&candidate, &gates, 100), "excluded");
+    }
+
+    #[test]
+    fn tier_1_at_70_plus() {
+        let mut candidate = minimal_candidate("test");
+        candidate.gates.provenance_pinned = Some(true);
+        candidate.gates.deterministic = Some(true);
+        candidate.license.redistribution = Some(Redistribution::Ok);
+        candidate.compat.status = Some(CompatStatus::Unmodified);
+        let gates = compute_gates(&candidate);
+        assert_eq!(compute_tier(&candidate, &gates, 70), "tier-1");
+        assert_eq!(compute_tier(&candidate, &gates, 100), "tier-1");
+    }
+
+    #[test]
+    fn tier_2_at_50_to_69() {
+        let mut candidate = minimal_candidate("test");
+        candidate.gates.provenance_pinned = Some(true);
+        candidate.gates.deterministic = Some(true);
+        candidate.license.redistribution = Some(Redistribution::Ok);
+        candidate.compat.status = Some(CompatStatus::Unmodified);
+        let gates = compute_gates(&candidate);
+        assert_eq!(compute_tier(&candidate, &gates, 50), "tier-2");
+        assert_eq!(compute_tier(&candidate, &gates, 69), "tier-2");
+    }
+
+    #[test]
+    fn tier_excluded_below_50() {
+        let mut candidate = minimal_candidate("test");
+        candidate.gates.provenance_pinned = Some(true);
+        candidate.gates.deterministic = Some(true);
+        candidate.license.redistribution = Some(Redistribution::Ok);
+        candidate.compat.status = Some(CompatStatus::Unmodified);
+        let gates = compute_gates(&candidate);
+        assert_eq!(compute_tier(&candidate, &gates, 49), "excluded");
+    }
+
+    // =========================================================================
+    // compare_scored
+    // =========================================================================
+
+    #[test]
+    fn compare_scored_by_final_total() {
+        let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut a = score_candidate(&minimal_candidate("a"), as_of);
+        let mut b = score_candidate(&minimal_candidate("b"), as_of);
+        a.score.final_total = 80;
+        b.score.final_total = 60;
+        assert_eq!(compare_scored(&a, &b), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_scored_tiebreak_by_id() {
+        let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let a = score_candidate(&minimal_candidate("alpha"), as_of);
+        let b = score_candidate(&minimal_candidate("beta"), as_of);
+        // Same scores, tiebreak by id
+        assert_eq!(
+            compare_scored(&a, &b),
+            std::cmp::Ordering::Less // "alpha" < "beta"
+        );
+    }
+
+    // =========================================================================
+    // build_histogram
+    // =========================================================================
+
+    #[test]
+    fn histogram_empty() {
+        let histogram = build_histogram(&[]);
+        assert_eq!(histogram.len(), 11);
+        for bucket in &histogram {
+            assert_eq!(bucket.count, 0);
+        }
+    }
+
+    #[test]
+    fn histogram_ranges_correct() {
+        let histogram = build_histogram(&[]);
+        assert_eq!(histogram[0].range, "0-9");
+        assert_eq!(histogram[5].range, "50-59");
+        assert_eq!(histogram[10].range, "100-100");
+    }
+
+    #[test]
+    fn histogram_counts_correctly() {
+        let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut items: Vec<ScoredCandidate> = (0..3)
+            .map(|i| score_candidate(&minimal_candidate(&format!("c{i}")), as_of))
+            .collect();
+        items[0].score.final_total = 15; // bucket 1 (10-19)
+        items[1].score.final_total = 15; // bucket 1 (10-19)
+        items[2].score.final_total = 75; // bucket 7 (70-79)
+        let histogram = build_histogram(&items);
+        assert_eq!(histogram[1].count, 2);
+        assert_eq!(histogram[7].count, 1);
+    }
+
+    // =========================================================================
+    // score_popularity (composite)
+    // =========================================================================
+
+    #[test]
+    fn popularity_capped_at_30() {
+        let mut missing = BTreeSet::new();
+        let signals = Signals {
+            official_listing: Some(true), // 10
+            github_stars: Some(10_000),   // 10
+            marketplace: Some(MarketplaceSignals {
+                rank: Some(1),        // 6
+                featured: Some(true), // +2 (capped at 6)
+                ..Default::default()
+            }),
+            references: (0..20).map(|i| format!("ref-{i}")).collect(), // 4
+            ..Default::default()
+        };
+        let (total, _) = score_popularity(&signals, &mut missing);
+        assert_eq!(total, 30); // capped
+    }
+
+    // =========================================================================
+    // score_adoption (composite)
+    // =========================================================================
+
+    #[test]
+    fn adoption_capped_at_15() {
+        let mut missing = BTreeSet::new();
+        let signals = Signals {
+            npm_downloads_month: Some(100_000), // 8
+            github_forks: Some(1_000),          // 2
+            marketplace: Some(MarketplaceSignals {
+                installs_month: Some(50_000), // 5
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (total, _) = score_adoption(&signals, &mut missing);
+        assert_eq!(total, 15); // capped
+    }
+
+    // =========================================================================
+    // score_coverage (composite)
+    // =========================================================================
+
+    #[test]
+    fn coverage_capped_at_20() {
+        let tags = Tags {
+            runtime: Some("pkg-with-deps".to_string()), // 6
+            interaction: vec![
+                "provider".to_string(),
+                "ui_integration".to_string(),
+                "event_hook".to_string(),
+                "slash_command".to_string(),
+                "tool_only".to_string(),
+            ], // 8
+            capabilities: vec![
+                "exec".to_string(),
+                "http".to_string(),
+                "read".to_string(),
+                "ui".to_string(),
+                "session".to_string(),
+            ], // 6
+        };
+        let (total, _) = score_coverage(&tags);
+        assert_eq!(total, 20); // capped
+    }
+
+    // =========================================================================
+    // score_candidates (integration)
+    // =========================================================================
+
+    #[test]
+    fn score_candidates_ranks_correctly() {
+        let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let generated_at = as_of;
+        let mut high = minimal_candidate("high");
+        high.signals.github_stars = Some(10_000);
+        high.signals.pi_mono_example = Some(true);
+        high.compat.status = Some(CompatStatus::Unmodified);
+        high.recency.updated_at = Some("2025-12-15T00:00:00Z".to_string());
+
+        let low = minimal_candidate("low");
+
+        let report = score_candidates(&[high, low], as_of, generated_at, 5);
+        assert_eq!(report.schema, "pi.ext.scoring.v1");
+        assert_eq!(report.items.len(), 2);
+        assert_eq!(report.items[0].rank, 1);
+        assert_eq!(report.items[1].rank, 2);
+        assert!(report.items[0].score.final_total >= report.items[1].score.final_total);
+    }
+
+    #[test]
+    fn score_candidates_empty_input() {
+        let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let report = score_candidates(&[], as_of, as_of, 5);
+        assert!(report.items.is_empty());
+        assert!(report.summary.top_overall.is_empty());
+    }
+
+    // =========================================================================
+    // Serde round-trips
+    // =========================================================================
+
+    #[test]
+    fn compat_status_serde_roundtrip() {
+        for status in [
+            CompatStatus::Unmodified,
+            CompatStatus::RequiresShims,
+            CompatStatus::RuntimeGap,
+            CompatStatus::Blocked,
+            CompatStatus::Unknown,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: CompatStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn redistribution_serde_roundtrip() {
+        for red in [
+            Redistribution::Ok,
+            Redistribution::Restricted,
+            Redistribution::Exclude,
+            Redistribution::Unknown,
+        ] {
+            let json = serde_json::to_string(&red).unwrap();
+            let back: Redistribution = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, red);
+        }
+    }
+
+    #[test]
+    fn risk_level_serde_roundtrip() {
+        for level in [
+            RiskLevel::Low,
+            RiskLevel::Moderate,
+            RiskLevel::High,
+            RiskLevel::Critical,
+        ] {
+            let json = serde_json::to_string(&level).unwrap();
+            let back: RiskLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, level);
+        }
+    }
+
+    #[test]
+    fn scoring_report_serde_roundtrip() {
+        let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut candidate = minimal_candidate("test-ext");
+        candidate.signals.github_stars = Some(500);
+        candidate.compat.status = Some(CompatStatus::Unmodified);
+        let report = score_candidates(&[candidate], as_of, as_of, 5);
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ScoringReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.items.len(), 1);
+        assert_eq!(back.items[0].id, "test-ext");
+    }
+
+    // =========================================================================
+    // Missing signals tracking
+    // =========================================================================
+
+    #[test]
+    fn missing_signals_collected_for_empty_candidate() {
+        let as_of = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let candidate = minimal_candidate("bare");
+        let scored = score_candidate(&candidate, as_of);
+        assert!(!scored.missing_signals.is_empty());
+        assert!(
+            scored
+                .missing_signals
+                .contains(&"signals.github_stars".to_string())
+        );
+        assert!(
+            scored
+                .missing_signals
+                .contains(&"signals.github_forks".to_string())
+        );
+        assert!(
+            scored
+                .missing_signals
+                .contains(&"recency.updated_at".to_string())
+        );
+    }
+}

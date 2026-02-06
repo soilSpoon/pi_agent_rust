@@ -86,6 +86,7 @@ files = [
 
 [suite.e2e]
 files = [
+    "e2e_agent_loop",
     "e2e_cli",
     "e2e_tui",
     "e2e_tools",
@@ -97,4 +98,5 @@ files = [
     "e2e_ts_extension_loading",
     "e2e_live",
     "e2e_live_harness",
+    "e2e_session_persistence",
 ]

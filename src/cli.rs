@@ -442,6 +442,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_index_subcommand() {
+        let cli = Cli::parse_from(["pi", "update-index"]);
+        assert!(matches!(cli.command, Some(Commands::UpdateIndex)));
+    }
+
+    #[test]
     fn no_subcommand_when_only_message() {
         let cli = Cli::parse_from(["pi", "hello"]);
         assert!(cli.command.is_none());
@@ -673,6 +679,10 @@ pub enum Commands {
         /// Specific source to update (or all if omitted)
         source: Option<String>,
     },
+
+    /// Refresh extension index cache from remote sources
+    #[command(name = "update-index")]
+    UpdateIndex,
 
     /// List installed packages
     List,

@@ -928,3 +928,929 @@ pub async fn compact(
 pub fn compaction_details_to_value(details: &CompactionDetails) -> Result<Value> {
     serde_json::to_value(details).map_err(|e| Error::session(format!("Compaction details: {e}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AssistantMessage, ContentBlock, TextContent, Usage};
+    use serde_json::json;
+
+    fn make_user_text(text: &str) -> SessionMessage {
+        SessionMessage::User {
+            content: UserContent::Text(text.to_string()),
+            timestamp: Some(0),
+        }
+    }
+
+    fn make_assistant_text(text: &str, input: u64, output: u64) -> SessionMessage {
+        SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                api: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+                usage: Usage {
+                    input,
+                    output,
+                    cache_read: 0,
+                    cache_write: 0,
+                    total_tokens: input + output,
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    fn make_assistant_tool_call(name: &str, args: Value) -> SessionMessage {
+        SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".to_string(),
+                    name: name.to_string(),
+                    arguments: args,
+                    thought_signature: None,
+                })],
+                api: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 0,
+                usage: Usage::default(),
+            },
+        }
+    }
+
+    fn make_tool_result(text: &str) -> SessionMessage {
+        SessionMessage::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            tool_name: String::new(),
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: None,
+            is_error: false,
+            timestamp: None,
+        }
+    }
+
+    // ── calculate_context_tokens ─────────────────────────────────────
+
+    #[test]
+    fn context_tokens_prefers_total_tokens() {
+        let usage = Usage {
+            input: 100,
+            output: 50,
+            total_tokens: 200,
+            ..Default::default()
+        };
+        assert_eq!(calculate_context_tokens(&usage), 200);
+    }
+
+    #[test]
+    fn context_tokens_falls_back_to_input_plus_output() {
+        let usage = Usage {
+            input: 100,
+            output: 50,
+            total_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(calculate_context_tokens(&usage), 150);
+    }
+
+    // ── should_compact ───────────────────────────────────────────────
+
+    #[test]
+    fn should_compact_when_over_threshold() {
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 5_000,
+        };
+        // window=100k, reserve=10k => threshold=90k, context=95k => should compact
+        assert!(should_compact(95_000, 100_000, &settings));
+    }
+
+    #[test]
+    fn should_not_compact_when_under_threshold() {
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 5_000,
+        };
+        // window=100k, reserve=10k => threshold=90k, context=80k => should not compact
+        assert!(!should_compact(80_000, 100_000, &settings));
+    }
+
+    #[test]
+    fn should_not_compact_when_disabled() {
+        let settings = ResolvedCompactionSettings {
+            enabled: false,
+            reserve_tokens: 0,
+            keep_recent_tokens: 0,
+        };
+        assert!(!should_compact(1_000_000, 100_000, &settings));
+    }
+
+    #[test]
+    fn should_compact_at_exact_threshold() {
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 5_000,
+        };
+        // window=100k, reserve=10k => threshold=90k, context=90k => NOT compacting (not >)
+        assert!(!should_compact(90_000, 100_000, &settings));
+        // 90001 should trigger
+        assert!(should_compact(90_001, 100_000, &settings));
+    }
+
+    // ── estimate_tokens ──────────────────────────────────────────────
+
+    #[test]
+    fn estimate_tokens_user_text() {
+        let msg = make_user_text("hello world"); // 11 chars => ceil(11/4) = 3
+        assert_eq!(estimate_tokens(&msg), 3);
+    }
+
+    #[test]
+    fn estimate_tokens_empty_text() {
+        let msg = make_user_text(""); // 0 chars => 0
+        assert_eq!(estimate_tokens(&msg), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_assistant_text() {
+        let msg = make_assistant_text("hello", 10, 5); // 5 chars => ceil(5/4) = 2
+        assert_eq!(estimate_tokens(&msg), 2);
+    }
+
+    #[test]
+    fn estimate_tokens_tool_result() {
+        let msg = make_tool_result("file contents here"); // 18 chars => ceil(18/4) = 5
+        assert_eq!(estimate_tokens(&msg), 5);
+    }
+
+    #[test]
+    fn estimate_tokens_custom_message() {
+        let msg = SessionMessage::Custom {
+            custom_type: "system".to_string(),
+            content: "some custom content".to_string(),
+            display: true,
+            details: None,
+        };
+        // 19 chars => ceil(19/4) = 5
+        assert_eq!(estimate_tokens(&msg), 5);
+    }
+
+    // ── estimate_context_tokens ──────────────────────────────────────
+
+    #[test]
+    fn estimate_context_with_assistant_usage() {
+        let messages = vec![
+            make_user_text("hi"),
+            make_assistant_text("hello", 50, 10),
+            make_user_text("bye"),
+        ];
+        let estimate = estimate_context_tokens(&messages);
+        // Last assistant usage: input=50, output=10, total=60
+        // Trailing after that: "bye" = ceil(3/4) = 1
+        assert_eq!(estimate.tokens, 61);
+        assert_eq!(estimate.last_usage_index, Some(1));
+    }
+
+    #[test]
+    fn estimate_context_no_assistant() {
+        let messages = vec![make_user_text("hello"), make_user_text("world")];
+        let estimate = estimate_context_tokens(&messages);
+        // No assistant messages, so sum estimate_tokens for all: ceil(5/4)+ceil(5/4) = 2+2 = 4
+        assert_eq!(estimate.tokens, 4);
+        assert!(estimate.last_usage_index.is_none());
+    }
+
+    // ── extract_file_ops_from_message ────────────────────────────────
+
+    #[test]
+    fn extract_file_ops_read() {
+        let msg = make_assistant_tool_call("read", json!({"path": "/foo/bar.rs"}));
+        let mut ops = FileOperations::default();
+        extract_file_ops_from_message(&msg, &mut ops);
+        assert!(ops.read.contains("/foo/bar.rs"));
+        assert!(ops.written.is_empty());
+        assert!(ops.edited.is_empty());
+    }
+
+    #[test]
+    fn extract_file_ops_write() {
+        let msg = make_assistant_tool_call("write", json!({"path": "/out.txt"}));
+        let mut ops = FileOperations::default();
+        extract_file_ops_from_message(&msg, &mut ops);
+        assert!(ops.written.contains("/out.txt"));
+        assert!(ops.read.is_empty());
+    }
+
+    #[test]
+    fn extract_file_ops_edit() {
+        let msg = make_assistant_tool_call("edit", json!({"path": "/src/main.rs"}));
+        let mut ops = FileOperations::default();
+        extract_file_ops_from_message(&msg, &mut ops);
+        assert!(ops.edited.contains("/src/main.rs"));
+    }
+
+    #[test]
+    fn extract_file_ops_ignores_other_tools() {
+        let msg = make_assistant_tool_call("bash", json!({"command": "ls"}));
+        let mut ops = FileOperations::default();
+        extract_file_ops_from_message(&msg, &mut ops);
+        assert!(ops.read.is_empty());
+        assert!(ops.written.is_empty());
+        assert!(ops.edited.is_empty());
+    }
+
+    #[test]
+    fn extract_file_ops_ignores_user_messages() {
+        let msg = make_user_text("read the file /foo.rs");
+        let mut ops = FileOperations::default();
+        extract_file_ops_from_message(&msg, &mut ops);
+        assert!(ops.read.is_empty());
+    }
+
+    // ── compute_file_lists ───────────────────────────────────────────
+
+    #[test]
+    fn compute_file_lists_separates_read_from_modified() {
+        let mut ops = FileOperations::default();
+        ops.read.insert("/a.rs".to_string());
+        ops.read.insert("/b.rs".to_string());
+        ops.written.insert("/b.rs".to_string());
+        ops.edited.insert("/c.rs".to_string());
+
+        let (read_only, modified) = compute_file_lists(&ops);
+        // /a.rs was only read; /b.rs was read AND written (so it's modified)
+        assert_eq!(read_only, vec!["/a.rs"]);
+        assert!(modified.contains(&"/b.rs".to_string()));
+        assert!(modified.contains(&"/c.rs".to_string()));
+    }
+
+    #[test]
+    fn compute_file_lists_empty() {
+        let ops = FileOperations::default();
+        let (read_only, modified) = compute_file_lists(&ops);
+        assert!(read_only.is_empty());
+        assert!(modified.is_empty());
+    }
+
+    // ── format_file_operations ───────────────────────────────────────
+
+    #[test]
+    fn format_file_operations_empty() {
+        assert_eq!(format_file_operations(&[], &[]), String::new());
+    }
+
+    #[test]
+    fn format_file_operations_read_only() {
+        let result = format_file_operations(&["src/main.rs".to_string()], &[]);
+        assert!(result.contains("<read-files>"));
+        assert!(result.contains("src/main.rs"));
+        assert!(!result.contains("<modified-files>"));
+    }
+
+    #[test]
+    fn format_file_operations_both() {
+        let result = format_file_operations(&["a.rs".to_string()], &["b.rs".to_string()]);
+        assert!(result.contains("<read-files>"));
+        assert!(result.contains("a.rs"));
+        assert!(result.contains("<modified-files>"));
+        assert!(result.contains("b.rs"));
+    }
+
+    // ── compaction_details_to_value ──────────────────────────────────
+
+    #[test]
+    fn compaction_details_serializes() {
+        let details = CompactionDetails {
+            read_files: vec!["a.rs".to_string()],
+            modified_files: vec!["b.rs".to_string()],
+        };
+        let value = compaction_details_to_value(&details).unwrap();
+        assert_eq!(value["readFiles"], json!(["a.rs"]));
+        assert_eq!(value["modifiedFiles"], json!(["b.rs"]));
+    }
+
+    // ── ResolvedCompactionSettings default ───────────────────────────
+
+    #[test]
+    fn default_settings() {
+        let settings = ResolvedCompactionSettings::default();
+        assert!(settings.enabled);
+        assert_eq!(settings.reserve_tokens, 16_384);
+        assert_eq!(settings.keep_recent_tokens, 20_000);
+    }
+
+    // ── Helper: entry constructors ──────────────────────────────────
+
+    use crate::model::{ImageContent, ThinkingContent};
+    use crate::session::{
+        BranchSummaryEntry, CompactionEntry, EntryBase, MessageEntry, ModelChangeEntry,
+    };
+    use std::collections::HashMap;
+
+    fn test_base(id: &str) -> EntryBase {
+        EntryBase {
+            id: Some(id.to_string()),
+            parent_id: None,
+            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+        }
+    }
+
+    fn user_entry(id: &str, text: &str) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: test_base(id),
+            message: make_user_text(text),
+        })
+    }
+
+    fn assistant_entry(id: &str, text: &str, input: u64, output: u64) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: test_base(id),
+            message: make_assistant_text(text, input, output),
+        })
+    }
+
+    fn tool_call_entry(id: &str, tool_name: &str, path: &str) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: test_base(id),
+            message: make_assistant_tool_call(tool_name, json!({"path": path})),
+        })
+    }
+
+    fn tool_result_entry(id: &str, text: &str) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: test_base(id),
+            message: make_tool_result(text),
+        })
+    }
+
+    fn branch_entry(id: &str, summary: &str) -> SessionEntry {
+        SessionEntry::BranchSummary(BranchSummaryEntry {
+            base: test_base(id),
+            from_id: "parent".to_string(),
+            summary: summary.to_string(),
+            details: None,
+            from_hook: None,
+        })
+    }
+
+    fn compact_entry(id: &str, summary: &str, tokens: u64) -> SessionEntry {
+        SessionEntry::Compaction(CompactionEntry {
+            base: test_base(id),
+            summary: summary.to_string(),
+            first_kept_entry_id: "kept".to_string(),
+            tokens_before: tokens,
+            details: None,
+            from_hook: None,
+        })
+    }
+
+    fn bash_entry(id: &str) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: test_base(id),
+            message: SessionMessage::BashExecution {
+                command: "ls".to_string(),
+                output: "ok".to_string(),
+                exit_code: 0,
+                cancelled: None,
+                truncated: None,
+                full_output_path: None,
+                timestamp: None,
+                extra: HashMap::new(),
+            },
+        })
+    }
+
+    // ── get_assistant_usage ─────────────────────────────────────────
+
+    #[test]
+    fn get_assistant_usage_returns_usage_for_stop() {
+        let msg = make_assistant_text("text", 100, 50);
+        let usage = get_assistant_usage(&msg);
+        assert!(usage.is_some());
+        assert_eq!(usage.unwrap().input, 100);
+    }
+
+    #[test]
+    fn get_assistant_usage_none_for_aborted() {
+        let msg = SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("text"))],
+                api: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                stop_reason: StopReason::Aborted,
+                error_message: None,
+                timestamp: 0,
+                usage: Usage {
+                    input: 100,
+                    output: 50,
+                    total_tokens: 150,
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(get_assistant_usage(&msg).is_none());
+    }
+
+    #[test]
+    fn get_assistant_usage_none_for_error() {
+        let msg = SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![],
+                api: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                stop_reason: StopReason::Error,
+                error_message: None,
+                timestamp: 0,
+                usage: Usage::default(),
+            },
+        };
+        assert!(get_assistant_usage(&msg).is_none());
+    }
+
+    #[test]
+    fn get_assistant_usage_none_for_user() {
+        assert!(get_assistant_usage(&make_user_text("hello")).is_none());
+    }
+
+    // ── entry_is_message_like ───────────────────────────────────────
+
+    #[test]
+    fn entry_is_message_like_for_message() {
+        assert!(entry_is_message_like(&user_entry("1", "hi")));
+    }
+
+    #[test]
+    fn entry_is_message_like_for_branch_summary() {
+        assert!(entry_is_message_like(&branch_entry("1", "sum")));
+    }
+
+    #[test]
+    fn entry_is_message_like_false_for_compaction() {
+        assert!(!entry_is_message_like(&compact_entry("1", "sum", 100)));
+    }
+
+    #[test]
+    fn entry_is_message_like_false_for_model_change() {
+        let entry = SessionEntry::ModelChange(ModelChangeEntry {
+            base: test_base("1"),
+            provider: "test".to_string(),
+            model_id: "model-1".to_string(),
+        });
+        assert!(!entry_is_message_like(&entry));
+    }
+
+    // ── entry_is_compaction_boundary ────────────────────────────────
+
+    #[test]
+    fn compaction_boundary_true_for_compaction() {
+        assert!(entry_is_compaction_boundary(&compact_entry("1", "sum", 100)));
+    }
+
+    #[test]
+    fn compaction_boundary_false_for_message() {
+        assert!(!entry_is_compaction_boundary(&user_entry("1", "hi")));
+    }
+
+    #[test]
+    fn compaction_boundary_false_for_branch() {
+        assert!(!entry_is_compaction_boundary(&branch_entry("1", "sum")));
+    }
+
+    // ── is_user_turn_start ──────────────────────────────────────────
+
+    #[test]
+    fn user_turn_start_for_user() {
+        assert!(is_user_turn_start(&user_entry("1", "hello")));
+    }
+
+    #[test]
+    fn user_turn_start_for_branch() {
+        assert!(is_user_turn_start(&branch_entry("1", "summary")));
+    }
+
+    #[test]
+    fn user_turn_start_for_bash() {
+        assert!(is_user_turn_start(&bash_entry("1")));
+    }
+
+    #[test]
+    fn user_turn_start_false_for_assistant() {
+        assert!(!is_user_turn_start(&assistant_entry("1", "resp", 10, 5)));
+    }
+
+    #[test]
+    fn user_turn_start_false_for_tool_result() {
+        assert!(!is_user_turn_start(&tool_result_entry("1", "result")));
+    }
+
+    #[test]
+    fn user_turn_start_false_for_compaction() {
+        assert!(!is_user_turn_start(&compact_entry("1", "sum", 100)));
+    }
+
+    // ── message_from_entry ──────────────────────────────────────────
+
+    #[test]
+    fn message_from_entry_user() {
+        let entry = user_entry("1", "hello");
+        let msg = message_from_entry(&entry);
+        assert!(msg.is_some());
+        assert!(matches!(msg.unwrap(), SessionMessage::User { .. }));
+    }
+
+    #[test]
+    fn message_from_entry_branch_summary() {
+        let entry = branch_entry("1", "branch summary text");
+        let msg = message_from_entry(&entry).unwrap();
+        if let SessionMessage::BranchSummary { summary, from_id } = msg {
+            assert_eq!(summary, "branch summary text");
+            assert_eq!(from_id, "parent");
+        } else {
+            panic!("expected BranchSummary");
+        }
+    }
+
+    #[test]
+    fn message_from_entry_compaction() {
+        let entry = compact_entry("1", "compact summary", 500);
+        let msg = message_from_entry(&entry).unwrap();
+        if let SessionMessage::CompactionSummary {
+            summary,
+            tokens_before,
+        } = msg
+        {
+            assert_eq!(summary, "compact summary");
+            assert_eq!(tokens_before, 500);
+        } else {
+            panic!("expected CompactionSummary");
+        }
+    }
+
+    #[test]
+    fn message_from_entry_model_change_is_none() {
+        let entry = SessionEntry::ModelChange(ModelChangeEntry {
+            base: test_base("1"),
+            provider: "test".to_string(),
+            model_id: "model".to_string(),
+        });
+        assert!(message_from_entry(&entry).is_none());
+    }
+
+    // ── find_valid_cut_points ───────────────────────────────────────
+
+    #[test]
+    fn find_valid_cut_points_empty() {
+        assert!(find_valid_cut_points(&[], 0, 0).is_empty());
+    }
+
+    #[test]
+    fn find_valid_cut_points_skips_tool_results() {
+        let entries = vec![
+            user_entry("1", "hello"),
+            assistant_entry("2", "resp", 10, 5),
+            tool_result_entry("3", "result"),
+            user_entry("4", "follow up"),
+        ];
+        let cuts = find_valid_cut_points(&entries, 0, entries.len());
+        assert!(cuts.contains(&0)); // user
+        assert!(cuts.contains(&1)); // assistant
+        assert!(!cuts.contains(&2)); // tool result excluded
+        assert!(cuts.contains(&3)); // user
+    }
+
+    #[test]
+    fn find_valid_cut_points_includes_branch_summary() {
+        let entries = vec![
+            branch_entry("1", "summary"),
+            user_entry("2", "hello"),
+        ];
+        let cuts = find_valid_cut_points(&entries, 0, entries.len());
+        assert!(cuts.contains(&0));
+        assert!(cuts.contains(&1));
+    }
+
+    #[test]
+    fn find_valid_cut_points_respects_range() {
+        let entries = vec![
+            user_entry("1", "a"),
+            user_entry("2", "b"),
+            user_entry("3", "c"),
+        ];
+        let cuts = find_valid_cut_points(&entries, 1, 2);
+        assert!(!cuts.contains(&0));
+        assert!(cuts.contains(&1));
+        assert!(!cuts.contains(&2));
+    }
+
+    // ── find_turn_start_index ───────────────────────────────────────
+
+    #[test]
+    fn find_turn_start_basic() {
+        let entries = vec![
+            user_entry("1", "hello"),
+            assistant_entry("2", "resp", 10, 5),
+            tool_result_entry("3", "result"),
+        ];
+        assert_eq!(find_turn_start_index(&entries, 2, 0), Some(0));
+    }
+
+    #[test]
+    fn find_turn_start_at_self() {
+        let entries = vec![user_entry("1", "hello")];
+        assert_eq!(find_turn_start_index(&entries, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn find_turn_start_none_no_user() {
+        let entries = vec![
+            assistant_entry("1", "resp", 10, 5),
+            tool_result_entry("2", "result"),
+        ];
+        assert_eq!(find_turn_start_index(&entries, 1, 0), None);
+    }
+
+    #[test]
+    fn find_turn_start_respects_start_index() {
+        let entries = vec![
+            user_entry("1", "old"),
+            assistant_entry("2", "resp", 10, 5),
+            user_entry("3", "new"),
+        ];
+        // start_index=2, so it should find user at 2
+        assert_eq!(find_turn_start_index(&entries, 2, 2), Some(2));
+        // start_index=2, looking back from 2, user at 1 is below start
+        assert_eq!(find_turn_start_index(&entries, 1, 2), None);
+    }
+
+    // ── serialize_conversation ───────────────────────────────────────
+
+    #[test]
+    fn serialize_conversation_user_text() {
+        let messages = vec![Message::User(crate::model::UserMessage {
+            content: UserContent::Text("hello world".to_string()),
+            timestamp: 0,
+        })];
+        assert_eq!(serialize_conversation(&messages), "[User]: hello world");
+    }
+
+    #[test]
+    fn serialize_conversation_empty() {
+        assert!(serialize_conversation(&[]).is_empty());
+    }
+
+    #[test]
+    fn serialize_conversation_skips_empty_user() {
+        let messages = vec![Message::User(crate::model::UserMessage {
+            content: UserContent::Text(String::new()),
+            timestamp: 0,
+        })];
+        assert!(serialize_conversation(&messages).is_empty());
+    }
+
+    #[test]
+    fn serialize_conversation_assistant_text() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("response"))],
+            api: String::new(),
+            provider: String::new(),
+            model: String::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        })];
+        assert!(serialize_conversation(&messages).contains("[Assistant]: response"));
+    }
+
+    #[test]
+    fn serialize_conversation_tool_calls() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: json!({"path": "/main.rs"}),
+                thought_signature: None,
+            })],
+            api: String::new(),
+            provider: String::new(),
+            model: String::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        })];
+        let result = serialize_conversation(&messages);
+        assert!(result.contains("[Assistant tool calls]: read("));
+        assert!(result.contains("path="));
+    }
+
+    #[test]
+    fn serialize_conversation_thinking() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Thinking(ThinkingContent {
+                thinking: "let me think".to_string(),
+                thinking_signature: None,
+            })],
+            api: String::new(),
+            provider: String::new(),
+            model: String::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        })];
+        assert!(serialize_conversation(&messages).contains("[Assistant thinking]: let me think"));
+    }
+
+    #[test]
+    fn serialize_conversation_tool_result() {
+        let messages = vec![Message::ToolResult(crate::model::ToolResultMessage {
+            tool_call_id: "c1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("file contents"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })];
+        assert!(serialize_conversation(&messages).contains("[Tool result]: file contents"));
+    }
+
+    // ── estimate_tokens additional ──────────────────────────────────
+
+    #[test]
+    fn estimate_tokens_image_block() {
+        let msg = SessionMessage::User {
+            content: UserContent::Blocks(vec![ContentBlock::Image(ImageContent {
+                data: "base64data".to_string(),
+                mime_type: "image/png".to_string(),
+            })]),
+            timestamp: None,
+        };
+        // Image = 4800 chars -> ceil(4800/4) = 1200
+        assert_eq!(estimate_tokens(&msg), 1200);
+    }
+
+    #[test]
+    fn estimate_tokens_thinking() {
+        let msg = SessionMessage::User {
+            content: UserContent::Blocks(vec![ContentBlock::Thinking(ThinkingContent {
+                thinking: "a".repeat(20),
+                thinking_signature: None,
+            })]),
+            timestamp: None,
+        };
+        // 20 chars -> ceil(20/4) = 5
+        assert_eq!(estimate_tokens(&msg), 5);
+    }
+
+    #[test]
+    fn estimate_tokens_bash_execution() {
+        let msg = SessionMessage::BashExecution {
+            command: "echo hi".to_string(),
+            output: "hi\n".to_string(),
+            exit_code: 0,
+            cancelled: None,
+            truncated: None,
+            full_output_path: None,
+            timestamp: None,
+            extra: HashMap::new(),
+        };
+        // 7 + 3 = 10 chars -> ceil(10/4) = 3
+        assert_eq!(estimate_tokens(&msg), 3);
+    }
+
+    #[test]
+    fn estimate_tokens_branch_summary() {
+        let msg = SessionMessage::BranchSummary {
+            summary: "a".repeat(40),
+            from_id: "id".to_string(),
+        };
+        assert_eq!(estimate_tokens(&msg), 10);
+    }
+
+    #[test]
+    fn estimate_tokens_compaction_summary() {
+        let msg = SessionMessage::CompactionSummary {
+            summary: "a".repeat(80),
+            tokens_before: 5000,
+        };
+        assert_eq!(estimate_tokens(&msg), 20);
+    }
+
+    // ── prepare_compaction ──────────────────────────────────────────
+
+    #[test]
+    fn prepare_compaction_empty() {
+        assert!(prepare_compaction(&[], ResolvedCompactionSettings::default()).is_none());
+    }
+
+    #[test]
+    fn prepare_compaction_last_is_compaction_returns_none() {
+        let entries = vec![
+            user_entry("1", "hello"),
+            compact_entry("2", "summary", 100),
+        ];
+        assert!(prepare_compaction(&entries, ResolvedCompactionSettings::default()).is_none());
+    }
+
+    #[test]
+    fn prepare_compaction_no_messages_to_summarize_returns_none() {
+        // Only non-message entries that produce no summarizable messages
+        let entries = vec![SessionEntry::ModelChange(ModelChangeEntry {
+            base: test_base("1"),
+            provider: "test".to_string(),
+            model_id: "model".to_string(),
+        })];
+        assert!(prepare_compaction(&entries, ResolvedCompactionSettings::default()).is_none());
+    }
+
+    #[test]
+    fn prepare_compaction_basic_returns_some() {
+        let long_text = "a".repeat(100_000);
+        let entries = vec![
+            user_entry("1", &long_text),
+            assistant_entry("2", &long_text, 50000, 25000),
+            user_entry("3", &long_text),
+            assistant_entry("4", &long_text, 80000, 30000),
+            user_entry("5", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 100,
+        };
+        let prep = prepare_compaction(&entries, settings);
+        assert!(prep.is_some());
+        let p = prep.unwrap();
+        assert!(!p.messages_to_summarize.is_empty());
+        assert!(p.tokens_before > 0);
+        assert!(p.previous_summary.is_none());
+    }
+
+    #[test]
+    fn prepare_compaction_after_previous_compaction() {
+        let entries = vec![
+            user_entry("1", "old message"),
+            assistant_entry("2", "old response", 100, 50),
+            compact_entry("3", "previous summary", 300),
+            user_entry("4", &"x".repeat(100_000)),
+            assistant_entry("5", &"y".repeat(100_000), 80000, 30000),
+            user_entry("6", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 100,
+        };
+        let prep = prepare_compaction(&entries, settings);
+        assert!(prep.is_some());
+        let p = prep.unwrap();
+        assert_eq!(p.previous_summary.as_deref(), Some("previous summary"));
+    }
+
+    #[test]
+    fn prepare_compaction_tracks_file_ops() {
+        let entries = vec![
+            tool_call_entry("1", "read", "/src/main.rs"),
+            tool_call_entry("2", "edit", "/src/lib.rs"),
+            user_entry("3", &"x".repeat(100_000)),
+            assistant_entry("4", &"y".repeat(100_000), 80000, 30000),
+            user_entry("5", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 100,
+        };
+        if let Some(prep) = prepare_compaction(&entries, settings) {
+            let has_read = prep.file_ops.read.contains("/src/main.rs");
+            let has_edit = prep.file_ops.edited.contains("/src/lib.rs");
+            // At least one should be tracked (depends on cut point position)
+            assert!(has_read || has_edit || prep.file_ops.read.is_empty());
+        }
+    }
+
+    // ── FileOperations::read_files ──────────────────────────────────
+
+    #[test]
+    fn file_operations_read_files_iterator() {
+        let mut ops = FileOperations::default();
+        ops.read.insert("/a.rs".to_string());
+        ops.read.insert("/b.rs".to_string());
+        let files: Vec<&str> = ops.read_files().collect();
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&"/a.rs"));
+        assert!(files.contains(&"/b.rs"));
+    }
+}

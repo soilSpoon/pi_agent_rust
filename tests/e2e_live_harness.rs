@@ -120,6 +120,19 @@ struct LiveProviderCostRecord {
 
 fn is_sensitive_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "totaltokens"
+            | "total_tokens"
+            | "inputtokens"
+            | "input_tokens"
+            | "outputtokens"
+            | "output_tokens"
+            | "cache_read_tokens"
+            | "cache_write_tokens"
+    ) {
+        return false;
+    }
     SENSITIVE_KEY_FRAGMENTS
         .iter()
         .any(|fragment| lower.contains(fragment))
@@ -163,10 +176,31 @@ fn scan_for_unredacted_header_pairs(value: &Value, path: &str, leaks: &mut Vec<S
 }
 
 fn assert_json_values_redacted(values: &[Value], label: &str) {
+    fn is_allowed_metric_field(path: &str) -> bool {
+        matches!(
+            path.rsplit('.').next(),
+            Some(
+                "totalTokens"
+                    | "total_tokens"
+                    | "inputTokens"
+                    | "input_tokens"
+                    | "outputTokens"
+                    | "output_tokens"
+                    | "cacheReadTokens"
+                    | "cache_read_tokens"
+                    | "cacheWriteTokens"
+                    | "cache_write_tokens"
+            )
+        )
+    }
+
     let mut leaks = Vec::new();
     for (index, value) in values.iter().enumerate() {
         let path = format!("{label}[{}]", index + 1);
         for leak in find_unredacted_keys(value) {
+            if is_allowed_metric_field(&leak) {
+                continue;
+            }
             leaks.push(format!("{path}: {leak}"));
         }
         scan_for_unredacted_header_pairs(value, &path, &mut leaks);
@@ -399,8 +433,8 @@ fn e2e_live_provider_harness_smoke() {
                 .unwrap_or_else(|err| panic!("create live provider vcr dir: {err}"));
 
             let mut runs = Vec::with_capacity(filtered_targets.len());
-            for target in filtered_targets.iter().copied() {
-                let run = run_live_provider_target(harness_ref, &registry, &target, &vcr_dir).await;
+            for target in &filtered_targets {
+                let run = run_live_provider_target(harness_ref, &registry, target, &vcr_dir).await;
                 runs.push(run);
             }
 

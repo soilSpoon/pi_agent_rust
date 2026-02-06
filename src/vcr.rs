@@ -992,8 +992,6 @@ mod tests {
         );
 
         let replay = run_async({
-            let request = request.clone();
-            let cassette_dir = cassette_dir.clone();
             async move {
                 let recorder =
                     VcrRecorder::new_with("auto_mode_cycle", VcrMode::Auto, cassette_dir);
@@ -1026,7 +1024,6 @@ mod tests {
         };
 
         run_async({
-            let recorded_request = recorded_request.clone();
             let cassette_dir = cassette_dir.clone();
             async move {
                 let recorder =
@@ -1059,7 +1056,6 @@ mod tests {
         };
 
         let err = run_async({
-            let cassette_dir = cassette_dir.clone();
             async move {
                 let recorder =
                     VcrRecorder::new_with("strict_mismatch", VcrMode::Playback, cassette_dir);
@@ -1087,8 +1083,8 @@ mod tests {
 
     #[test]
     fn test_env_override_helpers_set_and_restore_values() {
-        let _lock = env_test_lock().lock().expect("env test lock");
         const TEST_VAR: &str = "PI_AGENT_VCR_TEST_ENV_OVERRIDE";
+        let _lock = env_test_lock().lock().expect("env test lock");
 
         let original = set_test_env_var(TEST_VAR, None);
         assert_eq!(env_var(TEST_VAR), None);

@@ -25,6 +25,7 @@ use pi::auth::{AuthCredential, AuthStorage};
 use pi::cli;
 use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
+use pi::extension_index::ExtensionIndexStore;
 use pi::extensions::extension_event_from_agent;
 use pi::model::{AssistantMessage, ContentBlock, StopReason};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
@@ -472,6 +473,9 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::Update { source } => {
             handle_package_update(&manager, source).await?;
         }
+        cli::Commands::UpdateIndex => {
+            handle_update_index().await?;
+        }
         cli::Commands::List => {
             handle_package_list(&manager).await?;
         }
@@ -506,17 +510,29 @@ const fn scope_from_flag(local: bool) -> PackageScope {
 
 async fn handle_package_install(manager: &PackageManager, source: &str, local: bool) -> Result<()> {
     let scope = scope_from_flag(local);
-    manager.install(source, scope).await?;
-    manager.add_package_source(source, scope).await?;
-    println!("Installed {source}");
+    let resolved_source = manager.resolve_install_source_alias(source);
+    manager.install(&resolved_source, scope).await?;
+    manager.add_package_source(&resolved_source, scope).await?;
+    if resolved_source == source {
+        println!("Installed {source}");
+    } else {
+        println!("Installed {source} (resolved to {resolved_source})");
+    }
     Ok(())
 }
 
 async fn handle_package_remove(manager: &PackageManager, source: &str, local: bool) -> Result<()> {
     let scope = scope_from_flag(local);
-    manager.remove(source, scope).await?;
-    manager.remove_package_source(source, scope).await?;
-    println!("Removed {source}");
+    let resolved_source = manager.resolve_install_source_alias(source);
+    manager.remove(&resolved_source, scope).await?;
+    manager
+        .remove_package_source(&resolved_source, scope)
+        .await?;
+    if resolved_source == source {
+        println!("Removed {source}");
+    } else {
+        println!("Removed {source} (resolved to {resolved_source})");
+    }
     Ok(())
 }
 
@@ -524,14 +540,19 @@ async fn handle_package_update(manager: &PackageManager, source: Option<String>)
     let entries = manager.list_packages().await?;
 
     if let Some(source) = source {
-        let identity = manager.package_identity(&source);
+        let resolved_source = manager.resolve_install_source_alias(&source);
+        let identity = manager.package_identity(&resolved_source);
         for entry in entries {
             if manager.package_identity(&entry.source) != identity {
                 continue;
             }
             manager.update_source(&entry.source, entry.scope).await?;
         }
-        println!("Updated {source}");
+        if resolved_source == source {
+            println!("Updated {source}");
+        } else {
+            println!("Updated {source} (resolved to {resolved_source})");
+        }
         return Ok(());
     }
 
@@ -579,6 +600,28 @@ async fn handle_package_list(manager: &PackageManager) -> Result<()> {
     Ok(())
 }
 
+async fn handle_update_index() -> Result<()> {
+    let store = ExtensionIndexStore::default_store();
+    let client = pi::http::client::Client::new();
+    let (_, stats) = store.refresh_best_effort(&client).await?;
+
+    if !stats.refreshed {
+        println!(
+            "Extension index refresh skipped: remote sources unavailable; using existing seed/cache."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Extension index refreshed: {} merged entries (npm: {}, github: {}) at {}",
+        stats.merged_entries,
+        stats.npm_entries,
+        stats.github_entries,
+        store.path().display()
+    );
+    Ok(())
+}
+
 async fn print_package_entry(manager: &PackageManager, entry: &PackageEntry) -> Result<()> {
     let display = if entry.filter.is_some() {
         format!("{} (filtered)", entry.source)
@@ -607,6 +650,7 @@ fn handle_config(cwd: &Path) -> Result<()> {
     println!("  Auth:     {}", Config::auth_path().display());
     println!("  Sessions: {}", Config::sessions_dir().display());
     println!("  Packages: {}", Config::package_dir().display());
+    println!("  ExtIndex: {}", Config::extension_index_path().display());
     println!();
     println!("Settings precedence:");
     println!("  1) CLI flags");

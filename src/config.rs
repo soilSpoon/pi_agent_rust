@@ -182,6 +182,12 @@ impl Config {
         package_dir_from_env(env_lookup, &global_dir)
     }
 
+    /// Get the extension index cache file path.
+    pub fn extension_index_path() -> PathBuf {
+        let global_dir = Self::global_dir();
+        extension_index_path_from_env(env_lookup, &global_dir)
+    }
+
     /// Get the auth file path.
     pub fn auth_path() -> PathBuf {
         Self::global_dir().join("auth.json")
@@ -459,7 +465,15 @@ where
     get_env("PI_PACKAGE_DIR").map_or_else(|| global_dir.join("packages"), PathBuf::from)
 }
 
-fn parse_queue_mode(mode: Option<&str>) -> Option<QueueMode> {
+fn extension_index_path_from_env<F>(get_env: F, global_dir: &Path) -> PathBuf
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env("PI_EXTENSION_INDEX_PATH")
+        .map_or_else(|| global_dir.join("extension-index.json"), PathBuf::from)
+}
+
+pub(crate) fn parse_queue_mode(mode: Option<&str>) -> Option<QueueMode> {
     match mode.map(str::trim) {
         Some("all") => Some(QueueMode::All),
         Some("one-at-a-time") => Some(QueueMode::OneAtATime),
@@ -667,7 +681,8 @@ fn patch_settings_file(path: &Path, patch: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, SettingsScope, global_dir_from_env, package_dir_from_env, sessions_dir_from_env,
+        Config, SettingsScope, extension_index_path_from_env, global_dir_from_env,
+        package_dir_from_env, sessions_dir_from_env,
     };
     use crate::agent::QueueMode;
     use serde_json::json;
@@ -818,15 +833,21 @@ mod tests {
             ("PI_CODING_AGENT_DIR".to_string(), "env-root".to_string()),
             ("PI_SESSIONS_DIR".to_string(), "env-sessions".to_string()),
             ("PI_PACKAGE_DIR".to_string(), "env-packages".to_string()),
+            (
+                "PI_EXTENSION_INDEX_PATH".to_string(),
+                "env-extension-index.json".to_string(),
+            ),
         ]);
 
         let global = global_dir_from_env(|key| env.get(key).cloned());
         let sessions = sessions_dir_from_env(|key| env.get(key).cloned(), &global);
         let package = package_dir_from_env(|key| env.get(key).cloned(), &global);
+        let extension_index = extension_index_path_from_env(|key| env.get(key).cloned(), &global);
 
         assert_eq!(global, PathBuf::from("env-root"));
         assert_eq!(sessions, PathBuf::from("env-sessions"));
         assert_eq!(package, PathBuf::from("env-packages"));
+        assert_eq!(extension_index, PathBuf::from("env-extension-index.json"));
     }
 
     #[test]
@@ -835,10 +856,15 @@ mod tests {
         let global = global_dir_from_env(|key| env.get(key).cloned());
         let sessions = sessions_dir_from_env(|key| env.get(key).cloned(), &global);
         let package = package_dir_from_env(|key| env.get(key).cloned(), &global);
+        let extension_index = extension_index_path_from_env(|key| env.get(key).cloned(), &global);
 
         assert_eq!(global, PathBuf::from("root-dir"));
         assert_eq!(sessions, PathBuf::from("root-dir").join("sessions"));
         assert_eq!(package, PathBuf::from("root-dir").join("packages"));
+        assert_eq!(
+            extension_index,
+            PathBuf::from("root-dir").join("extension-index.json")
+        );
     }
 
     #[test]

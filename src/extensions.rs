@@ -6270,7 +6270,7 @@ async fn dispatch_hostcall_session(
             let message_value = payload.get("message").cloned().unwrap_or(payload);
             match serde_json::from_value(message_value) {
                 Ok(message) => session.append_message(message).await.map(|()| Value::Null),
-                Err(err) => Err(Error::extension(format!("Parse message: {err}"))),
+                Err(err) => Err(Error::validation(format!("Parse message: {err}"))),
             }
         }
         "append_entry" | "appendentry" => {
@@ -6312,15 +6312,18 @@ async fn dispatch_hostcall_session(
                 .await
                 .map(|()| Value::Null)
         }
-        _ => Err(Error::extension(format!("Unknown session op: {op}"))),
+        _ => Err(Error::validation(format!("Unknown session op: {op}"))),
     };
 
     match result {
         Ok(value) => HostcallOutcome::Success(value),
-        Err(err) => HostcallOutcome::Error {
-            code: "invalid_request".to_string(),
-            message: err.to_string(),
-        },
+        Err(err) => {
+            let code = err.hostcall_error_code().to_string();
+            HostcallOutcome::Error {
+                code,
+                message: err.to_string(),
+            }
+        }
     }
 }
 
@@ -9703,10 +9706,7 @@ mod tests {
                         "unexpected denial message: {message}"
                     );
                 }
-                other @ HostcallOutcome::Success(_) => {
-                    panic!("expected denied outcome for capability={capability}, got {other:?}");
-                }
-                other @ HostcallOutcome::StreamChunk { .. } => {
+                other @ (HostcallOutcome::Success(_) | HostcallOutcome::StreamChunk { .. }) => {
                     panic!("expected denied outcome for capability={capability}, got {other:?}");
                 }
             }
@@ -10047,6 +10047,15 @@ mod tests {
                 );
                 return;
             }
+            HostcallOutcome::StreamChunk {
+                sequence,
+                chunk,
+                is_final,
+            } => {
+                panic!(
+                    "expected read success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                );
+            }
         };
 
         let encoded = serde_json::to_string(&value).expect("serialize read output");
@@ -10089,6 +10098,15 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
+                }
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -10120,6 +10138,15 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
+                }
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -10147,6 +10174,15 @@ mod tests {
                 HostcallOutcome::Success(value) => value,
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
+                }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
                 }
             };
             let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
@@ -10200,6 +10236,15 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
+                }
             };
             let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
             assert_eq!(tool_list.len(), 2); // 1 built-in + 1 extension
@@ -10240,6 +10285,15 @@ mod tests {
                 HostcallOutcome::Success(value) => value,
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
+                }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
                 }
             };
             let tool_names: Vec<String> = value
@@ -10997,6 +11051,15 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
+                }
             };
             assert!(value.get("provider").unwrap().is_null());
             assert!(value.get("modelId").unwrap().is_null());
@@ -11042,6 +11105,15 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
+                }
             };
             assert!(value.get("thinkingLevel").unwrap().is_null());
         });
@@ -11076,6 +11148,15 @@ mod tests {
                 HostcallOutcome::Success(value) => value,
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
+                }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
                 }
             };
             assert_eq!(
@@ -11234,6 +11315,15 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
+                }
             };
             assert_eq!(value.as_str(), Some("My Feature Work"));
         });
@@ -11352,6 +11442,15 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
+                }
             };
             assert_eq!(
                 value.get("provider").and_then(Value::as_str),
@@ -11394,6 +11493,15 @@ mod tests {
                 HostcallOutcome::Success(value) => value,
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
+                }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
                 }
             };
             assert_eq!(
@@ -11794,6 +11902,15 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
+                }
             };
             assert_eq!(val.get("name").and_then(Value::as_str), Some("output-dir"));
             assert_eq!(val.get("type").and_then(Value::as_str), Some("string"));
@@ -11833,6 +11950,15 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success with null, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success with null, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
+                }
             };
             assert!(val.is_null());
         });
@@ -11862,6 +11988,15 @@ mod tests {
                 HostcallOutcome::Success(val) => val,
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
+                }
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    unreachable!(
+                        "expected success, got stream chunk seq={sequence} final={is_final}: {chunk}"
+                    );
                 }
             };
             let arr = val.as_array().expect("expected array");

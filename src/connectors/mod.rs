@@ -3,74 +3,19 @@
 //! Connectors provide capability-gated access to host resources (HTTP, filesystem, etc.)
 //! for extensions. Each connector validates requests against policy before execution.
 //!
-//! Types are defined locally to avoid coupling with the extensions module.
+//! Hostcall ABI types are re-exported from `crate::extensions` so protocol
+//! serialization stays canonical across runtime and connector boundaries.
 
 pub mod http;
 
 use crate::error::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-// ============================================================================
-// Hostcall protocol types (defined locally to avoid coupling with extensions)
-// ============================================================================
-
-/// Hostcall request payload from extension.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostCallPayload {
-    pub call_id: String,
-    pub capability: String,
-    pub method: String,
-    pub params: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cancel_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<Value>,
-}
-
-/// Error codes for hostcall failures.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum HostCallErrorCode {
-    Timeout,
-    Denied,
-    Io,
-    InvalidRequest,
-    Internal,
-}
-
-/// Structured error information for hostcall failures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostCallError {
-    pub code: HostCallErrorCode,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retryable: Option<bool>,
-}
-
-/// Optional streaming chunk metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostStreamChunk {
-    pub index: u64,
-    pub is_last: bool,
-}
-
-/// Hostcall result payload returned to extension.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostResultPayload {
-    pub call_id: String,
-    pub output: Value,
-    pub is_error: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<HostCallError>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk: Option<HostStreamChunk>,
-}
+pub use crate::extensions::{
+    HostCallError, HostCallErrorCode, HostCallPayload, HostResultPayload, HostStreamBackpressure,
+    HostStreamChunk,
+};
 
 /// Trait for connectors that handle hostcalls from extensions.
 #[async_trait]
@@ -200,5 +145,89 @@ mod tests {
                 "code={code:?} with details must produce object output"
             );
         }
+    }
+
+    #[test]
+    fn connectors_hostcall_types_are_canonical_extension_types() {
+        fn accepts_extension_call(_: crate::extensions::HostCallPayload) {}
+        fn accepts_extension_result(_: crate::extensions::HostResultPayload) {}
+
+        let call = HostCallPayload {
+            call_id: "c6".to_string(),
+            capability: "http".to_string(),
+            method: "http.fetch".to_string(),
+            params: json!({"url": "https://example.com"}),
+            timeout_ms: Some(1000),
+            cancel_token: None,
+            context: None,
+        };
+        accepts_extension_call(call);
+
+        let result = HostResultPayload {
+            call_id: "c7".to_string(),
+            output: json!({"ok": true}),
+            is_error: false,
+            error: None,
+            chunk: Some(HostStreamChunk {
+                index: 1,
+                is_last: false,
+                backpressure: Some(HostStreamBackpressure {
+                    credits: Some(8),
+                    delay_ms: Some(5),
+                }),
+            }),
+        };
+        accepts_extension_result(result);
+    }
+
+    #[test]
+    fn host_stream_chunk_serializes_backpressure_fields() {
+        let chunk = HostStreamChunk {
+            index: 2,
+            is_last: false,
+            backpressure: Some(HostStreamBackpressure {
+                credits: Some(4),
+                delay_ms: Some(25),
+            }),
+        };
+
+        let value = serde_json::to_value(&chunk).expect("serialize host stream chunk");
+        assert_eq!(value["index"], json!(2));
+        assert_eq!(value["is_last"], json!(false));
+        assert_eq!(value["backpressure"]["credits"], json!(4));
+        assert_eq!(value["backpressure"]["delay_ms"], json!(25));
+    }
+
+    #[test]
+    fn protocol_schema_still_declares_host_stream_backpressure_and_object_output() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../docs/schema/extension_protocol.json"))
+                .expect("parse extension protocol schema");
+        let defs = schema
+            .get("$defs")
+            .and_then(Value::as_object)
+            .expect("schema $defs object");
+
+        let host_stream_chunk = defs
+            .get("host_stream_chunk")
+            .and_then(|v| v.get("properties"))
+            .and_then(Value::as_object)
+            .expect("host_stream_chunk properties");
+        assert!(
+            host_stream_chunk.contains_key("backpressure"),
+            "schema drift: host_stream_chunk.backpressure missing",
+        );
+
+        let output_type = defs
+            .get("host_result")
+            .and_then(|v| v.get("properties"))
+            .and_then(|v| v.get("output"))
+            .and_then(|v| v.get("type"))
+            .and_then(Value::as_str)
+            .expect("host_result.output.type");
+        assert_eq!(
+            output_type, "object",
+            "schema drift: host_result.output must remain object",
+        );
     }
 }

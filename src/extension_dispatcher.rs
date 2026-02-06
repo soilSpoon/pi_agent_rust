@@ -339,166 +339,176 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         };
 
         // Categorised result: (Value, error_code) where error_code distinguishes taxonomy.
-        let result: std::result::Result<Value, (HostCallErrorCode, String)> =
-            match op_norm.as_str() {
-                "get_state" | "getstate" => Ok(self.session.get_state().await),
-                "get_messages" | "getmessages" => {
-                    serde_json::to_value(self.session.get_messages().await)
-                        .map_err(|err| (HostCallErrorCode::Internal, format!("Serialize messages: {err}")))
+        let result: std::result::Result<Value, (HostCallErrorCode, String)> = match op_norm.as_str()
+        {
+            "get_state" | "getstate" => Ok(self.session.get_state().await),
+            "get_messages" | "getmessages" => {
+                serde_json::to_value(self.session.get_messages().await).map_err(|err| {
+                    (
+                        HostCallErrorCode::Internal,
+                        format!("Serialize messages: {err}"),
+                    )
+                })
+            }
+            "get_entries" | "getentries" => serde_json::to_value(self.session.get_entries().await)
+                .map_err(|err| {
+                    (
+                        HostCallErrorCode::Internal,
+                        format!("Serialize entries: {err}"),
+                    )
+                }),
+            "get_branch" | "getbranch" => serde_json::to_value(self.session.get_branch().await)
+                .map_err(|err| {
+                    (
+                        HostCallErrorCode::Internal,
+                        format!("Serialize branch: {err}"),
+                    )
+                }),
+            "get_file" | "getfile" => {
+                let state = self.session.get_state().await;
+                let file = state
+                    .get("sessionFile")
+                    .or_else(|| state.get("session_file"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                Ok(file)
+            }
+            "get_name" | "getname" => {
+                let state = self.session.get_state().await;
+                let name = state
+                    .get("sessionName")
+                    .or_else(|| state.get("session_name"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                Ok(name)
+            }
+            "set_name" | "setname" => {
+                let name = payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.session
+                    .set_name(name)
+                    .await
+                    .map(|()| Value::Null)
+                    .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
+            }
+            "append_entry" | "appendentry" => {
+                let custom_type = payload
+                    .get("customType")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("custom_type").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                let data = payload.get("data").cloned();
+                self.session
+                    .append_custom_entry(custom_type, data)
+                    .await
+                    .map(|()| Value::Null)
+                    .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
+            }
+            "append_message" | "appendmessage" => {
+                let message_value = payload.get("message").cloned().unwrap_or(payload);
+                match serde_json::from_value(message_value) {
+                    Ok(message) => self
+                        .session
+                        .append_message(message)
+                        .await
+                        .map(|()| Value::Null)
+                        .map_err(|err| (HostCallErrorCode::Io, err.to_string())),
+                    Err(err) => Err((
+                        HostCallErrorCode::InvalidRequest,
+                        format!("Parse message: {err}"),
+                    )),
                 }
-                "get_entries" | "getentries" => {
-                    serde_json::to_value(self.session.get_entries().await)
-                        .map_err(|err| (HostCallErrorCode::Internal, format!("Serialize entries: {err}")))
-                }
-                "get_branch" | "getbranch" => {
-                    serde_json::to_value(self.session.get_branch().await)
-                        .map_err(|err| (HostCallErrorCode::Internal, format!("Serialize branch: {err}")))
-                }
-                "get_file" | "getfile" => {
-                    let state = self.session.get_state().await;
-                    let file = state
-                        .get("sessionFile")
-                        .or_else(|| state.get("session_file"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    Ok(file)
-                }
-                "get_name" | "getname" => {
-                    let state = self.session.get_state().await;
-                    let name = state
-                        .get("sessionName")
-                        .or_else(|| state.get("session_name"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    Ok(name)
-                }
-                "set_name" | "setname" => {
-                    let name = payload
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
+            }
+            "set_model" | "setmodel" => {
+                let provider = payload
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let model_id = payload
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("model_id").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                if provider.is_empty() || model_id.is_empty() {
+                    Err((
+                        HostCallErrorCode::InvalidRequest,
+                        "set_model requires 'provider' and 'modelId' fields".to_string(),
+                    ))
+                } else {
                     self.session
-                        .set_name(name)
+                        .set_model(provider, model_id)
+                        .await
+                        .map(|()| Value::Bool(true))
+                        .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
+                }
+            }
+            "get_model" | "getmodel" => {
+                let (provider, model_id) = self.session.get_model().await;
+                Ok(serde_json::json!({
+                    "provider": provider,
+                    "modelId": model_id,
+                }))
+            }
+            "set_thinking_level" | "setthinkinglevel" => {
+                let level = payload
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("thinkingLevel").and_then(Value::as_str))
+                    .or_else(|| payload.get("thinking_level").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                if level.is_empty() {
+                    Err((
+                        HostCallErrorCode::InvalidRequest,
+                        "set_thinking_level requires 'level' field".to_string(),
+                    ))
+                } else {
+                    self.session
+                        .set_thinking_level(level)
                         .await
                         .map(|()| Value::Null)
                         .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
                 }
-                "append_entry" | "appendentry" => {
-                    let custom_type = payload
-                        .get("customType")
-                        .and_then(Value::as_str)
-                        .or_else(|| payload.get("custom_type").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_string();
-                    let data = payload.get("data").cloned();
+            }
+            "get_thinking_level" | "getthinkinglevel" => {
+                let level = self.session.get_thinking_level().await;
+                Ok(level.map_or(Value::Null, Value::String))
+            }
+            "set_label" | "setlabel" => {
+                let target_id = payload
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("target_id").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                let label = payload
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                if target_id.is_empty() {
+                    Err((
+                        HostCallErrorCode::InvalidRequest,
+                        "set_label requires 'targetId' field".to_string(),
+                    ))
+                } else {
                     self.session
-                        .append_custom_entry(custom_type, data)
+                        .set_label(target_id, label)
                         .await
                         .map(|()| Value::Null)
                         .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
                 }
-                "append_message" | "appendmessage" => {
-                    let message_value = payload.get("message").cloned().unwrap_or(payload);
-                    match serde_json::from_value(message_value) {
-                        Ok(message) => self
-                            .session
-                            .append_message(message)
-                            .await
-                            .map(|()| Value::Null)
-                            .map_err(|err| (HostCallErrorCode::Io, err.to_string())),
-                        Err(err) => Err((
-                            HostCallErrorCode::InvalidRequest,
-                            format!("Parse message: {err}"),
-                        )),
-                    }
-                }
-                "set_model" | "setmodel" => {
-                    let provider = payload
-                        .get("provider")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let model_id = payload
-                        .get("modelId")
-                        .and_then(Value::as_str)
-                        .or_else(|| payload.get("model_id").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_string();
-                    if provider.is_empty() || model_id.is_empty() {
-                        Err((
-                            HostCallErrorCode::InvalidRequest,
-                            "set_model requires 'provider' and 'modelId' fields".to_string(),
-                        ))
-                    } else {
-                        self.session
-                            .set_model(provider, model_id)
-                            .await
-                            .map(|()| Value::Bool(true))
-                            .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
-                    }
-                }
-                "get_model" | "getmodel" => {
-                    let (provider, model_id) = self.session.get_model().await;
-                    Ok(serde_json::json!({
-                        "provider": provider,
-                        "modelId": model_id,
-                    }))
-                }
-                "set_thinking_level" | "setthinkinglevel" => {
-                    let level = payload
-                        .get("level")
-                        .and_then(Value::as_str)
-                        .or_else(|| payload.get("thinkingLevel").and_then(Value::as_str))
-                        .or_else(|| payload.get("thinking_level").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_string();
-                    if level.is_empty() {
-                        Err((
-                            HostCallErrorCode::InvalidRequest,
-                            "set_thinking_level requires 'level' field".to_string(),
-                        ))
-                    } else {
-                        self.session
-                            .set_thinking_level(level)
-                            .await
-                            .map(|()| Value::Null)
-                            .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
-                    }
-                }
-                "get_thinking_level" | "getthinkinglevel" => {
-                    let level = self.session.get_thinking_level().await;
-                    Ok(level.map_or(Value::Null, Value::String))
-                }
-                "set_label" | "setlabel" => {
-                    let target_id = payload
-                        .get("targetId")
-                        .and_then(Value::as_str)
-                        .or_else(|| payload.get("target_id").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_string();
-                    let label = payload
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .map(String::from);
-                    if target_id.is_empty() {
-                        Err((
-                            HostCallErrorCode::InvalidRequest,
-                            "set_label requires 'targetId' field".to_string(),
-                        ))
-                    } else {
-                        self.session
-                            .set_label(target_id, label)
-                            .await
-                            .map(|()| Value::Null)
-                            .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
-                    }
-                }
-                _ => Err((
-                    HostCallErrorCode::InvalidRequest,
-                    format!("Unknown session op: {op}"),
-                )),
-            };
+            }
+            _ => Err((
+                HostCallErrorCode::InvalidRequest,
+                format!("Unknown session op: {op}"),
+            )),
+        };
 
         match result {
             Ok(value) => HostcallOutcome::Success(value),
@@ -6326,9 +6336,12 @@ mod tests {
                 .await;
             match outcome {
                 HostcallOutcome::Error { code, .. } => {
-                    assert_eq!(code, "invalid_request", "unknown op must be invalid_request");
+                    assert_eq!(
+                        code, "invalid_request",
+                        "unknown op must be invalid_request"
+                    );
                 }
-                HostcallOutcome::Success(_) => {
+                HostcallOutcome::Success(_) | HostcallOutcome::StreamChunk { .. } => {
                     panic!("unknown op should not succeed");
                 }
             }
@@ -6345,11 +6358,7 @@ mod tests {
             );
             let dispatcher = build_dispatcher(Rc::clone(&runtime));
             let outcome = dispatcher
-                .dispatch_session(
-                    "c2",
-                    "set_model",
-                    serde_json::json!({"modelId": "gpt-4o"}),
-                )
+                .dispatch_session("c2", "set_model", serde_json::json!({"modelId": "gpt-4o"}))
                 .await;
             match outcome {
                 HostcallOutcome::Error { code, .. } => {
@@ -6360,6 +6369,9 @@ mod tests {
                 }
                 HostcallOutcome::Success(_) => {
                     panic!("set_model with missing provider should not succeed");
+                }
+                HostcallOutcome::StreamChunk { .. } => {
+                    panic!("set_model with missing provider should not stream");
                 }
             }
         });
@@ -6388,6 +6400,9 @@ mod tests {
                 HostcallOutcome::Success(_) => {
                     panic!("set_model with missing modelId should not succeed");
                 }
+                HostcallOutcome::StreamChunk { .. } => {
+                    panic!("set_model with missing modelId should not stream");
+                }
             }
         });
     }
@@ -6411,6 +6426,9 @@ mod tests {
                 HostcallOutcome::Success(_) => {
                     panic!("set_thinking_level with no level should not succeed");
                 }
+                HostcallOutcome::StreamChunk { .. } => {
+                    panic!("set_thinking_level with no level should not stream");
+                }
             }
         });
     }
@@ -6433,6 +6451,9 @@ mod tests {
                 }
                 HostcallOutcome::Success(_) => {
                     panic!("set_label with no targetId should not succeed");
+                }
+                HostcallOutcome::StreamChunk { .. } => {
+                    panic!("set_label with no targetId should not stream");
                 }
             }
         });
@@ -6464,11 +6485,15 @@ mod tests {
                 HostcallOutcome::Success(_) => {
                     panic!("invalid message should not succeed");
                 }
+                HostcallOutcome::StreamChunk { .. } => {
+                    panic!("invalid message should not stream");
+                }
             }
         });
     }
 
     #[test]
+    #[allow(clippy::items_after_statements, clippy::too_many_lines)]
     fn session_dispatch_taxonomy_io_error_from_session_trait() {
         futures::executor::block_on(async {
             let runtime = Rc::new(
@@ -6495,26 +6520,36 @@ mod tests {
                     Vec::new()
                 }
                 async fn set_name(&self, _name: String) -> Result<()> {
-                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other(
+                        "disk full",
+                    )))
                 }
                 async fn append_message(&self, _message: SessionMessage) -> Result<()> {
-                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other(
+                        "disk full",
+                    )))
                 }
                 async fn append_custom_entry(
                     &self,
                     _custom_type: String,
                     _data: Option<Value>,
                 ) -> Result<()> {
-                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other(
+                        "disk full",
+                    )))
                 }
                 async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
-                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other(
+                        "disk full",
+                    )))
                 }
                 async fn get_model(&self) -> (Option<String>, Option<String>) {
                     (None, None)
                 }
                 async fn set_thinking_level(&self, _level: String) -> Result<()> {
-                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other(
+                        "disk full",
+                    )))
                 }
                 async fn get_thinking_level(&self) -> Option<String> {
                     None
@@ -6524,7 +6559,9 @@ mod tests {
                     _target_id: String,
                     _label: Option<String>,
                 ) -> Result<()> {
-                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other(
+                        "disk full",
+                    )))
                 }
             }
 
@@ -6544,10 +6581,7 @@ mod tests {
                     "set_model",
                     serde_json::json!({"provider": "a", "modelId": "b"}),
                 ),
-                (
-                    "set_thinking_level",
-                    serde_json::json!({"level": "high"}),
-                ),
+                ("set_thinking_level", serde_json::json!({"level": "high"})),
                 (
                     "set_label",
                     serde_json::json!({"targetId": "abc", "label": "x"}),
@@ -6570,6 +6604,9 @@ mod tests {
                     }
                     HostcallOutcome::Success(_) => {
                         panic!("op '{op}' with failing session should not succeed");
+                    }
+                    HostcallOutcome::StreamChunk { .. } => {
+                        panic!("op '{op}' with failing session should not stream");
                     }
                 }
             }
@@ -6648,11 +6685,12 @@ mod tests {
                     .await;
                 match (&outcome_a, &outcome_b) {
                     (HostcallOutcome::Success(a), HostcallOutcome::Success(b)) => {
-                        assert_eq!(a, b, "alias pair ({snake}, {camel}) should produce same output");
+                        assert_eq!(
+                            a, b,
+                            "alias pair ({snake}, {camel}) should produce same output"
+                        );
                     }
-                    _ => panic!(
-                        "alias pair ({snake}, {camel}) should both succeed"
-                    ),
+                    _ => panic!("alias pair ({snake}, {camel}) should both succeed"),
                 }
             }
         });

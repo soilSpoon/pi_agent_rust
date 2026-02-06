@@ -482,10 +482,8 @@ pub fn select_model_and_thinking(
             .and_then(parse_thinking_level_opt);
     }
 
-    let thinking_level = clamp_thinking_level(
-        thinking_level.unwrap_or(model::ThinkingLevel::Medium),
-        &model_entry,
-    );
+    let thinking_level =
+        model_entry.clamp_thinking_level(thinking_level.unwrap_or(model::ThinkingLevel::Medium));
 
     Ok(ModelSelection {
         model_entry,
@@ -658,23 +656,6 @@ pub fn build_stream_options(
     }
 
     options
-}
-
-fn supports_xhigh(model_id: &str) -> bool {
-    matches!(model_id, "gpt-5.1-codex-max" | "gpt-5.2" | "gpt-5.2-codex")
-}
-
-fn clamp_thinking_level(
-    thinking: model::ThinkingLevel,
-    model_entry: &ModelEntry,
-) -> model::ThinkingLevel {
-    if !model_entry.model.reasoning {
-        return model::ThinkingLevel::Off;
-    }
-    if thinking == model::ThinkingLevel::XHigh && !supports_xhigh(&model_entry.model.id) {
-        return model::ThinkingLevel::High;
-    }
-    thinking
 }
 
 // === Model scoping helpers (used by main + tests) ===
@@ -1050,21 +1031,21 @@ mod tests {
     #[test]
     fn clamp_thinking_level_returns_off_for_non_reasoning_models() {
         let model_entry = test_model_entry("gpt-4o-mini", "openai", false);
-        let clamped = clamp_thinking_level(model::ThinkingLevel::High, &model_entry);
+        let clamped = model_entry.clamp_thinking_level(model::ThinkingLevel::High);
         assert_eq!(clamped, model::ThinkingLevel::Off);
     }
 
     #[test]
     fn clamp_thinking_level_clamps_xhigh_for_unsupported_models() {
         let model_entry = test_model_entry("gpt-4o", "openai", true);
-        let clamped = clamp_thinking_level(model::ThinkingLevel::XHigh, &model_entry);
+        let clamped = model_entry.clamp_thinking_level(model::ThinkingLevel::XHigh);
         assert_eq!(clamped, model::ThinkingLevel::High);
     }
 
     #[test]
     fn clamp_thinking_level_keeps_xhigh_for_supported_models() {
         let model_entry = test_model_entry("gpt-5.2", "openai", true);
-        let clamped = clamp_thinking_level(model::ThinkingLevel::XHigh, &model_entry);
+        let clamped = model_entry.clamp_thinking_level(model::ThinkingLevel::XHigh);
         assert_eq!(clamped, model::ThinkingLevel::XHigh);
     }
 }

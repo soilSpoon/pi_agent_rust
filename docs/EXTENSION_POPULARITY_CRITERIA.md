@@ -282,8 +282,23 @@ provenance, unmodified compatibility), emit a machine-readable shortfall report 
 ### 3.2 Executable Scoring Contract
 
 Normative implementation:
+- `src/bin/ext_popularity_snapshot.rs`
 - `src/extension_scoring.rs`
 - `src/bin/ext_score_candidates.rs`
+
+Example popularity snapshot run:
+
+```bash
+cargo run --bin ext_popularity_snapshot -- \
+  --input docs/extension-candidate-pool.json \
+  --out docs/extension-candidate-pool.json \
+  --log-jsonl tests/e2e_results/ext-popularity-snapshot.jsonl
+```
+
+Notes:
+- GitHub metrics require `GITHUB_TOKEN` in the environment.
+- If `GITHUB_TOKEN` is missing, GitHub lookups are skipped and npm signals are still refreshed.
+- Use `--dry-run` to preview summary stats without writing files.
 
 Example run:
 

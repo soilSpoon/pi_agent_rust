@@ -266,6 +266,9 @@ fn command_value(command: Option<&Commands>) -> Value {
             "name": "update",
             "source": source,
         }),
+        Some(Commands::UpdateIndex) => json!({
+            "name": "update-index",
+        }),
         Some(Commands::List) => json!({
             "name": "list",
         }),

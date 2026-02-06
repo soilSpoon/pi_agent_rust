@@ -115,10 +115,7 @@ impl Error {
     pub const fn hostcall_error_code(&self) -> &'static str {
         match self {
             Self::Validation(_) => "invalid_request",
-            Self::Io(_)
-            | Self::Session(_)
-            | Self::SessionNotFound { .. }
-            | Self::Sqlite(_) => "io",
+            Self::Io(_) | Self::Session(_) | Self::SessionNotFound { .. } | Self::Sqlite(_) => "io",
             Self::Auth(_) => "denied",
             Self::Aborted => "timeout",
             Self::Json(_)
@@ -946,7 +943,7 @@ mod tests {
 
     #[test]
     fn hints_io_generic() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "something");
+        let io_err = std::io::Error::other("something");
         let err = Error::from(io_err);
         let h = err.hints();
         assert!(h.summary.contains("I/O error"));

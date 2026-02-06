@@ -313,6 +313,33 @@ mod tests {
 
     use serde_json::json;
 
+    fn sample_images() -> Vec<ImageContent> {
+        vec![ImageContent {
+            data: "ORIGINAL_BASE64".to_string(),
+            mime_type: "image/png".to_string(),
+        }]
+    }
+
+    fn assert_continue(
+        outcome: InputEventOutcome,
+        expected_text: &str,
+        expected_images: &[ImageContent],
+    ) {
+        match outcome {
+            InputEventOutcome::Continue { text, images } => {
+                assert_eq!(text, expected_text);
+                assert_eq!(images.len(), expected_images.len());
+                for (actual, expected) in images.iter().zip(expected_images.iter()) {
+                    assert_eq!(actual.data, expected.data);
+                    assert_eq!(actual.mime_type, expected.mime_type);
+                }
+            }
+            InputEventOutcome::Block { reason } => {
+                panic!("expected continue, got block: {reason:?}");
+            }
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn event_name_matches_expected_strings() {
@@ -477,5 +504,121 @@ mod tests {
         assert_eq!(input.content.as_deref(), Some("hi"));
         assert!(!input.block);
         assert_eq!(input.reason, None);
+    }
+
+    #[test]
+    fn apply_input_event_response_preserves_original_for_none_and_null() {
+        let original_images = sample_images();
+
+        let none_response =
+            apply_input_event_response(None, "original".to_string(), original_images.clone());
+        assert_continue(none_response, "original", &original_images);
+
+        let null_response = apply_input_event_response(
+            Some(Value::Null),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(null_response, "original", &original_images);
+    }
+
+    #[test]
+    fn apply_input_event_response_blocks_for_action_variants() {
+        for action in ["handled", "block", "blocked"] {
+            let outcome = apply_input_event_response(
+                Some(json!({ "action": action, "reason": "Denied by policy" })),
+                "original".to_string(),
+                sample_images(),
+            );
+
+            match outcome {
+                InputEventOutcome::Block { reason } => {
+                    assert_eq!(reason.as_deref(), Some("Denied by policy"));
+                }
+                InputEventOutcome::Continue { .. } => {
+                    panic!("expected block for action={action}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_input_event_response_transform_uses_overrides_and_fallbacks() {
+        let original_images = sample_images();
+        let override_images = vec![ImageContent {
+            data: "NEW_BASE64".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        }];
+
+        let transformed = apply_input_event_response(
+            Some(json!({
+                "action": "transform",
+                "text": "rewritten",
+                "images": [{ "data": "NEW_BASE64", "mimeType": "image/jpeg" }]
+            })),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(transformed, "rewritten", &override_images);
+
+        let invalid_images = apply_input_event_response(
+            Some(json!({
+                "action": "transform",
+                "text": "still rewritten",
+                "images": "not-an-array"
+            })),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(invalid_images, "still rewritten", &original_images);
+
+        let null_images = apply_input_event_response(
+            Some(json!({
+                "content": "alt text",
+                "images": null
+            })),
+            "original".to_string(),
+            original_images,
+        );
+        assert_continue(null_images, "alt text", &[]);
+    }
+
+    #[test]
+    fn apply_input_event_response_continue_action_and_shorthand_string() {
+        let original_images = sample_images();
+
+        let explicit_continue = apply_input_event_response(
+            Some(json!({
+                "action": "continue",
+                "text": "ignored",
+                "images": []
+            })),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(explicit_continue, "original", &original_images);
+
+        let shorthand = apply_input_event_response(
+            Some(Value::String("replacement".to_string())),
+            "original".to_string(),
+            original_images.clone(),
+        );
+        assert_continue(shorthand, "replacement", &original_images);
+    }
+
+    #[test]
+    fn apply_input_event_response_block_flag_and_message_fallback() {
+        let blocked = apply_input_event_response(
+            Some(json!({ "block": true, "message": "Policy denied" })),
+            "original".to_string(),
+            sample_images(),
+        );
+
+        match blocked {
+            InputEventOutcome::Block { reason } => {
+                assert_eq!(reason.as_deref(), Some("Policy denied"));
+            }
+            InputEventOutcome::Continue { .. } => panic!("expected block"),
+        }
     }
 }

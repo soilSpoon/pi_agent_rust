@@ -3492,7 +3492,7 @@ mod tests {
         // Compact: keep from id_c onwards
         session.append_compaction(
             "Summary of old messages".to_string(),
-            id_c.clone(),
+            id_c,
             5000,
             None,
             None,
@@ -3838,7 +3838,7 @@ mod tests {
             if let SessionMessage::User { content, .. } = &msg.message {
                 match content {
                     UserContent::Text(t) => assert_eq!(t, "Modified"),
-                    _ => panic!("expected Text content"),
+                    UserContent::Blocks(_) => panic!("expected Text content"),
                 }
             } else {
                 panic!("expected user message");

@@ -40,7 +40,7 @@ struct PlannedProvider {
 }
 
 impl PlannedProvider {
-    fn new(steps: Vec<PlannedStep>) -> Self {
+    const fn new(steps: Vec<PlannedStep>) -> Self {
         Self {
             steps,
             call_count: AtomicUsize::new(0),
@@ -143,7 +143,7 @@ fn tool_step(tool_call: ToolCall, min_context_messages: usize, total_tokens: u64
     }
 }
 
-fn tool_names() -> [&'static str; 7] {
+const fn tool_names() -> [&'static str; 7] {
     ["read", "write", "edit", "bash", "grep", "find", "ls"]
 }
 
@@ -305,7 +305,7 @@ fn reload_session() {
             .filter_map(|message| match message {
                 Message::User(user) => match &user.content {
                     UserContent::Text(text) => Some(text.clone()),
-                    _ => None,
+                    UserContent::Blocks(_) => None,
                 },
                 _ => None,
             })
