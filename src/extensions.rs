@@ -5751,6 +5751,14 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     ) {
         while let Some(req) = pending.pop_front() {
             let call_id = req.call_id.clone();
+            if !runtime.is_hostcall_pending(&call_id) {
+                tracing::debug!(
+                    event = "pijs.hostcall.skip_cancelled",
+                    call_id = %call_id,
+                    "Skipping hostcall dispatch because call is no longer pending"
+                );
+                continue;
+            }
             let outcome = dispatch_hostcall_with_runtime(Some(runtime), host, req).await;
             runtime.complete_hostcall(call_id, outcome);
         }
@@ -6436,6 +6444,13 @@ async fn dispatch_hostcall_exec(
 
     if stream {
         if let Some(runtime) = runtime {
+            if !runtime.is_hostcall_pending(call_id) {
+                return HostcallOutcome::Error {
+                    code: "timeout".to_string(),
+                    message: "exec stream cancelled".to_string(),
+                };
+            }
+
             let cmd = cmd.to_string();
             let (tx, rx) = mpsc::sync_channel::<ExecStreamFrame>(256);
             let cancel = Arc::new(AtomicBool::new(false));
@@ -9732,6 +9747,69 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn js_runtime_pump_once_exec_streaming_return_cancels_before_dispatch() {
+        futures::executor::block_on(async {
+            let dir = tempdir().expect("tempdir");
+            let manager = ExtensionManager::new();
+            let host = JsRuntimeHost {
+                tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+                manager_ref: Arc::downgrade(&manager.inner),
+                http: Arc::new(HttpConnector::with_defaults()),
+                policy: ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    max_memory_mb: 256,
+                    default_caps: Vec::new(),
+                    deny_caps: Vec::new(),
+                },
+                interceptor: None,
+            };
+
+            let runtime = PiJsRuntime::new().await.expect("runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.cancelDone = false;
+                    (async () => {
+                        const stream = pi.exec("sh", ["-c", "sleep 2"], { stream: true });
+                        await stream.return();
+                        globalThis.cancelDone = true;
+                    })();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let start = Instant::now();
+            for _ in 0..64 {
+                let has_pending = pump_js_runtime_once(&runtime, &host)
+                    .await
+                    .expect("pump_once");
+                if !has_pending {
+                    break;
+                }
+            }
+            let elapsed = start.elapsed();
+
+            assert!(
+                !runtime.has_pending(),
+                "runtime should not remain pending after stream.return() cancellation"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "stream cancellation should complete quickly, took {elapsed:?}",
+            );
+            assert_eq!(
+                runtime
+                    .read_global_json("cancelDone")
+                    .await
+                    .expect("read cancelDone"),
+                Value::Bool(true)
+            );
+        });
+    }
+
+    #[test]
     fn extension_protocol_schema_accepts_all_variants() {
         let schema = compiled_extension_protocol_schema();
         for (label, message) in sample_protocol_messages() {
@@ -10590,7 +10668,13 @@ mod tests {
                 .get("event")
                 .is_some_and(|value| value.contains("host_call.start"))
         });
-        let start = start.expect("host_call.start event");
+        let start = start.unwrap_or_else(|| {
+            panic!(
+                "host_call.start event not found; captured {} events: {:#?}",
+                events.len(),
+                events
+            )
+        });
         assert_eq!(
             start.fields.get("runtime").map(std::string::String::as_str),
             Some("protocol")
@@ -14436,6 +14520,320 @@ mod tests {
         });
     }
 
+    // ========================================================================
+    // bd-2hz.4: UI method routing through shared dispatcher + taxonomy
+    // ========================================================================
+
+    /// UI confirm success path via shared dispatcher.
+    #[test]
+    fn shared_dispatch_ui_confirm_success() {
+        use asupersync::channel::mpsc;
+
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+
+        let manager = extension_manager_no_persisted_permissions();
+        let (ui_tx, ui_rx) = mpsc::channel(8);
+        manager.set_ui_sender(ui_tx);
+
+        let ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.ui-test"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager.clone()),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let call = HostCallPayload {
+            call_id: "ui-confirm-1".to_string(),
+            capability: "ui".to_string(),
+            method: "ui".to_string(),
+            params: json!({ "op": "confirm", "title": "Test?", "message": "Really?" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let cx = asupersync::Cx::for_request();
+
+            let ui_handler = async {
+                let req = ui_rx.recv(&cx).await.expect("ui recv");
+                assert_eq!(req.method, "confirm");
+                manager.respond_ui(ExtensionUiResponse {
+                    id: req.id,
+                    value: Some(Value::Bool(true)),
+                    cancelled: false,
+                });
+            };
+
+            let dispatch = async { dispatch_host_call_shared(&ctx, call).await };
+
+            let ((), result) = futures::join!(ui_handler, dispatch);
+            assert!(
+                !result.is_error,
+                "expected success, got error: {:?}",
+                result.error
+            );
+            // confirm returns the boolean value
+            assert_eq!(result.output, json!(true));
+        });
+    }
+
+    /// UI with no manager (shutdown) returns denied.
+    #[test]
+    fn shared_dispatch_ui_without_manager_returns_denied() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let call = HostCallPayload {
+            call_id: "ui-no-mgr".to_string(),
+            capability: "ui".to_string(),
+            method: "ui".to_string(),
+            params: json!({ "op": "confirm" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let result = dispatch_host_call_shared(&ctx, call).await;
+            assert!(result.is_error);
+            let err = result.error.expect("expected error payload");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
+            assert!(
+                err.message.contains("shutting down"),
+                "expected shutdown message, got: {}",
+                err.message
+            );
+        });
+    }
+
+    /// UI with no UI sender configured returns denied.
+    #[test]
+    fn shared_dispatch_ui_no_sender_returns_denied() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+
+        // Manager exists but no UI sender configured.
+        let manager = extension_manager_no_persisted_permissions();
+        let ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.ui-test"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let call = HostCallPayload {
+            call_id: "ui-no-sender".to_string(),
+            capability: "ui".to_string(),
+            method: "ui".to_string(),
+            params: json!({ "op": "confirm", "title": "Test?" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let result = dispatch_host_call_shared(&ctx, call).await;
+            assert!(result.is_error);
+            let err = result.error.expect("expected error payload");
+            // "not configured" maps to "denied" via classify_ui_hostcall_error
+            assert_eq!(err.code, HostCallErrorCode::Denied);
+        });
+    }
+
+    /// UI cancelled response maps to deterministic cancelled output.
+    #[test]
+    fn shared_dispatch_ui_cancelled_returns_deterministic_value() {
+        use asupersync::channel::mpsc;
+
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+
+        let manager = extension_manager_no_persisted_permissions();
+        let (ui_tx, ui_rx) = mpsc::channel(8);
+        manager.set_ui_sender(ui_tx);
+
+        let ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.ui-test"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager.clone()),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let call = HostCallPayload {
+            call_id: "ui-cancel-1".to_string(),
+            capability: "ui".to_string(),
+            method: "ui".to_string(),
+            params: json!({ "op": "confirm", "title": "Cancel me" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let cx = asupersync::Cx::for_request();
+
+            let ui_handler = async {
+                let req = ui_rx.recv(&cx).await.expect("ui recv");
+                assert_eq!(req.method, "confirm");
+                // Simulate user cancellation.
+                manager.respond_ui(ExtensionUiResponse {
+                    id: req.id,
+                    value: None,
+                    cancelled: true,
+                });
+            };
+
+            let dispatch = async { dispatch_host_call_shared(&ctx, call).await };
+
+            let ((), result) = futures::join!(ui_handler, dispatch);
+            // Cancelled confirm resolves with false (not an error).
+            assert!(!result.is_error, "cancelled should not be an error");
+            assert_eq!(
+                result.output,
+                json!(false),
+                "cancelled confirm should resolve to false"
+            );
+        });
+    }
+
+    /// UI with invalid (empty) op returns invalid_request.
+    #[test]
+    fn shared_dispatch_ui_empty_op_returns_invalid_request() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+
+        let manager = extension_manager_no_persisted_permissions();
+        let ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.ui-test"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let call = HostCallPayload {
+            call_id: "ui-empty-op".to_string(),
+            capability: "ui".to_string(),
+            method: "ui".to_string(),
+            params: json!({ "op": "" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let result = dispatch_host_call_shared(&ctx, call).await;
+            assert!(result.is_error);
+            let err = result.error.expect("expected error payload");
+            assert_eq!(err.code, HostCallErrorCode::InvalidRequest);
+        });
+    }
+
+    /// UI shared dispatch emits structured logs with params_hash and no raw payload.
+    #[test]
+    fn shared_dispatch_ui_logs_params_hash_no_raw_payload() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+
+        let manager = extension_manager_no_persisted_permissions();
+        let ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.ui-log"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let call = HostCallPayload {
+            call_id: "ui-log-1".to_string(),
+            capability: "ui".to_string(),
+            method: "ui".to_string(),
+            params: json!({
+                "op": "confirm",
+                "title": "Secret Title",
+                "message": "Secret Body"
+            }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let (_result, events) = capture_tracing_events(|| {
+            run_async(async { dispatch_host_call_shared(&ctx, call).await })
+        });
+
+        // Should have host_call.start with params_hash.
+        let start = events.iter().find(|e| {
+            e.fields
+                .get("event")
+                .is_some_and(|v| v.contains("host_call.start"))
+        });
+        let start = start.expect("host_call.start event for ui call");
+        assert!(
+            start.fields.contains_key("params_hash"),
+            "start event must include params_hash"
+        );
+
+        // Should have host_call.end with duration_ms.
+        let end = events.iter().find(|e| {
+            e.fields
+                .get("event")
+                .is_some_and(|v| v.contains("host_call.end"))
+        });
+        let end = end.expect("host_call.end event for ui call");
+        assert!(
+            end.fields.contains_key("duration_ms"),
+            "end event must include duration_ms"
+        );
+
+        // No raw payload fields should appear in any log event.
+        for event in &events {
+            for value in event.fields.values() {
+                assert!(
+                    !value.contains("Secret Title"),
+                    "raw payload leaked into logs: {value}"
+                );
+                assert!(
+                    !value.contains("Secret Body"),
+                    "raw payload leaked into logs: {value}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn hostcall_request_to_payload_preserves_method_and_capability() {
         let request = HostcallRequest {
@@ -14474,7 +14872,10 @@ mod tests {
         assert_eq!(payload.method, "exec");
         assert_eq!(payload.capability, "exec");
         // Params should have "cmd" injected
-        assert_eq!(payload.params.get("cmd").and_then(Value::as_str), Some("ls"));
+        assert_eq!(
+            payload.params.get("cmd").and_then(Value::as_str),
+            Some("ls")
+        );
         assert!(payload.params.get("args").is_some());
     }
 
@@ -14539,7 +14940,9 @@ mod tests {
         };
 
         let outcome = host_result_to_outcome(result);
-        assert!(matches!(outcome, HostcallOutcome::Success(ref v) if v == &json!({"data": "hello"})));
+        assert!(
+            matches!(outcome, HostcallOutcome::Success(ref v) if v == &json!({"data": "hello"}))
+        );
     }
 
     #[test]
@@ -14620,5 +15023,237 @@ mod tests {
         assert!(result.is_error);
         let err = result.error.unwrap();
         assert_eq!(err.code, HostCallErrorCode::Internal);
+    }
+
+    // ========================================================================
+    // bd-1uy.1.3: JS-origin hostcalls produce taxonomy-only error codes
+    // ========================================================================
+
+    /// Unknown tool → `invalid_request` (not `tool_error`).
+    #[test]
+    fn js_hostcall_unknown_tool_returns_invalid_request() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        let manager = extension_manager_no_persisted_permissions();
+
+        let host = JsRuntimeHost {
+            tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)),
+            manager_ref: Arc::downgrade(&manager.inner),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+            },
+            interceptor: None,
+        };
+
+        let request = crate::extensions_js::HostcallRequest {
+            call_id: "call-unknown-tool".to_string(),
+            kind: crate::extensions_js::HostcallKind::Tool {
+                name: "nonexistent_tool_xyz".to_string(),
+            },
+            payload: serde_json::json!({}),
+            trace_id: 0,
+            extension_id: Some("ext.test".to_string()),
+        };
+
+        let outcome = run_async(async { super::dispatch_hostcall(&host, request).await });
+        match &outcome {
+            HostcallOutcome::Error { code, message } => {
+                assert_eq!(
+                    code, "invalid_request",
+                    "expected taxonomy code, got: {code}"
+                );
+                assert!(
+                    message.contains("nonexistent_tool_xyz"),
+                    "error should mention tool name: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Tool execution failure → `io` (not `tool_error`).
+    #[test]
+    fn js_hostcall_tool_execution_failure_maps_to_taxonomy() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        let manager = extension_manager_no_persisted_permissions();
+
+        let host = JsRuntimeHost {
+            tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)),
+            manager_ref: Arc::downgrade(&manager.inner),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+            },
+            interceptor: None,
+        };
+
+        // Read a nonexistent file to trigger a tool execution error.
+        let request = crate::extensions_js::HostcallRequest {
+            call_id: "call-tool-fail".to_string(),
+            kind: crate::extensions_js::HostcallKind::Tool {
+                name: "read".to_string(),
+            },
+            payload: serde_json::json!({
+                "path": "/nonexistent/path/that/does/not/exist.txt"
+            }),
+            trace_id: 0,
+            extension_id: Some("ext.test".to_string()),
+        };
+
+        let outcome = run_async(async { super::dispatch_hostcall(&host, request).await });
+        match &outcome {
+            HostcallOutcome::Error { code, .. } => {
+                // Must be a taxonomy code, never "tool_error".
+                assert!(
+                    ["timeout", "denied", "io", "invalid_request", "internal"]
+                        .contains(&code.as_str()),
+                    "expected taxonomy error code, got non-taxonomy code: {code}"
+                );
+                assert_ne!(code, "tool_error", "must not emit legacy tool_error code");
+            }
+            // Tool may succeed with an error message in output (depends on implementation).
+            HostcallOutcome::Success(_) => {}
+            HostcallOutcome::StreamChunk { .. } => {
+                panic!("unexpected stream chunk from tool dispatch");
+            }
+        }
+    }
+
+    /// Manager shutdown → `denied` (not `SHUTDOWN`).
+    #[test]
+    fn js_hostcall_manager_shutdown_maps_to_denied() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+
+        // Create a manager then drop the inner Arc so manager() returns None.
+        let tools = Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None));
+        let http = Arc::new(crate::connectors::http::HttpConnector::with_defaults());
+
+        // Create a manager we intentionally don't hold, so the Weak ref is dead.
+        let dead_manager_ref = {
+            let manager = extension_manager_no_persisted_permissions();
+            Arc::downgrade(&manager.inner)
+            // manager dropped here → Weak upgrades fail
+        };
+
+        let host = JsRuntimeHost {
+            tools,
+            manager_ref: dead_manager_ref,
+            http,
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+            },
+            interceptor: None,
+        };
+
+        // Session call with dead manager should yield "denied", not "SHUTDOWN".
+        let request = crate::extensions_js::HostcallRequest {
+            call_id: "call-shutdown".to_string(),
+            kind: crate::extensions_js::HostcallKind::Session {
+                op: "get_state".to_string(),
+            },
+            payload: serde_json::json!({}),
+            trace_id: 0,
+            extension_id: Some("ext.test".to_string()),
+        };
+
+        let outcome = run_async(async { super::dispatch_hostcall(&host, request).await });
+        match &outcome {
+            HostcallOutcome::Error { code, .. } => {
+                assert_eq!(
+                    code, "denied",
+                    "shutdown path must map to 'denied', got: {code}"
+                );
+                assert_ne!(code, "SHUTDOWN", "must not emit legacy SHUTDOWN code");
+            }
+            other => panic!("expected Error for shutdown path, got {other:?}"),
+        }
+    }
+
+    /// Verify that all error codes emitted by the shared dispatcher are taxonomy-only.
+    #[test]
+    fn js_hostcall_all_error_codes_are_taxonomy_only() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        let manager = extension_manager_no_persisted_permissions();
+
+        let host = JsRuntimeHost {
+            tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)),
+            manager_ref: Arc::downgrade(&manager.inner),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: vec!["read".to_string()],
+                deny_caps: vec!["exec".to_string()],
+            },
+            interceptor: None,
+        };
+
+        let taxonomy_codes = ["timeout", "denied", "io", "invalid_request", "internal"];
+        let legacy_codes = ["tool_error", "SHUTDOWN", "CANCELLED", "cancelled"];
+
+        // Denied-by-policy (exec denied).
+        let denied_req = crate::extensions_js::HostcallRequest {
+            call_id: "call-denied".to_string(),
+            kind: crate::extensions_js::HostcallKind::Exec {
+                cmd: "ls".to_string(),
+            },
+            payload: serde_json::json!({}),
+            trace_id: 0,
+            extension_id: Some("ext.test".to_string()),
+        };
+
+        let outcome = run_async(async { super::dispatch_hostcall(&host, denied_req).await });
+        if let HostcallOutcome::Error { code, .. } = &outcome {
+            assert!(
+                taxonomy_codes.contains(&code.as_str()),
+                "denied-by-policy produced non-taxonomy code: {code}"
+            );
+            for legacy in &legacy_codes {
+                assert_ne!(code, legacy, "emitted legacy code: {code}");
+            }
+        }
+
+        // Unknown tool.
+        let unknown_req = crate::extensions_js::HostcallRequest {
+            call_id: "call-unknown".to_string(),
+            kind: crate::extensions_js::HostcallKind::Tool {
+                name: "no_such_tool".to_string(),
+            },
+            payload: serde_json::json!({}),
+            trace_id: 0,
+            extension_id: Some("ext.test".to_string()),
+        };
+
+        let outcome = run_async(async { super::dispatch_hostcall(&host, unknown_req).await });
+        if let HostcallOutcome::Error { code, .. } = &outcome {
+            assert!(
+                taxonomy_codes.contains(&code.as_str()),
+                "unknown-tool produced non-taxonomy code: {code}"
+            );
+            for legacy in &legacy_codes {
+                assert_ne!(code, legacy, "emitted legacy code: {code}");
+            }
+        }
     }
 }
