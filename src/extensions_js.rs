@@ -3943,32 +3943,12 @@ export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, rmdir, sta
 
     modules.insert(
         "node:http".to_string(),
-        r#"
-export function createServer() {
-  throw new Error("node:http.createServer is not available in PiJS");
-}
-
-export function request() {
-  throw new Error("node:http.request is not available in PiJS");
-}
-
-export default { createServer, request };
-"#
-        .trim()
-        .to_string(),
+        crate::http_shim::NODE_HTTP_JS.trim().to_string(),
     );
 
     modules.insert(
         "node:https".to_string(),
-        r#"
-export function request() {
-  throw new Error("node:https.request is not available in PiJS");
-}
-
-export default { request };
-"#
-        .trim()
-        .to_string(),
+        crate::http_shim::NODE_HTTPS_JS.trim().to_string(),
     );
 
     modules.insert(
@@ -10347,6 +10327,7 @@ mod tests {
                     r"
                     globalThis.fsResults = {};
                     import('node:fs').then((fs) => {
+                        fs.writeFileSync('/fake', '');
                         // readFile callback
                         fs.readFile('/fake', 'utf8', (err, data) => {
                             globalThis.fsResults.readFileCallbackCalled = true;
@@ -10824,14 +10805,17 @@ mod tests {
     fn build_node_os_module_produces_valid_js() {
         let source = super::build_node_os_module();
         // Verify basic structure - has expected exports
-        assert!(source.contains("export function platform()"), "missing platform");
+        assert!(
+            source.contains("export function platform()"),
+            "missing platform"
+        );
         assert!(source.contains("export function cpus()"), "missing cpus");
         assert!(source.contains("_numCpus"), "missing _numCpus");
         // Print first few lines for debugging
         for (i, line) in source.lines().enumerate().take(20) {
             eprintln!("  {i}: {line}");
         }
-        let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         assert!(
             source.contains(&format!("const _numCpus = {num_cpus}")),
             "expected _numCpus = {num_cpus} in module"
@@ -11434,10 +11418,10 @@ mod tests {
                             globalThis.stubResults.httpThrew = true;
                         }
 
-                        // node:https request should throw
+                        // node:https createServer should throw
                         const https = await import('node:https');
                         try {
-                            https.request('https://example.com');
+                            https.createServer();
                             globalThis.stubResults.httpsThrew = false;
                         } catch (e) {
                             globalThis.stubResults.httpsThrew = true;

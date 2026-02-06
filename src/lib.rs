@@ -56,6 +56,7 @@ pub mod extension_tools;
 pub mod extensions;
 pub mod extensions_js;
 pub mod http;
+pub mod http_shim;
 pub mod interactive;
 pub mod keybindings;
 pub mod model;
