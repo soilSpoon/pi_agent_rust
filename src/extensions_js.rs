@@ -9445,9 +9445,11 @@ mod tests {
                 .expect("eval Buffer");
 
             let r = get_global_json(&runtime, "bufResults").await;
-            if r["done"] == serde_json::json!(false) {
-                panic!("Buffer import failed: {}", r["error"]);
-            }
+            assert!(
+                r["done"] != serde_json::json!(false),
+                "Buffer import failed: {}",
+                r["error"]
+            );
             assert_eq!(r["done"], serde_json::json!(true));
             assert_eq!(r["hasBuffer"], serde_json::json!(true));
             assert_eq!(r["hasFrom"], serde_json::json!(true));

@@ -9302,7 +9302,7 @@ fn clamp_to_terminal_height(mut output: String, term_height: usize) -> String {
     let max_newlines = term_height.saturating_sub(1);
 
     // Fast path: count newlines and bail if we fit.
-    let newline_count = output.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    let newline_count = memchr::memchr_iter(b'\n', output.as_bytes()).count();
     if newline_count <= max_newlines {
         return output;
     }
