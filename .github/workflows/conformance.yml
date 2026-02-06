@@ -294,6 +294,12 @@ jobs:
           set -euxo pipefail
           cargo test --test ext_conformance_artifacts -- --nocapture 2>&1 | tee artifact-checksums.log
 
+      - name: Generate conformance report
+        if: always()
+        run: |
+          set -euxo pipefail
+          cargo test --test conformance_report generate_conformance_report -- --nocapture 2>&1 | tee conformance-report.log
+
       - name: Upload scenario conformance artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -305,8 +311,10 @@ jobs:
             pi_agent_rust/conformance-generated-nightly.log
             pi_agent_rust/fixture-schema.log
             pi_agent_rust/artifact-checksums.log
+            pi_agent_rust/conformance-report.log
             pi_agent_rust/tests/ext_conformance/reports/**/*.json
             pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
+            pi_agent_rust/tests/ext_conformance/reports/**/*.md
           if-no-files-found: warn
 
   conformance-weekly:

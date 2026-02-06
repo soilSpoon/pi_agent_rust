@@ -5,12 +5,16 @@
 //! - `tests/ext_conformance/reports/conformance_summary.json` — machine-readable summary
 //! - `tests/ext_conformance/reports/conformance_events.jsonl` — per-extension JSONL log
 //!
+//! Also enriches each extension with best-effort provenance/version metadata from
+//! `docs/extension-artifact-provenance.json`.
+//!
 //! Run with: `cargo test --test conformance_report generate_conformance_report -- --nocapture`
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 fn project_root() -> PathBuf {
@@ -23,6 +27,10 @@ fn reports_dir() -> PathBuf {
 
 fn manifest_path() -> PathBuf {
     project_root().join("tests/ext_conformance/VALIDATED_MANIFEST.json")
+}
+
+fn provenance_path() -> PathBuf {
+    project_root().join("docs/extension-artifact-provenance.json")
 }
 
 // ─── Data Structures ─────────────────────────────────────────────────────────
@@ -39,6 +47,18 @@ struct ManifestExtension {
     registrations: Value,
     #[serde(default)]
     mock_requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProvenanceManifest {
+    items: Vec<ProvenanceItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProvenanceItem {
+    id: String,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,9 +96,8 @@ fn read_json_file(path: &Path) -> Option<Value> {
 }
 
 fn read_jsonl_file(path: &Path) -> Vec<Value> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
     };
     content
         .lines()
@@ -87,10 +106,11 @@ fn read_jsonl_file(path: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn ingest_load_time_report(
-    statuses: &mut BTreeMap<String, ExtensionStatus>,
-    reports: &Path,
-) {
+fn u32_from_u64_saturating(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn ingest_load_time_report(statuses: &mut BTreeMap<String, ExtensionStatus>, reports: &Path) {
     let path = reports.join("load_time_benchmark.json");
     let Some(report) = read_json_file(&path) else {
         return;
@@ -104,11 +124,7 @@ fn ingest_load_time_report(
             continue;
         };
         // Extension name is like "hello/hello.ts" — extract the directory part as ID
-        let ext_id = ext_name
-            .split('/')
-            .next()
-            .unwrap_or(ext_name)
-            .to_string();
+        let ext_id = ext_name.split('/').next().unwrap_or(ext_name).to_string();
 
         let status = statuses.entry(ext_id).or_default();
 
@@ -124,10 +140,7 @@ fn ingest_load_time_report(
     }
 }
 
-fn ingest_scenario_report(
-    statuses: &mut BTreeMap<String, ExtensionStatus>,
-    reports: &Path,
-) {
+fn ingest_scenario_report(statuses: &mut BTreeMap<String, ExtensionStatus>, reports: &Path) {
     let path = reports.join("scenario_conformance.json");
     let Some(report) = read_json_file(&path) else {
         return;
@@ -159,10 +172,7 @@ fn ingest_scenario_report(
     }
 }
 
-fn ingest_smoke_report(
-    statuses: &mut BTreeMap<String, ExtensionStatus>,
-    reports: &Path,
-) {
+fn ingest_smoke_report(statuses: &mut BTreeMap<String, ExtensionStatus>, reports: &Path) {
     let path = reports.join("smoke/triage.json");
     let Some(report) = read_json_file(&path) else {
         return;
@@ -176,21 +186,18 @@ fn ingest_smoke_report(
             continue;
         };
         let status = statuses.entry(ext_id.to_string()).or_default();
-        status.smoke_pass += entry
-            .get("pass")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
-        status.smoke_fail += entry
-            .get("fail")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
+        let pass = entry.get("pass").and_then(Value::as_u64).unwrap_or(0);
+        let fail = entry.get("fail").and_then(Value::as_u64).unwrap_or(0);
+        status.smoke_pass = status
+            .smoke_pass
+            .saturating_add(u32_from_u64_saturating(pass));
+        status.smoke_fail = status
+            .smoke_fail
+            .saturating_add(u32_from_u64_saturating(fail));
     }
 }
 
-fn ingest_parity_report(
-    statuses: &mut BTreeMap<String, ExtensionStatus>,
-    reports: &Path,
-) {
+fn ingest_parity_report(statuses: &mut BTreeMap<String, ExtensionStatus>, reports: &Path) {
     let events = read_jsonl_file(&reports.join("parity/parity_events.jsonl"));
 
     for event in events {
@@ -216,20 +223,59 @@ fn ingest_negative_report(reports: &Path) -> (u32, u32) {
     let Some(report) = read_json_file(&path) else {
         return (0, 0);
     };
-    let pass = report
-        .get("counts")
-        .and_then(|c| c.get("pass"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
-    let fail = report
-        .get("counts")
-        .and_then(|c| c.get("fail"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+    let pass = u32_from_u64_saturating(
+        report
+            .get("counts")
+            .and_then(|c| c.get("pass"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
+    let fail = u32_from_u64_saturating(
+        report
+            .get("counts")
+            .and_then(|c| c.get("fail"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
     (pass, fail)
 }
 
 // ─── Report Generation ──────────────────────────────────────────────────────
+
+fn load_provenance_versions() -> BTreeMap<String, String> {
+    let path = provenance_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+
+    let Ok(manifest): Result<ProvenanceManifest, _> = serde_json::from_str(&content) else {
+        return BTreeMap::new();
+    };
+
+    manifest
+        .items
+        .into_iter()
+        .filter_map(|item| {
+            let version = item.version?;
+            let version = version.trim().to_string();
+            if version.is_empty() {
+                None
+            } else {
+                Some((item.id, version))
+            }
+        })
+        .collect()
+}
+
+fn artifact_rel_path(entry_path: &str) -> String {
+    format!("tests/ext_conformance/artifacts/{entry_path}")
+}
+
+fn report_log_rel_path(suite: &str, ext_id: &str) -> Option<String> {
+    let rel = format!("tests/ext_conformance/reports/{suite}/extensions/{ext_id}.jsonl");
+    let abs = project_root().join(&rel);
+    if abs.exists() { Some(rel) } else { None }
+}
 
 fn overall_status(status: &ExtensionStatus) -> &'static str {
     if status.scenario_fail > 0 || status.smoke_fail > 0 || status.parity_mismatch > 0 {
@@ -250,7 +296,7 @@ fn overall_status(status: &ExtensionStatus) -> &'static str {
     "N/A"
 }
 
-fn tier_label(tier: u8) -> &'static str {
+const fn tier_label(tier: u8) -> &'static str {
     match tier {
         1 => "T1 (simple single-file)",
         2 => "T2 (multi-registration)",
@@ -265,6 +311,7 @@ fn tier_label(tier: u8) -> &'static str {
 fn generate_markdown(
     extensions: &[ManifestExtension],
     statuses: &BTreeMap<String, ExtensionStatus>,
+    provenance_versions: &BTreeMap<String, String>,
     negative_pass: u32,
     negative_fail: u32,
 ) -> String {
@@ -286,7 +333,7 @@ fn generate_markdown(
     let mut na_count = 0u32;
     for ext in extensions {
         let status = statuses.get(&ext.id);
-        match status.map(overall_status).unwrap_or("N/A") {
+        match status.map_or("N/A", overall_status) {
             "PASS" => pass_count += 1,
             "FAIL" => fail_count += 1,
             _ => na_count += 1,
@@ -297,27 +344,30 @@ fn generate_markdown(
 
     // Header
     md.push_str("# Extension Conformance Report\n\n");
-    md.push_str(&format!("> Generated: {now}\n\n"));
+    let _ = writeln!(md, "> Generated: {now}\n");
 
     // Summary
     md.push_str("## Summary\n\n");
-    md.push_str(&format!("| Metric | Value |\n"));
+    md.push_str("| Metric | Value |\n");
     md.push_str("|----|----|\n");
-    md.push_str(&format!("| Total extensions | {total} |\n"));
-    md.push_str(&format!("| PASS | {pass_count} |\n"));
-    md.push_str(&format!("| FAIL | {fail_count} |\n"));
-    md.push_str(&format!("| N/A (not yet tested) | {na_count} |\n"));
+    let _ = writeln!(md, "| Total extensions | {total} |");
+    let _ = writeln!(md, "| PASS | {pass_count} |");
+    let _ = writeln!(md, "| FAIL | {fail_count} |");
+    let _ = writeln!(md, "| N/A (not yet tested) | {na_count} |");
     if total > 0 {
         #[allow(clippy::cast_precision_loss)]
-        let rate = (pass_count as f64) / ((pass_count + fail_count).max(1) as f64) * 100.0;
-        md.push_str(&format!("| Pass rate | {rate:.1}% |\n"));
+        let rate = f64::from(pass_count) / f64::from((pass_count + fail_count).max(1)) * 100.0;
+        let _ = writeln!(md, "| Pass rate | {rate:.1}% |");
     }
-    md.push_str(&format!("| Policy negative tests | {negative_pass} pass, {negative_fail} fail |\n"));
-    md.push_str(&format!("| Source tiers | {} |\n\n", by_tier.len()));
+    let _ = writeln!(
+        md,
+        "| Policy negative tests | {negative_pass} pass, {negative_fail} fail |"
+    );
+    let _ = writeln!(md, "| Source tiers | {} |\n", by_tier.len());
 
     // Per-tier tables
     for (tier_name, tier_exts) in &by_tier {
-        md.push_str(&format!("## {tier_name}\n\n"));
+        let _ = writeln!(md, "## {tier_name}\n");
 
         let tier_pass = tier_exts
             .iter()
@@ -328,18 +378,39 @@ fn generate_markdown(
             .filter(|e| statuses.get(&e.id).map(overall_status) == Some("FAIL"))
             .count();
 
-        md.push_str(&format!(
-            "{} extensions ({tier_pass} pass, {tier_fail} fail, {} untested)\n\n",
+        let _ = writeln!(
+            md,
+            "{} extensions ({tier_pass} pass, {tier_fail} fail, {} untested)\n",
             tier_exts.len(),
             tier_exts.len() - tier_pass - tier_fail
-        ));
+        );
 
-        md.push_str("| Extension | Tier | Status | Load (Rust) | Scenarios | Failures |\n");
-        md.push_str("|---|---|---|---|---|---|\n");
+        md.push_str("| Extension | Version | Tier | Status | Evidence | Load (Rust) | Scenarios | Failures |\n");
+        md.push_str("|---|---|---|---|---|---|---|---|\n");
 
         for ext in tier_exts {
             let status = statuses.get(&ext.id);
-            let overall = status.map(overall_status).unwrap_or("N/A");
+            let overall = status.map_or("N/A", overall_status);
+
+            let version = provenance_versions
+                .get(&ext.id)
+                .map_or_else(|| "-".to_string(), |v| format!("`{v}`"));
+
+            let artifact_rel = artifact_rel_path(&ext.entry_path);
+            let ext_display = format!("[`{}`]({artifact_rel})", ext.id);
+
+            let mut evidence = Vec::new();
+            if let Some(smoke) = report_log_rel_path("smoke", &ext.id) {
+                evidence.push(format!("[smoke]({smoke})"));
+            }
+            if let Some(parity) = report_log_rel_path("parity", &ext.id) {
+                evidence.push(format!("[parity]({parity})"));
+            }
+            let evidence = if evidence.is_empty() {
+                "-".to_string()
+            } else {
+                evidence.join(" ")
+            };
 
             let load_str = status
                 .and_then(|s| s.rust_load_ms)
@@ -379,15 +450,18 @@ fn generate_markdown(
                 _ => "N/A",
             };
 
-            md.push_str(&format!(
-                "| `{}` | {} | {} | {} | {} | {} |\n",
-                ext.id,
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} | {} | {} | {} | {} |",
+                ext_display,
+                version,
                 tier_label(ext.conformance_tier),
                 status_emoji,
+                evidence,
                 load_str,
                 scenario_str,
                 failures_str,
-            ));
+            );
         }
         md.push('\n');
     }
@@ -401,7 +475,9 @@ fn generate_markdown(
     md.push_str("cargo test --test ext_conformance_scenarios --features ext-conformance\n");
     md.push_str("cargo test --test extensions_policy_negative\n\n");
     md.push_str("# 2. Generate this consolidated report\n");
-    md.push_str("cargo test --test conformance_report generate_conformance_report -- --nocapture\n");
+    md.push_str(
+        "cargo test --test conformance_report generate_conformance_report -- --nocapture\n",
+    );
     md.push_str("```\n\n");
     md.push_str("Report files:\n");
     md.push_str("- `tests/ext_conformance/reports/CONFORMANCE_REPORT.md` (this file)\n");
@@ -439,6 +515,12 @@ fn generate_conformance_report() {
         extensions.len()
     );
 
+    let provenance_versions = load_provenance_versions();
+    eprintln!(
+        "[conformance_report] Loaded {} versions from provenance",
+        provenance_versions.len()
+    );
+
     // 2. Ingest all available reports
     let mut statuses: BTreeMap<String, ExtensionStatus> = BTreeMap::new();
     ingest_load_time_report(&mut statuses, &reports);
@@ -460,13 +542,22 @@ fn generate_conformance_report() {
     let mut jsonl_lines: Vec<String> = Vec::new();
     for ext in &extensions {
         let status = statuses.get(&ext.id);
-        let overall = status.map(overall_status).unwrap_or("N/A");
+        let overall = status.map_or("N/A", overall_status);
+        let artifact_rel = artifact_rel_path(&ext.entry_path);
+        let smoke_log = report_log_rel_path("smoke", &ext.id);
+        let parity_log = report_log_rel_path("parity", &ext.id);
         let entry = json!({
             "schema": "pi.ext.conformance_report.v1",
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             "extension_id": ext.id,
+            "version": provenance_versions.get(&ext.id),
             "source_tier": ext.source_tier,
             "conformance_tier": ext.conformance_tier,
+            "artifact_path": artifact_rel,
+            "logs": {
+                "smoke": smoke_log,
+                "parity": parity_log,
+            },
             "overall_status": overall,
             "rust_load_ms": status.and_then(|s| s.rust_load_ms),
             "ts_load_ms": status.and_then(|s| s.ts_load_ms),
@@ -491,7 +582,7 @@ fn generate_conformance_report() {
     let mut fail = 0u32;
     let mut na = 0u32;
     for ext in &extensions {
-        match statuses.get(&ext.id).map(overall_status).unwrap_or("N/A") {
+        match statuses.get(&ext.id).map_or("N/A", overall_status) {
             "PASS" => pass += 1,
             "FAIL" => fail += 1,
             _ => na += 1,
@@ -504,27 +595,23 @@ fn generate_conformance_report() {
             .entry(ext.source_tier.clone())
             .or_insert_with(|| json!({"total": 0, "pass": 0, "fail": 0, "na": 0}));
         let obj = entry.as_object_mut().unwrap();
-        *obj.get_mut("total").unwrap() =
-            json!(obj["total"].as_u64().unwrap_or(0) + 1);
-        match statuses.get(&ext.id).map(overall_status).unwrap_or("N/A") {
+        *obj.get_mut("total").unwrap() = json!(obj["total"].as_u64().unwrap_or(0) + 1);
+        match statuses.get(&ext.id).map_or("N/A", overall_status) {
             "PASS" => {
-                *obj.get_mut("pass").unwrap() =
-                    json!(obj["pass"].as_u64().unwrap_or(0) + 1);
+                *obj.get_mut("pass").unwrap() = json!(obj["pass"].as_u64().unwrap_or(0) + 1);
             }
             "FAIL" => {
-                *obj.get_mut("fail").unwrap() =
-                    json!(obj["fail"].as_u64().unwrap_or(0) + 1);
+                *obj.get_mut("fail").unwrap() = json!(obj["fail"].as_u64().unwrap_or(0) + 1);
             }
             _ => {
-                *obj.get_mut("na").unwrap() =
-                    json!(obj["na"].as_u64().unwrap_or(0) + 1);
+                *obj.get_mut("na").unwrap() = json!(obj["na"].as_u64().unwrap_or(0) + 1);
             }
         }
     }
 
     #[allow(clippy::cast_precision_loss)]
     let pass_rate = if pass + fail > 0 {
-        (pass as f64) / ((pass + fail) as f64) * 100.0
+        f64::from(pass) / f64::from(pass + fail) * 100.0
     } else {
         100.0
     };
@@ -553,7 +640,13 @@ fn generate_conformance_report() {
     .expect("write conformance_summary.json");
 
     // 5. Generate markdown report
-    let md = generate_markdown(&extensions, &statuses, negative_pass, negative_fail);
+    let md = generate_markdown(
+        &extensions,
+        &statuses,
+        &provenance_versions,
+        negative_pass,
+        negative_fail,
+    );
     let md_path = reports.join("CONFORMANCE_REPORT.md");
     std::fs::write(&md_path, &md).expect("write CONFORMANCE_REPORT.md");
 
@@ -571,7 +664,10 @@ fn generate_conformance_report() {
     eprintln!("    {}", events_path.display());
 
     // Verify report was generated
-    assert!(md_path.exists(), "CONFORMANCE_REPORT.md should be generated");
+    assert!(
+        md_path.exists(),
+        "CONFORMANCE_REPORT.md should be generated"
+    );
     assert!(
         summary_path.exists(),
         "conformance_summary.json should be generated"
@@ -614,6 +710,15 @@ fn report_reads_manifest() {
             "extension should have conformance_tier"
         );
     }
+}
+
+#[test]
+fn report_reads_provenance_versions() {
+    let versions = load_provenance_versions();
+    assert!(
+        !versions.is_empty(),
+        "expected at least one versioned entry in extension provenance"
+    );
 }
 
 #[test]

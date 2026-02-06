@@ -83,6 +83,19 @@ cargo test --test ext_conformance_diff --features ext-conformance -- --ignored -
 
 **Reports:** Test results are written to `tests/ext_conformance/reports/` in JSONL and JSON formats.
 
+#### Generating the Conformance Report
+
+After running conformance tests, generate a combined per-extension report:
+
+```bash
+cargo test --test conformance_report generate_conformance_report -- --nocapture
+```
+
+This produces three output files in `tests/ext_conformance/reports/`:
+- `CONFORMANCE_REPORT.md` - human-readable per-tier tables with pass/fail/N/A status
+- `conformance_summary.json` - machine-readable summary with per-tier breakdowns
+- `conformance_events.jsonl` - one line per extension with full metrics
+
 #### CI Integration
 
 | Trigger | Suite | Command |

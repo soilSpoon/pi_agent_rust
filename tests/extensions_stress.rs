@@ -5,7 +5,7 @@
 //! JSONL report.
 //!
 //! The full 1-hour test is available via the `ext_stress` binary:
-//!   cargo run --bin ext_stress -- --duration_secs=3600 --max_extensions=15
+//!   cargo run --bin `ext_stress` -- --`duration_secs=3600` --`max_extensions=15`
 //!
 //! These `#[test]` functions run shorter durations for CI gating.
 
@@ -154,9 +154,7 @@ fn collect_safe_extensions(max: usize) -> Vec<PathBuf> {
     let manifest_path = project_root().join("tests/ext_conformance/VALIDATED_MANIFEST.json");
     let data = std::fs::read_to_string(&manifest_path).expect("read VALIDATED_MANIFEST.json");
     let manifest: Value = serde_json::from_str(&data).expect("parse manifest");
-    let extensions = manifest["extensions"]
-        .as_array()
-        .expect("extensions array");
+    let extensions = manifest["extensions"].as_array().expect("extensions array");
 
     let artifacts = artifacts_dir();
     let mut paths = Vec::new();
@@ -235,7 +233,7 @@ fn load_extensions(paths: &[PathBuf]) -> (ExtensionManager, usize) {
 fn run_stress_loop(
     manager: &ExtensionManager,
     event: ExtensionEventName,
-    payload: Option<Value>,
+    payload: Option<&Value>,
     events_per_sec: u64,
     duration: Duration,
     rss_interval_secs: u64,
@@ -274,7 +272,7 @@ fn run_stress_loop(
         let dispatch_start = Instant::now();
         let result = common::run_async({
             let manager = manager.clone();
-            let payload = payload.clone();
+            let payload = payload.cloned();
             async move { manager.dispatch_event(event, payload).await }
         });
         let elapsed_us = u64::try_from(dispatch_start.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -321,8 +319,7 @@ fn run_stress_loop(
 
     let rss_growth_pct = if initial_rss_kb > 0 {
         #[allow(clippy::cast_precision_loss)]
-        let growth =
-            (max_rss_kb.saturating_sub(initial_rss_kb) as f64) / (initial_rss_kb as f64);
+        let growth = (max_rss_kb.saturating_sub(initial_rss_kb) as f64) / (initial_rss_kb as f64);
         Some(growth)
     } else {
         None
@@ -443,7 +440,10 @@ fn write_stress_report(result: &StressResult, duration_secs: u64, ext_names: &[S
         result.rss_growth_pct.unwrap_or(0.0) * 100.0
     );
     eprintln!("  RSS OK: {}", result.rss_ok);
-    eprintln!("  P99 first: {:?}us, last: {:?}us", result.p99_first, result.p99_last);
+    eprintln!(
+        "  P99 first: {:?}us, last: {:?}us",
+        result.p99_first, result.p99_last
+    );
     eprintln!("  Latency OK: {}", result.latency_ok);
     eprintln!("  Report: {}", events_path.display());
     eprintln!("  Triage: {}\n", triage_path.display());
@@ -560,13 +560,9 @@ fn p99_first_last_small() {
 fn p99_first_last_detects_degradation() {
     // First window: low latencies (100-200us)
     // Last window: high latencies (500-1000us)
-    let mut values: Vec<u64> = Vec::new();
-    for _ in 0..50 {
-        values.push(150);
-    }
-    for _ in 0..50 {
-        values.push(800);
-    }
+    let mut values: Vec<u64> = Vec::with_capacity(100);
+    values.extend(std::iter::repeat_n(150, 50));
+    values.extend(std::iter::repeat_n(800, 50));
     let (first, last) = p99_first_last(&values);
     let first = first.unwrap();
     let last = last.unwrap();
@@ -583,7 +579,10 @@ fn p99_first_last_stable_latency() {
     let (first, last) = p99_first_last(&values);
     let first = first.unwrap();
     let last = last.unwrap();
-    assert_eq!(first, last, "stable latency should have equal first/last p99");
+    assert_eq!(
+        first, last,
+        "stable latency should have equal first/last p99"
+    );
 }
 
 // ============================================================================
@@ -656,7 +655,10 @@ fn stress_short_10_extensions() {
         })
         .collect();
 
-    eprintln!("\n  Loading {} extensions for stress test:", ext_paths.len());
+    eprintln!(
+        "\n  Loading {} extensions for stress test:",
+        ext_paths.len()
+    );
     for name in &ext_names {
         eprintln!("    - {name}");
     }
@@ -669,13 +671,15 @@ fn stress_short_10_extensions() {
 
     eprintln!("  Running stress loop: {SHORT_STRESS_SECS}s at {EVENTS_PER_SEC} events/s");
 
+    let payload = json!({
+        "systemPrompt": "You are Pi.",
+        "model": "claude-sonnet-4-5",
+    });
+
     let mut result = run_stress_loop(
         &manager,
         ExtensionEventName::AgentStart,
-        Some(json!({
-            "systemPrompt": "You are Pi.",
-            "model": "claude-sonnet-4-5",
-        })),
+        Some(&payload),
         EVENTS_PER_SEC,
         Duration::from_secs(SHORT_STRESS_SECS),
         RSS_SAMPLE_INTERVAL_SECS,
@@ -712,8 +716,7 @@ fn stress_short_10_extensions() {
     assert!(
         result.latency_ok,
         "Latency degradation should be within budget: p99_first={:?}us p99_last={:?}us",
-        result.p99_first,
-        result.p99_last
+        result.p99_first, result.p99_last
     );
 
     // Verify low error rate (some errors OK due to missing handlers)
@@ -734,7 +737,7 @@ fn stress_short_10_extensions() {
 
     // Cleanup
     common::run_async({
-        let manager = manager.clone();
+        let manager = manager;
         async move {
             let _ = manager.shutdown(Duration::from_millis(500)).await;
         }
@@ -787,7 +790,7 @@ fn stress_verify_no_panic_rapid_dispatch() {
 
     // Cleanup
     common::run_async({
-        let manager = manager.clone();
+        let manager = manager;
         async move {
             let _ = manager.shutdown(Duration::from_millis(500)).await;
         }
@@ -807,7 +810,10 @@ fn stress_concurrent_event_types() {
     eprintln!("  Testing {loaded} extensions with mixed event types");
 
     let events = [
-        (ExtensionEventName::AgentStart, json!({"systemPrompt": "test"})),
+        (
+            ExtensionEventName::AgentStart,
+            json!({"systemPrompt": "test"}),
+        ),
         (ExtensionEventName::TurnStart, json!({"turnIndex": 1})),
         (ExtensionEventName::MessageStart, json!({"role": "user"})),
         (ExtensionEventName::Input, json!({"text": "hello"})),
@@ -844,7 +850,7 @@ fn stress_concurrent_event_types() {
 
     // Cleanup
     common::run_async({
-        let manager = manager.clone();
+        let manager = manager;
         async move {
             let _ = manager.shutdown(Duration::from_millis(500)).await;
         }
@@ -853,6 +859,8 @@ fn stress_concurrent_event_types() {
 
 #[test]
 fn stress_extension_load_unload_cycle() {
+    const CYCLES: usize = 3;
+
     // Load extensions, dispatch events, shutdown, repeat — verify no resource leaks
     let ext_paths = collect_safe_extensions(5);
     if ext_paths.len() < 3 {
@@ -866,8 +874,6 @@ fn stress_extension_load_unload_cycle() {
 
     system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), true, refresh);
     let initial_rss = system.process(pid).map_or(0, sysinfo::Process::memory);
-
-    const CYCLES: usize = 3;
     for cycle in 0..CYCLES {
         let (manager, loaded) = load_extensions(&ext_paths);
         eprintln!("  Cycle {}/{CYCLES}: loaded {loaded} extensions", cycle + 1);
@@ -891,7 +897,7 @@ fn stress_extension_load_unload_cycle() {
         common::run_async({
             let manager = manager.clone();
             async move {
-                let _ = manager.shutdown(Duration::from_millis(1000)).await;
+                let _ = manager.shutdown(Duration::from_secs(1)).await;
             }
         });
     }
@@ -900,10 +906,7 @@ fn stress_extension_load_unload_cycle() {
     system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), true, refresh);
     let final_rss = system.process(pid).map_or(0, sysinfo::Process::memory);
 
-    eprintln!(
-        "  Load/unload cycles: RSS {}KB → {}KB",
-        initial_rss, final_rss
-    );
+    eprintln!("  Load/unload cycles: RSS {initial_rss}KB → {final_rss}KB");
 
     // Allow generous budget for test overhead (GC, allocator fragmentation)
     // Main goal: detect catastrophic leaks, not minor fluctuations
