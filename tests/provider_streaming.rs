@@ -29,10 +29,14 @@ use std::path::PathBuf;
 mod anthropic;
 #[path = "provider_streaming/azure.rs"]
 mod azure;
+#[path = "provider_streaming/cohere.rs"]
+mod cohere;
 #[path = "provider_streaming/gemini.rs"]
 mod gemini;
 #[path = "provider_streaming/openai.rs"]
 mod openai;
+#[path = "provider_streaming/openai_responses.rs"]
+mod openai_responses;
 
 pub(crate) fn cassette_root() -> PathBuf {
     env::var("VCR_CASSETTE_DIR").map_or_else(
