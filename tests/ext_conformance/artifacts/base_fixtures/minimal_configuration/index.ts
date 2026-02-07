@@ -1,17 +1,15 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 export default function(pi: ExtensionAPI) {
-    pi.registerFlag({
-        name: "verbose",
+    pi.registerFlag("verbose", {
         description: "Enable verbose output",
         type: "boolean",
         default: false
     });
 
-    pi.registerShortcut({
-        key: "ctrl+shift+v",
+    pi.registerShortcut({ key: "v", modifiers: ["ctrl", "shift"] }, {
         description: "Toggle verbose mode",
-        action: async () => {
+        handler: async () => {
             // Toggle verbose flag
         }
     });

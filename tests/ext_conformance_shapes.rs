@@ -1,6 +1,6 @@
 //! Integration tests for the shape-aware conformance harness (bd-ljzb).
 //!
-//! These tests load real base fixtures through the QuickJS runtime and verify
+//! These tests load real base fixtures through the `QuickJS` runtime and verify
 //! that each extension shape is correctly handled: load, registration
 //! verification, invocation (where applicable), and shutdown.
 
@@ -105,6 +105,7 @@ fn load_and_snapshot(
 }
 
 /// Run a complete shape test lifecycle on a fixture, returning the result.
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult {
     let fixture_path = base_fixtures_dir().join(fixture_name).join("index.ts");
     let correlation_id = format!("shape-test-{shape}");
@@ -176,7 +177,6 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
             arguments,
         } => {
             let result = common::run_async({
-                let runtime = runtime.clone();
                 let tool_name = tool_name.clone();
                 let arguments = arguments.clone();
                 async move {
@@ -404,6 +404,55 @@ fn shape_harness_general_loads() {
     );
 }
 
+#[test]
+fn shape_harness_configuration_loads_and_registers() {
+    let result = run_shape_test(ExtensionShape::Configuration, "minimal_configuration");
+    eprintln!("{}", result.summary_line());
+    for event in &result.events {
+        eprintln!("  {}", event.to_jsonl());
+    }
+    assert!(
+        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        "Load phase should succeed for minimal_configuration"
+    );
+    // Configuration should pass registration (flags or shortcuts present)
+    assert!(
+        result.events.iter().any(|e| e.phase == LifecyclePhase::VerifyRegistrations && e.status == ShapeEventStatus::Ok),
+        "Registration verification should pass for Configuration shape"
+    );
+}
+
+#[test]
+fn shape_harness_ui_component_loads_and_registers() {
+    let result = run_shape_test(ExtensionShape::UiComponent, "minimal_ui_component");
+    eprintln!("{}", result.summary_line());
+    for event in &result.events {
+        eprintln!("  {}", event.to_jsonl());
+    }
+    assert!(
+        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        "Load phase should succeed for minimal_ui_component"
+    );
+}
+
+#[test]
+fn shape_harness_multi_loads_and_registers() {
+    let result = run_shape_test(ExtensionShape::Multi, "minimal_multi");
+    eprintln!("{}", result.summary_line());
+    for event in &result.events {
+        eprintln!("  {}", event.to_jsonl());
+    }
+    assert!(
+        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        "Load phase should succeed for minimal_multi"
+    );
+    // Multi should verify that 2+ registration types are present
+    assert!(
+        result.events.iter().any(|e| e.phase == LifecyclePhase::VerifyRegistrations && e.status == ShapeEventStatus::Ok),
+        "Registration verification should pass for Multi shape (tool + event_hook)"
+    );
+}
+
 // ─── Batch summary test ──────────────────────────────────────────────────────
 
 #[test]
@@ -413,6 +462,9 @@ fn shape_harness_batch_summary() {
         (ExtensionShape::Command, "minimal_command"),
         (ExtensionShape::Provider, "minimal_provider"),
         (ExtensionShape::EventHook, "minimal_event"),
+        (ExtensionShape::UiComponent, "minimal_ui_component"),
+        (ExtensionShape::Configuration, "minimal_configuration"),
+        (ExtensionShape::Multi, "minimal_multi"),
         (ExtensionShape::General, "minimal_resources"),
     ];
 
@@ -425,10 +477,10 @@ fn shape_harness_batch_summary() {
     let md = summary.render_markdown();
     eprintln!("{md}");
 
-    // All should load successfully
-    assert!(
-        summary.total >= 5,
-        "Should have at least 5 results"
+    // All 8 shapes should be represented
+    assert_eq!(
+        summary.total, 8,
+        "Should have 8 results (one per shape)"
     );
     // Print per-result summary
     for result in &results {
