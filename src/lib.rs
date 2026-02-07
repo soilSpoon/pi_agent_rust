@@ -69,6 +69,8 @@ pub mod model_selector;
 pub mod models;
 pub mod package_manager;
 pub mod permissions;
+#[cfg(feature = "wasm-host")]
+pub mod pi_wasm;
 pub mod provider;
 pub mod providers;
 pub mod resources;

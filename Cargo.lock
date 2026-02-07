@@ -4031,6 +4031,7 @@ dependencies = [
  "uuid",
  "vergen-gix",
  "wasmtime",
+ "wat",
 ]
 
 [[package]]

@@ -6151,6 +6151,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 // Register crypto hostcalls for node:crypto module
                 crate::crypto_shim::register_crypto_hostcalls(&global)?;
 
+                // Inject WebAssembly polyfill (wasmtime-backed) when wasm-host feature is enabled
+                #[cfg(feature = "wasm-host")]
+                {
+                    let wasm_state = std::rc::Rc::new(std::cell::RefCell::new(
+                        crate::pi_wasm::WasmBridgeState::new()
+                            .map_err(|e| rquickjs::Error::new_into_js_message("wasm", "init", e))?,
+                    ));
+                    crate::pi_wasm::inject_wasm_globals(&ctx, wasm_state)?;
+                }
+
                 // Install the JS bridge that creates Promises and wraps the native functions
                 match ctx.eval::<(), _>(PI_BRIDGE_JS) {
                     Ok(()) => {}
