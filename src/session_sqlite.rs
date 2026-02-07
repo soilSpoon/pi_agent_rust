@@ -381,8 +381,7 @@ mod tests {
 
     #[test]
     fn map_outcome_err() {
-        let outcome: Outcome<i32, SqliteError> =
-            Outcome::Err(SqliteError::ConnectionClosed);
+        let outcome: Outcome<i32, SqliteError> = Outcome::Err(SqliteError::ConnectionClosed);
         let result = map_outcome(outcome);
         let err = result.unwrap_err();
         match err {
@@ -405,8 +404,7 @@ mod tests {
     #[test]
     fn map_outcome_panicked() {
         use asupersync::types::PanicPayload;
-        let outcome: Outcome<i32, SqliteError> =
-            Outcome::Panicked(PanicPayload::new("test panic"));
+        let outcome: Outcome<i32, SqliteError> = Outcome::Panicked(PanicPayload::new("test panic"));
         let result = map_outcome(outcome);
         let err = result.unwrap_err();
         match err {

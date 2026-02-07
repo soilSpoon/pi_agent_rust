@@ -661,4 +661,400 @@ mod tests {
             }
         });
     }
+
+    // -- Constructor & builder tests --
+
+    #[test]
+    fn extension_tool_wrapper_default_timeout() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "t",
+                    description: "d",
+                    parameters: { type: "object" },
+                    execute: async () => ({ content: [], isError: false })
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "t").await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime);
+            assert_eq!(wrapper.timeout_ms, DEFAULT_EXTENSION_TOOL_TIMEOUT_MS);
+            assert_eq!(wrapper.timeout_ms, 60_000);
+        });
+    }
+
+    #[test]
+    fn extension_tool_wrapper_timeout_clamp_boundary() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "t",
+                    description: "d",
+                    parameters: { type: "object" },
+                    execute: async () => ({ content: [], isError: false })
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "t").await;
+
+            // timeout=0 clamped to 1
+            let w0 = ExtensionToolWrapper::new(def.clone(), js_runtime.clone()).with_timeout_ms(0);
+            assert_eq!(w0.timeout_ms, 1);
+
+            // timeout=1 stays 1
+            let w1 = ExtensionToolWrapper::new(def.clone(), js_runtime.clone()).with_timeout_ms(1);
+            assert_eq!(w1.timeout_ms, 1);
+
+            // timeout=u64::MAX stays u64::MAX
+            let wmax = ExtensionToolWrapper::new(def, js_runtime).with_timeout_ms(u64::MAX);
+            assert_eq!(wmax.timeout_ms, u64::MAX);
+        });
+    }
+
+    #[test]
+    fn extension_tool_wrapper_ctx_payload_default_empty() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "t",
+                    description: "d",
+                    parameters: { type: "object" },
+                    execute: async () => ({ content: [], isError: false })
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "t").await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime);
+            assert_eq!(wrapper.ctx_payload, json!({}));
+        });
+    }
+
+    #[test]
+    fn extension_tool_wrapper_ctx_payload_override() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "t",
+                    description: "d",
+                    parameters: { type: "object" },
+                    execute: async () => ({ content: [], isError: false })
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "t").await;
+            let custom_ctx = json!({"cwd": "/tmp", "user": "test"});
+            let wrapper =
+                ExtensionToolWrapper::new(def, js_runtime).with_ctx_payload(custom_ctx.clone());
+            assert_eq!(wrapper.ctx_payload, custom_ctx);
+        });
+    }
+
+    // -- collect_extension_tool_wrappers tests --
+
+    #[test]
+    fn collect_wrappers_no_js_runtime_returns_empty() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let manager = ExtensionManager::new();
+            let wrappers = collect_extension_tool_wrappers(&manager, json!({}))
+                .await
+                .expect("collect wrappers");
+            assert!(wrappers.is_empty());
+        });
+    }
+
+    #[test]
+    fn collect_wrappers_multiple_tools_from_one_extension() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "tool_alpha",
+                    description: "first tool",
+                    parameters: { type: "object" },
+                    execute: async () => ({ content: [{ type: "text", text: "alpha" }], isError: false })
+                  });
+                  pi.registerTool({
+                    name: "tool_beta",
+                    description: "second tool",
+                    parameters: { type: "object" },
+                    execute: async () => ({ content: [{ type: "text", text: "beta" }], isError: false })
+                  });
+                }
+                "#,
+            )
+            .expect("write extension");
+
+            let manager = ExtensionManager::new();
+            let tools = Arc::new(ToolRegistry::new(&[], temp_dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: temp_dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load js extensions");
+
+            let wrappers = collect_extension_tool_wrappers(&manager, json!({}))
+                .await
+                .expect("collect wrappers");
+            assert_eq!(wrappers.len(), 2);
+
+            // Sorted alphabetically
+            assert_eq!(wrappers[0].name(), "tool_alpha");
+            assert_eq!(wrappers[1].name(), "tool_beta");
+        });
+    }
+
+    #[test]
+    fn collect_wrappers_respects_active_tools_filter() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "tool_keep",
+                    description: "kept",
+                    parameters: { type: "object" },
+                    execute: async () => ({ content: [], isError: false })
+                  });
+                  pi.registerTool({
+                    name: "tool_skip",
+                    description: "skipped",
+                    parameters: { type: "object" },
+                    execute: async () => ({ content: [], isError: false })
+                  });
+                }
+                "#,
+            )
+            .expect("write extension");
+
+            let manager = ExtensionManager::new();
+            let tools = Arc::new(ToolRegistry::new(&[], temp_dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: temp_dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load js extensions");
+
+            // Set active_tools to only include tool_keep
+            manager.set_active_tools(vec!["tool_keep".to_string()]);
+
+            let wrappers = collect_extension_tool_wrappers(&manager, json!({}))
+                .await
+                .expect("collect wrappers");
+            assert_eq!(wrappers.len(), 1);
+            assert_eq!(wrappers[0].name(), "tool_keep");
+        });
+    }
+
+    #[test]
+    fn extension_tool_wrapper_js_error_maps_to_tool_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "throwing_tool",
+                    description: "throws an error",
+                    parameters: { type: "object" },
+                    execute: async () => { throw new Error("boom!"); }
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) =
+                setup_js_tool(source, "throwing_tool").await;
+
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime);
+            let err = wrapper
+                .execute("call-1", json!({}), None)
+                .await
+                .expect_err("throwing tool should fail");
+
+            match err {
+                Error::Tool { tool, message } => {
+                    assert_eq!(tool, "throwing_tool");
+                    assert!(
+                        message.contains("boom") || message.contains("error"),
+                        "Expected error message to reference the thrown error, got: {message}"
+                    );
+                }
+                other => panic!("expected tool error, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn extension_tool_wrapper_empty_content_result() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "empty_tool",
+                    description: "returns empty content",
+                    parameters: { type: "object" },
+                    execute: async () => ({
+                      content: [],
+                      isError: false
+                    })
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "empty_tool").await;
+
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime);
+            let output = wrapper
+                .execute("call-1", json!({}), None)
+                .await
+                .expect("execute tool");
+
+            assert!(!output.is_error);
+            assert!(output.content.is_empty());
+        });
+    }
+
+    #[test]
+    fn extension_tool_wrapper_is_error_flag() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "error_tool",
+                    description: "returns error flag",
+                    parameters: { type: "object" },
+                    execute: async () => ({
+                      content: [{ type: "text", text: "something went wrong" }],
+                      isError: true
+                    })
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "error_tool").await;
+
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime);
+            let output = wrapper
+                .execute("call-1", json!({}), None)
+                .await
+                .expect("execute tool");
+
+            assert!(output.is_error);
+            match output.content.as_slice() {
+                [ContentBlock::Text(text)] => {
+                    assert_eq!(text.text, "something went wrong");
+                }
+                other => panic!("expected text content, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn extension_tool_wrapper_passes_input_to_handler() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "echo_tool",
+                    description: "echoes input",
+                    parameters: { type: "object", properties: { msg: { type: "string" } } },
+                    execute: async (_callId, input) => ({
+                      content: [{ type: "text", text: JSON.stringify(input) }],
+                      isError: false
+                    })
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "echo_tool").await;
+
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime);
+            let output = wrapper
+                .execute("call-1", json!({"msg": "hello world"}), None)
+                .await
+                .expect("execute tool");
+
+            assert!(!output.is_error);
+            match output.content.as_slice() {
+                [ContentBlock::Text(text)] => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&text.text).expect("parse JSON");
+                    assert_eq!(parsed["msg"], "hello world");
+                }
+                other => panic!("expected text content, got {other:?}"),
+            }
+        });
+    }
 }
