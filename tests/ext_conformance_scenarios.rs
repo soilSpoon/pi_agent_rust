@@ -11,6 +11,7 @@ mod common;
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
+use pi::conformance::normalization::{is_path_key, path_suffix_match};
 use pi::extensions::{
     ExtensionManager, ExtensionSession, HostcallInterceptor, JsExtensionLoadSpec,
     JsExtensionRuntimeHandle,
@@ -1018,14 +1019,32 @@ fn check_expectations_inner(
 }
 
 /// Deep partial match: every key/value in `expected` must exist in `actual`.
+///
+/// Path-typed keys (detected by [`is_path_key`]) use suffix matching so
+/// that relative filenames in fixtures (`"SKILL.md"`) match absolute paths
+/// from the runtime (`"/data/.../SKILL.md"`).
 fn json_contains(actual: &Value, expected: &Value) -> bool {
+    json_contains_inner(actual, expected, None)
+}
+
+fn json_contains_inner(actual: &Value, expected: &Value, key: Option<&str>) -> bool {
     match (actual, expected) {
-        (Value::Object(actual_map), Value::Object(expected_map)) => expected_map
-            .iter()
-            .all(|(k, v)| actual_map.get(k).map_or(false, |av| json_contains(av, v))),
+        (Value::Object(actual_map), Value::Object(expected_map)) => {
+            expected_map.iter().all(|(k, v)| {
+                actual_map
+                    .get(k)
+                    .map_or(false, |av| json_contains_inner(av, v, Some(k)))
+            })
+        }
         (Value::Array(actual_arr), Value::Array(expected_arr)) => expected_arr
             .iter()
-            .all(|ev| actual_arr.iter().any(|av| json_contains(av, ev))),
+            .all(|ev| actual_arr.iter().any(|av| json_contains_inner(av, ev, key))),
+        // Path-typed string comparison: suffix match (bd-k5q5.1.2)
+        (Value::String(actual_s), Value::String(expected_s))
+            if key.is_some_and(|k| is_path_key(k)) =>
+        {
+            path_suffix_match(actual_s, expected_s)
+        }
         _ => actual == expected,
     }
 }
@@ -1055,7 +1074,7 @@ struct MockSpecInterceptor {
     exec_default: Value,
     http_rules: Vec<HttpRule>,
     http_default: Value,
-    ui_responses: HashMap<String, Value>,
+    ui_responses: Mutex<HashMap<String, Value>>,
     ui_confirm_default: bool,
     ui_notifications: Arc<Mutex<Vec<Value>>>,
     ui_status_updates: Arc<Mutex<Vec<Value>>>,
@@ -1143,7 +1162,7 @@ impl MockSpecInterceptor {
             exec_default,
             http_rules,
             http_default,
-            ui_responses,
+            ui_responses: Mutex::new(ui_responses),
             ui_confirm_default,
             ui_notifications: Arc::new(Mutex::new(Vec::new())),
             ui_status_updates: Arc::new(Mutex::new(Vec::new())),
@@ -1191,6 +1210,14 @@ impl MockSpecInterceptor {
         }
 
         interceptor
+    }
+
+    /// Update UI responses for the current step (called from multi-step runner).
+    fn set_ui_responses(&self, responses: &serde_json::Map<String, Value>) {
+        let mut locked = self.ui_responses.lock().unwrap();
+        for (k, v) in responses {
+            locked.insert(k.clone(), v.clone());
+        }
     }
 
     fn match_exec(&self, cmd: &str, payload: &Value) -> Value {
@@ -1290,18 +1317,15 @@ impl HostcallInterceptor for MockSpecInterceptor {
                     }
                     "select" => {
                         // Check ui_responses for a "select" key
-                        let value = self
-                            .ui_responses
-                            .get("select")
-                            .cloned()
-                            .unwrap_or(Value::Null);
+                        let locked = self.ui_responses.lock().unwrap();
+                        let value = locked.get("select").cloned().unwrap_or(Value::Null);
                         Some(HostcallOutcome::Success(
                             serde_json::json!({ "selected": value }),
                         ))
                     }
                     "input" => {
-                        let value = self
-                            .ui_responses
+                        let locked = self.ui_responses.lock().unwrap();
+                        let value = locked
                             .get("input")
                             .and_then(Value::as_str)
                             .unwrap_or("")
@@ -1766,6 +1790,17 @@ fn execute_tool_scenario_with_mocks(
 
     let settings = deterministic_settings_for(extension_path);
     let default_spec = load_default_mock_spec();
+
+    // Merge scenario-level ui_responses into the interceptor
+    if let Some(ui_resp) = scenario
+        .input
+        .as_ref()
+        .and_then(|v| v.pointer("/ctx/ui_responses"))
+        .and_then(Value::as_object)
+    {
+        loaded.interceptor.set_ui_responses(ui_resp);
+    }
+
     let ctx = build_ctx_payload_with_mocks(
         &settings,
         scenario.input.as_ref(),
@@ -1806,6 +1841,17 @@ fn execute_command_scenario_with_mocks(
 
     let settings = deterministic_settings_for(extension_path);
     let default_spec = load_default_mock_spec();
+
+    // Merge scenario-level ui_responses into the interceptor
+    if let Some(ui_resp) = scenario
+        .input
+        .as_ref()
+        .and_then(|v| v.pointer("/ctx/ui_responses"))
+        .and_then(Value::as_object)
+    {
+        loaded.interceptor.set_ui_responses(ui_resp);
+    }
+
     let ctx = build_ctx_payload_with_mocks(
         &settings,
         scenario.input.as_ref(),
@@ -1844,6 +1890,17 @@ fn execute_event_scenario_with_mocks(
 
     let settings = deterministic_settings_for(extension_path);
     let default_spec = load_default_mock_spec();
+
+    // Merge scenario-level ui_responses into the interceptor
+    if let Some(ui_resp) = scenario
+        .input
+        .as_ref()
+        .and_then(|v| v.pointer("/ctx/ui_responses"))
+        .and_then(Value::as_object)
+    {
+        loaded.interceptor.set_ui_responses(ui_resp);
+    }
+
     let ctx = build_ctx_payload_with_mocks(
         &settings,
         scenario.input.as_ref(),
@@ -1913,18 +1970,9 @@ fn execute_multi_step_scenario(
                     if let Some(ui_resp) = step_ctx.get("ui_responses") {
                         // Update the interceptor's UI responses for this step
                         if let Some(obj) = ui_resp.as_object() {
-                            for (k, _v) in obj {
-                                loaded
-                                    .interceptor
-                                    .ui_responses
-                                    .get(k)
-                                    .cloned()
-                                    .unwrap_or(Value::Null);
-                                // We can't mutate the interceptor's HashMap since it's behind Arc.
-                                // Instead pass responses via ctx payload.
-                                ctx_obj.insert("uiResponses".to_string(), ui_resp.clone());
-                            }
+                            loaded.interceptor.set_ui_responses(obj);
                         }
+                        ctx_obj.insert("uiResponses".to_string(), ui_resp.clone());
                     }
                 }
 

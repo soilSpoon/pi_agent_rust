@@ -180,7 +180,10 @@ impl Provider for OpenAIProvider {
         let response = Box::pin(request.send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::api(format!(
                 "OpenAI API error (HTTP {status}): {body}"
             )));
@@ -448,8 +451,13 @@ where
             for tc_delta in tool_calls {
                 let index = tc_delta.index as usize;
 
-                // Ensure we have a slot for this tool call
-                if self.tool_calls.len() <= index {
+                // OpenAI may emit sparse tool-call indices. Match by logical index
+                // instead of assuming contiguous 0..N ordering in arrival order.
+                let tool_state_idx = if let Some(existing_idx) =
+                    self.tool_calls.iter().position(|tc| tc.index == index)
+                {
+                    existing_idx
+                } else {
                     let content_index = self.partial.content.len();
                     self.tool_calls.push(ToolCallState {
                         index,
@@ -471,9 +479,10 @@ where
                         content_index,
                         partial: self.partial.clone(),
                     });
-                }
+                    self.tool_calls.len() - 1
+                };
 
-                let tc = &mut self.tool_calls[index];
+                let tc = &mut self.tool_calls[tool_state_idx];
                 let content_index = tc.content_index;
 
                 // Update ID if present
@@ -967,6 +976,55 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn test_stream_handles_sparse_tool_call_index_without_panic() {
+        let events = vec![
+            json!({ "choices": [{ "delta": {} }] }),
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 2,
+                            "id": "call_sparse",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"q\":\"sparse\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] }),
+            Value::String("[DONE]".to_string()),
+        ];
+
+        let out = collect_events(&events);
+        let done = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("done event");
+        let tool_calls: Vec<&ToolCall> = done
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall(tc) => Some(tc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_sparse");
+        assert_eq!(tool_calls[0].name, "lookup");
+        assert_eq!(tool_calls[0].arguments, json!({ "q": "sparse" }));
+        assert!(
+            out.iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallStart { .. })),
+            "expected tool call start event"
+        );
     }
 
     #[test]

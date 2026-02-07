@@ -41,7 +41,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct RpcOptions {
@@ -2817,6 +2817,7 @@ async fn run_bash_rpc(
     };
 
     // Drain remaining output (including anything still queued after senders drop).
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match rx.try_recv() {
             Ok(chunk) => match chunk.kind {
@@ -2824,6 +2825,9 @@ async fn run_bash_rpc(
                 StreamKind::Stderr => stderr_bytes.extend_from_slice(&chunk.bytes),
             },
             Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if Instant::now() >= drain_deadline {
+                    break;
+                }
                 sleep(wall_now(), tick).await;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,

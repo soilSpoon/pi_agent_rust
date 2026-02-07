@@ -152,7 +152,10 @@ impl Provider for OpenAIResponsesProvider {
         let response = Box::pin(request.send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::api(format!(
                 "OpenAI API error (HTTP {status}): {body}"
             )));

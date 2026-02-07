@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-07T02:24:04Z
+> Generated: 2026-02-07T21:55:06Z
 
 ## Summary
 
@@ -8,9 +8,9 @@
 |---|---|
 | Total budgets | 13 |
 | CI-enforced | 8 |
-| PASS | 8 |
+| PASS | 3 |
 | FAIL | 0 |
-| No data | 5 |
+| No data | 10 |
 
 ## Startup
 
@@ -23,8 +23,8 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `ext_cold_load_simple_p95` | p95 cold load time | 5 ms | 0.8 | PASS | Yes |
-| `ext_cold_load_complex_p95` | p95 cold load time | 50 ms | 0.6 | PASS | No |
+| `ext_cold_load_simple_p95` | p95 cold load time | 5 ms | - | NO_DATA | Yes |
+| `ext_cold_load_complex_p95` | p95 cold load time | 50 ms | - | NO_DATA | No |
 | `ext_load_60_total` | total load time (60 official extensions) | 10000 ms | 6198.0 | PASS | No |
 
 ## Tool_call
@@ -38,32 +38,32 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 45 | PASS | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 46 | PASS | No |
 
 ## Policy
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `policy_eval_p99` | p99 evaluation time | 500 ns | 95 | PASS | Yes |
+| `policy_eval_p99` | p99 evaluation time | 500 ns | - | NO_DATA | Yes |
 
 ## Memory
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `idle_memory_rss` | RSS at idle | 50 MB | 4.1 | PASS | Yes |
+| `idle_memory_rss` | RSS at idle | 50 MB | 4.0 | PASS | Yes |
 | `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | - | NO_DATA | No |
 
 ## Binary
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `binary_size_release` | release binary size | 20 MB | 12.5 | PASS | Yes |
+| `binary_size_release` | release binary size | 20 MB | - | NO_DATA | Yes |
 
 ## Protocol
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `protocol_parse_p99` | p99 parse+validate time | 50 us | 6 | PASS | Yes |
+| `protocol_parse_p99` | p99 parse+validate time | 50 us | - | NO_DATA | Yes |
 
 ## Measurement Methodology
 

@@ -186,7 +186,10 @@ impl Provider for AzureOpenAIProvider {
         let response = Box::pin(request.send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::api(format!(
                 "Azure OpenAI API error (HTTP {status}): {body}"
             )));
@@ -203,6 +206,9 @@ impl Provider for AzureOpenAIProvider {
         let stream = stream::unfold(
             StreamState::new(event_source, model, api, provider),
             |mut state| async move {
+                if state.done {
+                    return None;
+                }
                 loop {
                     if let Some(event) = state.pending_events.pop_front() {
                         return Some((Ok(event), state));
@@ -212,6 +218,7 @@ impl Provider for AzureOpenAIProvider {
                         Some(Ok(msg)) => {
                             // Azure also sends "[DONE]" as final message
                             if msg.data == "[DONE]" {
+                                state.done = true;
                                 let reason = state.partial.stop_reason;
                                 return Some((
                                     Ok(StreamEvent::Done {
@@ -223,14 +230,30 @@ impl Provider for AzureOpenAIProvider {
                             }
 
                             if let Err(e) = state.process_event(&msg.data) {
+                                state.done = true;
                                 return Some((Err(e), state));
                             }
                         }
                         Some(Err(e)) => {
+                            state.done = true;
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
                         }
-                        None => return None,
+                        // Stream ended without [DONE] sentinel (e.g.
+                        // premature server disconnect).  Emit Done so the
+                        // agent loop receives the accumulated partial
+                        // instead of silently losing it.
+                        None => {
+                            state.done = true;
+                            let reason = state.partial.stop_reason;
+                            return Some((
+                                Ok(StreamEvent::Done {
+                                    reason,
+                                    message: state.partial.clone(),
+                                }),
+                                state,
+                            ));
+                        }
                     }
                 }
             },
@@ -254,9 +277,11 @@ where
     tool_calls: Vec<ToolCallState>,
     pending_events: VecDeque<StreamEvent>,
     started: bool,
+    done: bool,
 }
 
 struct ToolCallState {
+    index: usize,
     content_index: usize,
     id: String,
     name: String,
@@ -284,6 +309,7 @@ where
             tool_calls: Vec::new(),
             pending_events: VecDeque::new(),
             started: false,
+            done: false,
         }
     }
 
@@ -407,10 +433,16 @@ where
                 for tc in tool_calls {
                     let idx = tc.index as usize;
 
-                    // Ensure we have a slot for this tool call
-                    if self.tool_calls.len() <= idx {
+                    // Azure may emit sparse tool-call indices. Match by logical index
+                    // instead of assuming contiguous 0..N ordering in arrival order.
+                    let tool_state_idx = if let Some(existing_idx) =
+                        self.tool_calls.iter().position(|tc| tc.index == idx)
+                    {
+                        existing_idx
+                    } else {
                         let content_index = self.partial.content.len();
                         self.tool_calls.push(ToolCallState {
+                            index: idx,
                             content_index,
                             id: String::new(),
                             name: String::new(),
@@ -432,9 +464,10 @@ where
                             content_index,
                             partial: self.partial.clone(),
                         });
-                    }
+                        self.tool_calls.len() - 1
+                    };
 
-                    let tc_state = &mut self.tool_calls[idx];
+                    let tc_state = &mut self.tool_calls[tool_state_idx];
                     let content_index = tc_state.content_index;
 
                     // Update the tool call state
@@ -927,6 +960,55 @@ mod tests {
             let summaries: Vec<EventSummary> = events.iter().map(summarize_event).collect();
             assert_eq!(summaries, case.expected, "case {}", case.name);
         }
+    }
+
+    #[test]
+    fn test_stream_handles_sparse_tool_call_index_without_panic() {
+        let events = vec![
+            json!({ "choices": [{ "delta": {} }] }),
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 3,
+                            "id": "call_sparse",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"q\":\"azure\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] }),
+            Value::String("[DONE]".to_string()),
+        ];
+
+        let out = collect_events(&events);
+        let done = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("done event");
+        let tool_calls: Vec<&ToolCall> = done
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall(tc) => Some(tc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_sparse");
+        assert_eq!(tool_calls[0].name, "lookup");
+        assert_eq!(tool_calls[0].arguments, json!({ "q": "azure" }));
+        assert!(
+            out.iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallStart { .. })),
+            "expected tool call start event"
+        );
     }
 
     fn load_fixture(file_name: &str) -> ProviderFixture {

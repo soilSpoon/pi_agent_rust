@@ -192,6 +192,7 @@ pub struct SseStream<S> {
     inner: S,
     parser: SseParser,
     pending_events: VecDeque<SseEvent>,
+    pending_error: Option<std::io::Error>,
     utf8_buffer: Vec<u8>,
 }
 
@@ -202,6 +203,7 @@ impl<S> SseStream<S> {
             inner,
             parser: SseParser::new(),
             pending_events: VecDeque::new(),
+            pending_error: None,
             utf8_buffer: Vec::new(),
         }
     }
@@ -211,140 +213,124 @@ impl<S> SseStream<S>
 where
     S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
 {
+    fn feed_valid_prefix(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Ok(s) = std::str::from_utf8(bytes) else {
+            return;
+        };
+        let events = self.parser.feed(s);
+        self.pending_events.extend(events);
+    }
+
+    fn process_chunk_without_utf8_tail(&mut self, bytes: Vec<u8>) -> Result<(), std::io::Error> {
+        match std::str::from_utf8(&bytes) {
+            Ok(s) => {
+                let events = self.parser.feed(s);
+                self.pending_events.extend(events);
+                Ok(())
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                self.feed_valid_prefix(&bytes[..valid_len]);
+
+                if err.error_len().is_some() {
+                    // Hard UTF-8 error: drop invalid tail so future chunks can recover.
+                    self.utf8_buffer.clear();
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
+                }
+
+                let mut remainder = bytes;
+                remainder.drain(..valid_len);
+                self.utf8_buffer = remainder;
+                Ok(())
+            }
+        }
+    }
+
+    fn process_chunk_with_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
+        self.utf8_buffer.extend_from_slice(bytes);
+        let mut utf8_buffer = std::mem::take(&mut self.utf8_buffer);
+
+        match std::str::from_utf8(&utf8_buffer) {
+            Ok(s) => {
+                let events = self.parser.feed(s);
+                self.pending_events.extend(events);
+                utf8_buffer.clear();
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                self.feed_valid_prefix(&utf8_buffer[..valid_len]);
+
+                if err.error_len().is_some() {
+                    // Hard UTF-8 error: clear carry buffer so stream can continue.
+                    self.utf8_buffer.clear();
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
+                }
+
+                utf8_buffer.drain(..valid_len);
+            }
+        }
+
+        self.utf8_buffer = utf8_buffer;
+        Ok(())
+    }
+
+    fn process_chunk(&mut self, bytes: Vec<u8>) -> Result<(), std::io::Error> {
+        if self.utf8_buffer.is_empty() {
+            self.process_chunk_without_utf8_tail(bytes)
+        } else {
+            self.process_chunk_with_utf8_tail(&bytes)
+        }
+    }
+
+    fn poll_stream_end(&mut self) -> Poll<Option<Result<SseEvent, std::io::Error>>> {
+        if !self.utf8_buffer.is_empty() {
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Stream ended with incomplete UTF-8 sequence",
+            ))));
+        }
+
+        if let Some(event) = self.parser.flush() {
+            return Poll::Ready(Some(Ok(event)));
+        }
+        Poll::Ready(None)
+    }
+
     /// Poll for the next SSE event.
-    #[allow(clippy::too_many_lines)]
     pub fn poll_next_event(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<SseEvent, std::io::Error>>> {
-        // Return any pending events first
         if let Some(event) = self.pending_events.pop_front() {
             return Poll::Ready(Some(Ok(event)));
         }
+        if let Some(err) = self.pending_error.take() {
+            return Poll::Ready(Some(Err(err)));
+        }
 
-        // Poll the inner stream for more data
         loop {
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if self.utf8_buffer.is_empty() {
-                        // Fast path: when we don't have a pending UTF-8 tail, avoid copying the
-                        // entire chunk into `utf8_buffer`. Most provider streams are UTF-8 aligned.
-                        match std::str::from_utf8(&bytes) {
-                            Ok(s) => {
-                                let events = self.parser.feed(s);
-                                self.pending_events.extend(events);
-                            }
-                            Err(e) => {
-                                if e.error_len().is_some() {
-                                    // Feed valid prefix before returning the error so
-                                    // events preceding the bad byte are not silently lost.
-                                    let valid_len = e.valid_up_to();
-                                    if valid_len > 0 {
-                                        let s = std::str::from_utf8(&bytes[..valid_len]).unwrap();
-                                        let events = self.parser.feed(s);
-                                        self.pending_events.extend(events);
-                                    }
-                                    // Keep only the offending bytes (skip already-processed prefix).
-                                    let mut remainder = bytes;
-                                    remainder.drain(..valid_len);
-                                    self.utf8_buffer = remainder;
-                                    return Poll::Ready(Some(Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        e,
-                                    ))));
-                                }
-
-                                let valid_len = e.valid_up_to();
-                                if valid_len > 0 {
-                                    let s = std::str::from_utf8(&bytes[..valid_len]).unwrap();
-                                    let events = self.parser.feed(s);
-                                    self.pending_events.extend(events);
-                                }
-
-                                // Keep only the trailing incomplete UTF-8 bytes (no allocation).
-                                let mut remainder = bytes;
-                                remainder.drain(..valid_len);
-                                self.utf8_buffer = remainder;
-                            }
+                    if let Err(err) = self.process_chunk(bytes) {
+                        if let Some(event) = self.pending_events.pop_front() {
+                            self.pending_error = Some(err);
+                            return Poll::Ready(Some(Ok(event)));
                         }
-                    } else {
-                        self.utf8_buffer.extend_from_slice(&bytes);
-
-                        // Determine how much of the buffer is valid UTF-8.
-                        // Take the bytes out so we can borrow self.parser mutably without fighting
-                        // the borrow checker over self.utf8_buffer.
-                        let mut utf8_buffer = std::mem::take(&mut self.utf8_buffer);
-
-                        let parsed = match std::str::from_utf8(&utf8_buffer) {
-                            Ok(s) => Some((utf8_buffer.len(), self.parser.feed(s))),
-                            Err(e) => {
-                                if e.error_len().is_some() {
-                                    // Feed valid prefix before returning the error so
-                                    // events preceding the bad byte are not silently lost.
-                                    let valid_len = e.valid_up_to();
-                                    if valid_len > 0 {
-                                        let s =
-                                            std::str::from_utf8(&utf8_buffer[..valid_len]).unwrap();
-                                        let events = self.parser.feed(s);
-                                        self.pending_events.extend(events);
-                                    }
-                                    // Keep only the offending bytes (skip already-processed prefix).
-                                    utf8_buffer.drain(..valid_len);
-                                    self.utf8_buffer = utf8_buffer;
-                                    return Poll::Ready(Some(Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        e,
-                                    ))));
-                                }
-                                let valid_len = e.valid_up_to();
-                                if valid_len == 0 {
-                                    None
-                                } else {
-                                    let s = std::str::from_utf8(&utf8_buffer[..valid_len]).unwrap();
-                                    Some((valid_len, self.parser.feed(s)))
-                                }
-                            }
-                        };
-
-                        if let Some((valid_len, events)) = parsed {
-                            self.pending_events.extend(events);
-
-                            // Remove the consumed bytes efficiently.
-                            if valid_len == utf8_buffer.len() {
-                                utf8_buffer.clear();
-                            } else {
-                                // Keep only the trailing incomplete UTF-8 bytes (no allocation).
-                                utf8_buffer.drain(..valid_len);
-                            }
-                        }
-
-                        self.utf8_buffer = utf8_buffer;
+                        return Poll::Ready(Some(Err(err)));
                     }
 
-                    // If we have pending events, return the first one
                     if let Some(event) = self.pending_events.pop_front() {
                         return Poll::Ready(Some(Ok(event)));
                     }
-                    // Otherwise continue polling
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(None) => {
-                    // Stream ended
-                    // If we have incomplete bytes in buffer, that's an error
-                    if !self.utf8_buffer.is_empty() {
-                        return Poll::Ready(Some(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Stream ended with incomplete UTF-8 sequence",
-                        ))));
-                    }
-
-                    // Flush any pending event
-                    if let Some(event) = self.parser.flush() {
-                        return Poll::Ready(Some(Ok(event)));
-                    }
-                    return Poll::Ready(None);
+                    return self.poll_stream_end();
                 }
                 Poll::Pending => {
                     return Poll::Pending;

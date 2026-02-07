@@ -1763,6 +1763,7 @@ mod tests {
                 content: "hello".to_string(),
                 display: true,
                 details: None,
+                timestamp: Some(0),
             };
             let entries = vec![serde_json::json!({ "id": "entry-1", "type": "custom" })];
             let branch = vec![serde_json::json!({ "id": "entry-2", "type": "branch" })];

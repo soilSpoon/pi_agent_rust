@@ -1952,6 +1952,8 @@ pub enum SessionMessage {
         display: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp: Option<i64>,
     },
     BashExecution {
         command: String,
@@ -1999,6 +2001,7 @@ impl From<Message> for SessionMessage {
                 content: custom.content,
                 display: custom.display,
                 details: custom.details,
+                timestamp: Some(custom.timestamp),
             },
         }
     }
@@ -2123,12 +2126,13 @@ pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Messa
             content,
             display,
             details,
+            timestamp,
         } => Some(Message::Custom(crate::model::CustomMessage {
             content: content.clone(),
             custom_type: custom_type.clone(),
             display: *display,
             details: details.clone(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
+            timestamp: timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
         })),
         SessionMessage::BashExecution {
             command,
@@ -3046,6 +3050,7 @@ mod tests {
             content: "some state".to_string(),
             display: false,
             details: Some(serde_json::json!({"key": "value"})),
+            timestamp: Some(0),
         };
         let custom_id = session.append_message(custom_msg);
 

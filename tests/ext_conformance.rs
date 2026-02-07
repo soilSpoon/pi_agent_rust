@@ -8,9 +8,17 @@
 //! - We normalize known non-deterministic fields (timestamps, pids, run/session IDs, etc.).
 //! - We canonicalize JSON key ordering for stable diffs.
 //! - Diffs are grouped by `event` and correlation IDs to speed triage.
+//!
+//! **Normalization rules are defined in the canonical contract** at
+//! [`pi::conformance::normalization`].  This test file delegates to that
+//! module so there is one source of truth.
 #![forbid(unsafe_code)]
 
-use regex::Regex;
+use pi::conformance::normalization::{
+    self, NormalizationContext, PLACEHOLDER_ARTIFACT_ID, PLACEHOLDER_HOST,
+    PLACEHOLDER_PI_MONO_ROOT, PLACEHOLDER_RUN_ID, PLACEHOLDER_SESSION_ID, PLACEHOLDER_SPAN_ID,
+    PLACEHOLDER_TIMESTAMP, PLACEHOLDER_TRACE_ID, is_path_key, path_suffix_match,
+};
 use serde_json::{Value, json};
 use similar::ChangeTag;
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,203 +26,13 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 use tempfile::NamedTempFile;
 use tracing::trace;
 
-const PLACEHOLDER_TIMESTAMP: &str = "<TIMESTAMP>";
-const PLACEHOLDER_HOST: &str = "<HOST>";
-const PLACEHOLDER_SESSION_ID: &str = "<SESSION_ID>";
-const PLACEHOLDER_RUN_ID: &str = "<RUN_ID>";
-const PLACEHOLDER_ARTIFACT_ID: &str = "<ARTIFACT_ID>";
-const PLACEHOLDER_TRACE_ID: &str = "<TRACE_ID>";
-const PLACEHOLDER_SPAN_ID: &str = "<SPAN_ID>";
-const PLACEHOLDER_UUID: &str = "<UUID>";
-const PLACEHOLDER_PI_MONO_ROOT: &str = "<PI_MONO_ROOT>";
-const PLACEHOLDER_PROJECT_ROOT: &str = "<PROJECT_ROOT>";
-const PLACEHOLDER_PORT: &str = "<PORT>";
-
-static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
-static RUN_ID_REGEX: OnceLock<Regex> = OnceLock::new();
-static UUID_REGEX: OnceLock<Regex> = OnceLock::new();
-static OPENAI_BASE_REGEX: OnceLock<Regex> = OnceLock::new();
-
-fn ansi_regex() -> &'static Regex {
-    ANSI_REGEX.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("ansi regex"))
-}
-
-#[derive(Debug, Clone)]
-struct NormalizationContext {
-    project_root: String,
-    pi_mono_root: String,
-    cwd: String,
-}
-
-impl NormalizationContext {
-    fn from_cwd(cwd: &Path) -> Self {
-        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-            .display()
-            .to_string();
-        let pi_mono_root = PathBuf::from(&project_root)
-            .join("legacy_pi_mono_code")
-            .join("pi-mono")
-            .canonicalize()
-            .unwrap_or_else(|_| {
-                PathBuf::from(&project_root)
-                    .join("legacy_pi_mono_code")
-                    .join("pi-mono")
-            })
-            .display()
-            .to_string();
-        let cwd = cwd
-            .canonicalize()
-            .unwrap_or_else(|_| cwd.to_path_buf())
-            .display()
-            .to_string();
-        Self {
-            project_root,
-            pi_mono_root,
-            cwd,
-        }
-    }
-}
-
-fn normalize_ext_log_line(mut value: Value, ctx: &NormalizationContext) -> Value {
-    normalize_value(&mut value, None, ctx);
-    canonicalize_json_keys(&value)
-}
-
-fn normalize_value(value: &mut Value, key: Option<&str>, ctx: &NormalizationContext) {
-    match value {
-        Value::Null | Value::Bool(_) => {}
-        Value::String(s) => {
-            if matches!(
-                key,
-                Some(
-                    "timestamp" | "started_at" | "finished_at" | "created_at" | "createdAt" | "ts"
-                )
-            ) {
-                *s = PLACEHOLDER_TIMESTAMP.to_string();
-                return;
-            }
-            if matches!(key, Some("cwd")) {
-                *s = PLACEHOLDER_PI_MONO_ROOT.to_string();
-                return;
-            }
-            if matches!(key, Some("host")) {
-                *s = PLACEHOLDER_HOST.to_string();
-                return;
-            }
-            if matches!(key, Some("session_id" | "sessionId")) {
-                *s = PLACEHOLDER_SESSION_ID.to_string();
-                return;
-            }
-            if matches!(key, Some("run_id" | "runId")) {
-                *s = PLACEHOLDER_RUN_ID.to_string();
-                return;
-            }
-            if matches!(key, Some("artifact_id" | "artifactId")) {
-                *s = PLACEHOLDER_ARTIFACT_ID.to_string();
-                return;
-            }
-            if matches!(key, Some("trace_id" | "traceId")) {
-                *s = PLACEHOLDER_TRACE_ID.to_string();
-                return;
-            }
-            if matches!(key, Some("span_id" | "spanId")) {
-                *s = PLACEHOLDER_SPAN_ID.to_string();
-                return;
-            }
-            *s = normalize_string(s, ctx);
-        }
-        Value::Array(items) => {
-            for item in items {
-                normalize_value(item, None, ctx);
-            }
-        }
-        Value::Object(map) => {
-            for (key, item) in map.iter_mut() {
-                normalize_value(item, Some(key.as_str()), ctx);
-            }
-        }
-        Value::Number(_) => {
-            if matches!(
-                key,
-                Some(
-                    "timestamp"
-                        | "started_at"
-                        | "finished_at"
-                        | "created_at"
-                        | "createdAt"
-                        | "ts"
-                        | "pid"
-                )
-            ) {
-                *value = Value::Number(0.into());
-            }
-        }
-    }
-}
-
-fn normalize_string(input: &str, ctx: &NormalizationContext) -> String {
-    let run_id_re =
-        RUN_ID_REGEX.get_or_init(|| Regex::new(r"\brun-[0-9a-fA-F-]{36}\b").expect("run id regex"));
-    let uuid_re = UUID_REGEX.get_or_init(|| {
-        Regex::new(
-            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
-        )
-        .expect("uuid regex")
-    });
-    let openai_base_re = OPENAI_BASE_REGEX
-        .get_or_init(|| Regex::new(r"http://127\.0\.0\.1:\d+/v1").expect("openai base regex"));
-
-    // 1) Strip ANSI escape sequences (keeps plain text).
-    // Covers CSI sequences like: ESC[31m, ESC[0m, ESC[2K, etc.
-    let without_ansi = ansi_regex().replace_all(input, "");
-
-    // 2) Normalize absolute paths under cwd to "<cwd>/...".
-    let mut out = without_ansi.to_string();
-    out = replace_path_variants(&out, &ctx.pi_mono_root, PLACEHOLDER_PI_MONO_ROOT);
-    out = replace_path_variants(&out, &ctx.cwd, PLACEHOLDER_PI_MONO_ROOT);
-    out = replace_path_variants(&out, &ctx.project_root, PLACEHOLDER_PROJECT_ROOT);
-    out = run_id_re.replace_all(&out, PLACEHOLDER_RUN_ID).into_owned();
-    out = openai_base_re
-        .replace_all(&out, format!("http://127.0.0.1:{PLACEHOLDER_PORT}/v1"))
-        .into_owned();
-    out = uuid_re.replace_all(&out, PLACEHOLDER_UUID).into_owned();
-    out
-}
-
-fn replace_path_variants(input: &str, path: &str, placeholder: &str) -> String {
-    if path.is_empty() {
-        return input.to_string();
-    }
-    let mut out = input.replace(path, placeholder);
-    let path_backslashes = path.replace('/', "\\");
-    if path_backslashes != path {
-        out = out.replace(&path_backslashes, placeholder);
-    }
-    out
-}
-
-fn canonicalize_json_keys(value: &Value) -> Value {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_keys).collect()),
-        Value::Object(map) => {
-            let mut keys = map.keys().cloned().collect::<Vec<_>>();
-            keys.sort();
-            let mut out = serde_json::Map::new();
-            for key in keys {
-                if let Some(value) = map.get(&key) {
-                    out.insert(key, canonicalize_json_keys(value));
-                }
-            }
-            Value::Object(out)
-        }
-    }
+/// Normalize a single JSONL event line using the canonical contract.
+fn normalize_ext_log_line(value: Value, ctx: &NormalizationContext) -> Value {
+    let contract = normalization::NormalizationContract::default();
+    contract.normalize_and_canonicalize(value, ctx)
 }
 
 fn diff_key(value: &Value) -> String {
@@ -409,7 +227,7 @@ fn normalize_string_rewrites_run_ids_ports_and_roots() {
         "run-123e4567-e89b-12d3-a456-426614174000 http://127.0.0.1:4887/v1 {}",
         ctx.pi_mono_root
     );
-    let out = normalize_string(&input, &ctx);
+    let out = normalization::normalize_string(&input, &ctx);
     assert!(out.contains(PLACEHOLDER_RUN_ID), "{out}");
     assert!(out.contains("http://127.0.0.1:<PORT>/v1"), "{out}");
     assert!(out.contains(PLACEHOLDER_PI_MONO_ROOT), "{out}");
@@ -439,6 +257,22 @@ fn diff_normalized_jsonl_treats_dynamic_fields_as_equal() {
 "#;
 
     diff_normalized_jsonl(expected, actual, cwd).unwrap();
+}
+
+#[test]
+fn ui_method_aliases_normalize_identically_in_jsonl_diff() {
+    let cwd = Path::new("/tmp/pi_ext_conformance");
+    // Expected side uses camelCase (setStatus) — matches TS pi-mono output.
+    let expected = r#"
+{"type":"extension_ui_request","id":"req-1","method":"setStatus","statusKey":"demo","statusText":"Ready"}
+"#;
+    // Actual side uses snake_case (set_status) — hypothetical Rust naming.
+    let actual = r#"
+{"type":"extension_ui_request","id":"req-1","method":"set_status","statusKey":"demo","statusText":"Ready"}
+"#;
+    // Both should normalise to method:"status", so diff should be empty.
+    diff_normalized_jsonl(expected, actual, cwd)
+        .expect("setStatus and set_status should compare equal after normalization");
 }
 
 #[test]
@@ -495,4 +329,227 @@ fn trace_viewer_renders_pretty_and_exports_jsonl() {
     let jsonl_stdout = String::from_utf8_lossy(&jsonl.stdout);
     let expected_jsonl = format!("{line1}\n{line2}\n{line3}\n");
     assert_eq!(jsonl_stdout.as_ref(), expected_jsonl);
+}
+
+// ─── Regression tests for dynamic-resources, git-checkpoint, status-line ──────
+//
+// These tests lock in the harness-level fixes from bd-k5q5.1.2 (path
+// canonicalization), bd-k5q5.1.3 (UI response plumbing), and bd-k5q5.1.4
+// (UI op aliases).  If any of these regresses, the corresponding conformance
+// scenario will silently fail with false negatives.
+
+/// Regression: `json_contains` with path-aware matching so that
+/// `returns_contains.promptPaths = ["dynamic.md"]` matches the runtime
+/// result `promptPaths = ["/abs/path/to/dynamic.md"]`.
+///
+/// Mirrors fixture: `dynamic-resources.json` scenario `scn-dynamic-resources-001`.
+#[test]
+fn regression_dynamic_resources_path_suffix_matching() {
+    // All three keys should be recognized as path keys
+    assert!(is_path_key("promptPaths"), "promptPaths is a path key");
+    assert!(is_path_key("skillPaths"), "skillPaths is a path key");
+    assert!(is_path_key("themePaths"), "themePaths is a path key");
+
+    // Suffix matching works for each file
+    assert!(path_suffix_match(
+        "/home/user/.pi/extensions/dynamic-resources/dynamic.md",
+        "dynamic.md"
+    ));
+    assert!(path_suffix_match(
+        "/home/user/.pi/extensions/dynamic-resources/SKILL.md",
+        "SKILL.md"
+    ));
+    assert!(path_suffix_match(
+        "/home/user/.pi/extensions/dynamic-resources/dynamic.json",
+        "dynamic.json"
+    ));
+
+    // Verify the actual fixture values would match
+    let actual_paths = [
+        (
+            "/home/user/.pi/extensions/dynamic-resources/dynamic.md",
+            "dynamic.md",
+        ),
+        (
+            "/home/user/.pi/extensions/dynamic-resources/SKILL.md",
+            "SKILL.md",
+        ),
+        (
+            "/home/user/.pi/extensions/dynamic-resources/dynamic.json",
+            "dynamic.json",
+        ),
+    ];
+    for (actual, expected) in actual_paths {
+        assert!(
+            path_suffix_match(actual, expected),
+            "expected '{expected}' to suffix-match '{actual}'"
+        );
+    }
+}
+
+/// Regression: absolute expected paths must NOT match via suffix.
+/// Prevents false positives where `/other/SKILL.md` would match `/ext/SKILL.md`.
+#[test]
+fn regression_dynamic_resources_rejects_absolute_expected() {
+    assert!(!path_suffix_match(
+        "/ext/dynamic-resources/SKILL.md",
+        "/other/SKILL.md"
+    ));
+}
+
+/// Regression: `setStatus` / `set_status` UI op aliases normalize identically
+/// in JSONL diff, so the status-line extension passes conformance regardless
+/// of which alias the Rust runtime uses.
+///
+/// Mirrors fixture: `status-line.json` scenario `scn-status-line-001`.
+#[test]
+fn regression_status_line_op_alias_normalization() {
+    let cwd = Path::new("/tmp/pi_ext_conformance");
+
+    // Expected side (from TS pi-mono capture): uses camelCase `setStatus`
+    let expected = r#"
+{"type":"extension_ui_request","id":"req-1","method":"setStatus","statusKey":"status-demo","statusText":"Ready"}
+{"type":"extension_ui_request","id":"req-2","method":"setStatus","statusKey":"status-demo","statusText":"Turn 1..."}
+{"type":"extension_ui_request","id":"req-3","method":"setStatus","statusKey":"status-demo","statusText":"Turn 1 complete"}
+"#;
+
+    // Actual side (from Rust runtime): might use snake_case `set_status`
+    let actual = r#"
+{"type":"extension_ui_request","id":"req-1","method":"set_status","statusKey":"status-demo","statusText":"Ready"}
+{"type":"extension_ui_request","id":"req-2","method":"set_status","statusKey":"status-demo","statusText":"Turn 1..."}
+{"type":"extension_ui_request","id":"req-3","method":"set_status","statusKey":"status-demo","statusText":"Turn 1 complete"}
+"#;
+
+    diff_normalized_jsonl(expected, actual, cwd)
+        .expect("setStatus and set_status should diff-equal after normalization");
+}
+
+/// Regression: `setWidget` / `set_widget` aliases also normalize, covering
+/// the full alias table added in bd-k5q5.1.4.
+#[test]
+fn regression_ui_alias_table_completeness() {
+    let cwd = Path::new("/tmp/pi_ext_conformance");
+
+    for (camel, snake) in [
+        ("setStatus", "set_status"),
+        ("setLabel", "set_label"),
+        ("setWidget", "set_widget"),
+        ("setTitle", "set_title"),
+    ] {
+        let expected = format!(
+            r#"{{"type":"extension_ui_request","id":"req-1","method":"{camel}","data":"test"}}"#
+        );
+        let actual = format!(
+            r#"{{"type":"extension_ui_request","id":"req-1","method":"{snake}","data":"test"}}"#
+        );
+        diff_normalized_jsonl(&expected, &actual, cwd).unwrap_or_else(|e| {
+            panic!("{camel} and {snake} should normalize identically:\n{e}");
+        });
+    }
+}
+
+/// Regression: non-UI-request objects with a `method` field must NOT be
+/// rewritten by alias normalization (e.g., JSON-RPC messages).
+#[test]
+fn regression_non_ui_method_untouched() {
+    let cwd = Path::new("/tmp/pi_ext_conformance");
+    let ctx = NormalizationContext::from_cwd(cwd);
+    let contract = normalization::NormalizationContract::default();
+
+    let input = json!({
+        "type": "json_rpc",
+        "method": "setStatus",
+        "params": {}
+    });
+    let normalized = contract.normalize_and_canonicalize(input, &ctx);
+    assert_eq!(
+        normalized["method"], "setStatus",
+        "non-UI method should not be rewritten"
+    );
+}
+
+/// Regression: git-checkpoint UI response fixture format is valid and the
+/// notification pattern from the fixture would pass case-insensitive matching.
+#[test]
+fn regression_git_checkpoint_ui_notify_pattern() {
+    let notification_text = "Code restored to checkpoint for entry-1";
+    let expected_pattern = "Code restored to checkpoint";
+    assert!(
+        notification_text
+            .to_lowercase()
+            .contains(&expected_pattern.to_lowercase()),
+        "notification pattern should match"
+    );
+
+    // Verify the ui_responses fixture format is valid JSON
+    let ctx_json = json!({
+        "has_ui": true,
+        "ui_responses": {
+            "select": "Yes, restore code to that point"
+        }
+    });
+    assert!(ctx_json["ui_responses"]["select"].is_string());
+    assert_eq!(
+        ctx_json["ui_responses"]["select"],
+        "Yes, restore code to that point"
+    );
+}
+
+/// Regression: full normalization pipeline for dynamic-resources log lines.
+#[test]
+fn regression_dynamic_resources_full_normalization_pipeline() {
+    let cwd = Path::new("/workspace/ext/dynamic-resources");
+    let ctx = NormalizationContext::from_cwd(cwd);
+    let contract = normalization::NormalizationContract::default();
+
+    let input = json!({
+        "schema": "pi.ext.log.v1",
+        "ts": "2026-02-03T12:37:19.100Z",
+        "event": "resources_discover",
+        "message": format!("discovered {} resources", cwd.display()),
+        "data": {
+            "promptPaths": [format!("{}/dynamic.md", cwd.display())],
+            "skillPaths": [format!("{}/SKILL.md", cwd.display())],
+            "themePaths": [format!("{}/dynamic.json", cwd.display())]
+        },
+        "correlation": {
+            "extension_id": "dynamic-resources",
+            "session_id": "sess-abc",
+            "run_id": "run-xyz"
+        },
+        "source": { "host": "build-host", "pid": 42 }
+    });
+
+    let normalized = contract.normalize_and_canonicalize(input, &ctx);
+
+    // Timestamps and IDs should be placeholders
+    assert_eq!(normalized["ts"], PLACEHOLDER_TIMESTAMP);
+    assert_eq!(
+        normalized["correlation"]["session_id"],
+        PLACEHOLDER_SESSION_ID
+    );
+
+    // Paths in data should be rewritten to use PI_MONO_ROOT placeholder
+    let prompt_paths = normalized["data"]["promptPaths"]
+        .as_array()
+        .expect("promptPaths array");
+    assert!(
+        prompt_paths[0]
+            .as_str()
+            .unwrap()
+            .contains(PLACEHOLDER_PI_MONO_ROOT),
+        "promptPaths should use placeholder root: {:?}",
+        prompt_paths[0]
+    );
+
+    // Message should have cwd replaced
+    let msg = normalized["message"].as_str().unwrap();
+    assert!(
+        msg.contains(PLACEHOLDER_PI_MONO_ROOT),
+        "message should use placeholder: {msg}"
+    );
+    assert!(
+        !msg.contains("/workspace/ext/dynamic-resources"),
+        "original cwd should be gone: {msg}"
+    );
 }

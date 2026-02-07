@@ -1146,6 +1146,7 @@ mod tests {
             content: "some custom content".to_string(),
             display: true,
             details: None,
+            timestamp: Some(0),
         };
         // 19 chars => ceil(19/4) = 5
         assert_eq!(estimate_tokens(&msg), 5);

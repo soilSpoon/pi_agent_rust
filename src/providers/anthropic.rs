@@ -173,7 +173,10 @@ impl Provider for AnthropicProvider {
         let response = Box::pin(request.send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::api(format!(
                 "Anthropic API error (HTTP {status}): {body}"
             )));
@@ -336,6 +339,10 @@ where
             self.partial.usage.input = usage.input;
             self.partial.usage.cache_read = usage.cache_read.unwrap_or(0);
             self.partial.usage.cache_write = usage.cache_write.unwrap_or(0);
+            self.partial.usage.total_tokens = self.partial.usage.input
+                + self.partial.usage.output
+                + self.partial.usage.cache_read
+                + self.partial.usage.cache_write;
         }
         StreamEvent::Start {
             partial: self.partial.clone(),

@@ -161,7 +161,10 @@ impl Provider for GeminiProvider {
         let response = Box::pin(request.send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::api(format!(
                 "Gemini API error (HTTP {status}): {body}"
             )));
@@ -178,6 +181,9 @@ impl Provider for GeminiProvider {
         let stream = stream::unfold(
             StreamState::new(event_source, model, api, provider),
             |mut state| async move {
+                if state.finished {
+                    return None;
+                }
                 loop {
                     // Drain pending events before polling for more SSE data
                     if let Some(event) = state.pending_events.pop_front() {
@@ -191,26 +197,25 @@ impl Provider for GeminiProvider {
                             }
 
                             if let Err(e) = state.process_event(&msg.data) {
+                                state.finished = true;
                                 return Some((Err(e), state));
                             }
                         }
                         Some(Err(e)) => {
+                            state.finished = true;
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
                         }
                         None => {
                             // Stream ended naturally
-                            if !state.finished {
-                                state.finished = true;
-                                return Some((
-                                    Ok(StreamEvent::Done {
-                                        reason: state.partial.stop_reason,
-                                        message: state.partial.clone(),
-                                    }),
-                                    state,
-                                ));
-                            }
-                            return None;
+                            state.finished = true;
+                            return Some((
+                                Ok(StreamEvent::Done {
+                                    reason: state.partial.stop_reason,
+                                    message: state.partial.clone(),
+                                }),
+                                state,
+                            ));
                         }
                     }
                 }

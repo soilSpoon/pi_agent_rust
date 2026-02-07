@@ -1356,6 +1356,946 @@ pub mod snapshot {
     }
 }
 
+// ============================================================================
+// Normalization Contract (bd-k5q5.1.1)
+// ============================================================================
+
+/// Canonical event schema and normalization contract for conformance testing.
+///
+/// This module formally defines which fields in conformance events are
+/// **semantic** (must match across runtimes), **transport** (non-deterministic
+/// noise that must be normalized before comparison), or **derived**
+/// (computed from other fields and ignored during comparison).
+///
+/// # Schema version
+///
+/// The schema is versioned so that changes to normalization rules can be
+/// tracked.  Fixtures and baselines record which schema version they were
+/// generated against.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use pi::conformance::normalization::*;
+///
+/// let contract = NormalizationContract::default();
+/// let ctx = NormalizationContext::from_cwd(std::path::Path::new("/tmp"));
+/// let mut event: serde_json::Value = serde_json::from_str(raw_line)?;
+/// contract.normalize(&mut event, &ctx);
+/// ```
+pub mod normalization {
+    use regex::Regex;
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    // ── Schema version ─────────────────────────────────────────────────
+
+    /// Current schema version.  Bump when normalization rules change.
+    pub const SCHEMA_VERSION: &str = "1.0.0";
+
+    // ── Placeholder constants ──────────────────────────────────────────
+    //
+    // Canonical placeholder strings used to replace transport-noise values.
+    // These were previously scattered in `tests/ext_conformance.rs`; now
+    // they live in the library so both test code and CI tooling share one
+    // source of truth.
+
+    pub const PLACEHOLDER_TIMESTAMP: &str = "<TIMESTAMP>";
+    pub const PLACEHOLDER_HOST: &str = "<HOST>";
+    pub const PLACEHOLDER_SESSION_ID: &str = "<SESSION_ID>";
+    pub const PLACEHOLDER_RUN_ID: &str = "<RUN_ID>";
+    pub const PLACEHOLDER_ARTIFACT_ID: &str = "<ARTIFACT_ID>";
+    pub const PLACEHOLDER_TRACE_ID: &str = "<TRACE_ID>";
+    pub const PLACEHOLDER_SPAN_ID: &str = "<SPAN_ID>";
+    pub const PLACEHOLDER_UUID: &str = "<UUID>";
+    pub const PLACEHOLDER_PI_MONO_ROOT: &str = "<PI_MONO_ROOT>";
+    pub const PLACEHOLDER_PROJECT_ROOT: &str = "<PROJECT_ROOT>";
+    pub const PLACEHOLDER_PORT: &str = "<PORT>";
+    pub const PLACEHOLDER_PID: &str = "<PID>";
+
+    // ── Field classification ───────────────────────────────────────────
+
+    /// How a conformance event field is treated during comparison.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FieldClassification {
+        /// Field carries meaning that MUST match between TS and Rust runtimes.
+        ///
+        /// Examples: `extension_id`, `event`, `level`, `schema`,
+        /// registration contents, hostcall payloads.
+        Semantic,
+
+        /// Field is non-deterministic transport noise that MUST be normalized
+        /// (replaced with a placeholder) before comparison.
+        ///
+        /// Examples: timestamps, PIDs, session IDs, UUIDs, absolute paths,
+        /// ANSI escape sequences, hostnames, port numbers.
+        Transport,
+
+        /// Field is derived from other fields and is skipped during comparison.
+        ///
+        /// Examples: computed durations, cache keys, internal sequence numbers.
+        Derived,
+    }
+
+    /// Describes a single field's normalization rule.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct FieldRule {
+        /// JSON path pattern (dot-separated, `*` for any key at that level).
+        ///
+        /// Examples: `"ts"`, `"correlation.session_id"`, `"source.pid"`,
+        /// `"*.timestamp"` (matches `timestamp` at any depth).
+        pub path_pattern: String,
+
+        /// Classification for this field.
+        pub classification: FieldClassification,
+
+        /// Placeholder to substitute for transport fields.
+        ///
+        /// Only meaningful when `classification == Transport`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub placeholder: Option<String>,
+    }
+
+    /// Describes a string-level rewrite applied to all string values.
+    #[derive(Debug, Clone)]
+    pub struct StringRewriteRule {
+        /// Human-readable name for this rule.
+        pub name: &'static str,
+        /// Regex pattern to match within string values.
+        pub regex: &'static OnceLock<Regex>,
+        /// Replacement string (may contain `$1` etc. for captures).
+        pub replacement: &'static str,
+    }
+
+    // ── Normalization context ──────────────────────────────────────────
+
+    /// Environment-specific values needed for path canonicalization.
+    ///
+    /// Promoted from `tests/ext_conformance.rs` to the library so that both
+    /// test code, CI tooling, and future replay infrastructure share one
+    /// implementation.
+    #[derive(Debug, Clone)]
+    pub struct NormalizationContext {
+        /// Absolute path to the pi_agent_rust repository root.
+        pub project_root: String,
+        /// Absolute path to `legacy_pi_mono_code/pi-mono`.
+        pub pi_mono_root: String,
+        /// Working directory used during the conformance run.
+        pub cwd: String,
+    }
+
+    impl NormalizationContext {
+        /// Build from a working directory, auto-detecting project roots.
+        #[must_use]
+        pub fn from_cwd(cwd: &Path) -> Self {
+            let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+                .display()
+                .to_string();
+            let pi_mono_root = PathBuf::from(&project_root)
+                .join("legacy_pi_mono_code")
+                .join("pi-mono")
+                .canonicalize()
+                .unwrap_or_else(|_| {
+                    PathBuf::from(&project_root)
+                        .join("legacy_pi_mono_code")
+                        .join("pi-mono")
+                })
+                .display()
+                .to_string();
+            let cwd = cwd
+                .canonicalize()
+                .unwrap_or_else(|_| cwd.to_path_buf())
+                .display()
+                .to_string();
+            Self {
+                project_root,
+                pi_mono_root,
+                cwd,
+            }
+        }
+
+        /// Build with explicit paths (for deterministic testing).
+        #[must_use]
+        pub const fn new(project_root: String, pi_mono_root: String, cwd: String) -> Self {
+            Self {
+                project_root,
+                pi_mono_root,
+                cwd,
+            }
+        }
+    }
+
+    // ── Lazy-initialized regexes ───────────────────────────────────────
+
+    static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
+    static RUN_ID_REGEX: OnceLock<Regex> = OnceLock::new();
+    static UUID_REGEX: OnceLock<Regex> = OnceLock::new();
+    static OPENAI_BASE_REGEX: OnceLock<Regex> = OnceLock::new();
+
+    fn ansi_regex() -> &'static Regex {
+        ANSI_REGEX.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("ansi regex"))
+    }
+
+    fn run_id_regex() -> &'static Regex {
+        RUN_ID_REGEX.get_or_init(|| Regex::new(r"\brun-[0-9a-fA-F-]{36}\b").expect("run id regex"))
+    }
+
+    fn uuid_regex() -> &'static Regex {
+        UUID_REGEX.get_or_init(|| {
+            Regex::new(
+                r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+            )
+            .expect("uuid regex")
+        })
+    }
+
+    fn openai_base_regex() -> &'static Regex {
+        OPENAI_BASE_REGEX
+            .get_or_init(|| Regex::new(r"http://127\.0\.0\.1:\d+/v1").expect("openai base regex"))
+    }
+
+    // ── Key-name classification ────────────────────────────────────────
+    //
+    // The canonical set of JSON key names whose *presence* determines
+    // transport classification.  This replaces the ad-hoc `matches!` chains
+    // that were scattered in the test file.
+
+    /// Key names that indicate a timestamp (string → placeholder, number → 0).
+    const TIMESTAMP_KEYS: &[&str] = &[
+        "timestamp",
+        "started_at",
+        "finished_at",
+        "created_at",
+        "createdAt",
+        "ts",
+    ];
+
+    /// Key names for string-valued transport IDs.
+    const TRANSPORT_ID_KEYS: &[(&str, &str)] = &[
+        ("session_id", PLACEHOLDER_SESSION_ID),
+        ("sessionId", PLACEHOLDER_SESSION_ID),
+        ("run_id", PLACEHOLDER_RUN_ID),
+        ("runId", PLACEHOLDER_RUN_ID),
+        ("artifact_id", PLACEHOLDER_ARTIFACT_ID),
+        ("artifactId", PLACEHOLDER_ARTIFACT_ID),
+        ("trace_id", PLACEHOLDER_TRACE_ID),
+        ("traceId", PLACEHOLDER_TRACE_ID),
+        ("span_id", PLACEHOLDER_SPAN_ID),
+        ("spanId", PLACEHOLDER_SPAN_ID),
+    ];
+
+    /// Key names replaced unconditionally with a fixed placeholder.
+    const FIXED_PLACEHOLDER_KEYS: &[(&str, &str)] = &[
+        ("cwd", PLACEHOLDER_PI_MONO_ROOT),
+        ("host", PLACEHOLDER_HOST),
+    ];
+
+    /// Numeric key names that are zeroed out.
+    const ZEROED_NUMBER_KEYS: &[&str] = &["pid"];
+
+    // ── Normalization contract ──────────────────────────────────────────
+
+    /// The canonical normalization contract.
+    ///
+    /// Encapsulates all rules needed to transform a raw conformance event
+    /// into its normalized form suitable for comparison.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NormalizationContract {
+        /// Schema version this contract was defined against.
+        pub schema_version: String,
+        /// Field-level rules (by key name).
+        pub field_rules: Vec<FieldRule>,
+    }
+
+    impl Default for NormalizationContract {
+        fn default() -> Self {
+            let mut field_rules = Vec::new();
+
+            // Timestamp fields → Transport
+            for &key in TIMESTAMP_KEYS {
+                field_rules.push(FieldRule {
+                    path_pattern: format!("*.{key}"),
+                    classification: FieldClassification::Transport,
+                    placeholder: Some(PLACEHOLDER_TIMESTAMP.to_string()),
+                });
+            }
+
+            // Transport ID fields
+            for &(key, placeholder) in TRANSPORT_ID_KEYS {
+                field_rules.push(FieldRule {
+                    path_pattern: format!("*.{key}"),
+                    classification: FieldClassification::Transport,
+                    placeholder: Some(placeholder.to_string()),
+                });
+            }
+
+            // Fixed placeholder fields
+            for &(key, placeholder) in FIXED_PLACEHOLDER_KEYS {
+                field_rules.push(FieldRule {
+                    path_pattern: format!("*.{key}"),
+                    classification: FieldClassification::Transport,
+                    placeholder: Some(placeholder.to_string()),
+                });
+            }
+
+            // Numeric transport fields
+            for &key in ZEROED_NUMBER_KEYS {
+                field_rules.push(FieldRule {
+                    path_pattern: format!("*.{key}"),
+                    classification: FieldClassification::Transport,
+                    placeholder: Some("0".to_string()),
+                });
+            }
+
+            // Semantic fields (documented for downstream consumers)
+            for key in &[
+                "schema",
+                "level",
+                "event",
+                "message",
+                "extension_id",
+                "data",
+            ] {
+                field_rules.push(FieldRule {
+                    path_pattern: (*key).to_string(),
+                    classification: FieldClassification::Semantic,
+                    placeholder: None,
+                });
+            }
+
+            Self {
+                schema_version: SCHEMA_VERSION.to_string(),
+                field_rules,
+            }
+        }
+    }
+
+    impl NormalizationContract {
+        /// Normalize a conformance event in-place.
+        ///
+        /// Applies all rules from this contract: key-based field replacement,
+        /// path canonicalization, ANSI stripping, UUID/run-ID/port rewriting.
+        pub fn normalize(&self, value: &mut Value, ctx: &NormalizationContext) {
+            normalize_value(value, None, ctx);
+        }
+
+        /// Normalize and canonicalize (sort keys) for stable comparison.
+        #[must_use]
+        pub fn normalize_and_canonicalize(
+            &self,
+            value: Value,
+            ctx: &NormalizationContext,
+        ) -> Value {
+            let mut v = value;
+            self.normalize(&mut v, ctx);
+            canonicalize_json_keys(&v)
+        }
+    }
+
+    // ── Core normalization functions ────────────────────────────────────
+    //
+    // Promoted from `tests/ext_conformance.rs` to library code.
+
+    /// Normalize a JSON value in-place according to the canonical rules.
+    ///
+    /// - Timestamp keys (string or number) → placeholder / zero
+    /// - Transport ID keys → placeholder
+    /// - Fixed keys (cwd, host) → placeholder
+    /// - Numeric transport keys (pid) → zero
+    /// - All strings: ANSI stripping, path canonicalization, UUID/run-ID
+    ///   rewriting
+    pub fn normalize_value(value: &mut Value, key: Option<&str>, ctx: &NormalizationContext) {
+        match value {
+            Value::Null | Value::Bool(_) => {}
+            Value::String(s) => {
+                // Key-based transport replacement (string timestamps)
+                if matches_any_key(key, TIMESTAMP_KEYS) {
+                    *s = PLACEHOLDER_TIMESTAMP.to_string();
+                    return;
+                }
+                // Transport ID fields
+                if let Some(placeholder) = transport_id_placeholder(key) {
+                    *s = placeholder.to_string();
+                    return;
+                }
+                // Fixed placeholder fields
+                if let Some(placeholder) = fixed_placeholder(key) {
+                    *s = placeholder.to_string();
+                    return;
+                }
+                // General string normalization
+                *s = normalize_string(s, ctx);
+            }
+            Value::Array(items) => {
+                for item in items {
+                    normalize_value(item, None, ctx);
+                }
+            }
+            Value::Object(map) => {
+                for (k, item) in map.iter_mut() {
+                    normalize_value(item, Some(k.as_str()), ctx);
+                }
+                // Canonicalize UI operation method names so that
+                // `setStatus`/`set_status`/`status` all compare equal.
+                canonicalize_ui_method(map);
+            }
+            Value::Number(_) => {
+                if matches_any_key(key, TIMESTAMP_KEYS) || matches_any_key(key, ZEROED_NUMBER_KEYS)
+                {
+                    *value = Value::Number(0.into());
+                }
+            }
+        }
+    }
+
+    /// Normalize a string value: strip ANSI, rewrite paths, replace UUIDs/run-IDs/ports.
+    #[must_use]
+    pub fn normalize_string(input: &str, ctx: &NormalizationContext) -> String {
+        // 1) Strip ANSI escape sequences
+        let without_ansi = ansi_regex().replace_all(input, "");
+
+        // 2) Path canonicalization (order matters: most-specific first)
+        let mut out = without_ansi.to_string();
+        out = replace_path_variants(&out, &ctx.pi_mono_root, PLACEHOLDER_PI_MONO_ROOT);
+        out = replace_path_variants(&out, &ctx.cwd, PLACEHOLDER_PI_MONO_ROOT);
+        out = replace_path_variants(&out, &ctx.project_root, PLACEHOLDER_PROJECT_ROOT);
+
+        // 3) Run-ID rewriting
+        out = run_id_regex()
+            .replace_all(&out, PLACEHOLDER_RUN_ID)
+            .into_owned();
+
+        // 4) OpenAI base URL port normalization
+        out = openai_base_regex()
+            .replace_all(&out, format!("http://127.0.0.1:{PLACEHOLDER_PORT}/v1"))
+            .into_owned();
+
+        // 5) UUID rewriting
+        out = uuid_regex()
+            .replace_all(&out, PLACEHOLDER_UUID)
+            .into_owned();
+
+        out
+    }
+
+    /// Sort JSON object keys recursively for stable serialization.
+    #[must_use]
+    pub fn canonicalize_json_keys(value: &Value) -> Value {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
+            Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_keys).collect()),
+            Value::Object(map) => {
+                let mut keys = map.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for key in keys {
+                    if let Some(v) = map.get(&key) {
+                        out.insert(key, canonicalize_json_keys(v));
+                    }
+                }
+                Value::Object(out)
+            }
+        }
+    }
+
+    /// Replace path and its backslash variant with a placeholder.
+    fn replace_path_variants(input: &str, path: &str, placeholder: &str) -> String {
+        if path.is_empty() {
+            return input.to_string();
+        }
+        let mut out = input.replace(path, placeholder);
+        let path_backslashes = path.replace('/', "\\");
+        if path_backslashes != path {
+            out = out.replace(&path_backslashes, placeholder);
+        }
+        out
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+
+    fn matches_any_key(key: Option<&str>, candidates: &[&str]) -> bool {
+        key.is_some_and(|k| candidates.contains(&k))
+    }
+
+    fn transport_id_placeholder(key: Option<&str>) -> Option<&'static str> {
+        let k = key?;
+        TRANSPORT_ID_KEYS
+            .iter()
+            .find(|(name, _)| *name == k)
+            .map(|(_, placeholder)| *placeholder)
+    }
+
+    fn fixed_placeholder(key: Option<&str>) -> Option<&'static str> {
+        let k = key?;
+        FIXED_PLACEHOLDER_KEYS
+            .iter()
+            .find(|(name, _)| *name == k)
+            .map(|(_, placeholder)| *placeholder)
+    }
+
+    /// If `map` represents an `extension_ui_request` event, replace its
+    /// `method` value with the canonical short form via [`canonicalize_op_name`].
+    fn canonicalize_ui_method(map: &mut serde_json::Map<String, Value>) {
+        let is_ui_request = map
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "extension_ui_request");
+        if !is_ui_request {
+            return;
+        }
+        if let Some(Value::String(method)) = map.get_mut("method") {
+            let canonical = canonicalize_op_name(method);
+            if canonical != method.as_str() {
+                *method = canonical.to_string();
+            }
+        }
+    }
+
+    // ── Alias mapping (unblocks bd-k5q5.1.4) ──────────────────────────
+
+    /// Known UI operation aliases that map to a canonical name.
+    ///
+    /// Extensions may use either form; the normalization contract treats
+    /// them as equivalent during comparison.  The canonical form is the
+    /// short verb (e.g. `"status"`) so that `setStatus`, `set_status`,
+    /// and `status` all compare equal after normalization.
+    pub const UI_OP_ALIASES: &[(&str, &str)] = &[
+        ("setStatus", "status"),
+        ("set_status", "status"),
+        ("setLabel", "label"),
+        ("set_label", "label"),
+        ("setWidget", "widget"),
+        ("set_widget", "widget"),
+        ("setTitle", "title"),
+        ("set_title", "title"),
+    ];
+
+    /// Resolve an operation name to its canonical form.
+    #[must_use]
+    pub fn canonicalize_op_name(op: &str) -> &str {
+        UI_OP_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == op)
+            .map_or(op, |(_, canonical)| canonical)
+    }
+
+    // ── Path canonicalization for conformance assertions (bd-k5q5.1.2) ─
+
+    /// Returns `true` if `key` names a JSON field whose values are
+    /// filesystem paths (e.g. `promptPaths`, `filePath`, `cwd`).
+    ///
+    /// The heuristic matches keys that end with common path suffixes or
+    /// are well-known path keys.  This is intentionally conservative;
+    /// it is better to match too little (and fail a test explicitly) than
+    /// too much (and mask a real mismatch).
+    #[must_use]
+    pub fn is_path_key(key: &str) -> bool {
+        key.ends_with("Path")
+            || key.ends_with("Paths")
+            || key.ends_with("path")
+            || key.ends_with("paths")
+            || key.ends_with("Dir")
+            || key.ends_with("dir")
+            || key == "cwd"
+    }
+
+    /// Path-aware suffix match for conformance assertions.
+    ///
+    /// Returns `true` when `actual` and `expected` refer to the same file:
+    ///
+    /// - If they are identical → `true`.
+    /// - If `expected` is *relative* (no leading `/` or `\`) and `actual`
+    ///   ends with `/<expected>` → `true`.
+    /// - Otherwise → `false`.
+    ///
+    /// This handles the common case where fixtures record relative
+    /// filenames (`SKILL.md`) while the runtime returns absolute paths
+    /// (`/data/projects/.../SKILL.md`).
+    #[must_use]
+    pub fn path_suffix_match(actual: &str, expected: &str) -> bool {
+        if actual == expected {
+            return true;
+        }
+        // Only apply suffix matching when expected is relative.
+        if expected.starts_with('/') || expected.starts_with('\\') {
+            return false;
+        }
+        // Normalize backslashes for cross-platform comparison.
+        let actual_norm = actual.replace('\\', "/");
+        let expected_norm = expected.replace('\\', "/");
+        actual_norm.ends_with(&format!("/{expected_norm}"))
+    }
+
+    // ── Tests ──────────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn schema_version_is_set() {
+            assert!(!SCHEMA_VERSION.is_empty());
+            assert_eq!(
+                SCHEMA_VERSION.split('.').count(),
+                3,
+                "semver format expected"
+            );
+        }
+
+        #[test]
+        fn default_contract_has_field_rules() {
+            let contract = NormalizationContract::default();
+            assert!(
+                !contract.field_rules.is_empty(),
+                "default contract must have rules"
+            );
+            assert_eq!(contract.schema_version, SCHEMA_VERSION);
+        }
+
+        #[test]
+        fn field_classification_serde_roundtrip() {
+            for class in [
+                FieldClassification::Semantic,
+                FieldClassification::Transport,
+                FieldClassification::Derived,
+            ] {
+                let json = serde_json::to_string(&class).unwrap();
+                let back: FieldClassification = serde_json::from_str(&json).unwrap();
+                assert_eq!(class, back);
+            }
+        }
+
+        #[test]
+        fn normalize_timestamp_string() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let mut val = json!({"ts": "2026-02-03T03:01:02.123Z"});
+            normalize_value(&mut val, None, &ctx);
+            assert_eq!(val["ts"], PLACEHOLDER_TIMESTAMP);
+        }
+
+        #[test]
+        fn normalize_timestamp_number() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let mut val = json!({"ts": 1_700_000_000_000_u64});
+            normalize_value(&mut val, None, &ctx);
+            assert_eq!(val["ts"], 0);
+        }
+
+        #[test]
+        fn normalize_transport_ids() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let mut val = json!({
+                "session_id": "sess-abc",
+                "run_id": "run-xyz",
+                "artifact_id": "art-123",
+                "trace_id": "tr-456",
+                "span_id": "sp-789"
+            });
+            normalize_value(&mut val, None, &ctx);
+            assert_eq!(val["session_id"], PLACEHOLDER_SESSION_ID);
+            assert_eq!(val["run_id"], PLACEHOLDER_RUN_ID);
+            assert_eq!(val["artifact_id"], PLACEHOLDER_ARTIFACT_ID);
+            assert_eq!(val["trace_id"], PLACEHOLDER_TRACE_ID);
+            assert_eq!(val["span_id"], PLACEHOLDER_SPAN_ID);
+        }
+
+        #[test]
+        fn normalize_camel_case_variants() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let mut val = json!({
+                "sessionId": "sess-abc",
+                "runId": "run-xyz",
+                "artifactId": "art-123",
+                "traceId": "tr-456",
+                "spanId": "sp-789",
+                "createdAt": "2026-01-01"
+            });
+            normalize_value(&mut val, None, &ctx);
+            assert_eq!(val["sessionId"], PLACEHOLDER_SESSION_ID);
+            assert_eq!(val["runId"], PLACEHOLDER_RUN_ID);
+            assert_eq!(val["artifactId"], PLACEHOLDER_ARTIFACT_ID);
+            assert_eq!(val["traceId"], PLACEHOLDER_TRACE_ID);
+            assert_eq!(val["spanId"], PLACEHOLDER_SPAN_ID);
+            assert_eq!(val["createdAt"], PLACEHOLDER_TIMESTAMP);
+        }
+
+        #[test]
+        fn normalize_fixed_keys() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let mut val = json!({"cwd": "/some/path", "host": "myhost.local"});
+            normalize_value(&mut val, None, &ctx);
+            assert_eq!(val["cwd"], PLACEHOLDER_PI_MONO_ROOT);
+            assert_eq!(val["host"], PLACEHOLDER_HOST);
+        }
+
+        #[test]
+        fn normalize_pid() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let mut val = json!({"source": {"pid": 42}});
+            normalize_value(&mut val, None, &ctx);
+            assert_eq!(val["source"]["pid"], 0);
+        }
+
+        #[test]
+        fn normalize_string_strips_ansi() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let input = "\x1b[31mERROR\x1b[0m: something failed";
+            let out = normalize_string(input, &ctx);
+            assert_eq!(out, "ERROR: something failed");
+        }
+
+        #[test]
+        fn normalize_string_rewrites_uuids() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let input = "id=123e4567-e89b-12d3-a456-426614174000";
+            let out = normalize_string(input, &ctx);
+            assert!(out.contains(PLACEHOLDER_UUID), "got: {out}");
+        }
+
+        #[test]
+        fn normalize_string_rewrites_run_ids() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let input = "run-123e4567-e89b-12d3-a456-426614174000";
+            let out = normalize_string(input, &ctx);
+            assert!(out.contains(PLACEHOLDER_RUN_ID), "got: {out}");
+        }
+
+        #[test]
+        fn normalize_string_rewrites_ports() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let input = "http://127.0.0.1:4887/v1/chat";
+            let out = normalize_string(input, &ctx);
+            assert!(
+                out.contains(&format!("http://127.0.0.1:{PLACEHOLDER_PORT}/v1")),
+                "got: {out}"
+            );
+        }
+
+        #[test]
+        fn normalize_string_rewrites_paths() {
+            let ctx = NormalizationContext::new(
+                "/repo/pi".to_string(),
+                "/repo/pi/legacy_pi_mono_code/pi-mono".to_string(),
+                "/tmp/work".to_string(),
+            );
+            let input = "opened /tmp/work/file.txt and /repo/pi/src/main.rs";
+            let out = normalize_string(input, &ctx);
+            assert!(
+                out.contains(&format!("{PLACEHOLDER_PI_MONO_ROOT}/file.txt")),
+                "got: {out}"
+            );
+            assert!(
+                out.contains(&format!("{PLACEHOLDER_PROJECT_ROOT}/src/main.rs")),
+                "got: {out}"
+            );
+        }
+
+        #[test]
+        fn canonicalize_json_keys_sorts_recursively() {
+            let input = json!({"z": 1, "a": {"c": 3, "b": 2}});
+            let out = canonicalize_json_keys(&input);
+            let serialized = serde_json::to_string(&out).unwrap();
+            assert_eq!(serialized, r#"{"a":{"b":2,"c":3},"z":1}"#);
+        }
+
+        #[test]
+        fn contract_normalize_and_canonicalize() {
+            let contract = NormalizationContract::default();
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let input = json!({
+                "z_field": "hello",
+                "ts": "2026-01-01",
+                "a_field": 42,
+                "session_id": "sess-x"
+            });
+            let out = contract.normalize_and_canonicalize(input, &ctx);
+            assert_eq!(out["ts"], PLACEHOLDER_TIMESTAMP);
+            assert_eq!(out["session_id"], PLACEHOLDER_SESSION_ID);
+            // Keys should be sorted
+            let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+            let mut sorted = keys.clone();
+            sorted.sort();
+            assert_eq!(keys, sorted);
+        }
+
+        #[test]
+        fn canonicalize_op_name_resolves_aliases() {
+            assert_eq!(canonicalize_op_name("setStatus"), "status");
+            assert_eq!(canonicalize_op_name("set_status"), "status");
+            assert_eq!(canonicalize_op_name("setLabel"), "label");
+            assert_eq!(canonicalize_op_name("set_label"), "label");
+            assert_eq!(canonicalize_op_name("setWidget"), "widget");
+            assert_eq!(canonicalize_op_name("set_widget"), "widget");
+            assert_eq!(canonicalize_op_name("setTitle"), "title");
+            assert_eq!(canonicalize_op_name("set_title"), "title");
+            // Already-canonical and unknown ops pass through
+            assert_eq!(canonicalize_op_name("status"), "status");
+            assert_eq!(canonicalize_op_name("notify"), "notify");
+            assert_eq!(canonicalize_op_name("unknown_op"), "unknown_op");
+        }
+
+        #[test]
+        fn normalize_canonicalizes_ui_method() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let mut input = json!({
+                "type": "extension_ui_request",
+                "id": "req-1",
+                "method": "setStatus",
+                "statusKey": "demo",
+                "statusText": "Ready"
+            });
+            normalize_value(&mut input, None, &ctx);
+            assert_eq!(
+                input["method"], "status",
+                "setStatus should be canonicalized to status"
+            );
+        }
+
+        #[test]
+        fn normalize_skips_non_ui_request_method() {
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            let mut input = json!({
+                "type": "http_request",
+                "method": "setStatus"
+            });
+            normalize_value(&mut input, None, &ctx);
+            assert_eq!(
+                input["method"], "setStatus",
+                "non-ui-request method should NOT be canonicalized"
+            );
+        }
+
+        #[test]
+        fn normalize_and_canonicalize_handles_ui_aliases() {
+            let contract = NormalizationContract::default();
+            let ctx = NormalizationContext::new(String::new(), String::new(), String::new());
+            // Two events that differ only by method naming
+            let event_camel = json!({
+                "type": "extension_ui_request",
+                "method": "setStatus",
+                "statusKey": "k"
+            });
+            let event_snake = json!({
+                "type": "extension_ui_request",
+                "method": "set_status",
+                "statusKey": "k"
+            });
+            let a = contract.normalize_and_canonicalize(event_camel, &ctx);
+            let b = contract.normalize_and_canonicalize(event_snake, &ctx);
+            assert_eq!(
+                a, b,
+                "setStatus and set_status should normalize identically"
+            );
+            assert_eq!(a["method"], "status");
+        }
+
+        #[test]
+        fn contract_serializes_to_json() {
+            let contract = NormalizationContract::default();
+            let json = serde_json::to_string_pretty(&contract).unwrap();
+            assert!(json.contains("schema_version"));
+            assert!(json.contains("field_rules"));
+            // Roundtrip
+            let back: NormalizationContract = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.schema_version, SCHEMA_VERSION);
+            assert_eq!(back.field_rules.len(), contract.field_rules.len());
+        }
+
+        #[test]
+        fn default_contract_covers_all_transport_keys() {
+            let contract = NormalizationContract::default();
+            let transport_rules: Vec<_> = contract
+                .field_rules
+                .iter()
+                .filter(|r| r.classification == FieldClassification::Transport)
+                .collect();
+            // At minimum: 6 timestamp + 10 transport IDs + 2 fixed + 1 pid = 19
+            assert!(
+                transport_rules.len() >= 19,
+                "expected >= 19 transport rules, got {}",
+                transport_rules.len()
+            );
+        }
+
+        #[test]
+        fn default_contract_has_semantic_rules() {
+            let contract = NormalizationContract::default();
+            assert!(
+                contract
+                    .field_rules
+                    .iter()
+                    .any(|r| r.classification == FieldClassification::Semantic),
+                "contract should document semantic fields"
+            );
+        }
+
+        // ── Path canonicalization tests (bd-k5q5.1.2) ────────────────
+
+        #[test]
+        fn is_path_key_matches_common_suffixes() {
+            assert!(is_path_key("promptPaths"));
+            assert!(is_path_key("skillPaths"));
+            assert!(is_path_key("themePaths"));
+            assert!(is_path_key("filePath"));
+            assert!(is_path_key("cwd"));
+            assert!(is_path_key("workingDir"));
+            assert!(!is_path_key("method"));
+            assert!(!is_path_key("statusKey"));
+            assert!(!is_path_key("name"));
+        }
+
+        #[test]
+        fn path_suffix_match_exact() {
+            assert!(path_suffix_match("SKILL.md", "SKILL.md"));
+            assert!(path_suffix_match("/a/b/c.txt", "/a/b/c.txt"));
+        }
+
+        #[test]
+        fn path_suffix_match_relative_in_absolute() {
+            assert!(path_suffix_match(
+                "/data/projects/pi/tests/ext_conformance/artifacts/dynamic-resources/SKILL.md",
+                "SKILL.md"
+            ));
+            assert!(path_suffix_match(
+                "/data/projects/pi/tests/ext_conformance/artifacts/dynamic-resources/dynamic.md",
+                "dynamic.md"
+            ));
+        }
+
+        #[test]
+        fn path_suffix_match_multi_component_relative() {
+            assert!(path_suffix_match(
+                "/data/projects/ext/sub/dir/file.ts",
+                "dir/file.ts"
+            ));
+            assert!(!path_suffix_match(
+                "/data/projects/ext/sub/dir/file.ts",
+                "other/file.ts"
+            ));
+        }
+
+        #[test]
+        fn path_suffix_match_rejects_when_expected_is_absolute() {
+            // Two different absolute paths should not match via suffix.
+            assert!(!path_suffix_match("/a/b/c.txt", "/x/y/c.txt"));
+        }
+
+        #[test]
+        fn path_suffix_match_handles_backslashes() {
+            assert!(path_suffix_match(
+                "C:\\Users\\dev\\project\\SKILL.md",
+                "SKILL.md"
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::compare_conformance_output;
