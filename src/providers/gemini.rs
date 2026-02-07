@@ -179,16 +179,19 @@ impl Provider for GeminiProvider {
             StreamState::new(event_source, model, api, provider),
             |mut state| async move {
                 loop {
+                    // Drain pending events before polling for more SSE data
+                    if let Some(event) = state.pending_events.pop_front() {
+                        return Some((Ok(event), state));
+                    }
+
                     match state.event_source.next().await {
                         Some(Ok(msg)) => {
                             if msg.event == "ping" {
                                 continue;
                             }
 
-                            match state.process_event(&msg.data) {
-                                Ok(Some(event)) => return Some((Ok(event), state)),
-                                Ok(None) => {}
-                                Err(e) => return Some((Err(e), state)),
+                            if let Err(e) = state.process_event(&msg.data) {
+                                return Some((Err(e), state));
                             }
                         }
                         Some(Err(e)) => {
@@ -228,17 +231,9 @@ where
 {
     event_source: SseStream<S>,
     partial: AssistantMessage,
-    current_text: String,
-    tool_calls: Vec<ToolCallState>,
     pending_events: VecDeque<StreamEvent>,
     started: bool,
     finished: bool,
-}
-
-struct ToolCallState {
-    id: String,
-    name: String,
-    arguments: serde_json::Value,
 }
 
 impl<S> StreamState<S>
@@ -258,15 +253,13 @@ where
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
-            current_text: String::new(),
-            tool_calls: Vec::new(),
             pending_events: VecDeque::new(),
             started: false,
             finished: false,
         }
     }
 
-    fn process_event(&mut self, data: &str) -> Result<Option<StreamEvent>> {
+    fn process_event(&mut self, data: &str) -> Result<()> {
         let response: GeminiStreamResponse = serde_json::from_str(data)
             .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
@@ -280,15 +273,15 @@ where
         // Process candidates
         if let Some(candidates) = response.candidates {
             if let Some(candidate) = candidates.into_iter().next() {
-                return self.process_candidate(candidate);
+                self.process_candidate(candidate)?;
             }
         }
 
-        Ok(None)
+        Ok(())
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<Option<StreamEvent>> {
+    fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
         // Handle finish reason
         if let Some(reason) = candidate.finish_reason {
             self.partial.stop_reason = match reason.as_str() {
@@ -299,12 +292,12 @@ where
             };
         }
 
-        // Process content parts
+        // Process content parts — queue all events into pending_events
         if let Some(content) = candidate.content {
             for part in content.parts {
                 match part {
                     GeminiPart::Text { text } => {
-                        // Always accumulate text into partial first
+                        // Accumulate text into partial
                         let last_is_text =
                             matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
                         if !last_is_text {
@@ -320,24 +313,19 @@ where
                             t.text.push_str(&text);
                         }
 
-                        if !self.started {
-                            self.started = true;
-                            return Ok(Some(StreamEvent::Start {
-                                partial: self.partial.clone(),
-                            }));
-                        }
+                        self.ensure_started();
 
-                        return Ok(Some(StreamEvent::TextDelta {
+                        self.pending_events.push_back(StreamEvent::TextDelta {
                             content_index,
                             delta: text,
                             partial: self.partial.clone(),
-                        }));
+                        });
                     }
                     GeminiPart::FunctionCall { function_call } => {
                         // Generate a unique ID for this tool call
                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
 
-                        // Serialize args
+                        // Serialize args for the delta event
                         let args_str = serde_json::to_string(&function_call.args)
                             .unwrap_or_else(|_| "{}".to_string());
                         let GeminiFunctionCall { name, args } = function_call;
@@ -349,26 +337,31 @@ where
                             thought_signature: None,
                         };
 
-                        self.partial.content.push(ContentBlock::ToolCall(tool_call));
+                        self.partial
+                            .content
+                            .push(ContentBlock::ToolCall(tool_call.clone()));
                         let content_index = self.partial.content.len() - 1;
 
                         // Update stop reason for tool use
                         self.partial.stop_reason = StopReason::ToolUse;
 
-                        // Emit start if not started
-                        if !self.started {
-                            self.started = true;
-                            return Ok(Some(StreamEvent::Start {
-                                partial: self.partial.clone(),
-                            }));
-                        }
+                        self.ensure_started();
 
-                        // Emit tool call delta (Gemini sends full args, so delta is full args)
-                        return Ok(Some(StreamEvent::ToolCallDelta {
+                        // Emit full ToolCallStart → ToolCallDelta → ToolCallEnd sequence
+                        self.pending_events.push_back(StreamEvent::ToolCallStart {
+                            content_index,
+                            partial: self.partial.clone(),
+                        });
+                        self.pending_events.push_back(StreamEvent::ToolCallDelta {
                             content_index,
                             delta: args_str,
                             partial: self.partial.clone(),
-                        }));
+                        });
+                        self.pending_events.push_back(StreamEvent::ToolCallEnd {
+                            content_index,
+                            tool_call,
+                            partial: self.partial.clone(),
+                        });
                     }
                     GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
                         // These are for input, not output
@@ -377,7 +370,16 @@ where
             }
         }
 
-        Ok(None)
+        Ok(())
+    }
+
+    fn ensure_started(&mut self) {
+        if !self.started {
+            self.started = true;
+            self.pending_events.push_back(StreamEvent::Start {
+                partial: self.partial.clone(),
+            });
+        }
     }
 }
 
@@ -767,9 +769,8 @@ mod tests {
                 if msg.event == "ping" {
                     continue;
                 }
-                if let Some(event) = state.process_event(&msg.data).expect("process_event") {
-                    out.push(event);
-                }
+                state.process_event(&msg.data).expect("process_event");
+                out.extend(state.pending_events.drain(..));
             }
 
             out

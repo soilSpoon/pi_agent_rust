@@ -31,6 +31,7 @@
       ],
       "expected": [
         { "kind": "start" },
+        { "kind": "text_delta", "content_index": 0, "delta": "Hello " },
         { "kind": "text_delta", "content_index": 0, "delta": "world" },
         { "kind": "done", "reason": "stop" }
       ]
@@ -64,6 +65,7 @@
       ],
       "expected": [
         { "kind": "start" },
+        { "kind": "text_delta", "content_index": 0, "delta": "First " },
         { "kind": "text_delta", "content_index": 0, "delta": "second " },
         { "kind": "text_delta", "content_index": 0, "delta": "third" },
         { "kind": "done", "reason": "stop" }
@@ -97,6 +99,9 @@
       ],
       "expected": [
         { "kind": "start" },
+        { "kind": "other" },
+        { "kind": "other" },
+        { "kind": "other" },
         { "kind": "done", "reason": "tool_use" }
       ]
     },
@@ -124,6 +129,7 @@
       ],
       "expected": [
         { "kind": "start" },
+        { "kind": "text_delta", "content_index": 0, "delta": "truncated output" },
         { "kind": "text_delta", "content_index": 0, "delta": "..." },
         { "kind": "done", "reason": "length" }
       ]
@@ -148,6 +154,7 @@
       ],
       "expected": [
         { "kind": "start" },
+        { "kind": "text_delta", "content_index": 0, "delta": "I " },
         { "kind": "done", "reason": "error" }
       ]
     },
@@ -179,6 +186,9 @@
       ],
       "expected": [
         { "kind": "start" },
+        { "kind": "text_delta", "content_index": 0, "delta": "Let me check that file." },
+        { "kind": "other" },
+        { "kind": "other" },
         { "kind": "other" },
         { "kind": "done", "reason": "tool_use" }
       ]
@@ -209,6 +219,7 @@
       ],
       "expected": [
         { "kind": "start" },
+        { "kind": "text_delta", "content_index": 0, "delta": "hi" },
         { "kind": "text_delta", "content_index": 0, "delta": " there" },
         { "kind": "done", "reason": "stop" }
       ]
