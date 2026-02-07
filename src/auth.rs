@@ -782,8 +782,12 @@ fn parse_oauth_code_input(input: &str) -> (Option<String>, Option<String>) {
 fn lock_file(file: File, timeout: Duration) -> Result<LockedFile> {
     let start = Instant::now();
     loop {
-        if matches!(FileExt::try_lock_exclusive(&file), Ok(true)) {
-            return Ok(LockedFile { file });
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(true) => return Ok(LockedFile { file }),
+            Ok(false) => {} // Lock held by another process, retry
+            Err(e) => {
+                return Err(Error::auth(format!("Failed to lock auth file: {e}")));
+            }
         }
 
         if start.elapsed() >= timeout {
@@ -797,9 +801,12 @@ fn lock_file(file: File, timeout: Duration) -> Result<LockedFile> {
 async fn lock_file_async(file: File, timeout: Duration) -> Result<LockedFile> {
     let start = Instant::now();
     loop {
-        let lock_result = FileExt::try_lock_exclusive(&file);
-        if matches!(lock_result, Ok(true)) {
-            return Ok(LockedFile { file });
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(true) => return Ok(LockedFile { file }),
+            Ok(false) => {} // Lock held by another process, retry
+            Err(e) => {
+                return Err(Error::auth(format!("Failed to lock auth file: {e}")));
+            }
         }
 
         if start.elapsed() >= timeout {

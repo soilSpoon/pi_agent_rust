@@ -270,6 +270,16 @@ impl<S> StreamState<S>
 where
     S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
 {
+    const fn recompute_total_tokens(&mut self) {
+        self.partial.usage.total_tokens = self
+            .partial
+            .usage
+            .input
+            .saturating_add(self.partial.usage.output)
+            .saturating_add(self.partial.usage.cache_read)
+            .saturating_add(self.partial.usage.cache_write);
+    }
+
     fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
         Self {
             event_source,
@@ -339,10 +349,7 @@ where
             self.partial.usage.input = usage.input;
             self.partial.usage.cache_read = usage.cache_read.unwrap_or(0);
             self.partial.usage.cache_write = usage.cache_write.unwrap_or(0);
-            self.partial.usage.total_tokens = self.partial.usage.input
-                + self.partial.usage.output
-                + self.partial.usage.cache_read
-                + self.partial.usage.cache_write;
+            self.recompute_total_tokens();
         }
         StreamEvent::Start {
             partial: self.partial.clone(),
@@ -535,10 +542,7 @@ where
 
         if let Some(u) = usage {
             self.partial.usage.output = u.output_tokens;
-            self.partial.usage.total_tokens = self.partial.usage.input
-                + self.partial.usage.output
-                + self.partial.usage.cache_read
-                + self.partial.usage.cache_write;
+            self.recompute_total_tokens();
         }
     }
 }
@@ -1112,6 +1116,38 @@ mod tests {
             assert_eq!(message.usage.input, 5);
             assert_eq!(message.usage.output, 7);
             assert_eq!(message.usage.total_tokens, 12);
+        } else {
+            panic!("expected Done event, got {:?}", out[1]);
+        }
+    }
+
+    #[test]
+    fn test_usage_total_tokens_saturates_on_large_values() {
+        let events = vec![
+            json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": u64::MAX,
+                        "cache_read_input_tokens": 1,
+                        "cache_creation_input_tokens": 1
+                    }
+                }
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "output_tokens": 1 }
+            }),
+            json!({
+                "type": "message_stop"
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert_eq!(out.len(), 2);
+        if let StreamEvent::Done { message, .. } = &out[1] {
+            assert_eq!(message.usage.total_tokens, u64::MAX);
         } else {
             panic!("expected Done event, got {:?}", out[1]);
         }
