@@ -448,6 +448,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_info_subcommand() {
+        let cli = Cli::parse_from(["pi", "info", "auto-commit-on-exit"]);
+        match cli.command {
+            Some(Commands::Info { name }) => {
+                assert_eq!(name, "auto-commit-on-exit");
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn no_subcommand_when_only_message() {
         let cli = Cli::parse_from(["pi", "hello"]);
         assert!(cli.command.is_none());
@@ -683,6 +694,27 @@ pub enum Commands {
     /// Refresh extension index cache from remote sources
     #[command(name = "update-index")]
     UpdateIndex,
+
+    /// Show detailed information about an extension
+    Info {
+        /// Extension name or id to look up
+        name: String,
+    },
+
+    /// Search available extensions by keyword
+    Search {
+        /// Search query (e.g. "git", "auto commit")
+        query: String,
+        /// Filter results by tag
+        #[arg(long)]
+        tag: Option<String>,
+        /// Sort results: relevance, name
+        #[arg(long, default_value = "relevance")]
+        sort: String,
+        /// Maximum number of results
+        #[arg(long, default_value = "25")]
+        limit: usize,
+    },
 
     /// List installed packages
     List,

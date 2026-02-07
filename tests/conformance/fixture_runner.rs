@@ -275,6 +275,22 @@ fn command_value(command: Option<&Commands>) -> Value {
         Some(Commands::Config) => json!({
             "name": "config",
         }),
+        Some(Commands::Search {
+            query,
+            tag,
+            sort,
+            limit,
+        }) => json!({
+            "name": "search",
+            "query": query,
+            "tag": tag,
+            "sort": sort,
+            "limit": limit,
+        }),
+        Some(Commands::Info { name }) => json!({
+            "name": "info",
+            "extension": name,
+        }),
         None => Value::Null,
     }
 }

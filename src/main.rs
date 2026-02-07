@@ -476,6 +476,17 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::UpdateIndex => {
             handle_update_index().await?;
         }
+        cli::Commands::Search {
+            query,
+            tag,
+            sort,
+            limit,
+        } => {
+            handle_search(&query, tag.as_deref(), &sort, limit).await?;
+        }
+        cli::Commands::Info { name } => {
+            handle_info(&name).await?;
+        }
         cli::Commands::List => {
             handle_package_list(&manager).await?;
         }
@@ -620,6 +631,278 @@ async fn handle_update_index() -> Result<()> {
         store.path().display()
     );
     Ok(())
+}
+
+async fn handle_search(query: &str, tag: Option<&str>, sort: &str, limit: usize) -> Result<()> {
+    let store = ExtensionIndexStore::default_store();
+
+    // Load cached index; auto-refresh only if a cache file exists but is stale.
+    // If no cache exists, use the built-in seed index without a network call.
+    let mut index = store.load_or_seed()?;
+    let has_cache = store.path().exists();
+    if has_cache
+        && index.is_stale(
+            chrono::Utc::now(),
+            pi::extension_index::DEFAULT_INDEX_MAX_AGE,
+        )
+    {
+        println!("Refreshing extension index...");
+        let client = pi::http::client::Client::new();
+        match store.refresh_best_effort(&client).await {
+            Ok((refreshed, _)) => index = refreshed,
+            Err(_) => {
+                println!(
+                    "Warning: Could not refresh index (network unavailable). Using cached results."
+                );
+            }
+        }
+    }
+
+    // Search
+    let mut hits = index.search(query, limit);
+
+    // Filter by tag if requested
+    if let Some(tag_filter) = tag {
+        let tag_lower = tag_filter.to_ascii_lowercase();
+        hits.retain(|hit| {
+            hit.entry
+                .tags
+                .iter()
+                .any(|t| t.to_ascii_lowercase() == tag_lower)
+        });
+    }
+
+    // Sort by name if requested (relevance is the default from search())
+    if sort == "name" {
+        hits.sort_by(|a, b| {
+            a.entry
+                .name
+                .to_ascii_lowercase()
+                .cmp(&b.entry.name.to_ascii_lowercase())
+        });
+    }
+
+    if hits.is_empty() {
+        println!("No extensions found for \"{query}\".");
+        return Ok(());
+    }
+
+    print_search_results(&hits);
+    Ok(())
+}
+
+#[allow(clippy::uninlined_format_args)]
+fn print_search_results(hits: &[pi::extension_index::ExtensionSearchHit]) {
+    // Column widths
+    let name_w = hits
+        .iter()
+        .map(|h| h.entry.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(4); // "Name"
+    let desc_w = hits
+        .iter()
+        .map(|h| h.entry.description.as_deref().unwrap_or("").len().min(50))
+        .max()
+        .unwrap_or(0)
+        .max(11); // "Description"
+    let tags_w = hits
+        .iter()
+        .map(|h| h.entry.tags.join(", ").len().min(30))
+        .max()
+        .unwrap_or(0)
+        .max(4); // "Tags"
+    let source_w = 6; // "Source"
+
+    // Header
+    println!(
+        "  {:<name_w$}  {:<desc_w$}  {:<tags_w$}  {:<source_w$}",
+        "Name", "Description", "Tags", "Source"
+    );
+    println!(
+        "  {:<name_w$}  {:<desc_w$}  {:<tags_w$}  {:<source_w$}",
+        "-".repeat(name_w),
+        "-".repeat(desc_w),
+        "-".repeat(tags_w),
+        "-".repeat(source_w)
+    );
+
+    // Rows
+    for hit in hits {
+        let desc = hit.entry.description.as_deref().unwrap_or("");
+        let desc_truncated = if desc.len() > 50 {
+            format!("{}...", &desc[..47])
+        } else {
+            desc.to_string()
+        };
+        let tags_joined = hit.entry.tags.join(", ");
+        let tags_truncated = if tags_joined.len() > 30 {
+            format!("{}...", &tags_joined[..27])
+        } else {
+            tags_joined
+        };
+        let source_label = match &hit.entry.source {
+            Some(pi::extension_index::ExtensionIndexSource::Npm { .. }) => "npm",
+            Some(pi::extension_index::ExtensionIndexSource::Git { .. }) => "git",
+            Some(pi::extension_index::ExtensionIndexSource::Url { .. }) => "url",
+            None => "-",
+        };
+        println!(
+            "  {:<name_w$}  {:<desc_w$}  {:<tags_w$}  {:<source_w$}",
+            hit.entry.name, desc_truncated, tags_truncated, source_label
+        );
+    }
+
+    let count = hits.len();
+    let noun = if count == 1 {
+        "extension"
+    } else {
+        "extensions"
+    };
+    println!("\n  {count} {noun} found. Install with: pi install <name>");
+}
+
+async fn handle_info(name: &str) -> Result<()> {
+    let store = ExtensionIndexStore::default_store();
+    let index = store.load_or_seed()?;
+
+    // Look up by exact id, name, or fuzzy match (top-1 search hit)
+    let entry = index
+        .entries
+        .iter()
+        .find(|e| e.id.eq_ignore_ascii_case(name) || e.name.eq_ignore_ascii_case(name))
+        .or_else(|| {
+            let hits = index.search(name, 1);
+            hits.into_iter()
+                .next()
+                .map(|h| h.entry)
+                .and_then(|matched| {
+                    // Return a reference from the index, not the owned clone
+                    index.entries.iter().find(|e| e.id == matched.id)
+                })
+        });
+
+    let Some(entry) = entry else {
+        println!("Extension \"{name}\" not found.");
+        println!("Try: pi search {name}");
+        return Ok(());
+    };
+
+    print_extension_info(entry);
+    Ok(())
+}
+
+fn print_extension_info(entry: &pi::extension_index::ExtensionIndexEntry) {
+    let width = 60;
+    let bar = "─".repeat(width);
+
+    // Header
+    println!("  ┌{bar}┐");
+    let title = &entry.name;
+    let padding = width.saturating_sub(title.len() + 1);
+    println!("  │ {title}{:padding$}│", "");
+
+    // ID (if different from name)
+    if entry.id != entry.name {
+        let id_line = format!("id: {}", entry.id);
+        let padding = width.saturating_sub(id_line.len() + 1);
+        println!("  │ {id_line}{:padding$}│", "");
+    }
+
+    // Description
+    if let Some(desc) = &entry.description {
+        println!("  │{:width$}│", "");
+        for line in wrap_text(desc, width - 2) {
+            let padding = width.saturating_sub(line.len() + 1);
+            println!("  │ {line}{:padding$}│", "");
+        }
+    }
+
+    // Separator
+    println!("  ├{bar}┤");
+
+    // Tags
+    if !entry.tags.is_empty() {
+        let tags_line = format!("Tags: {}", entry.tags.join(", "));
+        let padding = width.saturating_sub(tags_line.len() + 1);
+        println!("  │ {tags_line}{:padding$}│", "");
+    }
+
+    // License
+    if let Some(license) = &entry.license {
+        let lic_line = format!("License: {license}");
+        let padding = width.saturating_sub(lic_line.len() + 1);
+        println!("  │ {lic_line}{:padding$}│", "");
+    }
+
+    // Source
+    if let Some(source) = &entry.source {
+        let source_line = match source {
+            pi::extension_index::ExtensionIndexSource::Npm {
+                package, version, ..
+            } => {
+                let ver = version.as_deref().unwrap_or("latest");
+                format!("Source: npm:{package}@{ver}")
+            }
+            pi::extension_index::ExtensionIndexSource::Git { repo, path, .. } => {
+                let suffix = path.as_deref().map_or(String::new(), |p| format!(" ({p})"));
+                format!("Source: git:{repo}{suffix}")
+            }
+            pi::extension_index::ExtensionIndexSource::Url { url } => {
+                format!("Source: {url}")
+            }
+        };
+        for line in wrap_text(&source_line, width - 2) {
+            let padding = width.saturating_sub(line.len() + 1);
+            println!("  │ {line}{:padding$}│", "");
+        }
+    }
+
+    // Install command
+    println!("  ├{bar}┤");
+    if let Some(install_source) = &entry.install_source {
+        let install_line = format!("Install: pi install {install_source}");
+        for line in wrap_text(&install_line, width - 2) {
+            let padding = width.saturating_sub(line.len() + 1);
+            println!("  │ {line}{:padding$}│", "");
+        }
+    } else {
+        let hint = "Install source not available";
+        let padding = width.saturating_sub(hint.len() + 1);
+        println!("  │ {hint}{:padding$}│", "");
+    }
+
+    println!("  └{bar}┘");
+}
+
+/// Wrap text to fit within `max_width` characters.
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if current.is_empty() {
+                current = word.to_string();
+            } else if current.len() + 1 + word.len() <= max_width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current);
+                current = word.to_string();
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 async fn print_package_entry(manager: &PackageManager, entry: &PackageEntry) -> Result<()> {
