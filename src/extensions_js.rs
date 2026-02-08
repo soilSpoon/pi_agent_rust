@@ -1132,6 +1132,62 @@ struct PiJsResolver {
     state: Rc<RefCell<PiJsModuleState>>,
 }
 
+fn canonical_node_builtin(spec: &str) -> Option<&'static str> {
+    match spec {
+        "fs" | "node:fs" => Some("node:fs"),
+        "fs/promises" | "node:fs/promises" => Some("node:fs/promises"),
+        "path" | "node:path" => Some("node:path"),
+        "os" | "node:os" => Some("node:os"),
+        "child_process" | "node:child_process" => Some("node:child_process"),
+        "crypto" | "node:crypto" => Some("node:crypto"),
+        "http" | "node:http" => Some("node:http"),
+        "https" | "node:https" => Some("node:https"),
+        "util" | "node:util" => Some("node:util"),
+        "readline" | "node:readline" => Some("node:readline"),
+        "url" | "node:url" => Some("node:url"),
+        "net" | "node:net" => Some("node:net"),
+        "events" | "node:events" => Some("node:events"),
+        "buffer" | "node:buffer" => Some("node:buffer"),
+        "assert" | "node:assert" => Some("node:assert"),
+        "stream" | "node:stream" => Some("node:stream"),
+        "module" | "node:module" => Some("node:module"),
+        "string_decoder" | "node:string_decoder" => Some("node:string_decoder"),
+        "querystring" | "node:querystring" => Some("node:querystring"),
+        "process" | "node:process" => Some("node:process"),
+        "stream/promises" | "node:stream/promises" => Some("node:stream/promises"),
+        _ => None,
+    }
+}
+
+fn is_network_specifier(spec: &str) -> bool {
+    spec.starts_with("http://")
+        || spec.starts_with("https://")
+        || spec.starts_with("http:")
+        || spec.starts_with("https:")
+}
+
+fn is_bare_package_specifier(spec: &str) -> bool {
+    if spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.starts_with('/')
+        || spec.starts_with("file://")
+        || spec.starts_with("node:")
+    {
+        return false;
+    }
+    !spec.contains(':')
+}
+
+fn unsupported_module_specifier_message(spec: &str) -> String {
+    if is_network_specifier(spec) {
+        return format!("Network module imports are not supported in PiJS: {spec}");
+    }
+    if is_bare_package_specifier(spec) {
+        return format!("Package module specifiers are not supported in PiJS: {spec}");
+    }
+    format!("Unsupported module specifier: {spec}")
+}
+
 impl JsModuleResolver for PiJsResolver {
     fn resolve(&mut self, _ctx: &Ctx<'_>, base: &str, name: &str) -> rquickjs::Result<String> {
         let spec = name.trim();
@@ -1140,30 +1196,7 @@ impl JsModuleResolver for PiJsResolver {
         }
 
         // Alias bare Node.js builtins to their node: prefixed virtual modules.
-        let canonical = match spec {
-            "fs" => "node:fs",
-            "fs/promises" => "node:fs/promises",
-            "path" => "node:path",
-            "os" => "node:os",
-            "child_process" => "node:child_process",
-            "crypto" => "node:crypto",
-            "http" => "node:http",
-            "https" => "node:https",
-            "util" => "node:util",
-            "readline" => "node:readline",
-            "url" => "node:url",
-            "net" => "node:net",
-            "events" => "node:events",
-            "buffer" => "node:buffer",
-            "assert" => "node:assert",
-            "stream" => "node:stream",
-            "module" => "node:module",
-            "string_decoder" => "node:string_decoder",
-            "querystring" => "node:querystring",
-            "process" => "node:process",
-            "stream/promises" => "node:stream/promises",
-            other => other,
-        };
+        let canonical = canonical_node_builtin(spec).unwrap_or(spec);
 
         if self.state.borrow().virtual_modules.contains_key(canonical) {
             return Ok(canonical.to_string());
@@ -1176,7 +1209,7 @@ impl JsModuleResolver for PiJsResolver {
         Err(rquickjs::Error::new_resolving_message(
             base,
             name,
-            format!("Unsupported module specifier: {spec}"),
+            unsupported_module_specifier_message(spec),
         ))
     }
 }
@@ -1299,7 +1332,7 @@ fn resolve_existing_module_candidate(path: PathBuf) -> Option<PathBuf> {
     }
 
     if path.is_dir() {
-        for candidate in ["index.ts", "index.js"] {
+        for candidate in ["index.ts", "index.tsx", "index.js", "index.mjs", "index.json"] {
             let full = path.join(candidate);
             if full.is_file() {
                 return Some(full);
@@ -1311,13 +1344,15 @@ fn resolve_existing_module_candidate(path: PathBuf) -> Option<PathBuf> {
     let extension = path.extension().and_then(|ext| ext.to_str());
     match extension {
         Some("js" | "mjs") => {
-            let ts = path.with_extension("ts");
-            if ts.is_file() {
-                return Some(ts);
+            for ext in ["ts", "tsx"] {
+                let fallback = path.with_extension(ext);
+                if fallback.is_file() {
+                    return Some(fallback);
+                }
             }
         }
         None => {
-            for ext in ["ts", "js"] {
+            for ext in ["ts", "tsx", "js", "mjs", "json"] {
                 let candidate = path.with_extension(ext);
                 if candidate.is_file() {
                     return Some(candidate);
@@ -9041,6 +9076,134 @@ mod tests {
             message.contains("Unsupported module extension"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn resolver_error_messages_are_classified_deterministically() {
+        assert_eq!(
+            unsupported_module_specifier_message("left-pad"),
+            "Package module specifiers are not supported in PiJS: left-pad"
+        );
+        assert_eq!(
+            unsupported_module_specifier_message("https://example.com/mod.js"),
+            "Network module imports are not supported in PiJS: https://example.com/mod.js"
+        );
+        assert_eq!(
+            unsupported_module_specifier_message("pi:internal/foo"),
+            "Unsupported module specifier: pi:internal/foo"
+        );
+    }
+
+    #[test]
+    fn resolve_module_path_uses_documented_candidate_order() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path();
+        let base = root.join("entry.ts");
+        std::fs::write(&base, "export {};\n").expect("write base");
+
+        let pkg_dir = root.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg");
+        let pkg_index_js = pkg_dir.join("index.js");
+        let pkg_index_ts = pkg_dir.join("index.ts");
+        std::fs::write(&pkg_index_js, "export const js = true;\n").expect("write index.js");
+        std::fs::write(&pkg_index_ts, "export const ts = true;\n").expect("write index.ts");
+
+        let module_js = root.join("module.js");
+        let module_ts = root.join("module.ts");
+        std::fs::write(&module_js, "export const js = true;\n").expect("write module.js");
+        std::fs::write(&module_ts, "export const ts = true;\n").expect("write module.ts");
+
+        let only_json = root.join("only_json.json");
+        std::fs::write(&only_json, "{\"ok\":true}\n").expect("write only_json.json");
+
+        let resolved_pkg = resolve_module_path(base.to_string_lossy().as_ref(), "./pkg")
+            .expect("resolve ./pkg");
+        assert_eq!(resolved_pkg, pkg_index_ts);
+
+        let resolved_module = resolve_module_path(base.to_string_lossy().as_ref(), "./module")
+            .expect("resolve ./module");
+        assert_eq!(resolved_module, module_ts);
+
+        let resolved_json = resolve_module_path(base.to_string_lossy().as_ref(), "./only_json")
+            .expect("resolve ./only_json");
+        assert_eq!(resolved_json, only_json);
+
+        let file_url = format!("file://{}", module_ts.display());
+        let resolved_file_url =
+            resolve_module_path(base.to_string_lossy().as_ref(), &file_url).expect("file://");
+        assert_eq!(resolved_file_url, module_ts);
+    }
+
+    #[test]
+    fn pijs_dynamic_import_reports_deterministic_package_error() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.packageImportError = {};
+                    import('left-pad')
+                      .then(() => {
+                        globalThis.packageImportError.done = true;
+                        globalThis.packageImportError.message = '';
+                      })
+                      .catch((err) => {
+                        globalThis.packageImportError.done = true;
+                        globalThis.packageImportError.message = String((err && err.message) || err || '');
+                      });
+                    ",
+                )
+                .await
+                .expect("eval package import");
+
+            let result = get_global_json(&runtime, "packageImportError").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            let message = result["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("Package module specifiers are not supported in PiJS: left-pad"),
+                "unexpected message: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_dynamic_import_reports_deterministic_network_error() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.networkImportError = {};
+                    import('https://example.com/mod.js')
+                      .then(() => {
+                        globalThis.networkImportError.done = true;
+                        globalThis.networkImportError.message = '';
+                      })
+                      .catch((err) => {
+                        globalThis.networkImportError.done = true;
+                        globalThis.networkImportError.message = String((err && err.message) || err || '');
+                      });
+                    ",
+                )
+                .await
+                .expect("eval network import");
+
+            let result = get_global_json(&runtime, "networkImportError").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            let message = result["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(
+                    "Network module imports are not supported in PiJS: https://example.com/mod.js"
+                ),
+                "unexpected message: {message}"
+            );
+        });
     }
 
     // Tests for the Promise bridge (bd-2ke)
