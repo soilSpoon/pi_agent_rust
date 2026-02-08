@@ -980,6 +980,12 @@ pub enum RepairPattern {
     /// Pattern 5: CJS/ESM default-export mismatch was corrected by trying
     /// alternative lifecycle method names.
     ExportShape,
+    /// Pattern 6 (bd-k5q5.9.3.2): Extension manifest field normalization
+    /// (deprecated keys, schema version migration).
+    ManifestNormalization,
+    /// Pattern 7 (bd-k5q5.9.3.3): AST-based codemod for known API renames
+    /// or signature migrations.
+    ApiMigration,
 }
 
 /// Risk tier for repair patterns (bd-k5q5.9.1.4).
@@ -1000,12 +1006,15 @@ impl RepairPattern {
     /// The risk tier of this pattern.
     pub const fn risk(self) -> RepairRisk {
         match self {
-            // Patterns 1 & 2 only remap paths / return empty strings.
-            Self::DistToSrc | Self::MissingAsset => RepairRisk::Safe,
-            // Patterns 3-5 inject stubs or rewrite exports.
-            Self::MonorepoEscape | Self::MissingNpmDep | Self::ExportShape => {
-                RepairRisk::Aggressive
+            // Patterns 1, 2, 6: path remaps, empty strings, manifest JSON.
+            Self::DistToSrc | Self::MissingAsset | Self::ManifestNormalization => {
+                RepairRisk::Safe
             }
+            // Patterns 3-5 and 7: inject stubs, rewrite exports, or modify AST.
+            Self::MonorepoEscape
+            | Self::MissingNpmDep
+            | Self::ExportShape
+            | Self::ApiMigration => RepairRisk::Aggressive,
         }
     }
 
@@ -1026,6 +1035,8 @@ impl std::fmt::Display for RepairPattern {
             Self::MonorepoEscape => write!(f, "monorepo_escape"),
             Self::MissingNpmDep => write!(f, "missing_npm_dep"),
             Self::ExportShape => write!(f, "export_shape"),
+            Self::ManifestNormalization => write!(f, "manifest_normalization"),
+            Self::ApiMigration => write!(f, "api_migration"),
         }
     }
 }
@@ -1046,6 +1057,209 @@ pub struct ExtensionRepairEvent {
     pub success: bool,
     /// Wall-clock timestamp (ms since UNIX epoch).
     pub timestamp_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic rule registry (bd-k5q5.9.3.1)
+// ---------------------------------------------------------------------------
+
+/// A static repair rule with deterministic ordering and versioning.
+#[derive(Debug, Clone)]
+pub struct RepairRule {
+    /// Unique identifier for the rule (e.g. `"dist_to_src_v1"`).
+    pub id: &'static str,
+    /// Semantic version of this rule's logic.
+    pub version: &'static str,
+    /// Which `RepairPattern` this rule implements.
+    pub pattern: RepairPattern,
+    /// Human-readable description of what the rule does.
+    pub description: &'static str,
+}
+
+impl RepairRule {
+    /// Risk tier inherited from the pattern.
+    pub const fn risk(&self) -> RepairRisk {
+        self.pattern.risk()
+    }
+
+    /// Whether this rule can fire under the given mode.
+    pub const fn is_allowed_by(&self, mode: RepairMode) -> bool {
+        self.pattern.is_allowed_by(mode)
+    }
+}
+
+/// The canonical, deterministic rule registry.
+///
+/// Rules are evaluated **in array order** — the first applicable rule wins.
+/// New rules MUST be appended; existing order must never change to preserve
+/// determinism across versions.
+pub static REPAIR_RULES: &[RepairRule] = &[
+    RepairRule {
+        id: "dist_to_src_v1",
+        pattern: RepairPattern::DistToSrc,
+        version: "1.0.0",
+        description: "Remap ./dist/X.js to ./src/X.ts when build output is missing",
+    },
+    RepairRule {
+        id: "missing_asset_v1",
+        pattern: RepairPattern::MissingAsset,
+        version: "1.0.0",
+        description: "Return empty string for missing bundled asset reads",
+    },
+    RepairRule {
+        id: "monorepo_escape_v1",
+        pattern: RepairPattern::MonorepoEscape,
+        version: "1.0.0",
+        description: "Stub monorepo sibling imports (../../shared) with empty module",
+    },
+    RepairRule {
+        id: "missing_npm_dep_v1",
+        pattern: RepairPattern::MissingNpmDep,
+        version: "1.0.0",
+        description: "Provide proxy-based stub for unresolvable npm bare specifiers",
+    },
+    RepairRule {
+        id: "export_shape_v1",
+        pattern: RepairPattern::ExportShape,
+        version: "1.0.0",
+        description: "Try alternative lifecycle exports (CJS default, named activate)",
+    },
+    // ── Manifest normalization rules (bd-k5q5.9.3.2) ──
+    RepairRule {
+        id: "manifest_schema_v1",
+        pattern: RepairPattern::ManifestNormalization,
+        version: "1.0.0",
+        description: "Migrate deprecated manifest fields to current schema",
+    },
+    // ── AST codemod rules (bd-k5q5.9.3.3) ──
+    RepairRule {
+        id: "api_migration_v1",
+        pattern: RepairPattern::ApiMigration,
+        version: "1.0.0",
+        description: "Rewrite known deprecated API calls to current equivalents",
+    },
+];
+
+/// Find all rules applicable under the given mode, in registry order.
+pub fn applicable_rules(mode: RepairMode) -> Vec<&'static RepairRule> {
+    REPAIR_RULES
+        .iter()
+        .filter(|rule| rule.is_allowed_by(mode))
+        .collect()
+}
+
+/// Look up a rule by its ID.
+pub fn rule_by_id(id: &str) -> Option<&'static RepairRule> {
+    REPAIR_RULES.iter().find(|r| r.id == id)
+}
+
+/// The registry version: bumped whenever rules are added or modified.
+pub const REPAIR_REGISTRY_VERSION: &str = "1.1.0";
+
+// ---------------------------------------------------------------------------
+// Model patch primitive whitelist (bd-k5q5.9.4.1)
+// ---------------------------------------------------------------------------
+
+/// Primitive patch operations that model-generated repair proposals may use.
+///
+/// Each variant represents a constrained, validatable operation. The union of
+/// all variants defines the complete vocabulary available to the model repair
+/// adapter — anything outside this enum is rejected at the schema level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchOp {
+    /// Replace a module import path with a different path.
+    /// Both paths must resolve within the extension root.
+    ReplaceModulePath {
+        from: String,
+        to: String,
+    },
+    /// Add a named export to a module's source text.
+    AddExport {
+        module_path: String,
+        export_name: String,
+        export_value: String,
+    },
+    /// Remove an import statement by specifier.
+    RemoveImport {
+        module_path: String,
+        specifier: String,
+    },
+    /// Inject a stub module at the given virtual path.
+    InjectStub {
+        virtual_path: String,
+        source: String,
+    },
+    /// Rewrite a `require()` call to use a different specifier.
+    RewriteRequire {
+        module_path: String,
+        from_specifier: String,
+        to_specifier: String,
+    },
+}
+
+impl PatchOp {
+    /// The risk tier of this operation.
+    pub const fn risk(&self) -> RepairRisk {
+        match self {
+            // Path remapping and require rewriting are safe (no new code).
+            Self::ReplaceModulePath { .. } | Self::RewriteRequire { .. } => RepairRisk::Safe,
+            // Adding exports, removing imports, or injecting stubs change code.
+            Self::AddExport { .. } | Self::RemoveImport { .. } | Self::InjectStub { .. } => {
+                RepairRisk::Aggressive
+            }
+        }
+    }
+
+    /// Short tag for logging and telemetry.
+    pub const fn tag(&self) -> &'static str {
+        match self {
+            Self::ReplaceModulePath { .. } => "replace_module_path",
+            Self::AddExport { .. } => "add_export",
+            Self::RemoveImport { .. } => "remove_import",
+            Self::InjectStub { .. } => "inject_stub",
+            Self::RewriteRequire { .. } => "rewrite_require",
+        }
+    }
+}
+
+/// A model-generated repair proposal.
+///
+/// Contains one or more `PatchOp`s plus metadata for audit. Proposals are
+/// validated against the current `RepairMode` and monotonicity checker before
+/// any operations are applied.
+#[derive(Debug, Clone)]
+pub struct PatchProposal {
+    /// Which rule triggered this proposal.
+    pub rule_id: String,
+    /// Ordered list of operations to apply.
+    pub ops: Vec<PatchOp>,
+    /// Model-provided rationale (for audit log).
+    pub rationale: String,
+    /// Confidence score (0.0–1.0) from the model, if available.
+    pub confidence: Option<f64>,
+}
+
+impl PatchProposal {
+    /// The highest risk across all ops in the proposal.
+    pub fn max_risk(&self) -> RepairRisk {
+        if self
+            .ops
+            .iter()
+            .any(|op| op.risk() == RepairRisk::Aggressive)
+        {
+            RepairRisk::Aggressive
+        } else {
+            RepairRisk::Safe
+        }
+    }
+
+    /// Whether this proposal is allowed under the given mode.
+    pub fn is_allowed_by(&self, mode: RepairMode) -> bool {
+        match self.max_risk() {
+            RepairRisk::Safe => mode.should_apply(),
+            RepairRisk::Aggressive => mode.allows_aggressive(),
+        }
+    }
 }
 
 /// Statistics from a tick execution.

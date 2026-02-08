@@ -13,8 +13,8 @@ mod common;
 
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
 use pi::extensions_js::{
-    ExtensionRepairEvent, MonotonicityVerdict, PiJsRuntimeConfig, PiJsTickStats, RepairMode,
-    RepairPattern, RepairRisk,
+    ExtensionRepairEvent, MonotonicityVerdict, PatchOp, PatchProposal, PiJsRuntimeConfig,
+    PiJsTickStats, RepairMode, RepairPattern, RepairRisk, REPAIR_REGISTRY_VERSION, REPAIR_RULES,
 };
 use pi::tools::ToolRegistry;
 use std::sync::Arc;
@@ -249,16 +249,18 @@ fn handle_drain_repair_events_after_clean_extension_load() {
     shutdown(&handle);
 }
 
-// ─── All five patterns constructible ────────────────────────────────────────
+// ─── All patterns constructible ──────────────────────────────────────────────
 
 #[test]
-fn all_five_patterns_constructible() {
+fn all_patterns_constructible() {
     let patterns = [
         RepairPattern::DistToSrc,
         RepairPattern::MissingAsset,
         RepairPattern::MonorepoEscape,
         RepairPattern::MissingNpmDep,
         RepairPattern::ExportShape,
+        RepairPattern::ManifestNormalization,
+        RepairPattern::ApiMigration,
     ];
 
     for (i, pattern) in patterns.iter().enumerate() {
@@ -651,6 +653,10 @@ fn monotonicity_safe_at_root_boundary() {
 fn safe_patterns_have_safe_risk() {
     assert_eq!(RepairPattern::DistToSrc.risk(), RepairRisk::Safe);
     assert_eq!(RepairPattern::MissingAsset.risk(), RepairRisk::Safe);
+    assert_eq!(
+        RepairPattern::ManifestNormalization.risk(),
+        RepairRisk::Safe
+    );
 }
 
 #[test]
@@ -658,6 +664,7 @@ fn aggressive_patterns_have_aggressive_risk() {
     assert_eq!(RepairPattern::MonorepoEscape.risk(), RepairRisk::Aggressive);
     assert_eq!(RepairPattern::MissingNpmDep.risk(), RepairRisk::Aggressive);
     assert_eq!(RepairPattern::ExportShape.risk(), RepairRisk::Aggressive);
+    assert_eq!(RepairPattern::ApiMigration.risk(), RepairRisk::Aggressive);
 }
 
 #[test]
@@ -688,6 +695,8 @@ fn no_patterns_allowed_by_off() {
         RepairPattern::MonorepoEscape,
         RepairPattern::MissingNpmDep,
         RepairPattern::ExportShape,
+        RepairPattern::ManifestNormalization,
+        RepairPattern::ApiMigration,
     ] {
         assert!(
             !pattern.is_allowed_by(RepairMode::Off),
@@ -704,10 +713,193 @@ fn no_patterns_allowed_by_suggest() {
         RepairPattern::MonorepoEscape,
         RepairPattern::MissingNpmDep,
         RepairPattern::ExportShape,
+        RepairPattern::ManifestNormalization,
+        RepairPattern::ApiMigration,
     ] {
         assert!(
             !pattern.is_allowed_by(RepairMode::Suggest),
             "{pattern} should be blocked in Suggest mode"
         );
     }
+}
+
+// ─── Deterministic rule registry (bd-k5q5.9.3.1) ────────────────────────────
+
+use pi::extensions_js::{applicable_rules, rule_by_id};
+
+#[test]
+fn registry_has_seven_rules() {
+    assert_eq!(REPAIR_RULES.len(), 7);
+}
+
+#[test]
+fn registry_version_is_set() {
+    assert!(!REPAIR_REGISTRY_VERSION.is_empty());
+}
+
+#[test]
+fn all_rules_have_unique_ids() {
+    let mut ids: Vec<&str> = REPAIR_RULES.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), REPAIR_RULES.len(), "duplicate rule IDs detected");
+}
+
+#[test]
+fn rule_by_id_finds_existing() {
+    let rule = rule_by_id("dist_to_src_v1").expect("should find rule");
+    assert_eq!(rule.pattern, RepairPattern::DistToSrc);
+    assert_eq!(rule.version, "1.0.0");
+}
+
+#[test]
+fn rule_by_id_returns_none_for_unknown() {
+    assert!(rule_by_id("nonexistent_rule").is_none());
+}
+
+#[test]
+fn applicable_rules_auto_safe_returns_safe_only() {
+    let rules = applicable_rules(RepairMode::AutoSafe);
+    assert!(rules.iter().all(|r| r.risk() == RepairRisk::Safe));
+    assert_eq!(rules.len(), 3); // DistToSrc + MissingAsset + ManifestNormalization
+}
+
+#[test]
+fn applicable_rules_auto_strict_returns_all() {
+    let rules = applicable_rules(RepairMode::AutoStrict);
+    assert_eq!(rules.len(), 7);
+}
+
+#[test]
+fn applicable_rules_off_returns_empty() {
+    let rules = applicable_rules(RepairMode::Off);
+    assert!(rules.is_empty());
+}
+
+#[test]
+fn applicable_rules_suggest_returns_empty() {
+    let rules = applicable_rules(RepairMode::Suggest);
+    assert!(rules.is_empty());
+}
+
+#[test]
+fn registry_order_is_deterministic() {
+    let ids: Vec<&str> = REPAIR_RULES.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "dist_to_src_v1",
+            "missing_asset_v1",
+            "monorepo_escape_v1",
+            "missing_npm_dep_v1",
+            "export_shape_v1",
+            "manifest_schema_v1",
+            "api_migration_v1",
+        ]
+    );
+}
+
+// ─── Model patch primitives (bd-k5q5.9.4.1) ─────────────────────────────────
+
+#[test]
+fn patch_op_replace_module_path_is_safe() {
+    let op = PatchOp::ReplaceModulePath {
+        from: "./dist/lib.js".to_string(),
+        to: "./src/lib.ts".to_string(),
+    };
+    assert_eq!(op.risk(), RepairRisk::Safe);
+    assert_eq!(op.tag(), "replace_module_path");
+}
+
+#[test]
+fn patch_op_inject_stub_is_aggressive() {
+    let op = PatchOp::InjectStub {
+        virtual_path: "/@stubs/missing.js".to_string(),
+        source: "export default {};".to_string(),
+    };
+    assert_eq!(op.risk(), RepairRisk::Aggressive);
+    assert_eq!(op.tag(), "inject_stub");
+}
+
+#[test]
+fn patch_op_add_export_is_aggressive() {
+    let op = PatchOp::AddExport {
+        module_path: "./index.ts".to_string(),
+        export_name: "activate".to_string(),
+        export_value: "function activate() {}".to_string(),
+    };
+    assert_eq!(op.risk(), RepairRisk::Aggressive);
+}
+
+#[test]
+fn patch_op_rewrite_require_is_safe() {
+    let op = PatchOp::RewriteRequire {
+        module_path: "./entry.js".to_string(),
+        from_specifier: "missing-pkg".to_string(),
+        to_specifier: "/@stubs/missing-pkg".to_string(),
+    };
+    assert_eq!(op.risk(), RepairRisk::Safe);
+}
+
+#[test]
+fn proposal_max_risk_safe_when_all_safe() {
+    let proposal = PatchProposal {
+        rule_id: "dist_to_src_v1".to_string(),
+        ops: vec![PatchOp::ReplaceModulePath {
+            from: "./dist/x.js".to_string(),
+            to: "./src/x.ts".to_string(),
+        }],
+        rationale: "remap path".to_string(),
+        confidence: Some(0.95),
+    };
+    assert_eq!(proposal.max_risk(), RepairRisk::Safe);
+    assert!(proposal.is_allowed_by(RepairMode::AutoSafe));
+}
+
+#[test]
+fn proposal_max_risk_aggressive_when_any_aggressive() {
+    let proposal = PatchProposal {
+        rule_id: "mixed_v1".to_string(),
+        ops: vec![
+            PatchOp::ReplaceModulePath {
+                from: "./a.js".to_string(),
+                to: "./b.ts".to_string(),
+            },
+            PatchOp::InjectStub {
+                virtual_path: "/@stubs/x".to_string(),
+                source: "export default {};".to_string(),
+            },
+        ],
+        rationale: "mixed ops".to_string(),
+        confidence: None,
+    };
+    assert_eq!(proposal.max_risk(), RepairRisk::Aggressive);
+    assert!(!proposal.is_allowed_by(RepairMode::AutoSafe));
+    assert!(proposal.is_allowed_by(RepairMode::AutoStrict));
+}
+
+#[test]
+fn proposal_blocked_by_off_mode() {
+    let proposal = PatchProposal {
+        rule_id: "safe_v1".to_string(),
+        ops: vec![PatchOp::ReplaceModulePath {
+            from: "a".to_string(),
+            to: "b".to_string(),
+        }],
+        rationale: "test".to_string(),
+        confidence: None,
+    };
+    assert!(!proposal.is_allowed_by(RepairMode::Off));
+}
+
+#[test]
+fn empty_proposal_is_safe() {
+    let proposal = PatchProposal {
+        rule_id: "empty_v1".to_string(),
+        ops: vec![],
+        rationale: "no-op".to_string(),
+        confidence: None,
+    };
+    // No aggressive ops → Safe
+    assert_eq!(proposal.max_risk(), RepairRisk::Safe);
 }
