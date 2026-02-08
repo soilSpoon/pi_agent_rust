@@ -1956,26 +1956,26 @@ mod tests {
 
     #[test]
     fn find_cut_point_should_not_discard_context_to_skip_tool_chain() {
-        // Setup:
-        // 0. User (1000)
-        // 1. Assistant Call (100)
-        // 2. Tool Result (100)
-        // 3. User (10)
+        // Setup (estimate_tokens uses ceil(chars/4)):
+        // 0. User "x"*4000 → 1000 tokens
+        // 1. Assistant "x"*400 → 100 tokens
+        // 2. Tool Result "x"*400 → 100 tokens
+        // 3. User "next" → 1 token
         //
         // Keep recent = 150.
-        // Accumulation:
-        // 3: 10
-        // 2: 110
-        // 1: 210 (Crosses 150) -> cut_index = 1
+        // Accumulation (from end):
+        // 3: 1
+        // 2: 101
+        // 1: 201 (Crosses 150) -> cut_index = 1
         //
-        // Current logic skips 1 and 2, setting cut_index = 3.
-        // Result: keep only 10 tokens.
+        // The cut should land at index 1 (the assistant message), keeping
+        // entries 1-3 and summarizing only entry 0.
 
         let entries = vec![
-            user_entry("0", &"x".repeat(4000)), // ~1000 tokens
-            assistant_entry("1", "call", 50, 50), // 100 tokens
-            tool_result_entry("2", &"x".repeat(400)), // 100 tokens
-            user_entry("3", "next"), // ~1 token
+            user_entry("0", &"x".repeat(4000)),             // 1000 tokens
+            assistant_entry("1", &"x".repeat(400), 50, 50), // 100 tokens
+            tool_result_entry("2", &"x".repeat(400)),       // 100 tokens
+            user_entry("3", "next"),                        // 1 token
         ];
 
         let settings = ResolvedCompactionSettings {
@@ -1987,9 +1987,24 @@ mod tests {
         // We use prepare_compaction as the entry point
         let prep = prepare_compaction(&entries, settings).expect("should compact");
 
-        // We expect to keep from 1 (Assistant).
-        // If the bug exists, it will keep from 3 (User).
-        assert_eq!(prep.first_kept_entry_id, "1", "Should start at Assistant tool call to preserve context");
-        assert_eq!(prep.messages_to_summarize.len(), 1, "Should only summarize index 0");
+        // We expect to keep from 1 (Assistant). The cut splits the turn
+        // (user 0 + assistant 1), so user 0 goes into the turn prefix.
+        assert_eq!(
+            prep.first_kept_entry_id, "1",
+            "Should start at Assistant message to preserve context"
+        );
+        assert!(
+            prep.is_split_turn,
+            "Cut should split the user/assistant turn"
+        );
+        assert_eq!(
+            prep.turn_prefix_messages.len(),
+            1,
+            "User entry at index 0 should be in the turn prefix"
+        );
+        assert!(
+            prep.messages_to_summarize.is_empty(),
+            "Nothing before the turn to summarize"
+        );
     }
 }

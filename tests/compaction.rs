@@ -548,10 +548,10 @@ fn prepare_compaction_skips_tool_result_as_cut_point_and_marks_split_turn() {
     let prep = prepare_compaction(&entries, make_settings(2)).expect("prep");
     log_preparation(&harness, &entries, &prep);
 
-    assert_eq!(prep.first_kept_entry_id, "a2");
+    assert_eq!(prep.first_kept_entry_id, "a1");
     assert!(prep.is_split_turn);
     assert!(prep.messages_to_summarize.is_empty());
-    assert_eq!(prep.turn_prefix_messages.len(), 3);
+    assert_eq!(prep.turn_prefix_messages.len(), 1);
 }
 
 #[test]

@@ -1328,10 +1328,9 @@ fn trend_report_updates_history() {
     update_trend_report(&summary, reports);
     let trend_path = reports.join("conformance_trend.json");
     assert!(trend_path.exists());
-    
-    let report: TrendReport = serde_json::from_str(
-        &std::fs::read_to_string(&trend_path).unwrap()
-    ).unwrap();
+
+    let report: TrendReport =
+        serde_json::from_str(&std::fs::read_to_string(&trend_path).unwrap()).unwrap();
     assert_eq!(report.history.len(), 1);
     assert_eq!(report.history[0].pass, 80);
 
@@ -1347,10 +1346,9 @@ fn trend_report_updates_history() {
         "pass_rate_pct": 94.4
     });
     update_trend_report(&summary2, reports);
-    
-    let report2: TrendReport = serde_json::from_str(
-        &std::fs::read_to_string(&trend_path).unwrap()
-    ).unwrap();
+
+    let report2: TrendReport =
+        serde_json::from_str(&std::fs::read_to_string(&trend_path).unwrap()).unwrap();
     assert_eq!(report2.history.len(), 2);
     assert_eq!(report2.history[1].pass, 85);
 }

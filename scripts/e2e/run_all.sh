@@ -25,6 +25,11 @@
 #   VCR_MODE           Override VCR mode for all suites (default: unset, per-test decision)
 #   VERIFY_PROFILE     Default profile when --profile is omitted (default: full)
 #   E2E_DIFF_FROM      Baseline summary.json to diff against (optional)
+#   VERIFY_MIN_FREE_MB Minimum free MB required for repo/artifact mounts (default: 2048)
+#   VERIFY_MIN_TMP_FREE_MB Minimum free MB required for tmp/cargo mounts (default: 8192)
+#   CARGO_TARGET_DIR   Optional cargo target directory (checked by preflight)
+#   CARGO_HOME         Optional cargo home directory (checked by preflight)
+#   VERIFY_MIN_FREE_INODE_PCT Minimum free inode percent required (default: 5)
 
 set -euo pipefail
 
@@ -149,6 +154,11 @@ while [[ $# -gt 0 ]]; do
             echo "  RUST_LOG             Log level (default: info)"
             echo "  VERIFY_PROFILE       Default profile when --profile not provided"
             echo "  E2E_DIFF_FROM        Baseline summary.json for diff/triage output"
+            echo "  VERIFY_MIN_TMP_FREE_MB Minimum free MB for tmp/cargo mounts (default: 8192)"
+            echo "  CARGO_TARGET_DIR     Optional cargo target directory (checked by preflight)"
+            echo "  CARGO_HOME           Optional cargo home directory (checked by preflight)"
+            echo "  VERIFY_MIN_FREE_MB   Minimum free MB for repo/artifact mounts (default: 2048)"
+            echo "  VERIFY_MIN_FREE_INODE_PCT Minimum free inode percent required (default: 5)"
             exit 0
             ;;
         *)
@@ -279,11 +289,108 @@ fi
 
 # ─── Environment Capture ─────────────────────────────────────────────────────
 
-mkdir -p "$ARTIFACT_DIR"
+check_disk_headroom() {
+    local min_free_mb="${VERIFY_MIN_FREE_MB:-2048}"
+    local min_tmp_free_mb="${VERIFY_MIN_TMP_FREE_MB:-8192}"
+    local min_inode_free_pct="${VERIFY_MIN_FREE_INODE_PCT:-5}"
+    local tmp_dir="${TMPDIR:-/tmp}"
+    local cargo_target_dir="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+    local cargo_home="${CARGO_HOME:-${HOME:-}/.cargo}"
 
+    if ! [[ "$min_free_mb" =~ ^[0-9]+$ ]] || [[ "$min_free_mb" -le 0 ]]; then
+        echo "[preflight] Invalid VERIFY_MIN_FREE_MB='$min_free_mb' (must be positive integer)" >&2
+        return 1
+    fi
+    if ! [[ "$min_tmp_free_mb" =~ ^[0-9]+$ ]] || [[ "$min_tmp_free_mb" -le 0 ]]; then
+        echo "[preflight] Invalid VERIFY_MIN_TMP_FREE_MB='$min_tmp_free_mb' (must be positive integer)" >&2
+        return 1
+    fi
+    if ! [[ "$min_inode_free_pct" =~ ^[0-9]+$ ]] || [[ "$min_inode_free_pct" -le 0 || "$min_inode_free_pct" -ge 100 ]]; then
+        echo "[preflight] Invalid VERIFY_MIN_FREE_INODE_PCT='$min_inode_free_pct' (must be integer 1-99)" >&2
+        return 1
+    fi
+
+    local min_free_kb=$((min_free_mb * 1024))
+    local min_tmp_free_kb=$((min_tmp_free_mb * 1024))
+    local failed=false
+    local -a probe_specs=(
+        "$PROJECT_ROOT|repo|$min_free_kb|$min_free_mb"
+        "$ARTIFACT_DIR|artifacts|$min_free_kb|$min_free_mb"
+        "$tmp_dir|tmp|$min_tmp_free_kb|$min_tmp_free_mb"
+        "$cargo_target_dir|cargo_target|$min_tmp_free_kb|$min_tmp_free_mb"
+        "$cargo_home|cargo_home|$min_tmp_free_kb|$min_tmp_free_mb"
+    )
+
+    echo "[preflight] Disk headroom check: repo/artifacts >=${min_free_mb}MB, tmp/cargo >=${min_tmp_free_mb}MB, inodes >=${min_inode_free_pct}%"
+
+    for probe_spec in "${probe_specs[@]}"; do
+        IFS='|' read -r raw_path probe_label required_kb required_mb <<<"$probe_spec"
+
+        local probe_path="$raw_path"
+        if [[ ! -e "$probe_path" ]]; then
+            probe_path="$(dirname "$probe_path")"
+        fi
+
+        if [[ ! -e "$probe_path" ]]; then
+            echo "[preflight] WARN: cannot probe path '$raw_path' (missing parent '$probe_path')" >&2
+            continue
+        fi
+
+        local disk_row
+        disk_row="$(df -Pk "$probe_path" | awk 'NR==2 {print $4 "|" $6}')"
+        if [[ -z "$disk_row" ]]; then
+            echo "[preflight] WARN: unable to read disk stats for '$probe_path'" >&2
+            failed=true
+            continue
+        fi
+
+        local avail_kb mount_point
+        avail_kb="${disk_row%%|*}"
+        mount_point="${disk_row#*|}"
+
+        local inode_used_pct inode_free_pct
+        inode_used_pct="$(df -Pi "$probe_path" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')"
+        if [[ -z "$inode_used_pct" ]]; then
+            inode_free_pct=0
+        else
+            inode_free_pct=$((100 - inode_used_pct))
+        fi
+
+        local avail_mb
+        avail_mb=$((avail_kb / 1024))
+        echo "[preflight] target=$probe_label mount=$mount_point free=${avail_mb}MB inode_free=${inode_free_pct}% path=$raw_path"
+
+        if (( avail_kb < required_kb )); then
+            echo "[preflight] FAIL: target '$probe_label' on mount '$mount_point' has ${avail_mb}MB free (< ${required_mb}MB required)" >&2
+            failed=true
+        fi
+        if (( inode_free_pct < min_inode_free_pct )); then
+            echo "[preflight] FAIL: mount '$mount_point' has ${inode_free_pct}% free inodes (< ${min_inode_free_pct}% required)" >&2
+            failed=true
+        fi
+    done
+
+    if $failed; then
+        cat >&2 <<EOF
+[preflight] Verification aborted: insufficient filesystem headroom.
+[preflight] Free space on the workspace filesystem is too low for cargo build/test artifacts.
+[preflight] Fix by freeing disk space, or moving temp/build/artifact paths to roomier mounts:
+[preflight]   TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/pi_verify_target ./verify --profile quick
+[preflight]   CARGO_HOME=/dev/shm/pi_cargo ./verify --profile quick
+[preflight]   E2E_ARTIFACT_DIR=/dev/shm/pi_e2e_results/$TIMESTAMP ./verify --profile quick
+[preflight] You can also tune thresholds:
+[preflight]   VERIFY_MIN_FREE_MB=1024 VERIFY_MIN_TMP_FREE_MB=2048 ./verify --profile quick
+EOF
+        return 1
+    fi
+
+    echo "[preflight] PASS"
+    return 0
+}
 capture_env() {
     local env_file="$ARTIFACT_DIR/environment.json"
     local rustc_version cargo_version os_info git_sha git_branch
+    mkdir -p "$ARTIFACT_DIR"
     rustc_version="$(rustc --version 2>/dev/null || echo 'unknown')"
     cargo_version="$(cargo --version 2>/dev/null || echo 'unknown')"
     os_info="$(uname -srm 2>/dev/null || echo 'unknown')"
@@ -3556,6 +3663,11 @@ main() {
     fi
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
+
+    if ! check_disk_headroom; then
+        echo "[fatal] Preflight checks failed; refusing to start verification run." >&2
+        exit 2
+    fi
 
     capture_env
 
