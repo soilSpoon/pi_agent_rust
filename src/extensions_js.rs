@@ -1260,6 +1260,495 @@ impl PatchProposal {
             RepairRisk::Aggressive => mode.allows_aggressive(),
         }
     }
+
+    /// Number of patch operations in this proposal.
+    pub fn op_count(&self) -> usize {
+        self.ops.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Minimal-diff candidate selector and conflict resolver (bd-k5q5.9.3.4)
+// ---------------------------------------------------------------------------
+
+/// Outcome of conflict detection between two proposals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// No conflict: the proposals touch different files/paths.
+    None,
+    /// Both proposals modify the same module path.
+    SameModulePath(String),
+    /// Both proposals inject stubs at the same virtual path.
+    SameVirtualPath(String),
+}
+
+impl ConflictKind {
+    /// True if there is no conflict.
+    pub const fn is_clear(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// Detect conflicts between two `PatchProposal`s.
+///
+/// Two proposals conflict if they modify the same module path or inject
+/// stubs at the same virtual path. This is a conservative check — any
+/// overlap is treated as a conflict.
+pub fn detect_conflict(a: &PatchProposal, b: &PatchProposal) -> ConflictKind {
+    for op_a in &a.ops {
+        for op_b in &b.ops {
+            if let Some(conflict) = ops_conflict(op_a, op_b) {
+                return conflict;
+            }
+        }
+    }
+    ConflictKind::None
+}
+
+/// Check if two individual ops conflict.
+fn ops_conflict(a: &PatchOp, b: &PatchOp) -> Option<ConflictKind> {
+    match (a, b) {
+        (
+            PatchOp::ReplaceModulePath { from: fa, .. },
+            PatchOp::ReplaceModulePath { from: fb, .. },
+        ) if fa == fb => Some(ConflictKind::SameModulePath(fa.clone())),
+
+        (
+            PatchOp::AddExport {
+                module_path: pa, ..
+            },
+            PatchOp::AddExport {
+                module_path: pb, ..
+            },
+        ) if pa == pb => Some(ConflictKind::SameModulePath(pa.clone())),
+
+        (
+            PatchOp::RemoveImport {
+                module_path: pa, ..
+            },
+            PatchOp::RemoveImport {
+                module_path: pb, ..
+            },
+        ) if pa == pb => Some(ConflictKind::SameModulePath(pa.clone())),
+
+        (
+            PatchOp::InjectStub {
+                virtual_path: va, ..
+            },
+            PatchOp::InjectStub {
+                virtual_path: vb, ..
+            },
+        ) if va == vb => Some(ConflictKind::SameVirtualPath(va.clone())),
+
+        (
+            PatchOp::RewriteRequire {
+                module_path: pa,
+                from_specifier: sa,
+                ..
+            },
+            PatchOp::RewriteRequire {
+                module_path: pb,
+                from_specifier: sb,
+                ..
+            },
+        ) if pa == pb && sa == sb => Some(ConflictKind::SameModulePath(pa.clone())),
+
+        _ => Option::None,
+    }
+}
+
+/// Select the best candidate from a set of proposals.
+///
+/// Candidates are ranked by:
+/// 1. Lowest risk (Safe before Aggressive)
+/// 2. Fewest operations (minimal diff)
+/// 3. Highest confidence (if provided)
+/// 4. Earliest rule ID (deterministic tiebreak)
+///
+/// Only candidates allowed by the given `RepairMode` are considered.
+/// Returns `None` if no candidate is allowed.
+pub fn select_best_candidate(
+    candidates: &[PatchProposal],
+    mode: RepairMode,
+) -> Option<&PatchProposal> {
+    candidates
+        .iter()
+        .filter(|p| p.is_allowed_by(mode))
+        .min_by(|a, b| compare_proposals(a, b))
+}
+
+/// Compare two proposals for selection ordering.
+fn compare_proposals(a: &PatchProposal, b: &PatchProposal) -> std::cmp::Ordering {
+    // 1. Lower risk wins.
+    let risk_ord = risk_rank(a.max_risk()).cmp(&risk_rank(b.max_risk()));
+    if risk_ord != std::cmp::Ordering::Equal {
+        return risk_ord;
+    }
+
+    // 2. Fewer ops wins.
+    let ops_ord = a.op_count().cmp(&b.op_count());
+    if ops_ord != std::cmp::Ordering::Equal {
+        return ops_ord;
+    }
+
+    // 3. Higher confidence wins (reverse order).
+    let conf_a = a.confidence.unwrap_or(0.0);
+    let conf_b = b.confidence.unwrap_or(0.0);
+    // Reverse: higher confidence = better = Less in ordering.
+    let conf_ord = conf_b.partial_cmp(&conf_a).unwrap_or(std::cmp::Ordering::Equal);
+    if conf_ord != std::cmp::Ordering::Equal {
+        return conf_ord;
+    }
+
+    // 4. Lexicographic rule_id tiebreak.
+    a.rule_id.cmp(&b.rule_id)
+}
+
+/// Map `RepairRisk` to a numeric rank for ordering.
+const fn risk_rank(risk: RepairRisk) -> u8 {
+    match risk {
+        RepairRisk::Safe => 0,
+        RepairRisk::Aggressive => 1,
+    }
+}
+
+/// Resolve conflicts among a set of proposals.
+///
+/// When two proposals conflict, the lower-ranked one (by
+/// `compare_proposals`) is dropped. Returns a conflict-free subset.
+pub fn resolve_conflicts(proposals: &[PatchProposal]) -> Vec<&PatchProposal> {
+    if proposals.is_empty() {
+        return vec![];
+    }
+
+    // Sort by selection order.
+    let mut indexed: Vec<(usize, &PatchProposal)> =
+        proposals.iter().enumerate().collect();
+    indexed.sort_by(|(_, a), (_, b)| compare_proposals(a, b));
+
+    let mut accepted: Vec<&PatchProposal> = Vec::new();
+    for (_, candidate) in indexed {
+        let conflicts_with_accepted = accepted
+            .iter()
+            .any(|acc| !detect_conflict(acc, candidate).is_clear());
+        if !conflicts_with_accepted {
+            accepted.push(candidate);
+        }
+    }
+
+    accepted
+}
+
+// ---------------------------------------------------------------------------
+// Bounded-context model proposer adapter (bd-k5q5.9.4.2)
+// ---------------------------------------------------------------------------
+
+/// Curated context provided to the model for repair proposal generation.
+///
+/// This struct is the *only* information the model sees. It deliberately
+/// excludes secrets, full file contents, and anything outside the extension's
+/// scope. The model can only produce proposals using the allowed primitives.
+#[derive(Debug, Clone)]
+pub struct RepairContext {
+    /// Extension identity.
+    pub extension_id: String,
+    /// The gating verdict (includes confidence and reason codes).
+    pub gating: GatingVerdict,
+    /// Normalized intent graph.
+    pub intent: IntentGraph,
+    /// Tolerant parse result.
+    pub parse: TolerantParseResult,
+    /// Current repair mode.
+    pub mode: RepairMode,
+    /// Diagnostic messages from the failed load attempt.
+    pub diagnostics: Vec<String>,
+    /// Allowed `PatchOp` tags for this mode.
+    pub allowed_op_tags: Vec<&'static str>,
+}
+
+impl RepairContext {
+    /// Build a repair context from constituent parts.
+    pub fn new(
+        extension_id: String,
+        gating: GatingVerdict,
+        intent: IntentGraph,
+        parse: TolerantParseResult,
+        mode: RepairMode,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        let allowed_op_tags = allowed_op_tags_for_mode(mode);
+        Self {
+            extension_id,
+            gating,
+            intent,
+            parse,
+            mode,
+            diagnostics,
+            allowed_op_tags,
+        }
+    }
+}
+
+/// Return the `PatchOp` tags allowed under the given repair mode.
+pub fn allowed_op_tags_for_mode(mode: RepairMode) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    if mode.should_apply() {
+        // Safe ops always allowed when repairs are active.
+        tags.extend_from_slice(&["replace_module_path", "rewrite_require"]);
+    }
+    if mode.allows_aggressive() {
+        // Aggressive ops only in AutoStrict.
+        tags.extend_from_slice(&["add_export", "remove_import", "inject_stub"]);
+    }
+    tags
+}
+
+// ---------------------------------------------------------------------------
+// Proposal validator and constrained applicator (bd-k5q5.9.4.3)
+// ---------------------------------------------------------------------------
+
+/// Validation error for a model-generated proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalValidationError {
+    /// Proposal contains zero operations.
+    EmptyProposal,
+    /// An operation uses a tag not allowed by the current mode.
+    DisallowedOp { tag: String },
+    /// Risk level exceeds what the mode permits.
+    RiskExceedsMode { risk: RepairRisk, mode: RepairMode },
+    /// The `rule_id` does not match any known rule.
+    UnknownRule { rule_id: String },
+    /// Proposal references a path that escapes the extension root.
+    MonotonicityViolation { path: String },
+}
+
+impl std::fmt::Display for ProposalValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyProposal => write!(f, "proposal has no operations"),
+            Self::DisallowedOp { tag } => write!(f, "op '{tag}' not allowed in current mode"),
+            Self::RiskExceedsMode { risk, mode } => {
+                write!(f, "{risk:?} risk not allowed in {mode:?} mode")
+            }
+            Self::UnknownRule { rule_id } => write!(f, "unknown rule: {rule_id}"),
+            Self::MonotonicityViolation { path } => {
+                write!(f, "path escapes extension root: {path}")
+            }
+        }
+    }
+}
+
+/// Validate a `PatchProposal` against policy constraints.
+///
+/// Checks:
+/// 1. Proposal is non-empty.
+/// 2. All ops are in the allowed tag set for the mode.
+/// 3. Overall risk does not exceed mode permissions.
+/// 4. The rule_id references a known rule (if non-empty).
+/// 5. Module paths stay within the extension root (monotonicity).
+pub fn validate_proposal(
+    proposal: &PatchProposal,
+    mode: RepairMode,
+    extension_root: Option<&Path>,
+) -> Vec<ProposalValidationError> {
+    let mut errors = Vec::new();
+
+    // 1. Non-empty.
+    if proposal.ops.is_empty() {
+        errors.push(ProposalValidationError::EmptyProposal);
+        return errors;
+    }
+
+    // 2. Allowed ops.
+    let allowed = allowed_op_tags_for_mode(mode);
+    for op in &proposal.ops {
+        if !allowed.contains(&op.tag()) {
+            errors.push(ProposalValidationError::DisallowedOp {
+                tag: op.tag().to_string(),
+            });
+        }
+    }
+
+    // 3. Risk check.
+    if !proposal.is_allowed_by(mode) {
+        errors.push(ProposalValidationError::RiskExceedsMode {
+            risk: proposal.max_risk(),
+            mode,
+        });
+    }
+
+    // 4. Known rule.
+    if !proposal.rule_id.is_empty() && rule_by_id(&proposal.rule_id).is_none() {
+        errors.push(ProposalValidationError::UnknownRule {
+            rule_id: proposal.rule_id.clone(),
+        });
+    }
+
+    // 5. Monotonicity for path-bearing ops.
+    if let Some(root) = extension_root {
+        for op in &proposal.ops {
+            let path_str = op_target_path(op);
+            let target = Path::new(&path_str);
+            if target.is_absolute() {
+                let verdict = verify_repair_monotonicity(root, root, target);
+                if !verdict.is_safe() {
+                    errors.push(ProposalValidationError::MonotonicityViolation {
+                        path: path_str,
+                    });
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+/// Extract the target path from a `PatchOp`.
+fn op_target_path(op: &PatchOp) -> String {
+    match op {
+        PatchOp::ReplaceModulePath { to, .. } => to.clone(),
+        PatchOp::AddExport { module_path, .. }
+        | PatchOp::RemoveImport { module_path, .. }
+        | PatchOp::RewriteRequire { module_path, .. } => module_path.clone(),
+        PatchOp::InjectStub { virtual_path, .. } => virtual_path.clone(),
+    }
+}
+
+/// Result of applying a validated proposal.
+#[derive(Debug, Clone)]
+pub struct ApplicationResult {
+    /// Whether the application succeeded.
+    pub success: bool,
+    /// Number of operations applied.
+    pub ops_applied: usize,
+    /// Human-readable summary.
+    pub summary: String,
+}
+
+/// Apply a validated proposal (dry-run: only validates and reports).
+///
+/// In the current implementation, actual file modifications are deferred
+/// to the module loader. This function validates and produces an audit
+/// record of what would be applied.
+pub fn apply_proposal(
+    proposal: &PatchProposal,
+    mode: RepairMode,
+    extension_root: Option<&Path>,
+) -> std::result::Result<ApplicationResult, Vec<ProposalValidationError>> {
+    let errors = validate_proposal(proposal, mode, extension_root);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    Ok(ApplicationResult {
+        success: true,
+        ops_applied: proposal.ops.len(),
+        summary: format!(
+            "Applied {} op(s) from rule '{}'",
+            proposal.ops.len(),
+            proposal.rule_id
+        ),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed human approval workflow (bd-k5q5.9.4.4)
+// ---------------------------------------------------------------------------
+
+/// Whether a proposal requires human approval before application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApprovalRequirement {
+    /// No approval needed — proposal can be applied automatically.
+    AutoApproved,
+    /// Human review required before applying.
+    RequiresApproval,
+}
+
+impl ApprovalRequirement {
+    /// True if human review is required.
+    pub const fn needs_approval(&self) -> bool {
+        matches!(self, Self::RequiresApproval)
+    }
+}
+
+impl std::fmt::Display for ApprovalRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AutoApproved => write!(f, "auto_approved"),
+            Self::RequiresApproval => write!(f, "requires_approval"),
+        }
+    }
+}
+
+/// An approval request presented to the human reviewer.
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    /// Extension being repaired.
+    pub extension_id: String,
+    /// The proposal awaiting approval.
+    pub proposal: PatchProposal,
+    /// Overall risk level.
+    pub risk: RepairRisk,
+    /// Confidence score from the scoring model.
+    pub confidence_score: f64,
+    /// Human-readable rationale from the proposal.
+    pub rationale: String,
+    /// Summary of what each operation does.
+    pub op_summaries: Vec<String>,
+}
+
+/// Human response to an approval request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalResponse {
+    /// Approved: apply the proposal.
+    Approved,
+    /// Rejected: discard the proposal.
+    Rejected,
+}
+
+/// Determine whether a proposal requires human approval.
+///
+/// The decision is fail-closed: any high-risk indicator triggers the
+/// approval requirement. A proposal requires approval if:
+/// - It contains any Aggressive-risk operations, OR
+/// - The confidence score is below the repairable threshold (0.5), OR
+/// - The mode is `AutoStrict` and the proposal touches 3+ operations.
+pub fn check_approval_requirement(
+    proposal: &PatchProposal,
+    confidence_score: f64,
+) -> ApprovalRequirement {
+    if proposal.max_risk() == RepairRisk::Aggressive {
+        return ApprovalRequirement::RequiresApproval;
+    }
+    if confidence_score < 0.5 {
+        return ApprovalRequirement::RequiresApproval;
+    }
+    if proposal.ops.len() >= 3 {
+        return ApprovalRequirement::RequiresApproval;
+    }
+    ApprovalRequirement::AutoApproved
+}
+
+/// Build an approval request for human review.
+pub fn build_approval_request(
+    extension_id: &str,
+    proposal: &PatchProposal,
+    confidence_score: f64,
+) -> ApprovalRequest {
+    let op_summaries = proposal
+        .ops
+        .iter()
+        .map(|op| format!("[{}] {}", op.tag(), op_target_path(op)))
+        .collect();
+
+    ApprovalRequest {
+        extension_id: extension_id.to_string(),
+        proposal: proposal.clone(),
+        risk: proposal.max_risk(),
+        confidence_score,
+        rationale: proposal.rationale.clone(),
+        op_summaries,
+    }
 }
 
 // ---------------------------------------------------------------------------

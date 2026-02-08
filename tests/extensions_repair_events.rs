@@ -13,11 +13,14 @@ mod common;
 
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
 use pi::extensions_js::{
-    compute_confidence, compute_gating_verdict, tolerant_parse, validate_repaired_artifact,
-    AmbiguitySignal, ConfidenceReport, ExtensionRepairEvent, GatingDecision, IntentGraph,
-    IntentSignal, MonotonicityVerdict, PatchOp, PatchProposal, PiJsRuntimeConfig, PiJsTickStats,
-    RepairMode, RepairPattern, RepairRisk, StructuralVerdict, TolerantParseResult,
-    REPAIR_REGISTRY_VERSION, REPAIR_RULES,
+    allowed_op_tags_for_mode, apply_proposal, build_approval_request,
+    check_approval_requirement, compute_confidence, compute_gating_verdict, detect_conflict,
+    resolve_conflicts, select_best_candidate, tolerant_parse, validate_proposal,
+    validate_repaired_artifact, AmbiguitySignal, ApprovalRequirement, ConfidenceReport,
+    ConflictKind, ExtensionRepairEvent, GatingDecision, IntentGraph, IntentSignal,
+    MonotonicityVerdict, PatchOp, PatchProposal, PiJsRuntimeConfig, PiJsTickStats,
+    ProposalValidationError, RepairMode, RepairPattern, RepairRisk, StructuralVerdict,
+    TolerantParseResult, REPAIR_REGISTRY_VERSION, REPAIR_RULES,
 };
 use pi::tools::ToolRegistry;
 use std::sync::Arc;
@@ -1643,6 +1646,408 @@ fn gating_verdict_confidence_preserved() {
     let verdict = compute_gating_verdict(&rich_intent(), &well_formed_parse());
     assert!(verdict.confidence.score > 0.0);
     assert!(!verdict.confidence.reasons.is_empty());
+}
+
+// ─── Minimal-diff candidate selector and conflict resolver (bd-k5q5.9.3.4) ──
+
+fn make_safe_proposal(rule_id: &str, from: &str, to: &str) -> PatchProposal {
+    PatchProposal {
+        rule_id: rule_id.to_string(),
+        ops: vec![PatchOp::ReplaceModulePath {
+            from: from.to_string(),
+            to: to.to_string(),
+        }],
+        rationale: "test".to_string(),
+        confidence: Some(0.9),
+    }
+}
+
+fn make_aggressive_proposal(rule_id: &str) -> PatchProposal {
+    PatchProposal {
+        rule_id: rule_id.to_string(),
+        ops: vec![PatchOp::InjectStub {
+            virtual_path: "/@stubs/test".to_string(),
+            source: "export default {};".to_string(),
+        }],
+        rationale: "test".to_string(),
+        confidence: Some(0.8),
+    }
+}
+
+#[test]
+fn select_prefers_safe_over_aggressive() {
+    let safe = make_safe_proposal("rule_a", "./a.js", "./b.ts");
+    let aggressive = make_aggressive_proposal("rule_b");
+    let candidates = vec![aggressive, safe];
+    let best = select_best_candidate(&candidates, RepairMode::AutoStrict).unwrap();
+    assert_eq!(best.rule_id, "rule_a", "should prefer safe proposal");
+}
+
+#[test]
+fn select_prefers_fewer_ops() {
+    let one_op = make_safe_proposal("rule_a", "./a.js", "./b.ts");
+    let two_ops = PatchProposal {
+        rule_id: "rule_b".to_string(),
+        ops: vec![
+            PatchOp::ReplaceModulePath {
+                from: "./a.js".to_string(),
+                to: "./b.ts".to_string(),
+            },
+            PatchOp::ReplaceModulePath {
+                from: "./c.js".to_string(),
+                to: "./d.ts".to_string(),
+            },
+        ],
+        rationale: "test".to_string(),
+        confidence: Some(0.9),
+    };
+    let candidates = vec![two_ops, one_op];
+    let best = select_best_candidate(&candidates, RepairMode::AutoSafe).unwrap();
+    assert_eq!(best.rule_id, "rule_a", "should prefer fewer ops");
+}
+
+#[test]
+fn select_prefers_higher_confidence() {
+    let high_conf = PatchProposal {
+        rule_id: "rule_a".to_string(),
+        ops: vec![PatchOp::ReplaceModulePath {
+            from: "./a.js".to_string(),
+            to: "./b.ts".to_string(),
+        }],
+        rationale: "test".to_string(),
+        confidence: Some(0.95),
+    };
+    let low_conf = PatchProposal {
+        rule_id: "rule_b".to_string(),
+        ops: vec![PatchOp::ReplaceModulePath {
+            from: "./c.js".to_string(),
+            to: "./d.ts".to_string(),
+        }],
+        rationale: "test".to_string(),
+        confidence: Some(0.5),
+    };
+    let candidates = vec![low_conf, high_conf];
+    let best = select_best_candidate(&candidates, RepairMode::AutoSafe).unwrap();
+    assert_eq!(best.rule_id, "rule_a", "should prefer higher confidence");
+}
+
+#[test]
+fn select_filters_by_mode() {
+    let aggressive = make_aggressive_proposal("rule_a");
+    let candidates = vec![aggressive];
+    // AutoSafe shouldn't allow aggressive proposals.
+    let result = select_best_candidate(&candidates, RepairMode::AutoSafe);
+    assert!(result.is_none(), "AutoSafe should not select aggressive proposal");
+}
+
+#[test]
+fn select_returns_none_for_empty() {
+    let result = select_best_candidate(&[], RepairMode::AutoSafe);
+    assert!(result.is_none());
+}
+
+#[test]
+fn conflict_none_for_different_paths() {
+    let a = make_safe_proposal("rule_a", "./a.js", "./b.ts");
+    let b = make_safe_proposal("rule_b", "./c.js", "./d.ts");
+    assert!(detect_conflict(&a, &b).is_clear());
+}
+
+#[test]
+fn conflict_detected_for_same_module_path() {
+    let a = make_safe_proposal("rule_a", "./shared.js", "./b.ts");
+    let b = make_safe_proposal("rule_b", "./shared.js", "./c.ts");
+    let conflict = detect_conflict(&a, &b);
+    assert!(
+        matches!(conflict, ConflictKind::SameModulePath(ref p) if p == "./shared.js"),
+        "expected SameModulePath, got {conflict:?}"
+    );
+}
+
+#[test]
+fn conflict_detected_for_same_virtual_path() {
+    let a = PatchProposal {
+        rule_id: "rule_a".to_string(),
+        ops: vec![PatchOp::InjectStub {
+            virtual_path: "/@stubs/shared".to_string(),
+            source: "v1".to_string(),
+        }],
+        rationale: "test".to_string(),
+        confidence: None,
+    };
+    let b = PatchProposal {
+        rule_id: "rule_b".to_string(),
+        ops: vec![PatchOp::InjectStub {
+            virtual_path: "/@stubs/shared".to_string(),
+            source: "v2".to_string(),
+        }],
+        rationale: "test".to_string(),
+        confidence: None,
+    };
+    let conflict = detect_conflict(&a, &b);
+    assert!(matches!(conflict, ConflictKind::SameVirtualPath(_)));
+}
+
+#[test]
+fn resolve_conflicts_drops_lower_ranked() {
+    let better = make_safe_proposal("rule_a", "./shared.js", "./b.ts");
+    let worse = PatchProposal {
+        rule_id: "rule_b".to_string(),
+        ops: vec![
+            PatchOp::ReplaceModulePath {
+                from: "./shared.js".to_string(),
+                to: "./c.ts".to_string(),
+            },
+            PatchOp::ReplaceModulePath {
+                from: "./x.js".to_string(),
+                to: "./y.ts".to_string(),
+            },
+        ],
+        rationale: "test".to_string(),
+        confidence: Some(0.5),
+    };
+    let proposals = [better, worse];
+    let accepted = resolve_conflicts(&proposals);
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].rule_id, "rule_a");
+}
+
+#[test]
+fn resolve_conflicts_keeps_non_conflicting() {
+    let a = make_safe_proposal("rule_a", "./a.js", "./b.ts");
+    let b = make_safe_proposal("rule_b", "./c.js", "./d.ts");
+    let proposals = [a, b];
+    let accepted = resolve_conflicts(&proposals);
+    assert_eq!(accepted.len(), 2);
+}
+
+#[test]
+fn resolve_conflicts_empty_input() {
+    let accepted = resolve_conflicts(&[]);
+    assert!(accepted.is_empty());
+}
+
+#[test]
+fn conflict_kind_display() {
+    assert!(ConflictKind::None.is_clear());
+    assert!(!ConflictKind::SameModulePath("x".to_string()).is_clear());
+    assert!(!ConflictKind::SameVirtualPath("y".to_string()).is_clear());
+}
+
+// ─── Bounded-context model proposer adapter (bd-k5q5.9.4.2) ─────────────────
+
+#[test]
+fn allowed_ops_auto_safe_only_safe() {
+    let tags = allowed_op_tags_for_mode(RepairMode::AutoSafe);
+    assert!(tags.contains(&"replace_module_path"));
+    assert!(tags.contains(&"rewrite_require"));
+    assert!(!tags.contains(&"inject_stub"));
+    assert!(!tags.contains(&"add_export"));
+}
+
+#[test]
+fn allowed_ops_auto_strict_includes_aggressive() {
+    let tags = allowed_op_tags_for_mode(RepairMode::AutoStrict);
+    assert!(tags.contains(&"replace_module_path"));
+    assert!(tags.contains(&"inject_stub"));
+    assert!(tags.contains(&"add_export"));
+    assert!(tags.contains(&"remove_import"));
+}
+
+#[test]
+fn allowed_ops_off_returns_empty() {
+    let tags = allowed_op_tags_for_mode(RepairMode::Off);
+    assert!(tags.is_empty());
+}
+
+#[test]
+fn allowed_ops_suggest_returns_empty() {
+    let tags = allowed_op_tags_for_mode(RepairMode::Suggest);
+    assert!(tags.is_empty());
+}
+
+// ─── Proposal validator and applicator (bd-k5q5.9.4.3) ──────────────────────
+
+#[test]
+fn validate_empty_proposal_rejected() {
+    let proposal = PatchProposal {
+        rule_id: "dist_to_src_v1".to_string(),
+        ops: vec![],
+        rationale: "test".to_string(),
+        confidence: None,
+    };
+    let errors = validate_proposal(&proposal, RepairMode::AutoSafe, None);
+    assert!(errors.contains(&ProposalValidationError::EmptyProposal));
+}
+
+#[test]
+fn validate_safe_proposal_in_auto_safe() {
+    let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
+    let errors = validate_proposal(&proposal, RepairMode::AutoSafe, None);
+    assert!(errors.is_empty(), "safe proposal should pass in AutoSafe: {errors:?}");
+}
+
+#[test]
+fn validate_aggressive_proposal_rejected_in_auto_safe() {
+    let proposal = make_aggressive_proposal("monorepo_escape_v1");
+    let errors = validate_proposal(&proposal, RepairMode::AutoSafe, None);
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            ProposalValidationError::DisallowedOp { .. }
+                | ProposalValidationError::RiskExceedsMode { .. }
+        )),
+        "aggressive proposal should fail in AutoSafe: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_aggressive_proposal_passes_in_auto_strict() {
+    let proposal = make_aggressive_proposal("monorepo_escape_v1");
+    let errors = validate_proposal(&proposal, RepairMode::AutoStrict, None);
+    assert!(errors.is_empty(), "aggressive should pass in AutoStrict: {errors:?}");
+}
+
+#[test]
+fn validate_unknown_rule_rejected() {
+    let proposal = PatchProposal {
+        rule_id: "nonexistent_rule_v99".to_string(),
+        ops: vec![PatchOp::ReplaceModulePath {
+            from: "./a.js".to_string(),
+            to: "./b.ts".to_string(),
+        }],
+        rationale: "test".to_string(),
+        confidence: None,
+    };
+    let errors = validate_proposal(&proposal, RepairMode::AutoSafe, None);
+    assert!(
+        errors.iter().any(|e| matches!(e, ProposalValidationError::UnknownRule { .. })),
+        "unknown rule should be flagged: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_empty_rule_id_accepted() {
+    let proposal = PatchProposal {
+        rule_id: String::new(),
+        ops: vec![PatchOp::ReplaceModulePath {
+            from: "./a.js".to_string(),
+            to: "./b.ts".to_string(),
+        }],
+        rationale: "test".to_string(),
+        confidence: None,
+    };
+    let errors = validate_proposal(&proposal, RepairMode::AutoSafe, None);
+    assert!(
+        !errors.iter().any(|e| matches!(e, ProposalValidationError::UnknownRule { .. })),
+        "empty rule_id should not trigger unknown rule"
+    );
+}
+
+#[test]
+fn apply_valid_proposal_succeeds() {
+    let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
+    let result = apply_proposal(&proposal, RepairMode::AutoSafe, None);
+    assert!(result.is_ok());
+    let app = result.unwrap();
+    assert!(app.success);
+    assert_eq!(app.ops_applied, 1);
+    assert!(app.summary.contains("dist_to_src_v1"));
+}
+
+#[test]
+fn apply_invalid_proposal_returns_errors() {
+    let proposal = PatchProposal {
+        rule_id: "dist_to_src_v1".to_string(),
+        ops: vec![],
+        rationale: "test".to_string(),
+        confidence: None,
+    };
+    let result = apply_proposal(&proposal, RepairMode::AutoSafe, None);
+    assert!(result.is_err());
+}
+
+#[test]
+fn validation_error_display() {
+    let err = ProposalValidationError::EmptyProposal;
+    assert!(err.to_string().contains("no operations"));
+
+    let err2 = ProposalValidationError::DisallowedOp {
+        tag: "inject_stub".to_string(),
+    };
+    assert!(err2.to_string().contains("inject_stub"));
+}
+
+// ─── Fail-closed human approval workflow (bd-k5q5.9.4.4) ────────────────────
+
+#[test]
+fn safe_proposal_auto_approved() {
+    let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
+    let req = check_approval_requirement(&proposal, 0.9);
+    assert_eq!(req, ApprovalRequirement::AutoApproved);
+    assert!(!req.needs_approval());
+}
+
+#[test]
+fn aggressive_proposal_requires_approval() {
+    let proposal = make_aggressive_proposal("monorepo_escape_v1");
+    let req = check_approval_requirement(&proposal, 0.9);
+    assert_eq!(req, ApprovalRequirement::RequiresApproval);
+    assert!(req.needs_approval());
+}
+
+#[test]
+fn low_confidence_requires_approval() {
+    let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
+    let req = check_approval_requirement(&proposal, 0.3);
+    assert_eq!(req, ApprovalRequirement::RequiresApproval);
+}
+
+#[test]
+fn many_ops_requires_approval() {
+    let proposal = PatchProposal {
+        rule_id: "dist_to_src_v1".to_string(),
+        ops: vec![
+            PatchOp::ReplaceModulePath {
+                from: "./a.js".to_string(),
+                to: "./b.ts".to_string(),
+            },
+            PatchOp::ReplaceModulePath {
+                from: "./c.js".to_string(),
+                to: "./d.ts".to_string(),
+            },
+            PatchOp::RewriteRequire {
+                module_path: "./e.js".to_string(),
+                from_specifier: "old".to_string(),
+                to_specifier: "new".to_string(),
+            },
+        ],
+        rationale: "test".to_string(),
+        confidence: Some(0.9),
+    };
+    let req = check_approval_requirement(&proposal, 0.9);
+    assert_eq!(req, ApprovalRequirement::RequiresApproval);
+}
+
+#[test]
+fn approval_request_has_op_summaries() {
+    let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
+    let req = build_approval_request("test-ext", &proposal, 0.8);
+    assert_eq!(req.extension_id, "test-ext");
+    assert_eq!(req.op_summaries.len(), 1);
+    assert!(req.op_summaries[0].contains("replace_module_path"));
+}
+
+#[test]
+fn approval_requirement_display() {
+    assert_eq!(
+        ApprovalRequirement::AutoApproved.to_string(),
+        "auto_approved"
+    );
+    assert_eq!(
+        ApprovalRequirement::RequiresApproval.to_string(),
+        "requires_approval"
+    );
 }
 
 use std::path::Path;
