@@ -866,6 +866,11 @@ impl Capability {
     pub const fn is_dangerous(self) -> bool {
         matches!(self, Self::Exec | Self::Env)
     }
+
+    /// List of all dangerous capabilities.
+    pub const fn dangerous_list() -> &'static [Self] {
+        &[Self::Exec, Self::Env]
+    }
 }
 
 impl std::fmt::Display for Capability {
@@ -1048,8 +1053,7 @@ impl ExtensionPolicy {
             };
         }
 
-        let ext_override = extension_id
-            .and_then(|id| self.per_extension.get(id));
+        let ext_override = extension_id.and_then(|id| self.per_extension.get(id));
 
         // Layer 1: per-extension deny.
         if let Some(ovr) = ext_override {
@@ -1101,9 +1105,7 @@ impl ExtensionPolicy {
             .any(|cap| cap.eq_ignore_ascii_case(&normalized));
 
         // Layer 5: mode fallback (use per-extension mode if set).
-        let effective_mode = ext_override
-            .and_then(|ovr| ovr.mode)
-            .unwrap_or(self.mode);
+        let effective_mode = ext_override.and_then(|ovr| ovr.mode).unwrap_or(self.mode);
 
         match effective_mode {
             ExtensionPolicyMode::Strict => PolicyCheck {
@@ -8224,7 +8226,11 @@ impl ExtensionManager {
         guard.host_actions.clone()
     }
 
-    fn cached_policy_prompt_decision(&self, extension_id: &str, capability: &str) -> Option<bool> {
+    pub fn cached_policy_prompt_decision(
+        &self,
+        extension_id: &str,
+        capability: &str,
+    ) -> Option<bool> {
         let guard = self.inner.lock().unwrap();
         guard
             .policy_prompt_cache
@@ -8233,7 +8239,7 @@ impl ExtensionManager {
             .copied()
     }
 
-    fn cache_policy_prompt_decision(&self, extension_id: &str, capability: &str, allow: bool) {
+    pub fn cache_policy_prompt_decision(&self, extension_id: &str, capability: &str, allow: bool) {
         let mut guard = self.inner.lock().unwrap();
         guard
             .policy_prompt_cache

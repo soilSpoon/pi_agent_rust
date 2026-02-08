@@ -308,7 +308,7 @@ impl Config {
     }
 
     /// Merge two configurations, with `other` taking precedence.
-    fn merge(base: Self, other: Self) -> Self {
+    pub fn merge(base: Self, other: Self) -> Self {
         Self {
             // Appearance
             theme: other.theme.or(base.theme),
@@ -1398,10 +1398,7 @@ mod tests {
     fn extension_policy_cli_override_safe() {
         let config = Config::default();
         let policy = config.resolve_extension_policy(Some("safe"));
-        assert_eq!(
-            policy.mode,
-            crate::extensions::ExtensionPolicyMode::Strict
-        );
+        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Strict);
         assert!(policy.deny_caps.contains(&"exec".to_string()));
     }
 
@@ -1427,10 +1424,7 @@ mod tests {
 
         let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
         let policy = config.resolve_extension_policy(None);
-        assert_eq!(
-            policy.mode,
-            crate::extensions::ExtensionPolicyMode::Strict
-        );
+        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Strict);
     }
 
     #[test]
@@ -1495,27 +1489,19 @@ mod tests {
     fn extension_policy_unknown_profile_defaults_to_standard() {
         let config = Config::default();
         let policy = config.resolve_extension_policy(Some("unknown-value"));
-        assert_eq!(
-            policy.mode,
-            crate::extensions::ExtensionPolicyMode::Prompt
-        );
+        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Prompt);
     }
 
     #[test]
     fn extension_policy_deserializes_camel_case() {
-        let json =
-            r#"{ "extensionPolicy": { "profile": "safe", "allowDangerous": false } }"#;
+        let json = r#"{ "extensionPolicy": { "profile": "safe", "allowDangerous": false } }"#;
         let config: Config = serde_json::from_str(json).expect("parse");
         assert_eq!(
             config.extension_policy.as_ref().unwrap().profile.as_deref(),
             Some("safe")
         );
         assert_eq!(
-            config
-                .extension_policy
-                .as_ref()
-                .unwrap()
-                .allow_dangerous,
+            config.extension_policy.as_ref().unwrap().allow_dangerous,
             Some(false)
         );
     }
