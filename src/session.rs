@@ -21,8 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::io::IsTerminal;
-use std::io::Write;
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -605,46 +604,70 @@ impl Session {
     }
 
     async fn open_jsonl_with_diagnostics(path: &Path) -> Result<(Self, SessionOpenDiagnostics)> {
-        let content = asupersync::fs::read_to_string(path).await?;
-        let mut lines = content.lines();
+        let path_buf = path.to_path_buf();
+        let (tx, rx) = oneshot::channel();
 
-        // Parse header (first line)
-        let header: SessionHeader = lines
-            .next()
-            .map(serde_json::from_str)
-            .transpose()?
-            .ok_or_else(|| crate::Error::session("Empty session file"))?;
+        thread::spawn(move || {
+            let res = (|| -> Result<(Self, SessionOpenDiagnostics)> {
+                let file = std::fs::File::open(&path_buf)
+                    .map_err(|e| crate::Error::Io(Box::new(e)))?;
+                let reader = BufReader::new(file);
+                let mut lines = reader.lines();
 
-        // Parse entries
-        let mut entries = Vec::new();
-        let mut diagnostics = SessionOpenDiagnostics::default();
-        for (line_num, line) in lines.enumerate() {
-            match serde_json::from_str::<SessionEntry>(line) {
-                Ok(entry) => entries.push(entry),
-                Err(e) => {
-                    diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
-                        line_number: line_num + 2, // +2 for 1-based indexing and header line
-                        error: e.to_string(),
-                    });
+                // Parse header (first line)
+                let header_line = lines
+                    .next()
+                    .ok_or_else(|| crate::Error::session("Empty session file"))?
+                    .map_err(|e| crate::Error::session(format!("Failed to read header: {e}")))?;
+
+                let header: SessionHeader = serde_json::from_str(&header_line)
+                    .map_err(|e| crate::Error::session(format!("Invalid header: {e}")))?;
+
+                // Parse entries
+                let mut entries = Vec::new();
+                let mut diagnostics = SessionOpenDiagnostics::default();
+
+                for (line_num, line_res) in lines.enumerate() {
+                    let line = line_res.map_err(|e| {
+                        crate::Error::session(format!("Failed to read line {}: {e}", line_num + 2))
+                    })?;
+
+                    match serde_json::from_str::<SessionEntry>(&line) {
+                        Ok(entry) => entries.push(entry),
+                        Err(e) => {
+                            diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
+                                line_number: line_num + 2, // +2 for 1-based indexing and header line
+                                error: e.to_string(),
+                            });
+                        }
+                    }
                 }
-            }
-        }
 
-        ensure_entry_ids(&mut entries);
+                ensure_entry_ids(&mut entries);
 
-        let leaf_id = entries.iter().rev().find_map(|e| e.base_id().cloned());
+                let leaf_id = entries.iter().rev().find_map(|e| e.base_id().cloned());
 
-        Ok((
-            Self {
-                header,
-                entries,
-                path: Some(path.to_path_buf()),
-                leaf_id,
-                session_dir: None,
-                store_kind: SessionStoreKind::Jsonl,
-            },
-            diagnostics,
-        ))
+                Ok((
+                    Self {
+                        header,
+                        entries,
+                        path: Some(path_buf),
+                        leaf_id,
+                        session_dir: None,
+                        store_kind: SessionStoreKind::Jsonl,
+                    },
+                    diagnostics,
+                ))
+            })();
+
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
+        });
+
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
+            .await
+            .map_err(|_| crate::Error::session("Open task cancelled"))?
     }
 
     #[cfg(feature = "sqlite-sessions")]
@@ -1714,27 +1737,34 @@ fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
 }
 
 fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
-    let content = std::fs::read_to_string(path)
+    let file = std::fs::File::open(path)
         .map_err(|e| Error::session(format!("Failed to read session: {e}")))?;
-    let mut lines = content.lines();
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
     let header_line = lines
         .next()
-        .ok_or_else(|| Error::session("Empty session file"))?;
+        .ok_or_else(|| Error::session("Empty session file"))?
+        .map_err(|e| Error::session(format!("Failed to read header: {e}")))?;
+
     let header: SessionHeader =
-        serde_json::from_str(header_line).map_err(|e| Error::session(format!("{e}")))?;
+        serde_json::from_str(&header_line).map_err(|e| Error::session(format!("{e}")))?;
 
     let mut message_count = 0u64;
     let mut name = None;
+
     for line in lines {
-        if let Ok(entry) = serde_json::from_str::<SessionEntry>(line) {
-            match entry {
-                SessionEntry::Message(_) => message_count += 1,
-                SessionEntry::SessionInfo(info) => {
-                    if info.name.is_some() {
-                        name = info.name;
+        if let Ok(line_content) = line {
+            if let Ok(entry) = serde_json::from_str::<SessionEntry>(&line_content) {
+                match entry {
+                    SessionEntry::Message(_) => message_count += 1,
+                    SessionEntry::SessionInfo(info) => {
+                        if info.name.is_some() {
+                            name = info.name;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }

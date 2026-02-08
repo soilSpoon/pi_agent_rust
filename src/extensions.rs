@@ -257,6 +257,8 @@ impl CompatibilityScanner {
         forbidden: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
         flagged: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
     ) {
+        const LONG_LINE_COMMENT_BYPASS_LEN: usize = 4096;
+
         let Ok(content) = fs::read_to_string(path) else {
             return;
         };
@@ -267,15 +269,31 @@ impl CompatibilityScanner {
         for (idx, raw_line) in content.lines().enumerate() {
             let line_no = idx + 1;
             let stripped = strip_js_comments(raw_line, &mut in_block_comment);
-            let trimmed = stripped.trim_end().to_string();
-            if trimmed.is_empty() {
+            let trimmed = stripped.trim_end();
+            let raw_trimmed = raw_line.trim_end();
+
+            // Comment stripping is line-oriented and intentionally lightweight. For very long
+            // minified lines, regex literals can confuse comment stripping and truncate the line
+            // before later import/require calls. For those cases, prefer raw text to avoid
+            // dropping capability evidence from bundled artifacts.
+            let scan_text = if raw_trimmed.len() >= LONG_LINE_COMMENT_BYPASS_LEN
+                && trimmed.len() < raw_trimmed.len()
+            {
+                raw_trimmed
+            } else {
+                trimmed
+            };
+
+            if scan_text.is_empty() {
                 continue;
             }
 
-            Self::scan_imports_in_line(&rel, line_no, &trimmed, caps, rewrites, forbidden, flagged);
-            Self::scan_pi_apis_in_line(&rel, line_no, &trimmed, caps);
-            Self::scan_flagged_apis_in_line(&rel, line_no, &trimmed, flagged);
-            Self::scan_forbidden_patterns_in_line(&rel, line_no, &trimmed, forbidden);
+            Self::scan_imports_in_line(
+                &rel, line_no, scan_text, caps, rewrites, forbidden, flagged,
+            );
+            Self::scan_pi_apis_in_line(&rel, line_no, scan_text, caps);
+            Self::scan_flagged_apis_in_line(&rel, line_no, scan_text, flagged);
+            Self::scan_forbidden_patterns_in_line(&rel, line_no, scan_text, forbidden);
         }
     }
 
@@ -946,6 +964,29 @@ pi.exec("echo hello");
         );
         assert!(ledger.forbidden.is_empty());
         assert!(ledger.flagged.is_empty());
+    }
+
+    #[test]
+    fn compatibility_scanner_keeps_late_requires_in_minified_lines() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sample =
+            repo_root.join("tests/ext_conformance/artifacts/doom-overlay/doom/build/doom.js");
+        let sample_content = fs::read_to_string(&sample).expect("read minified sample bundle");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let entry = temp.path().join("bundle.js");
+        fs::write(&entry, sample_content).expect("write bundle sample");
+
+        let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
+        let ledger = scanner.scan_path(&entry).expect("scan");
+
+        assert!(
+            ledger
+                .capabilities
+                .iter()
+                .any(|cap| cap.capability == "exec" && cap.reason == "import:child_process"),
+            "minified bundle should still infer exec capability from child_process require"
+        );
     }
 }
 

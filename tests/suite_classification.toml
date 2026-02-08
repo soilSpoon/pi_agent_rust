@@ -108,6 +108,8 @@ files = [
     "provider_streaming",
     "repro_config_error",
     "repro_edit_encoding",
+    "reproduce_bom_bug",
+    "reproduce_edit_whitespace",
     "repro_sse_flush",
     "release_evidence_gate",
     "release_readiness",

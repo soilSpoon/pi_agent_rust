@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use tempfile::tempdir;
 
 fn project_root() -> PathBuf {
@@ -33,6 +34,8 @@ fn manifest_path() -> PathBuf {
 fn provenance_path() -> PathBuf {
     project_root().join("docs/extension-artifact-provenance.json")
 }
+
+static CONFORMANCE_REPORT_IO_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 // ─── Data Structures ─────────────────────────────────────────────────────────
 
@@ -699,9 +702,8 @@ fn generate_markdown(
 
 // ─── Test Entry Points ──────────────────────────────────────────────────────
 
-#[test]
 #[allow(clippy::too_many_lines)]
-fn generate_conformance_report() {
+fn generate_conformance_report_impl() {
     let reports = reports_dir();
     let _ = std::fs::create_dir_all(&reports);
 
@@ -920,6 +922,27 @@ fn generate_conformance_report() {
 }
 
 #[test]
+fn generate_conformance_report() {
+    let _guard = CONFORMANCE_REPORT_IO_LOCK
+        .lock()
+        .expect("acquire conformance report IO lock");
+    generate_conformance_report_impl();
+}
+
+fn read_or_regenerate_conformance_events() -> Vec<Value> {
+    let _guard = CONFORMANCE_REPORT_IO_LOCK
+        .lock()
+        .expect("acquire conformance report IO lock");
+    let events_path = reports_dir().join("conformance_events.jsonl");
+    let mut events = read_jsonl_file(&events_path);
+    if events.is_empty() {
+        generate_conformance_report_impl();
+        events = read_jsonl_file(&events_path);
+    }
+    events
+}
+
+#[test]
 fn report_reads_manifest() {
     // Verify the manifest can be read and parsed
     let manifest_content =
@@ -1050,13 +1073,7 @@ fn smoke_report_log_prefers_canonical_extensions_path() {
 #[test]
 fn evidence_links_valid() {
     // Verify that all evidence file links in JSONL point to files that actually exist
-    let events_path = reports_dir().join("conformance_events.jsonl");
-    if !events_path.exists() {
-        eprintln!("No conformance_events.jsonl yet — skipping evidence validation");
-        return;
-    }
-
-    let events = read_jsonl_file(&events_path);
+    let events = read_or_regenerate_conformance_events();
     assert!(!events.is_empty(), "events file should have entries");
 
     let mut checked = 0u32;
@@ -1242,13 +1259,7 @@ fn exception_policy_covers_full_conformance_failures() {
 
 #[test]
 fn events_jsonl_has_capabilities() {
-    let events_path = reports_dir().join("conformance_events.jsonl");
-    if !events_path.exists() {
-        eprintln!("No conformance_events.jsonl yet — skipping");
-        return;
-    }
-
-    let events = read_jsonl_file(&events_path);
+    let events = read_or_regenerate_conformance_events();
     assert!(!events.is_empty(), "events file should have entries");
 
     // Every event should have capabilities and registrations fields

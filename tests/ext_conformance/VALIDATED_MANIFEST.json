@@ -40,7 +40,9 @@
           "AskUserQuestion",
           "session_query"
         ],
-        "commands": [],
+        "commands": [
+          "handoff"
+        ],
         "flags": [],
         "event_handlers": [
           "SIGINT",
@@ -1503,7 +1505,9 @@
         "tools": [
           "lsp"
         ],
-        "commands": [],
+        "commands": [
+          "lsp"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
@@ -3174,7 +3178,7 @@
       "entry_path": "npm/aliou-pi-linkup/src/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -3191,8 +3195,14 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "linkup_web_answer",
+          "linkup_web_fetch",
+          "linkup_web_search"
+        ],
+        "commands": [
+          "linkup:balance"
+        ],
         "flags": [],
         "event_handlers": [
           "session_start"
@@ -3272,7 +3282,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": [],
+        "commands": [
+          "synthetic:quotas"
+        ],
         "flags": [],
         "event_handlers": [
           "session_start"
@@ -3565,7 +3577,7 @@
       "entry_path": "npm/lsp-pi/lsp.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -3596,7 +3608,9 @@
         "exec"
       ],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "lsp"
+        ],
         "commands": [
           "lsp"
         ],
@@ -3623,7 +3637,7 @@
       "entry_path": "npm/marckrenn-pi-sub-bar/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -3659,7 +3673,8 @@
         "tools": [],
         "commands": [
           "sub-bar:import",
-          "sub-bar:settings"
+          "sub-bar:settings",
+          "sub-core:settings"
         ],
         "flags": [],
         "event_handlers": [
@@ -3740,7 +3755,7 @@
       "entry_path": "npm/mitsupi/pi-extensions/answer.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": true,
         "registers_providers": false,
@@ -3769,9 +3784,21 @@
         "exec"
       ],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "list_sessions",
+          "send_to_session",
+          "signal_loop_success",
+          "todo"
+        ],
         "commands": [
-          "answer"
+          "answer",
+          "control-sessions",
+          "diff",
+          "end-review",
+          "files",
+          "loop",
+          "review",
+          "todos"
         ],
         "flags": [],
         "event_handlers": [
@@ -3937,7 +3964,7 @@
       "entry_path": "npm/pi-amplike/extensions/handoff.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -3952,7 +3979,9 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "session_query"
+        ],
         "commands": [
           "handoff"
         ],
@@ -4029,7 +4058,12 @@
       "registrations": {
         "tools": [],
         "commands": [
-          "bash-confirm"
+          "bash-confirm",
+          "demo-bash-confirm",
+          "test-bash-confirm",
+          "test-edit-mode",
+          "test-safe-patterns",
+          "test-unsafe-patterns"
         ],
         "flags": [],
         "event_handlers": [
@@ -4152,7 +4186,7 @@
       "entry_path": "npm/pi-extensions/agent-guidance/agent-guidance.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -4176,8 +4210,25 @@
         "exec"
       ],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "ralph_done",
+          "ralph_start"
+        ],
+        "commands": [
+          "code",
+          "diff",
+          "mario-not",
+          "paste",
+          "picman",
+          "ping",
+          "ralph",
+          "ralph-stop",
+          "readfiles",
+          "review",
+          "spice-invaders",
+          "tetris",
+          "usage"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
@@ -4593,7 +4644,7 @@
       "entry_path": "npm/pi-package-test/extensions/confirm-destructive.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": true,
         "registers_providers": false,
@@ -4623,8 +4674,28 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "signal_loop_success"
+        ],
+        "commands": [
+          "cost",
+          "flicker-corp",
+          "footer",
+          "fun-working",
+          "handoff",
+          "loop",
+          "mem",
+          "oracle",
+          "plan",
+          "remember",
+          "signature-flicker",
+          "speedread",
+          "status",
+          "status-refresh",
+          "todos",
+          "ultrathink",
+          "usage"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
@@ -5551,7 +5622,24 @@
           "plan",
           "signal_loop_success"
         ],
-        "commands": [],
+        "commands": [
+          "cost",
+          "flicker-corp",
+          "fun-working",
+          "handoff",
+          "loop",
+          "mem",
+          "oracle",
+          "plan",
+          "remember",
+          "resistance",
+          "signature-flicker",
+          "speedread",
+          "status",
+          "status-refresh",
+          "ultrathink",
+          "usage"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
@@ -5587,7 +5675,11 @@
       "registrations": {
         "tools": [],
         "commands": [
-          "spice-invaders"
+          "mario-not",
+          "picman",
+          "ping",
+          "spice-invaders",
+          "tetris"
         ],
         "flags": [],
         "event_handlers": []
@@ -5673,7 +5765,9 @@
           "mcp_list",
           "subagent"
         ],
-        "commands": [],
+        "commands": [
+          "powerline"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
@@ -6542,7 +6636,7 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [],
-        "uses_exec": true,
+        "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
         "uses_session": false,
@@ -6550,9 +6644,7 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": [
-        "exec"
-      ],
+      "mock_requirements": [],
       "registrations": {
         "tools": [
           "deploy_and_exit",
@@ -6841,6 +6933,15 @@
         ],
         "commands": [
           "ad-name",
+          "dumb-zone-status",
+          "extensions:update",
+          "plan:list",
+          "plan:save",
+          "processes",
+          "providers:toggle-widget",
+          "providers:usage",
+          "session:copy-id",
+          "session:copy-path",
           "system-prompt",
           "theme"
         ],
@@ -6870,10 +6971,10 @@
       "entry_path": "third-party/ben-vargas-pi-packages/pi-ancestor-discovery/extensions/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": true,
-        "registers_providers": false,
+        "registers_providers": true,
         "subscribes_events": [
           "model_select",
           "session_start"
@@ -6888,8 +6989,15 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "generate_image",
+          "get_code_context_exa",
+          "image_quota",
+          "web_search_exa"
+        ],
+        "commands": [
+          "synthetic-models"
+        ],
         "flags": [],
         "event_handlers": [
           "model_select",
@@ -6902,7 +7010,7 @@
       "entry_path": "third-party/charles-cooper-pi-extensions/per-model-system-prompt.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -6928,8 +7036,12 @@
         "exec"
       ],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "subagent"
+        ],
+        "commands": [
+          "subagent"
+        ],
         "flags": [],
         "event_handlers": [
           "before_agent_start",
@@ -7125,7 +7237,11 @@
         "tools": [
           "apply_patch"
         ],
-        "commands": [],
+        "commands": [
+          "assistant",
+          "codemap",
+          "skill"
+        ],
         "flags": [],
         "event_handlers": [
           "SIGINT",
@@ -7239,7 +7355,7 @@
       "entry_path": "third-party/marckrenn-pi-sub/sub-bar/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -7275,7 +7391,8 @@
         "tools": [],
         "commands": [
           "sub-bar:import",
-          "sub-bar:settings"
+          "sub-bar:settings",
+          "sub-core:settings"
         ],
         "flags": [],
         "event_handlers": [
@@ -7401,7 +7518,9 @@
       "registrations": {
         "tools": [],
         "commands": [
-          "diff"
+          "diff",
+          "files",
+          "tui"
         ],
         "flags": [],
         "event_handlers": [
@@ -7416,7 +7535,7 @@
       "entry_path": "third-party/pasky-pi-amplike/handoff.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -7431,7 +7550,9 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "session_query"
+        ],
         "commands": [
           "handoff"
         ],
@@ -7662,7 +7783,7 @@
       "entry_path": "third-party/w-winter-dot314/agentic-compaction/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": true,
         "registers_providers": false,
@@ -7708,8 +7829,49 @@
         "exec"
       ],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "brave_grounding",
+          "brave_search",
+          "questionnaire",
+          "rp",
+          "rp_bind",
+          "rp_exec",
+          "session_ask",
+          "session_lineage",
+          "todo"
+        ],
+        "commands": [
+          "ask",
+          "askwith",
+          "branch",
+          "code",
+          "command-center",
+          "end-review",
+          "ephemeral",
+          "files",
+          "followup",
+          "md",
+          "model-sysprompt-appendix",
+          "notify",
+          "oracle",
+          "plan",
+          "preset",
+          "review",
+          "rp",
+          "rp-tools-lock",
+          "rpbind",
+          "sandbox",
+          "session-ask",
+          "skill",
+          "speedread",
+          "steer",
+          "todos",
+          "tools",
+          "ultrathink",
+          "usage",
+          "vog",
+          "ws"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",

@@ -60,15 +60,9 @@ mod tests {
             // But let's say the file has "baz  " (2 spaces).
             fs::write(&file_path, "baz  ").unwrap();
 
-            // User provides "baz " (1 space).
-            // Exact match fails ("baz " != "baz  ").
-            // Fuzzy match logic:
-            // Norm file line: "baz". Norm old: "baz". Match.
-            // But "baz " provided by user has a space.
-            // `normalize_for_fuzzy_match_text` trims it.
-            // So we match "baz" against "baz".
-            // Replaces "baz" with "qux".
-            // Result: "qux  " (2 spaces preserved).
+            // User provides "baz " (1 space). This is an exact substring match at the
+            // beginning of "baz  ", so edit replacement happens in exact mode first.
+            // Result: "qux " (one trailing space remains).
 
             let output = tool
                 .execute(
@@ -85,7 +79,7 @@ mod tests {
 
             assert!(!output.is_error);
             let content = fs::read_to_string(&file_path).unwrap();
-            assert_eq!(content, "qux  ");
+            assert_eq!(content, "qux ");
         });
     }
 }

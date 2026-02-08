@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-08T02:11:50Z
+> Generated: 2026-02-08T08:35:19Z
 
 ## Summary
 
@@ -10,9 +10,9 @@
 | CI-enforced | 8 |
 | CI-enforced with data | 1 |
 | CI-enforced FAIL | 0 |
-| PASS | 3 |
+| PASS | 4 |
 | FAIL | 0 |
-| No data | 10 |
+| No data | 9 |
 
 ## Startup
 
@@ -40,7 +40,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | - | NO_DATA | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 51 | PASS | No |
 
 ## Policy
 
