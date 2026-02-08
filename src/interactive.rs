@@ -1922,23 +1922,15 @@ fn extension_commands_for_catalog(
 
 fn parse_bash_command(input: &str) -> Option<(String, bool)> {
     let trimmed = input.trim_start();
-    if trimmed.starts_with("!!") {
-        let command = trimmed.trim_start_matches("!!").trim();
-        if command.is_empty() {
-            None
-        } else {
-            Some((command.to_string(), true))
-        }
-    } else if trimmed.starts_with('!') {
-        let command = trimmed.trim_start_matches('!').trim();
-        if command.is_empty() {
-            None
-        } else {
-            Some((command.to_string(), false))
-        }
-    } else {
-        None
+    let (rest, force) = trimmed
+        .strip_prefix("!!")
+        .map(|r| (r, true))
+        .or_else(|| trimmed.strip_prefix('!').map(|r| (r, false)))?;
+    let command = rest.trim();
+    if command.is_empty() {
+        return None;
     }
+    Some((command.to_string(), force))
 }
 
 fn user_content_to_text(content: &UserContent) -> String {
@@ -7159,11 +7151,8 @@ impl PiApp {
                 }
 
                 // Update usage
-                if let Some(u) = usage {
-                    self.total_usage.input += u.input;
-                    self.total_usage.output += u.output;
-                    self.total_usage.total_tokens += u.total_tokens;
-                    self.total_usage.cost.total += u.cost.total;
+                if let Some(ref u) = usage {
+                    add_usage(&mut self.total_usage, u);
                 }
 
                 self.agent_state = AgentState::Idle;
@@ -7240,6 +7229,7 @@ impl PiApp {
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
                 self.abort_handle = None;
+                self.extension_streaming.store(false, Ordering::SeqCst);
                 self.extension_compacting.store(false, Ordering::SeqCst);
                 self.input.focus();
 
