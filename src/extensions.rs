@@ -5524,6 +5524,7 @@ impl JsExtensionRuntimeHandle {
     /// within the budget.
     pub async fn shutdown(&self, budget: Duration) -> bool {
         let cx = Cx::for_request();
+        let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
 
         // Send shutdown command (ignore error if channel already closed).
         let _ = self.sender.send(&cx, JsRuntimeCommand::Shutdown).await;
@@ -5541,16 +5542,27 @@ impl JsExtensionRuntimeHandle {
             return true;
         };
 
-        if timeout(wall_now(), budget, rx.recv(&cx)).await == Ok(Ok(())) {
-            true
-        } else {
-            let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
-            tracing::warn!(
-                event = "extension_runtime.shutdown_timeout",
-                budget_ms,
-                "JS extension runtime did not exit within cleanup budget"
-            );
-            false
+        match timeout(wall_now(), budget, rx.recv(&cx)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(err)) => {
+                // Sender dropped without explicit ack: runtime is gone, so cleanup is
+                // complete, but log for postmortem visibility.
+                tracing::warn!(
+                    event = "extension_runtime.shutdown_exit_signal_dropped",
+                    budget_ms,
+                    error = %err,
+                    "JS extension runtime exit signal channel closed before ack"
+                );
+                true
+            }
+            Err(_) => {
+                tracing::warn!(
+                    event = "extension_runtime.shutdown_timeout",
+                    budget_ms,
+                    "JS extension runtime did not exit within cleanup budget"
+                );
+                false
+            }
         }
     }
 
@@ -14568,6 +14580,26 @@ mod tests {
                 assert!(
                     manager.js_runtime().is_none(),
                     "runtime should be cleared after shutdown"
+                );
+            });
+        }
+
+        #[test]
+        fn runtime_shutdown_treats_closed_exit_signal_as_success() {
+            asupersync::test_utils::run_test(|| async {
+                let (sender, _rx) = mpsc::channel(1);
+                let (exit_tx, exit_rx) = oneshot::channel::<()>();
+                drop(exit_tx);
+
+                let runtime = JsExtensionRuntimeHandle {
+                    sender,
+                    exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
+                };
+
+                let ok = runtime.shutdown(Duration::from_secs(1)).await;
+                assert!(
+                    ok,
+                    "closed exit signal means runtime is already gone; shutdown should succeed"
                 );
             });
         }

@@ -264,6 +264,15 @@ impl PackageManager {
             .map_err(|_| Error::tool("package_manager", "Installed path lookup cancelled"))?
     }
 
+    /// Synchronous variant of [`Self::installed_path`] for startup fast paths.
+    pub fn installed_path_blocking(
+        &self,
+        source: &str,
+        scope: PackageScope,
+    ) -> Result<Option<PathBuf>> {
+        self.installed_path_sync(source, scope)
+    }
+
     fn installed_path_sync(&self, source: &str, scope: PackageScope) -> Result<Option<PathBuf>> {
         let parsed = parse_source(source, &self.cwd);
         Ok(match parsed {
@@ -289,6 +298,11 @@ impl PackageManager {
         rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "List packages task cancelled"))?
+    }
+
+    /// Synchronous variant of [`Self::list_packages`] for startup fast paths.
+    pub fn list_packages_blocking(&self) -> Result<Vec<PackageEntry>> {
+        self.list_packages_sync()
     }
 
     fn list_packages_sync(&self) -> Result<Vec<PackageEntry>> {

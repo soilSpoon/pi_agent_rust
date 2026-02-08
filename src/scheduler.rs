@@ -15,8 +15,8 @@
 //! - **I5 (total order):** all observable scheduling is ordered by seq
 
 use std::cmp::Ordering;
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
@@ -237,8 +237,8 @@ impl Clock for DeterministicClock {
 pub struct Scheduler<C: Clock = WallClock> {
     /// Monotone sequence counter.
     seq: Seq,
-    /// Macrotask queue (FIFO, ordered by seq).
-    macrotask_queue: VecDeque<Macrotask>,
+    /// Macrotask queue (Min-Heap via Reverse, ordered by seq).
+    macrotask_queue: BinaryHeap<Reverse<Macrotask>>,
     /// Timer heap (min-heap by deadline_ms, seq).
     timer_heap: BinaryHeap<TimerEntry>,
     /// Next timer ID.
@@ -269,7 +269,7 @@ impl<C: Clock> Scheduler<C> {
     pub fn with_clock(clock: C) -> Self {
         Self {
             seq: Seq::zero(),
-            macrotask_queue: VecDeque::new(),
+            macrotask_queue: BinaryHeap::new(),
             timer_heap: BinaryHeap::new(),
             next_timer_id: 1,
             cancelled_timers: std::collections::HashSet::new(),
@@ -365,7 +365,7 @@ impl<C: Clock> Scheduler<C> {
             "Hostcall completion enqueued"
         );
         let task = Macrotask::new(seq, MacrotaskKind::HostcallComplete { call_id, outcome });
-        self.macrotask_queue.push_back(task);
+        self.macrotask_queue.push(Reverse(task));
     }
 
     /// Convenience: enqueue a stream chunk for a hostcall.
@@ -396,7 +396,7 @@ impl<C: Clock> Scheduler<C> {
             "Inbound event enqueued"
         );
         let task = Macrotask::new(seq, MacrotaskKind::InboundEvent { event_id, payload });
-        self.macrotask_queue.push_back(task);
+        self.macrotask_queue.push(Reverse(task));
     }
 
     /// Move due timers from the timer heap to the macrotask queue.
@@ -422,21 +422,24 @@ impl<C: Clock> Scheduler<C> {
                 continue;
             }
 
-            // The timer keeps its original seq for ordering
+            // Preserve (deadline, timer-seq) order while assigning a fresh
+            // macrotask seq so queue ordering remains globally monotone.
+            let task_seq = self.next_seq();
             let task = Macrotask::new(
-                entry.seq,
+                task_seq,
                 MacrotaskKind::TimerFired {
                     timer_id: entry.timer_id,
                 },
             );
-            self.macrotask_queue.push_back(task);
+            self.macrotask_queue.push(Reverse(task));
 
             tracing::trace!(
                 event = "scheduler.timer.fire",
                 timer_id = entry.timer_id,
                 deadline_ms = entry.deadline_ms,
                 now_ms = now,
-                seq = %entry.seq,
+                timer_seq = %entry.seq,
+                macrotask_seq = %task_seq,
                 "Timer fired"
             );
         }
@@ -456,7 +459,7 @@ impl<C: Clock> Scheduler<C> {
         self.move_due_timers();
 
         // Step 3: Run one macrotask
-        let task = self.macrotask_queue.pop_front();
+        let task = self.macrotask_queue.pop().map(|Reverse(t)| t);
 
         if let Some(ref task) = task {
             tracing::debug!(
@@ -1332,15 +1335,14 @@ mod tests {
         sched.clock.advance(150);
 
         // Enqueue final stream chunk after timer.
-        sched.enqueue_stream_chunk("s1".to_string(), 1, serde_json::json!("b"), true);
+        sched.enqueue_stream_chunk("s1".to_string(), 1, serde_json::json!("b"), true); // seq=3
 
         let mut trace = Vec::new();
         while let Some(task) = sched.tick() {
             trace.push(trace_entry(&task));
         }
 
-        // Macrotask queue is drained first (FIFO); timers are only transferred
-        // when the macrotask queue is empty. So: chunk 0, chunk 1, then timer.
+        // Pending macrotasks run first; due timers are enqueued after existing work.
         assert_eq!(trace.len(), 3);
         assert!(
             trace[0].contains("s1") && trace[0].contains("chunk"),
@@ -1357,5 +1359,47 @@ mod tests {
             "third: timer, got: {}",
             trace[2]
         );
+    }
+
+    #[test]
+    fn scheduler_due_timers_do_not_preempt_queued_macrotasks() {
+        let clock = DeterministicClock::new(0);
+        let mut sched = Scheduler::with_clock(clock);
+
+        // 1. Set a timer T1. Deadline = 100ms.
+        let t1_id = sched.set_timeout(100);
+
+        // 2. Enqueue an event E1 before timer delivery.
+        sched.enqueue_event("E1".to_string(), serde_json::json!({}));
+
+        // 3. Advance time so T1 is due.
+        sched.clock.advance(100);
+
+        // 4. Tick 1: queued event executes first.
+        let task1 = sched.tick().expect("Should have a task");
+
+        // 5. Tick 2: timer executes next.
+        let task2 = sched.tick().expect("Should have a task");
+
+        let seq1 = task1.seq.value();
+        let seq2 = task2.seq.value();
+
+        // Global macrotask seq is monotone for externally observed execution.
+        assert!(
+            seq1 < seq2,
+            "Invariant I5 violation: Task execution not ordered by seq. Executed {seq1} then {seq2}"
+        );
+
+        if let MacrotaskKind::InboundEvent { event_id, .. } = task1.kind {
+            assert_eq!(event_id, "E1");
+        } else {
+            panic!("Expected InboundEvent first, got {:?}", task1.kind);
+        }
+
+        if let MacrotaskKind::TimerFired { timer_id } = task2.kind {
+            assert_eq!(timer_id, t1_id);
+        } else {
+            panic!("Expected TimerFired second, got {:?}", task2.kind);
+        }
     }
 }

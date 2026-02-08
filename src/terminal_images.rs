@@ -179,16 +179,47 @@ pub fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 
 fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     let mut i = 2;
-    while i + 1 < data.len() {
-        if data[i] != 0xFF {
+    while i < data.len() {
+        // Find marker prefix.
+        while i < data.len() && data[i] != 0xFF {
+            i += 1;
+        }
+        if i >= data.len() {
             return None;
         }
-        let marker = data[i + 1];
-        i += 2;
 
-        // SOF markers (baseline, progressive, etc.).
-        if matches!(marker, 0xC0..=0xC3) {
-            if i + 7 > data.len() {
+        // Skip any fill bytes (0xFF) to land on the marker byte.
+        while i < data.len() && data[i] == 0xFF {
+            i += 1;
+        }
+        if i >= data.len() {
+            return None;
+        }
+
+        let marker = data[i];
+        i += 1;
+
+        // Standalone markers without length payload.
+        if matches!(marker, 0x01 | 0xD0..=0xD7) {
+            continue;
+        }
+
+        // Start-of-scan or end-of-image reached before SOF.
+        if matches!(marker, 0xDA | 0xD9) {
+            return None;
+        }
+
+        if i + 1 >= data.len() {
+            return None;
+        }
+        let seg_len = usize::from(u16::from_be_bytes([data[i], data[i + 1]]));
+        if seg_len < 2 || i.saturating_add(seg_len) > data.len() {
+            return None;
+        }
+
+        // SOF markers (baseline/progressive and less-common extended variants).
+        if is_jpeg_sof_marker(marker) {
+            if seg_len < 7 {
                 return None;
             }
             let h = u32::from(u16::from_be_bytes([data[i + 3], data[i + 4]]));
@@ -196,14 +227,16 @@ fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
             return Some((w, h));
         }
 
-        // Skip segment.
-        if i + 1 >= data.len() {
-            return None;
-        }
-        let seg_len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
         i += seg_len;
     }
     None
+}
+
+const fn is_jpeg_sof_marker(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +379,47 @@ mod tests {
 
         let dims = image_dimensions(&data);
         assert_eq!(dims, Some((100, 50)));
+    }
+
+    #[test]
+    fn jpeg_dimensions_with_fill_bytes_before_sof() {
+        // Valid JPEG marker stream with an APP0 segment and extra 0xFF fill bytes.
+        let data = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE0, // APP0 marker
+            0x00, 0x02, // segment length (length field only)
+            0xFF, 0xFF, // fill bytes before next marker
+            0xC0, // SOF0 marker byte
+            0x00, 0x11, // segment length
+            0x08, // precision
+            0x00, 0x32, // height
+            0x00, 0x64, // width
+            0x03, // component count
+            0x01, 0x11, 0x00, // Y
+            0x02, 0x11, 0x00, // Cb
+            0x03, 0x11, 0x00, // Cr
+        ];
+
+        assert_eq!(image_dimensions(&data), Some((100, 50)));
+    }
+
+    #[test]
+    fn jpeg_dimensions_supports_extended_sof_markers() {
+        // SOF5 (differential sequential DCT) is uncommon but valid.
+        let data = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC5, // SOF5 marker
+            0x00, 0x11, // segment length
+            0x08, // precision
+            0x00, 0x2A, // height = 42
+            0x00, 0x54, // width = 84
+            0x03, // component count
+            0x01, 0x11, 0x00, // Y
+            0x02, 0x11, 0x00, // Cb
+            0x03, 0x11, 0x00, // Cr
+        ];
+
+        assert_eq!(image_dimensions(&data), Some((84, 42)));
     }
 
     #[test]

@@ -66,6 +66,13 @@ fn main_impl() -> Result<()> {
         return Ok(());
     }
 
+    // List is an offline local query; keep it on the same fast path as config.
+    if matches!(cli.command, Some(cli::Commands::List)) {
+        let manager = PackageManager::new(cwd);
+        handle_package_list_blocking(&manager)?;
+        return Ok(());
+    }
+
     if cli.explain_extension_policy {
         let config = Config::load()?;
         let resolved =
@@ -820,15 +827,7 @@ async fn handle_package_update(manager: &PackageManager, source: Option<String>)
 
 async fn handle_package_list(manager: &PackageManager) -> Result<()> {
     let entries = manager.list_packages().await?;
-
-    let mut user = Vec::new();
-    let mut project = Vec::new();
-    for entry in entries {
-        match entry.scope {
-            PackageScope::User => user.push(entry),
-            PackageScope::Project | PackageScope::Temporary => project.push(entry),
-        }
-    }
+    let (user, project) = split_package_entries(entries);
 
     if user.is_empty() && project.is_empty() {
         println!("No packages installed.");
@@ -849,6 +848,58 @@ async fn handle_package_list(manager: &PackageManager) -> Result<()> {
         println!("Project packages:");
         for entry in &project {
             print_package_entry(manager, entry).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_package_list_blocking(manager: &PackageManager) -> Result<()> {
+    let entries = manager.list_packages_blocking()?;
+    print_package_list_entries_blocking(manager, entries, print_package_entry_blocking)
+}
+
+fn split_package_entries(entries: Vec<PackageEntry>) -> (Vec<PackageEntry>, Vec<PackageEntry>) {
+    let mut user = Vec::new();
+    let mut project = Vec::new();
+    for entry in entries {
+        match entry.scope {
+            PackageScope::User => user.push(entry),
+            PackageScope::Project | PackageScope::Temporary => project.push(entry),
+        }
+    }
+    (user, project)
+}
+
+fn print_package_list_entries_blocking<F>(
+    manager: &PackageManager,
+    entries: Vec<PackageEntry>,
+    mut print_entry: F,
+) -> Result<()>
+where
+    F: FnMut(&PackageManager, &PackageEntry) -> Result<()>,
+{
+    let (user, project) = split_package_entries(entries);
+
+    if user.is_empty() && project.is_empty() {
+        println!("No packages installed.");
+        return Ok(());
+    }
+
+    if !user.is_empty() {
+        println!("User packages:");
+        for entry in &user {
+            print_entry(manager, entry)?;
+        }
+    }
+
+    if !project.is_empty() {
+        if !user.is_empty() {
+            println!();
+        }
+        println!("Project packages:");
+        for entry in &project {
+            print_entry(manager, entry)?;
         }
     }
 
@@ -1159,6 +1210,19 @@ async fn print_package_entry(manager: &PackageManager, entry: &PackageEntry) -> 
     };
     println!("  {display}");
     if let Some(path) = manager.installed_path(&entry.source, entry.scope).await? {
+        println!("    {}", path.display());
+    }
+    Ok(())
+}
+
+fn print_package_entry_blocking(manager: &PackageManager, entry: &PackageEntry) -> Result<()> {
+    let display = if entry.filter.is_some() {
+        format!("{} (filtered)", entry.source)
+    } else {
+        entry.source.clone()
+    };
+    println!("  {display}");
+    if let Some(path) = manager.installed_path_blocking(&entry.source, entry.scope)? {
         println!("    {}", path.display());
     }
     Ok(())

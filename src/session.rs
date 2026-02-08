@@ -609,8 +609,8 @@ impl Session {
 
         thread::spawn(move || {
             let res = (|| -> Result<(Self, SessionOpenDiagnostics)> {
-                let file = std::fs::File::open(&path_buf)
-                    .map_err(|e| crate::Error::Io(Box::new(e)))?;
+                let file =
+                    std::fs::File::open(&path_buf).map_err(|e| crate::Error::Io(Box::new(e)))?;
                 let reader = BufReader::new(file);
                 let mut lines = reader.lines();
 
@@ -1736,6 +1736,14 @@ fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
     }
 }
 
+#[derive(Deserialize)]
+struct PartialEntry {
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
     let file = std::fs::File::open(path)
         .map_err(|e| Error::session(format!("Failed to read session: {e}")))?;
@@ -1753,18 +1761,16 @@ fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
     let mut message_count = 0u64;
     let mut name = None;
 
-    for line in lines {
-        if let Ok(line_content) = line {
-            if let Ok(entry) = serde_json::from_str::<SessionEntry>(&line_content) {
-                match entry {
-                    SessionEntry::Message(_) => message_count += 1,
-                    SessionEntry::SessionInfo(info) => {
-                        if info.name.is_some() {
-                            name = info.name;
-                        }
+    for line_content in lines.map_while(std::result::Result::ok) {
+        if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_content) {
+            match entry.r#type.as_str() {
+                "message" => message_count += 1,
+                "session_info" => {
+                    if entry.name.is_some() {
+                        name = entry.name;
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }

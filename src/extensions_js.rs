@@ -3546,14 +3546,23 @@ const __builtinModules = {
 };
 
 export function createRequire(_path) {
-  return function require(id) {
+  function require(id) {
     const normalized = __normalizeBuiltin(id);
     const builtIn = __builtinModules[normalized];
     if (builtIn) {
       return builtIn;
     }
     throw new Error(`Cannot find module '${String(id ?? "")}' in PiJS require()`);
+  }
+  require.resolve = function resolve(id) {
+    // Return a synthetic path for the requested module.  This satisfies
+    // extensions that call require.resolve() to locate a binary entry
+    // point (e.g. @sourcegraph/scip-python) without actually needing the
+    // real node_modules tree.
+    return `/pijs-virtual/${String(id ?? "unknown")}`;
   };
+  require.resolve.paths = function() { return []; };
+  return require;
 }
 
 export default { createRequire };
@@ -6016,10 +6025,16 @@ export function renderMermaidAscii(source) {
         "@aliou/pi-utils-settings".to_string(),
         r"
 export class ConfigLoader {
-    constructor(opts) { this._opts = opts || {}; this._data = {}; }
-    load() { return this._data; }
+    constructor(name, defaultConfig, options) {
+        this._name = name;
+        this._default = defaultConfig || {};
+        this._opts = options || {};
+        this._data = structuredClone(this._default);
+    }
+    async load() { return this._data; }
     save(d) { this._data = d; }
     get() { return this._data; }
+    getConfig() { return this._data; }
     set(k, v) { this._data[k] = v; }
 }
 export class ArrayEditor {
@@ -6063,15 +6078,22 @@ export class ParseError extends Error { constructor(msg) { super(msg); this.name
 
     modules.insert(
         "@marckrenn/pi-sub-shared".to_string(),
-        r"
-export const PROVIDERS = ['anthropic', 'openai'];
+        r#"
+export const PROVIDERS = ["anthropic", "openai", "google", "aws", "azure"];
 export const MODEL_MULTIPLIERS = {};
-export const PROVIDER_DISPLAY_NAMES = {};
-export const PROVIDER_METADATA = {};
+const _meta = (name) => ({
+    name, displayName: name.charAt(0).toUpperCase() + name.slice(1),
+    detection: { envVars: [], configPaths: [] },
+    status: { operational: true },
+});
+export const PROVIDER_METADATA = Object.fromEntries(PROVIDERS.map(p => [p, _meta(p)]));
+export const PROVIDER_DISPLAY_NAMES = Object.fromEntries(
+    PROVIDERS.map(p => [p, p.charAt(0).toUpperCase() + p.slice(1)])
+);
 export function getDefaultCoreSettings() {
     return { providers: {}, behavior: { autoSwitch: false } };
 }
-"
+"#
         .trim()
         .to_string(),
     );
@@ -6364,6 +6386,26 @@ export async function getDocumentProxy(data) {
 export async function extractText(data) { return { totalPages: 0, text: "" }; }
 export async function renderPageAsImage() { return new Uint8Array(); }
 "#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@sourcegraph/scip-python".to_string(),
+        r"
+export class PythonIndexer { async index() { return []; } }
+export default { PythonIndexer };
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@sourcegraph/scip-python/index.js".to_string(),
+        r"
+export class PythonIndexer { async index() { return []; } }
+export default { PythonIndexer };
+"
         .trim()
         .to_string(),
     );

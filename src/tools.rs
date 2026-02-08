@@ -1582,14 +1582,15 @@ impl Tool for BashTool {
             Some(serde_json::Value::Object(details_map))
         };
 
-        if result.cancelled || result.exit_code != 0 {
+        let is_error = result.cancelled || result.exit_code != 0;
+        if is_error {
             return Err(Error::tool("bash", result.output));
         }
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(result.output))],
             details,
-            is_error: false,
+            is_error,
         })
     }
 }
@@ -2467,15 +2468,15 @@ impl Tool for GrepTool {
             gitignore_files.push(root_gitignore);
         }
         let nested_pattern = ignore_root.join("**/.gitignore");
-        if let Some(pattern_str) = nested_pattern.to_str() {
-            if let Ok(paths) = glob::glob(pattern_str) {
-                for entry in paths.flatten() {
-                    let entry_str = entry.to_string_lossy();
-                    if entry_str.contains("node_modules") || entry_str.contains("/.git/") {
-                        continue;
-                    }
-                    gitignore_files.push(entry);
+        if let Some(pattern_str) = nested_pattern.to_str()
+            && let Ok(paths) = glob::glob(pattern_str)
+        {
+            for entry in paths.flatten() {
+                let entry_str = entry.to_string_lossy();
+                if entry_str.contains("node_modules") || entry_str.contains("/.git/") {
+                    continue;
                 }
+                gitignore_files.push(entry);
             }
         }
         gitignore_files.sort();
@@ -2836,15 +2837,15 @@ impl Tool for FindTool {
         }
 
         let nested_pattern = search_path.join("**/.gitignore");
-        if let Some(pattern_str) = nested_pattern.to_str() {
-            if let Ok(paths) = glob::glob(pattern_str) {
-                for entry in paths.flatten() {
-                    let entry_str = entry.to_string_lossy();
-                    if entry_str.contains("node_modules") || entry_str.contains("/.git/") {
-                        continue;
-                    }
-                    gitignore_files.push(entry);
+        if let Some(pattern_str) = nested_pattern.to_str()
+            && let Ok(paths) = glob::glob(pattern_str)
+        {
+            for entry in paths.flatten() {
+                let entry_str = entry.to_string_lossy();
+                if entry_str.contains("node_modules") || entry_str.contains("/.git/") {
+                    continue;
                 }
+                gitignore_files.push(entry);
             }
         }
 
@@ -3121,10 +3122,9 @@ impl Tool for LsTool {
                 break;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(meta) = entry.metadata().await else {
-                continue;
-            };
-            entries.push((name, meta.is_dir()));
+            // Handle broken symlinks or permission errors by treating them as non-directories
+            let is_dir = entry.metadata().await.is_ok_and(|meta| meta.is_dir());
+            entries.push((name, is_dir));
         }
 
         // Sort alphabetically (case-insensitive).
