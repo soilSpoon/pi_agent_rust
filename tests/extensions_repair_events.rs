@@ -13,8 +13,10 @@ mod common;
 
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
 use pi::extensions_js::{
-    ExtensionRepairEvent, MonotonicityVerdict, PatchOp, PatchProposal, PiJsRuntimeConfig,
-    PiJsTickStats, RepairMode, RepairPattern, RepairRisk, REPAIR_REGISTRY_VERSION, REPAIR_RULES,
+    tolerant_parse, validate_repaired_artifact, AmbiguitySignal, ExtensionRepairEvent, IntentGraph,
+    IntentSignal, MonotonicityVerdict, PatchOp, PatchProposal, PiJsRuntimeConfig, PiJsTickStats,
+    RepairMode, RepairPattern, RepairRisk, StructuralVerdict, REPAIR_REGISTRY_VERSION,
+    REPAIR_RULES,
 };
 use pi::tools::ToolRegistry;
 use std::sync::Arc;
@@ -903,3 +905,509 @@ fn empty_proposal_is_safe() {
     // No aggressive ops → Safe
     assert_eq!(proposal.max_risk(), RepairRisk::Safe);
 }
+
+// ─── Structural validation gate (bd-k5q5.9.5.1) ─────────────────────────────
+
+#[test]
+fn structural_verdict_valid_is_valid() {
+    let v = StructuralVerdict::Valid;
+    assert!(v.is_valid());
+    assert_eq!(v.to_string(), "valid");
+}
+
+#[test]
+fn structural_verdict_unreadable_is_not_valid() {
+    let v = StructuralVerdict::Unreadable {
+        path: PathBuf::from("/fake/file.ts"),
+        reason: "permission denied".to_string(),
+    };
+    assert!(!v.is_valid());
+    assert!(v.to_string().contains("unreadable"));
+}
+
+#[test]
+fn structural_verdict_unsupported_extension_is_not_valid() {
+    let v = StructuralVerdict::UnsupportedExtension {
+        path: PathBuf::from("/fake/file.wasm"),
+        extension: "wasm".to_string(),
+    };
+    assert!(!v.is_valid());
+    assert!(v.to_string().contains("unsupported extension"));
+}
+
+#[test]
+fn structural_verdict_parse_error_is_not_valid() {
+    let v = StructuralVerdict::ParseError {
+        path: PathBuf::from("/fake/file.ts"),
+        message: "unexpected token".to_string(),
+    };
+    assert!(!v.is_valid());
+    assert!(v.to_string().contains("parse error"));
+}
+
+#[test]
+fn validate_valid_typescript_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("index.ts");
+    std::fs::write(&file, "export function hello(): string { return 'hi'; }\n")
+        .expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(v.is_valid(), "expected valid, got: {v}");
+}
+
+#[test]
+fn validate_valid_tsx_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("component.tsx");
+    std::fs::write(&file, "export const App = () => <div>Hello</div>;\n")
+        .expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(v.is_valid(), "expected valid, got: {v}");
+}
+
+#[test]
+fn validate_valid_js_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("index.js");
+    std::fs::write(&file, "module.exports = { hello: 'world' };\n")
+        .expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(v.is_valid(), "expected valid, got: {v}");
+}
+
+#[test]
+fn validate_valid_json_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("package.json");
+    std::fs::write(&file, r#"{"name": "test", "version": "1.0.0"}"#)
+        .expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(v.is_valid(), "expected valid, got: {v}");
+}
+
+#[test]
+fn validate_invalid_typescript_returns_parse_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("broken.ts");
+    std::fs::write(&file, "export function {{{ invalid syntax").expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(
+        matches!(v, StructuralVerdict::ParseError { .. }),
+        "expected ParseError, got: {v}"
+    );
+}
+
+#[test]
+fn validate_invalid_json_returns_parse_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("bad.json");
+    std::fs::write(&file, "{not valid json}").expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(
+        matches!(v, StructuralVerdict::ParseError { .. }),
+        "expected ParseError, got: {v}"
+    );
+}
+
+#[test]
+fn validate_nonexistent_file_returns_unreadable() {
+    let v = validate_repaired_artifact(Path::new("/nonexistent/path/file.ts"));
+    assert!(
+        matches!(v, StructuralVerdict::Unreadable { .. }),
+        "expected Unreadable, got: {v}"
+    );
+}
+
+#[test]
+fn validate_unsupported_extension_returns_unsupported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("data.wasm");
+    std::fs::write(&file, [0x00, 0x61, 0x73, 0x6d]).expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(
+        matches!(v, StructuralVerdict::UnsupportedExtension { .. }),
+        "expected UnsupportedExtension, got: {v}"
+    );
+}
+
+#[test]
+fn validate_mjs_file_is_valid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("mod.mjs");
+    std::fs::write(&file, "export default 42;\n").expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(v.is_valid(), "expected valid, got: {v}");
+}
+
+#[test]
+fn validate_empty_ts_file_is_valid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("empty.ts");
+    std::fs::write(&file, "").expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(v.is_valid(), "expected valid for empty TS, got: {v}");
+}
+
+#[test]
+fn validate_ts_with_decorators_is_valid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("decorated.ts");
+    std::fs::write(
+        &file,
+        "function log(_t: any, _k: string) {}\nclass Foo { @log bar() {} }\nexport { Foo };\n",
+    )
+    .expect("write");
+    let v = validate_repaired_artifact(&file);
+    assert!(v.is_valid(), "expected valid with decorators, got: {v}");
+}
+
+// ─── Structural validation gate integration (bd-k5q5.9.5.1) ─────────────────
+
+#[test]
+fn repair_blocked_when_src_has_broken_syntax() {
+    let harness = common::TestHarness::new("repair_blocked_broken_syntax");
+
+    // Create src/lib.ts with BROKEN syntax (structural validation should fail).
+    harness.create_file(
+        "extensions/src/lib.ts",
+        b"export function {{{ totally broken syntax !!!",
+    );
+
+    let (_manager, handle, _load_result) =
+        try_start_runtime_with_mode(&harness, DIST_IMPORT_SOURCE, RepairMode::AutoSafe);
+
+    // The structural validation gate should block the repair → no "greet" tool.
+    let tools = common::run_async({
+        let h = handle.clone();
+        async move { h.get_registered_tools().await.unwrap() }
+    });
+    assert!(
+        !tools.iter().any(|t| t.name == "greet"),
+        "AutoSafe should block fallback when src file has broken syntax"
+    );
+
+    shutdown(&handle);
+}
+
+#[test]
+fn repair_succeeds_when_src_has_valid_syntax() {
+    let harness = common::TestHarness::new("repair_ok_valid_syntax");
+
+    // Create src/lib.ts with valid syntax.
+    harness.create_file(
+        "extensions/src/lib.ts",
+        br#"export const greeting: string = "from src";"#,
+    );
+
+    let (_manager, handle, _load_result) =
+        try_start_runtime_with_mode(&harness, DIST_IMPORT_SOURCE, RepairMode::AutoSafe);
+
+    // Valid file passes structural validation → "greet" tool registered.
+    let tools = common::run_async({
+        let h = handle.clone();
+        async move { h.get_registered_tools().await.unwrap() }
+    });
+    assert!(
+        tools.iter().any(|t| t.name == "greet"),
+        "AutoSafe should allow fallback when src file is structurally valid"
+    );
+
+    shutdown(&handle);
+}
+
+// ─── Intent graph extractor (bd-k5q5.9.2.1) ─────────────────────────────────
+
+fn sample_register_payload() -> serde_json::Value {
+    serde_json::json!({
+        "tools": [
+            { "name": "greet", "description": "say hello", "parameters": {} },
+            { "name": "farewell", "description": "say goodbye", "parameters": {} }
+        ],
+        "slash_commands": [
+            { "name": "/hello", "description": "greeting command" }
+        ],
+        "shortcuts": [
+            { "name": "ctrl+g", "action": "greet" }
+        ],
+        "flags": [
+            { "name": "verbose", "description": "enable verbose mode", "type": "boolean", "default": false }
+        ],
+        "event_hooks": ["tool_call", "tool_result"]
+    })
+}
+
+#[test]
+fn intent_graph_extracts_tools() {
+    let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
+    let tools = graph.signals_by_category("tool");
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].name(), "greet");
+    assert_eq!(tools[1].name(), "farewell");
+}
+
+#[test]
+fn intent_graph_extracts_commands() {
+    let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
+    let cmds = graph.signals_by_category("command");
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0].name(), "/hello");
+}
+
+#[test]
+fn intent_graph_extracts_shortcuts() {
+    let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
+    let shortcuts = graph.signals_by_category("shortcut");
+    assert_eq!(shortcuts.len(), 1);
+    assert_eq!(shortcuts[0].name(), "ctrl+g");
+}
+
+#[test]
+fn intent_graph_extracts_flags() {
+    let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
+    let flags = graph.signals_by_category("flag");
+    assert_eq!(flags.len(), 1);
+    assert_eq!(flags[0].name(), "verbose");
+}
+
+#[test]
+fn intent_graph_extracts_event_hooks() {
+    let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
+    let hooks = graph.signals_by_category("event_hook");
+    assert_eq!(hooks.len(), 2);
+    assert_eq!(hooks[0].name(), "tool_call");
+    assert_eq!(hooks[1].name(), "tool_result");
+}
+
+#[test]
+fn intent_graph_extracts_capabilities() {
+    let caps = vec!["read".to_string(), "exec".to_string()];
+    let graph =
+        IntentGraph::from_register_payload("test-ext", &serde_json::json!({}), &caps);
+    let cap_signals = graph.signals_by_category("capability");
+    assert_eq!(cap_signals.len(), 2);
+    assert_eq!(cap_signals[0].name(), "read");
+    assert_eq!(cap_signals[1].name(), "exec");
+}
+
+#[test]
+fn intent_graph_deduplicates_signals() {
+    let payload = serde_json::json!({
+        "tools": [
+            { "name": "greet", "description": "v1" },
+            { "name": "greet", "description": "v2" }
+        ]
+    });
+    let graph = IntentGraph::from_register_payload("test-ext", &payload, &[]);
+    let tools = graph.signals_by_category("tool");
+    assert_eq!(tools.len(), 1, "duplicate tools should be deduplicated");
+}
+
+#[test]
+fn intent_graph_empty_payload() {
+    let graph =
+        IntentGraph::from_register_payload("test-ext", &serde_json::json!({}), &[]);
+    assert!(graph.is_empty());
+    assert_eq!(graph.signal_count(), 0);
+    assert_eq!(graph.category_count(), 0);
+}
+
+#[test]
+fn intent_graph_category_count() {
+    let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
+    // tools, commands, shortcuts, flags, event_hooks = 5 categories
+    assert_eq!(graph.category_count(), 5);
+}
+
+#[test]
+fn intent_graph_signal_count() {
+    let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
+    // 2 tools + 1 command + 1 shortcut + 1 flag + 2 hooks = 7 signals
+    assert_eq!(graph.signal_count(), 7);
+}
+
+#[test]
+fn intent_signal_display() {
+    let sig = IntentSignal::RegistersTool("greet".to_string());
+    assert_eq!(sig.to_string(), "tool:greet");
+
+    let sig2 = IntentSignal::HooksEvent("tool_call".to_string());
+    assert_eq!(sig2.to_string(), "event_hook:tool_call");
+}
+
+#[test]
+fn intent_graph_extension_id_preserved() {
+    let graph = IntentGraph::from_register_payload(
+        "my-ext-123",
+        &serde_json::json!({}),
+        &[],
+    );
+    assert_eq!(graph.extension_id, "my-ext-123");
+}
+
+// ─── Tolerant AST recovery and ambiguity detection (bd-k5q5.9.2.2) ──────────
+
+#[test]
+fn tolerant_parse_valid_ts() {
+    let result = tolerant_parse(
+        "import { foo } from './bar';\nexport function hello() { return foo; }\n",
+        "test.ts",
+    );
+    assert!(result.parsed_ok);
+    assert_eq!(result.statement_count, 2);
+    assert_eq!(result.import_export_count, 2); // import + export
+    assert!(result.ambiguities.is_empty());
+    assert!(result.is_legible());
+}
+
+#[test]
+fn tolerant_parse_broken_ts() {
+    let result = tolerant_parse(
+        "export function {{{ totally broken",
+        "broken.ts",
+    );
+    assert!(!result.parsed_ok);
+    assert_eq!(result.statement_count, 0);
+    assert!(!result.ambiguities.is_empty()); // Should have RecoverableParseErrors
+}
+
+#[test]
+fn tolerant_parse_valid_js() {
+    let result = tolerant_parse(
+        "const x = require('./foo');\nmodule.exports = x;\n",
+        "test.js",
+    );
+    assert!(result.parsed_ok);
+    assert!(result.statement_count > 0);
+}
+
+#[test]
+fn tolerant_parse_detects_dynamic_eval() {
+    let result = tolerant_parse(
+        "const code = 'console.log(1)';\neval(code);\n",
+        "test.js",
+    );
+    assert!(result.ambiguities.contains(&AmbiguitySignal::DynamicEval));
+    // eval has weight 0.9, which is >= 0.8 threshold.
+    assert!(!result.is_legible());
+}
+
+#[test]
+fn tolerant_parse_detects_new_function() {
+    let result = tolerant_parse(
+        "const fn = new Function('return 1');\n",
+        "test.js",
+    );
+    assert!(result.ambiguities.contains(&AmbiguitySignal::DynamicFunction));
+}
+
+#[test]
+fn tolerant_parse_detects_dynamic_import() {
+    let result = tolerant_parse(
+        "const mod = await import('./dynamic.js');\n",
+        "test.mjs",
+    );
+    assert!(result.ambiguities.contains(&AmbiguitySignal::DynamicImport));
+}
+
+#[test]
+fn tolerant_parse_detects_star_reexport() {
+    let result = tolerant_parse(
+        "export * from './utils';\n",
+        "test.ts",
+    );
+    assert!(result.ambiguities.contains(&AmbiguitySignal::StarReExport));
+    // StarReExport has weight 0.3, still legible.
+    assert!(result.is_legible());
+}
+
+#[test]
+fn tolerant_parse_detects_proxy() {
+    let result = tolerant_parse(
+        "const handler = {};\nconst p = new Proxy({}, handler);\n",
+        "test.js",
+    );
+    assert!(result.ambiguities.contains(&AmbiguitySignal::ProxyUsage));
+}
+
+#[test]
+fn tolerant_parse_detects_with_statement() {
+    let result = tolerant_parse(
+        "with (obj) { foo(); }\n",
+        "test.js",
+    );
+    assert!(result.ambiguities.contains(&AmbiguitySignal::WithStatement));
+}
+
+#[test]
+fn tolerant_parse_detects_dynamic_require() {
+    let result = tolerant_parse(
+        "const mod = require(path.join(__dirname, 'foo'));\n",
+        "test.js",
+    );
+    assert!(result.ambiguities.contains(&AmbiguitySignal::DynamicRequire));
+}
+
+#[test]
+fn tolerant_parse_static_require_not_flagged() {
+    let result = tolerant_parse(
+        "const mod = require('./static-path');\n",
+        "test.js",
+    );
+    assert!(
+        !result.ambiguities.contains(&AmbiguitySignal::DynamicRequire),
+        "static string require should not be flagged"
+    );
+}
+
+#[test]
+fn tolerant_parse_empty_source() {
+    let result = tolerant_parse("", "empty.ts");
+    assert!(result.parsed_ok);
+    assert_eq!(result.statement_count, 0);
+    assert!(result.ambiguities.is_empty());
+    assert!(result.is_legible());
+}
+
+#[test]
+fn ambiguity_signal_weight_ordering() {
+    // eval/Function are most dangerous.
+    assert!(AmbiguitySignal::DynamicEval.weight() > AmbiguitySignal::DynamicImport.weight());
+    // Star re-export is least dangerous.
+    assert!(AmbiguitySignal::StarReExport.weight() < AmbiguitySignal::DynamicImport.weight());
+}
+
+#[test]
+fn ambiguity_signal_display() {
+    assert_eq!(AmbiguitySignal::DynamicEval.to_string(), "dynamic_eval");
+    assert_eq!(
+        AmbiguitySignal::RecoverableParseErrors { count: 3 }.to_string(),
+        "recoverable_parse_errors(3)"
+    );
+}
+
+#[test]
+fn ambiguity_score_zero_for_clean_source() {
+    let result = tolerant_parse(
+        "export const x = 42;\n",
+        "clean.ts",
+    );
+    assert!(result.ambiguity_score().abs() < f64::EPSILON);
+}
+
+#[test]
+fn ambiguity_score_high_for_eval() {
+    let result = tolerant_parse(
+        "eval('code');\n",
+        "dangerous.js",
+    );
+    assert!(result.ambiguity_score() >= 0.9);
+}
+
+#[test]
+fn unsupported_extension_returns_not_parsed() {
+    let result = tolerant_parse("binary data", "data.wasm");
+    assert!(!result.parsed_ok);
+    assert_eq!(result.statement_count, 0);
+}
+
+use std::path::Path;

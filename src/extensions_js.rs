@@ -1262,6 +1262,548 @@ impl PatchProposal {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Structural validation gate (bd-k5q5.9.5.1)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a structural validation check on a repaired artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructuralVerdict {
+    /// The artifact passed all structural checks.
+    Valid,
+    /// The file could not be read.
+    Unreadable { path: PathBuf, reason: String },
+    /// The file has an unsupported extension.
+    UnsupportedExtension { path: PathBuf, extension: String },
+    /// The file failed to parse as valid JS/TS/JSON.
+    ParseError { path: PathBuf, message: String },
+}
+
+impl StructuralVerdict {
+    /// Returns `true` when the artifact passed all checks.
+    pub const fn is_valid(&self) -> bool {
+        matches!(self, Self::Valid)
+    }
+}
+
+impl std::fmt::Display for StructuralVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Valid => write!(f, "valid"),
+            Self::Unreadable { path, reason } => {
+                write!(f, "unreadable: {} ({})", path.display(), reason)
+            }
+            Self::UnsupportedExtension { path, extension } => {
+                write!(
+                    f,
+                    "unsupported extension: {} (.{})",
+                    path.display(),
+                    extension
+                )
+            }
+            Self::ParseError { path, message } => {
+                write!(f, "parse error: {} ({})", path.display(), message)
+            }
+        }
+    }
+}
+
+/// Validate that a repaired artifact is structurally sound.
+///
+/// Performs three checks in order:
+/// 1. **Readable** — the file can be read as UTF-8 text.
+/// 2. **Supported extension** — `.ts`, `.tsx`, `.js`, `.mjs`, or `.json`.
+/// 3. **Parseable** — SWC can parse `.ts`/`.tsx` files; JSON files are valid
+///    JSON; `.js`/`.mjs` files are read successfully (syntax errors surface at
+///    load time via QuickJS, but we verify readability here).
+pub fn validate_repaired_artifact(path: &Path) -> StructuralVerdict {
+    // 1. Readable check.
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(err) => {
+            return StructuralVerdict::Unreadable {
+                path: path.to_path_buf(),
+                reason: err.to_string(),
+            };
+        }
+    };
+
+    // 2. Extension check.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "ts" | "tsx" => validate_typescript_parse(path, &source, &ext),
+        "js" | "mjs" => {
+            // JS files are loaded by QuickJS which reports its own syntax
+            // errors. We only verify readability (done above).
+            StructuralVerdict::Valid
+        }
+        "json" => validate_json_parse(path, &source),
+        _ => StructuralVerdict::UnsupportedExtension {
+            path: path.to_path_buf(),
+            extension: ext,
+        },
+    }
+}
+
+/// Try to parse a TypeScript/TSX source with SWC.
+fn validate_typescript_parse(path: &Path, source: &str, ext: &str) -> StructuralVerdict {
+    use swc_common::{FileName, Globals, GLOBALS};
+    use swc_ecma_parser::{Parser as SwcParser, StringInput, Syntax, TsSyntax};
+
+    let globals = Globals::new();
+    GLOBALS.set(&globals, || {
+        let cm: swc_common::sync::Lrc<swc_common::SourceMap> = swc_common::sync::Lrc::default();
+        let fm = cm.new_source_file(
+            FileName::Custom(path.display().to_string()).into(),
+            source.to_string(),
+        );
+        let syntax = Syntax::Typescript(TsSyntax {
+            tsx: ext == "tsx",
+            decorators: true,
+            ..Default::default()
+        });
+        let mut parser = SwcParser::new(syntax, StringInput::from(&*fm), None);
+        match parser.parse_module() {
+            Ok(_) => StructuralVerdict::Valid,
+            Err(err) => StructuralVerdict::ParseError {
+                path: path.to_path_buf(),
+                message: format!("{err:?}"),
+            },
+        }
+    })
+}
+
+/// Validate that JSON source is well-formed.
+fn validate_json_parse(path: &Path, source: &str) -> StructuralVerdict {
+    match serde_json::from_str::<serde_json::Value>(source) {
+        Ok(_) => StructuralVerdict::Valid,
+        Err(err) => StructuralVerdict::ParseError {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tolerant AST recovery and ambiguity detection (bd-k5q5.9.2.2)
+// ---------------------------------------------------------------------------
+
+/// A construct in the source that reduces repair confidence.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AmbiguitySignal {
+    /// Source contains `eval(...)` — arbitrary code execution.
+    DynamicEval,
+    /// Source contains `new Function(...)` — dynamic function construction.
+    DynamicFunction,
+    /// Source contains `import(...)` — dynamic import expression.
+    DynamicImport,
+    /// Source contains `export * from` — star re-export hides export shape.
+    StarReExport,
+    /// Source contains `require(` with a non-literal argument.
+    DynamicRequire,
+    /// Source contains `new Proxy(` — metaprogramming.
+    ProxyUsage,
+    /// Source contains `with (` — deprecated scope-altering statement.
+    WithStatement,
+    /// SWC parser produced recoverable errors.
+    RecoverableParseErrors { count: usize },
+}
+
+impl AmbiguitySignal {
+    /// Severity weight (0.0–1.0) for confidence scoring.
+    pub fn weight(&self) -> f64 {
+        match self {
+            Self::DynamicEval | Self::DynamicFunction => 0.9,
+            Self::ProxyUsage | Self::WithStatement => 0.7,
+            Self::DynamicImport | Self::DynamicRequire => 0.5,
+            Self::StarReExport => 0.3,
+            Self::RecoverableParseErrors { count } => {
+                // More errors → more ambiguous, capped at 1.0.
+                (f64::from(u32::try_from(*count).unwrap_or(u32::MAX)) * 0.2).min(1.0)
+            }
+        }
+    }
+
+    /// Short tag for logging.
+    pub const fn tag(&self) -> &'static str {
+        match self {
+            Self::DynamicEval => "dynamic_eval",
+            Self::DynamicFunction => "dynamic_function",
+            Self::DynamicImport => "dynamic_import",
+            Self::StarReExport => "star_reexport",
+            Self::DynamicRequire => "dynamic_require",
+            Self::ProxyUsage => "proxy_usage",
+            Self::WithStatement => "with_statement",
+            Self::RecoverableParseErrors { .. } => "recoverable_parse_errors",
+        }
+    }
+}
+
+impl std::fmt::Display for AmbiguitySignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecoverableParseErrors { count } => {
+                write!(f, "{}({})", self.tag(), count)
+            }
+            _ => write!(f, "{}", self.tag()),
+        }
+    }
+}
+
+/// Result of tolerant parsing: partial analysis even when source has errors.
+#[derive(Debug, Clone)]
+pub struct TolerantParseResult {
+    /// Whether the source parsed without fatal errors.
+    pub parsed_ok: bool,
+    /// Number of top-level statements recovered (0 if parse failed fatally).
+    pub statement_count: usize,
+    /// Number of import/export declarations found.
+    pub import_export_count: usize,
+    /// Detected ambiguity signals that reduce repair confidence.
+    pub ambiguities: Vec<AmbiguitySignal>,
+}
+
+impl TolerantParseResult {
+    /// Overall ambiguity score (0.0 = fully legible, 1.0 = fully opaque).
+    pub fn ambiguity_score(&self) -> f64 {
+        if self.ambiguities.is_empty() {
+            return 0.0;
+        }
+        // Take the max weight — one high-severity signal dominates.
+        self.ambiguities
+            .iter()
+            .map(AmbiguitySignal::weight)
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// True if the source is sufficiently legible for automated repair.
+    pub fn is_legible(&self) -> bool {
+        self.parsed_ok && self.ambiguity_score() < 0.8
+    }
+}
+
+/// Perform tolerant parsing and ambiguity detection on source text.
+///
+/// Attempts SWC parse for `.ts`/`.tsx` files to count statements
+/// and imports. For all supported extensions, scans source text
+/// for ambiguity patterns. Returns partial results even on parse
+/// failure.
+pub fn tolerant_parse(source: &str, filename: &str) -> TolerantParseResult {
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let (parsed_ok, statement_count, import_export_count, parse_errors) = match ext.as_str() {
+        "ts" | "tsx" | "js" | "mjs" => try_swc_parse(source, filename, &ext),
+        _ => (false, 0, 0, 0),
+    };
+
+    let mut ambiguities = detect_ambiguity_patterns(source);
+    if parse_errors > 0 {
+        ambiguities.push(AmbiguitySignal::RecoverableParseErrors {
+            count: parse_errors,
+        });
+    }
+
+    // Deduplicate.
+    let mut seen = std::collections::HashSet::new();
+    ambiguities.retain(|s| seen.insert(s.clone()));
+
+    TolerantParseResult {
+        parsed_ok,
+        statement_count,
+        import_export_count,
+        ambiguities,
+    }
+}
+
+/// Attempt SWC parse and return (ok, stmts, imports, error_count).
+fn try_swc_parse(source: &str, filename: &str, ext: &str) -> (bool, usize, usize, usize) {
+    use swc_common::{FileName, Globals, GLOBALS};
+    use swc_ecma_parser::{Parser as SwcParser, StringInput, Syntax, TsSyntax};
+
+    let globals = Globals::new();
+    GLOBALS.set(&globals, || {
+        let cm: swc_common::sync::Lrc<swc_common::SourceMap> = swc_common::sync::Lrc::default();
+        let fm = cm.new_source_file(
+            FileName::Custom(filename.to_string()).into(),
+            source.to_string(),
+        );
+        let is_ts = ext == "ts" || ext == "tsx";
+        let syntax = if is_ts {
+            Syntax::Typescript(TsSyntax {
+                tsx: ext == "tsx",
+                decorators: true,
+                ..Default::default()
+            })
+        } else {
+            Syntax::Es(swc_ecma_parser::EsSyntax {
+                jsx: true,
+                ..Default::default()
+            })
+        };
+        let mut parser = SwcParser::new(syntax, StringInput::from(&*fm), None);
+        if let Ok(module) = parser.parse_module() {
+            let errors = parser.take_errors();
+            let stmts = module.body.len();
+            let imports = module
+                .body
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        swc_ecma_ast::ModuleItem::ModuleDecl(
+                            swc_ecma_ast::ModuleDecl::Import(_)
+                                | swc_ecma_ast::ModuleDecl::ExportAll(_)
+                                | swc_ecma_ast::ModuleDecl::ExportNamed(_)
+                                | swc_ecma_ast::ModuleDecl::ExportDefaultDecl(_)
+                                | swc_ecma_ast::ModuleDecl::ExportDefaultExpr(_)
+                                | swc_ecma_ast::ModuleDecl::ExportDecl(_)
+                        )
+                    )
+                })
+                .count();
+            (true, stmts, imports, errors.len())
+        } else {
+            let errors = parser.take_errors();
+            // Fatal parse error — report 0 statements but count errors.
+            (false, 0, 0, errors.len() + 1)
+        }
+    })
+}
+
+/// Detect ambiguity patterns in source text.
+fn detect_ambiguity_patterns(source: &str) -> Vec<AmbiguitySignal> {
+    use std::sync::OnceLock;
+
+    static PATTERNS: OnceLock<Vec<(regex::Regex, AmbiguitySignal)>> = OnceLock::new();
+    static DYN_REQUIRE: OnceLock<regex::Regex> = OnceLock::new();
+
+    let patterns = PATTERNS.get_or_init(|| {
+        vec![
+            (
+                regex::Regex::new(r"\beval\s*\(").expect("regex"),
+                AmbiguitySignal::DynamicEval,
+            ),
+            (
+                regex::Regex::new(r"\bnew\s+Function\s*\(").expect("regex"),
+                AmbiguitySignal::DynamicFunction,
+            ),
+            (
+                regex::Regex::new(r"\bimport\s*\(").expect("regex"),
+                AmbiguitySignal::DynamicImport,
+            ),
+            (
+                regex::Regex::new(r"export\s+\*\s+from\b").expect("regex"),
+                AmbiguitySignal::StarReExport,
+            ),
+            (
+                regex::Regex::new(r"\bnew\s+Proxy\s*\(").expect("regex"),
+                AmbiguitySignal::ProxyUsage,
+            ),
+            (
+                regex::Regex::new(r"\bwith\s*\(").expect("regex"),
+                AmbiguitySignal::WithStatement,
+            ),
+        ]
+    });
+
+    let dyn_require = DYN_REQUIRE.get_or_init(|| {
+        regex::Regex::new(r#"\brequire\s*\(\s*[^"'`\s)]"#).expect("regex")
+    });
+
+    let mut signals = Vec::new();
+    for (re, signal) in patterns {
+        if re.is_match(source) {
+            signals.push(signal.clone());
+        }
+    }
+    if dyn_require.is_match(source) {
+        signals.push(AmbiguitySignal::DynamicRequire);
+    }
+
+    signals
+}
+
+// ---------------------------------------------------------------------------
+// Intent graph extractor (bd-k5q5.9.2.1)
+// ---------------------------------------------------------------------------
+
+/// A normalized intent signal extracted from an extension.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IntentSignal {
+    /// The extension registers a tool with the given name.
+    RegistersTool(String),
+    /// The extension registers a slash command with the given name.
+    RegistersCommand(String),
+    /// The extension registers a keyboard shortcut.
+    RegistersShortcut(String),
+    /// The extension registers a feature flag with the given name.
+    RegistersFlag(String),
+    /// The extension registers a custom LLM provider.
+    RegistersProvider(String),
+    /// The extension hooks into a lifecycle event.
+    HooksEvent(String),
+    /// The extension declares a capability requirement.
+    RequiresCapability(String),
+    /// The extension registers a message renderer.
+    RegistersRenderer(String),
+}
+
+impl IntentSignal {
+    /// Category tag for logging and grouping.
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::RegistersTool(_) => "tool",
+            Self::RegistersCommand(_) => "command",
+            Self::RegistersShortcut(_) => "shortcut",
+            Self::RegistersFlag(_) => "flag",
+            Self::RegistersProvider(_) => "provider",
+            Self::HooksEvent(_) => "event_hook",
+            Self::RequiresCapability(_) => "capability",
+            Self::RegistersRenderer(_) => "renderer",
+        }
+    }
+
+    /// The name/identifier within the signal.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::RegistersTool(n)
+            | Self::RegistersCommand(n)
+            | Self::RegistersShortcut(n)
+            | Self::RegistersFlag(n)
+            | Self::RegistersProvider(n)
+            | Self::HooksEvent(n)
+            | Self::RequiresCapability(n)
+            | Self::RegistersRenderer(n) => n,
+        }
+    }
+}
+
+impl std::fmt::Display for IntentSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.category(), self.name())
+    }
+}
+
+/// Normalized intent graph for a single extension.
+///
+/// Captures every registration and capability declaration the extension makes,
+/// providing a complete picture of what the extension *intends* to do. Used by
+/// the confidence scoring model to decide whether automated repair is safe.
+#[derive(Debug, Clone, Default)]
+pub struct IntentGraph {
+    /// Extension identity.
+    pub extension_id: String,
+    /// All extracted intent signals (deduplicated).
+    pub signals: Vec<IntentSignal>,
+}
+
+impl IntentGraph {
+    /// Build an intent graph from a `RegisterPayload` and capability list.
+    pub fn from_register_payload(
+        extension_id: &str,
+        payload: &serde_json::Value,
+        capabilities: &[String],
+    ) -> Self {
+        let mut signals = Vec::new();
+
+        // Extract tools.
+        if let Some(tools) = payload.get("tools").and_then(|v| v.as_array()) {
+            for tool in tools {
+                if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                    signals.push(IntentSignal::RegistersTool(name.to_string()));
+                }
+            }
+        }
+
+        // Extract slash commands.
+        if let Some(cmds) = payload.get("slash_commands").and_then(|v| v.as_array()) {
+            for cmd in cmds {
+                if let Some(name) = cmd.get("name").and_then(|n| n.as_str()) {
+                    signals.push(IntentSignal::RegistersCommand(name.to_string()));
+                }
+            }
+        }
+
+        // Extract shortcuts.
+        if let Some(shortcuts) = payload.get("shortcuts").and_then(|v| v.as_array()) {
+            for sc in shortcuts {
+                let label = sc
+                    .get("name")
+                    .or_else(|| sc.get("key"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
+                signals.push(IntentSignal::RegistersShortcut(label.to_string()));
+            }
+        }
+
+        // Extract flags.
+        if let Some(flags) = payload.get("flags").and_then(|v| v.as_array()) {
+            for flag in flags {
+                if let Some(name) = flag.get("name").and_then(|n| n.as_str()) {
+                    signals.push(IntentSignal::RegistersFlag(name.to_string()));
+                }
+            }
+        }
+
+        // Extract event hooks.
+        if let Some(hooks) = payload.get("event_hooks").and_then(|v| v.as_array()) {
+            for hook in hooks {
+                if let Some(name) = hook.as_str() {
+                    signals.push(IntentSignal::HooksEvent(name.to_string()));
+                }
+            }
+        }
+
+        // Capability declarations.
+        for cap in capabilities {
+            signals.push(IntentSignal::RequiresCapability(cap.clone()));
+        }
+
+        // Deduplicate while preserving order.
+        let mut seen = std::collections::HashSet::new();
+        signals.retain(|s| seen.insert(s.clone()));
+
+        Self {
+            extension_id: extension_id.to_string(),
+            signals,
+        }
+    }
+
+    /// Return signals of a specific category.
+    pub fn signals_by_category(&self, category: &str) -> Vec<&IntentSignal> {
+        self.signals
+            .iter()
+            .filter(|s| s.category() == category)
+            .collect()
+    }
+
+    /// Number of distinct signal categories present.
+    pub fn category_count(&self) -> usize {
+        let cats: std::collections::HashSet<&str> =
+            self.signals.iter().map(IntentSignal::category).collect();
+        cats.len()
+    }
+
+    /// True if the graph contains no signals at all.
+    pub fn is_empty(&self) -> bool {
+        self.signals.is_empty()
+    }
+
+    /// Total number of signals.
+    pub fn signal_count(&self) -> usize {
+        self.signals.len()
+    }
+}
+
 /// Statistics from a tick execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PiJsTickStats {
@@ -1827,6 +2369,20 @@ fn try_dist_to_src_fallback(path: &Path) -> Option<PathBuf> {
                     "repair blocked: resolved path escapes extension root"
                 );
                 return None;
+            }
+
+            // Structural validation gate (bd-k5q5.9.5.1): verify the
+            // resolved file is parseable before accepting the repair.
+            let structural = validate_repaired_artifact(&resolved);
+            if !structural.is_valid() {
+                tracing::warn!(
+                    event = "pijs.repair.structural_validation_failed",
+                    original = %path_str,
+                    resolved = %resolved.display(),
+                    verdict = %structural,
+                    "repair blocked: resolved artifact failed structural validation"
+                );
+                continue;
             }
 
             tracing::info!(
