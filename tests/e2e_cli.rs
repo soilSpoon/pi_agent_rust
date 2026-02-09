@@ -271,6 +271,12 @@ impl CliTestHarness {
     }
 }
 
+/// Canonicalize a path and strip the Windows `\\?\` prefix if present.
+fn canon(p: &Path) -> PathBuf {
+    let c = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    pi::extensions::strip_unc_prefix(c)
+}
+
 fn assert_contains(harness: &TestHarness, haystack: &str, needle: &str) {
     harness.assert_log(format!("assert contains: {needle}").as_str());
     assert!(
@@ -1116,6 +1122,8 @@ fn e2e_cli_config_paths_honor_env_overrides() {
     let mut harness = CliTestHarness::new("e2e_cli_config_paths_honor_env_overrides");
 
     let env_root = harness.harness.temp_path("env-overrides");
+    // Strip \\?\ prefix so env vars and expected paths match CLI output.
+    let env_root = pi::extensions::strip_unc_prefix(env_root);
     let agent_dir = env_root.join("agent-root");
     let config_path = env_root.join("settings-override.json");
     let sessions_dir = env_root.join("sessions-root");
@@ -1149,10 +1157,8 @@ fn e2e_cli_config_paths_honor_env_overrides() {
         &result.stdout,
         &format!("Global:  {}", config_path.display()),
     );
-    // On macOS, temp_dir() is a symlink (/var/folders → /private/var/folders).
-    // The binary resolves CWD via current_dir(), so canonicalize for matching.
-    let canonical_temp = fs::canonicalize(harness.harness.temp_dir())
-        .unwrap_or_else(|_| harness.harness.temp_dir().to_path_buf());
+    // On macOS, temp_dir() is a symlink; on Windows, strip \\?\ prefix.
+    let canonical_temp = canon(harness.harness.temp_dir());
     let project_path = canonical_temp.join(".pi/settings.json");
     assert_contains(
         &harness.harness,
@@ -1183,6 +1189,8 @@ fn e2e_cli_config_paths_fallback_to_agent_dir() {
     let env_root = harness.harness.temp_path("env-fallback");
     let agent_dir = env_root.join("agent-root");
     std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+    // Strip \\?\ prefix so env var and expected paths match CLI output.
+    let agent_dir = pi::extensions::strip_unc_prefix(agent_dir);
 
     harness.env.insert(
         "PI_CODING_AGENT_DIR".to_string(),
@@ -1201,8 +1209,8 @@ fn e2e_cli_config_paths_fallback_to_agent_dir() {
         &format!("Global:  {}", agent_dir.join("settings.json").display()),
     );
     // On macOS, temp_dir() is a symlink; canonicalize to match binary output.
-    let canonical_temp = fs::canonicalize(harness.harness.temp_dir())
-        .unwrap_or_else(|_| harness.harness.temp_dir().to_path_buf());
+    // On Windows, strip \\?\ prefix.
+    let canonical_temp = canon(harness.harness.temp_dir());
     let project_path = canonical_temp.join(".pi/settings.json");
     assert_contains(
         &harness.harness,
@@ -2363,9 +2371,8 @@ fn e2e_cli_print_mode_file_ref_reads_file() {
 
     // Canonicalize the path so the VCR cassette body matches what the binary
     // actually sends. On macOS, temp_dir() returns /var/folders/... which is
-    // a symlink to /private/var/folders/...; the binary resolves this via
-    // current_dir().
-    let file_path = fs::canonicalize(&file_path).expect("canonicalize file path");
+    // a symlink to /private/var/folders/...; on Windows, strip \\?\ prefix.
+    let file_path = canon(&file_path);
 
     // Build the user message text that the binary produces after @file expansion.
     // process_file_arguments wraps text files as:
