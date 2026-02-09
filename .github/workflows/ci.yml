@@ -17,6 +17,7 @@ jobs:
       VCR_MODE: "playback"
       VCR_CASSETTE_DIR: "tests/fixtures/vcr"
       RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
       CI_GATE_PROMOTION_MODE: ${{ vars.CI_GATE_PROMOTION_MODE || 'strict' }}
       CI_GATE_THRESHOLD_VERSION: ${{ vars.CI_GATE_THRESHOLD_VERSION || '2026-02-08.v1' }}
       CI_GATE_MIN_PASS_RATE_PCT: ${{ vars.CI_GATE_MIN_PASS_RATE_PCT || '80.0' }}
@@ -197,8 +198,28 @@ jobs:
       - name: cargo doc
         run: cargo doc --no-deps
 
+      - name: Reclaim disk space before tests [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          df -h /
+          # Remove clippy/doc artifacts; tests will recompile what they need
+          cargo clean --doc 2>/dev/null || true
+          rm -rf target/debug/incremental
+          df -h /
+
       - name: cargo test
         run: cargo test --all-targets
+
+      - name: Reclaim disk space before wasm-host tests [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          df -h /
+          # Remove default-feature test binaries before building wasm-host ones
+          rm -rf target/debug/deps/ext_conformance* target/debug/deps/extensions_* target/debug/deps/e2e_*
+          rm -rf target/debug/incremental
+          df -h /
 
       - name: cargo test (wasm-host) [linux]
         if: runner.os == 'Linux'
