@@ -324,8 +324,13 @@ fn run_setup_steps(steps: &[SetupStep], dir: &Path) -> Result<(), String> {
                     .map_err(|e| format!("Failed to create dir {path}: {e}"))?;
             }
             SetupStep::RunCommand { command } => {
-                let output = std::process::Command::new("bash")
-                    .arg("-c")
+                let (shell, flag) = if cfg!(windows) {
+                    ("cmd", "/C")
+                } else {
+                    ("bash", "-c")
+                };
+                let output = std::process::Command::new(shell)
+                    .arg(flag)
                     .arg(command)
                     .current_dir(dir)
                     .output()

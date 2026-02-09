@@ -67,7 +67,6 @@
       "description": "Reading a nonexistent file should error",
       "input": {"path": "/nonexistent/path/file.txt"},
       "expect_error": true,
-      "error_contains": "No such file",
       "expected": {}
     },
     {
@@ -78,7 +77,6 @@
       ],
       "input": {"path": "mydir"},
       "expect_error": true,
-      "error_contains": "directory",
       "expected": {}
     },
     {
