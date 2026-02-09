@@ -124,13 +124,15 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-For heavyweight local runs (especially `--all-targets`) in multi-agent environments, prefer a tmpfs-backed target dir to avoid linker failures when `/` is near capacity:
+For heavyweight local runs (especially `--all-targets`) in multi-agent environments, set both build artifacts and test temp files to a high-capacity tmpfs to avoid `No space left on device` failures:
 
 ```bash
-export CARGO_TARGET_DIR="/tmp/pi_agent_rust/${USER:-agent}"
+export CARGO_TARGET_DIR="/dev/shm/pi_agent_rust/${USER:-agent}"
+export TMPDIR="/dev/shm/pi_agent_rust/${USER:-agent}/tmp"
+mkdir -p "$TMPDIR"
 ```
 
-Use an agent-specific suffix (for example `/tmp/pi_agent_rust/topazfalcon`) to avoid build artifact collisions.
+Use an agent-specific suffix (for example `/dev/shm/pi_agent_rust/topazfalcon`) to avoid collisions across concurrent agents.
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
