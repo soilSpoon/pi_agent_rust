@@ -20,12 +20,13 @@ use pi::extensions_js::{
     compute_semantic_parity, decide_promotion, detect_conflict, evaluate_health,
     execute_promotion, execute_rollback, explain_gating, extract_hostcall_surface,
     format_proposal_diff, replay_conformance_fixtures, resolve_conflicts,
-    select_best_candidate, should_auto_rollback, tolerant_parse, transition_overlay,
-    validate_proposal, validate_repaired_artifact, AmbiguitySignal, ApprovalRequirement,
-    AuditEntryKind, AuditLedger, CanaryConfig, CanaryRoute, CapabilityDelta,
-    CapabilityMonotonicityVerdict, ConformanceFixture, ConformanceReplayVerdict,
-    ConfidenceReport, ConflictKind, ExtensionRepairEvent, GatingDecision, HealthSignal,
-    HostcallCategory, HostcallDelta, IntentGraph, IntentSignal, MonotonicityVerdict,
+    run_governance_checklist, select_best_candidate, should_auto_rollback, tolerant_parse,
+    transition_overlay, validate_proposal, validate_repaired_artifact, AmbiguitySignal,
+    ApprovalRequirement, AuditEntryKind, AuditLedger, CanaryConfig, CanaryRoute,
+    CapabilityDelta, CapabilityMonotonicityVerdict, ConformanceFixture,
+    ConformanceReplayVerdict, ConfidenceReport, ConflictKind, DeveloperGuide,
+    ExtensionRepairEvent, GatingDecision, HealthSignal, HostcallCategory, HostcallDelta,
+    IntentGraph, IntentSignal, LisrAdr, MonotonicityVerdict, OperatorPlaybook,
     OverlayArtifact, OverlayState, OverlayTransitionError, PatchOp, PatchProposal,
     PiJsRuntimeConfig, PiJsTickStats, PromotionDecision, ProposalValidationError,
     RepairMode, RepairPattern, RepairRisk, SemanticDriftSeverity, SemanticParityVerdict,
@@ -3380,4 +3381,115 @@ fn forensic_bundle_with_verification() {
         11_000,
     );
     assert!(bundle.has_verification());
+}
+
+// ─── Architecture ADR tests (bd-k5q5.9.8.1) ────────────────────────────────
+
+#[test]
+fn adr_has_id_and_title() {
+    assert!(!LisrAdr::ID.is_empty());
+    assert!(!LisrAdr::TITLE.is_empty());
+}
+
+#[test]
+fn adr_has_context_and_decision() {
+    assert!(!LisrAdr::CONTEXT.is_empty());
+    assert!(!LisrAdr::DECISION.is_empty());
+}
+
+#[test]
+fn adr_documents_threats() {
+    assert!(LisrAdr::THREATS.len() >= 6);
+    for threat in LisrAdr::THREATS {
+        assert!(threat.starts_with('T'));
+    }
+}
+
+#[test]
+fn adr_has_fail_closed_rationale() {
+    assert!(!LisrAdr::FAIL_CLOSED_RATIONALE.is_empty());
+    assert!(LisrAdr::FAIL_CLOSED_RATIONALE.contains("denial"));
+}
+
+#[test]
+fn adr_documents_invariants() {
+    assert!(LisrAdr::INVARIANTS.len() >= 6);
+    for inv in LisrAdr::INVARIANTS {
+        assert!(inv.starts_with('I'));
+    }
+}
+
+// ─── Operator playbook tests (bd-k5q5.9.8.2) ──────────────────────────────
+
+#[test]
+fn playbook_mode_guidance_covers_all_modes() {
+    let modes: Vec<&str> = OperatorPlaybook::MODE_GUIDANCE
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(modes.contains(&"Off"));
+    assert!(modes.contains(&"Suggest"));
+    assert!(modes.contains(&"AutoSafe"));
+    assert!(modes.contains(&"AutoStrict"));
+}
+
+#[test]
+fn playbook_canary_procedure_has_steps() {
+    assert!(OperatorPlaybook::CANARY_PROCEDURE.len() >= 5);
+}
+
+#[test]
+fn playbook_incident_response_has_steps() {
+    assert!(OperatorPlaybook::INCIDENT_RESPONSE.len() >= 5);
+    assert!(OperatorPlaybook::INCIDENT_RESPONSE[0].contains("Off"));
+}
+
+// ─── Developer guide tests (bd-k5q5.9.8.3) ─────────────────────────────────
+
+#[test]
+fn developer_guide_add_rule_checklist() {
+    assert!(DeveloperGuide::ADD_RULE_CHECKLIST.len() >= 8);
+}
+
+#[test]
+fn developer_guide_anti_patterns() {
+    assert!(DeveloperGuide::ANTI_PATTERNS.len() >= 4);
+    for (name, guidance) in DeveloperGuide::ANTI_PATTERNS {
+        assert!(!name.is_empty());
+        assert!(!guidance.is_empty());
+    }
+}
+
+#[test]
+fn developer_guide_testing_expectations() {
+    assert!(DeveloperGuide::TESTING_EXPECTATIONS.len() >= 5);
+}
+
+// ─── Governance checklist tests (bd-k5q5.9.8.4) ────────────────────────────
+
+#[test]
+fn governance_checklist_all_pass() {
+    let report = run_governance_checklist();
+    assert!(
+        report.all_passed(),
+        "Governance failures: {:?}",
+        report
+            .failures()
+            .iter()
+            .map(|c| format!("{}: {}", c.id, c.detail))
+            .collect::<Vec<_>>()
+    );
+    assert!(report.total_count >= 6);
+}
+
+#[test]
+fn governance_report_has_expected_checks() {
+    let report = run_governance_checklist();
+    let ids: Vec<&str> = report.checks.iter().map(|c| c.id.as_str()).collect();
+    assert!(ids.contains(&"GOV-001"));
+    assert!(ids.contains(&"GOV-002"));
+    assert!(ids.contains(&"GOV-003"));
+    assert!(ids.contains(&"GOV-004"));
+    assert!(ids.contains(&"GOV-005"));
+    assert!(ids.contains(&"GOV-006"));
 }
