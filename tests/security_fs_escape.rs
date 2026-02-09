@@ -668,3 +668,144 @@ fn access_sync_nonexistent() {
         "accessSync on nonexistent should error: {result}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pattern 2 (bd-k5q5.8.3): missing asset fallback
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn missing_asset_html_returns_empty_document() {
+    // Reading a nonexistent .html in the extension root should return a
+    // minimal empty HTML document instead of throwing ENOENT.
+    let result = eval_fs(
+        r"(() => {
+        try {
+            return fs.readFileSync('extensions/missing_template.html', 'utf8');
+        } catch (e) {
+            return 'ERROR:' + e.message;
+        }
+    })()",
+    );
+    assert!(
+        result.contains("<!DOCTYPE html>"),
+        "expected HTML fallback, got: {result}"
+    );
+}
+
+#[test]
+fn missing_asset_css_returns_empty_stylesheet() {
+    let result = eval_fs(
+        r"(() => {
+        try {
+            return fs.readFileSync('extensions/theme.css', 'utf8');
+        } catch (e) {
+            return 'ERROR:' + e.message;
+        }
+    })()",
+    );
+    assert!(
+        result.contains("empty stylesheet"),
+        "expected CSS fallback, got: {result}"
+    );
+}
+
+#[test]
+fn missing_asset_js_returns_empty_script() {
+    let result = eval_fs(
+        r"(() => {
+        try {
+            return fs.readFileSync('extensions/helper.js', 'utf8');
+        } catch (e) {
+            return 'ERROR:' + e.message;
+        }
+    })()",
+    );
+    assert!(
+        result.contains("empty script"),
+        "expected JS fallback, got: {result}"
+    );
+}
+
+#[test]
+fn missing_asset_md_returns_empty_string() {
+    let result = eval_fs(
+        r"(() => {
+        try {
+            const content = fs.readFileSync('extensions/README.md', 'utf8');
+            return content.length === 0 ? 'EMPTY' : 'NONEMPTY:' + content;
+        } catch (e) {
+            return 'ERROR:' + e.message;
+        }
+    })()",
+    );
+    assert_eq!(result, "EMPTY", "expected empty string for .md, got: {result}");
+}
+
+#[test]
+fn missing_asset_json_still_throws() {
+    // .json files should NOT get a fallback (empty string is invalid JSON).
+    let result = eval_fs(
+        r"(() => {
+        try {
+            return fs.readFileSync('extensions/config.json', 'utf8');
+        } catch (e) {
+            return 'ERROR:' + e.message;
+        }
+    })()",
+    );
+    assert!(
+        result.contains("ERROR:"),
+        "expected error for .json, got: {result}"
+    );
+}
+
+#[test]
+fn missing_asset_outside_ext_root_still_throws() {
+    // A missing file in the workspace root (not extension root) should
+    // NOT get a fallback — only extension-root files are auto-repaired.
+    let result = eval_fs(
+        r"(() => {
+        try {
+            return fs.readFileSync('missing_workspace_file.html', 'utf8');
+        } catch (e) {
+            return 'ERROR:' + e.message;
+        }
+    })()",
+    );
+    assert!(
+        result.contains("ERROR:"),
+        "expected error for file outside ext root, got: {result}"
+    );
+}
+
+#[test]
+fn missing_asset_mjs_returns_empty_script() {
+    let result = eval_fs(
+        r"(() => {
+        try {
+            return fs.readFileSync('extensions/util.mjs', 'utf8');
+        } catch (e) {
+            return 'ERROR:' + e.message;
+        }
+    })()",
+    );
+    assert!(
+        result.contains("empty script"),
+        "expected JS fallback for .mjs, got: {result}"
+    );
+}
+
+#[test]
+fn missing_asset_yaml_returns_empty_string() {
+    let result = eval_fs(
+        r"(() => {
+        try {
+            const content = fs.readFileSync('extensions/config.yaml', 'utf8');
+            return content.length === 0 ? 'EMPTY' : 'NONEMPTY:' + content;
+        } catch (e) {
+            return 'ERROR:' + e.message;
+        }
+    })()",
+    );
+    assert_eq!(result, "EMPTY", "expected empty string for .yaml, got: {result}");
+}

@@ -10792,6 +10792,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let process_args = self.config.args.clone();
         let env = self.config.env.clone();
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
+        let bridge_repair_mode = self.config.repair_mode;
+        let bridge_repair_events = Arc::clone(&self.repair_events);
 
         self.context
             .with(|ctx| {
@@ -11350,6 +11352,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let repair_mode = bridge_repair_mode;
+                        let repair_events = Arc::clone(&bridge_repair_events);
                         move |path: String| -> rquickjs::Result<String> {
                             let workspace_root = std::fs::canonicalize(&process_cwd)
                                 .unwrap_or_else(|_| PathBuf::from(&process_cwd));
@@ -11394,11 +11398,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                             // Allow reads from workspace root or any registered
                             // extension root directory.
-                            let allowed = checked_path.starts_with(&workspace_root) || {
-                                allowed_read_roots.lock().is_ok_and(|roots| {
-                                    roots.iter().any(|root| checked_path.starts_with(root))
-                                })
-                            };
+                            let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
+                                roots.iter().any(|root| checked_path.starts_with(root))
+                            });
+                            let allowed =
+                                checked_path.starts_with(&workspace_root) || in_ext_root;
                             if !allowed {
                                 return Err(rquickjs::Error::new_loading_message(
                                     &path,
@@ -11406,12 +11410,68 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 ));
                             }
 
-                            std::fs::read_to_string(&checked_path).map_err(|err| {
-                                rquickjs::Error::new_loading_message(
+                            match std::fs::read_to_string(&checked_path) {
+                                Ok(content) => Ok(content),
+                                Err(err)
+                                    if err.kind() == std::io::ErrorKind::NotFound
+                                        && in_ext_root
+                                        && repair_mode.should_apply() =>
+                                {
+                                    // Pattern 2 (bd-k5q5.8.3): missing asset fallback.
+                                    // Return type-appropriate empty content for known
+                                    // asset extensions. Never for .json (invalid) or
+                                    // .env (security-relevant).
+                                    let ext = checked_path
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("");
+                                    let fallback = match ext {
+                                        "html" | "htm" => {
+                                            "<!DOCTYPE html><html><body></body></html>"
+                                        }
+                                        "css" => "/* auto-repair: empty stylesheet */",
+                                        "js" | "mjs" => "// auto-repair: empty script",
+                                        "md" | "txt" | "toml" | "yaml" | "yml" => "",
+                                        // Do NOT fallback for .json (empty string is
+                                        // not valid JSON) or .env (security-relevant).
+                                        _ => {
+                                            return Err(rquickjs::Error::new_loading_message(
+                                                &path,
+                                                format!("host read: {err}"),
+                                            ));
+                                        }
+                                    };
+
+                                    tracing::info!(
+                                        event = "pijs.repair.missing_asset",
+                                        path = %path,
+                                        ext = %ext,
+                                        "returning empty fallback for missing asset"
+                                    );
+
+                                    // Record repair event.
+                                    if let Ok(mut events) = repair_events.lock() {
+                                        events.push(ExtensionRepairEvent {
+                                            extension_id: String::new(),
+                                            pattern: RepairPattern::MissingAsset,
+                                            original_error: format!(
+                                                "ENOENT: {}", checked_path.display()
+                                            ),
+                                            repair_action: format!(
+                                                "returned empty {ext} fallback"
+                                            ),
+                                            success: true,
+                                            timestamp_ms: 0,
+                                        });
+                                    }
+
+                                    Ok(fallback.to_string())
+                                }
+                                Err(err) => Err(rquickjs::Error::new_loading_message(
                                     &path,
                                     format!("host read: {err}"),
-                                )
-                            })
+                                )),
+                            }
                         }
                     }),
                 )?;
