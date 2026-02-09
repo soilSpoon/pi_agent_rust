@@ -10782,6 +10782,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .entry("PI_TARGET_ARCH".to_string())
             .or_insert_with(|| "x64".to_string());
 
+        // Inject target platform so JS process.platform matches os.platform().
+        // OSTYPE env var is a shell variable and not always exported.
+        {
+            let platform = match std::env::consts::OS {
+                "macos" => "darwin",
+                "windows" => "win32",
+                other => other,
+            };
+            config
+                .env
+                .entry("PI_PLATFORM".to_string())
+                .or_insert_with(|| platform.to_string());
+        }
+
         let runtime = AsyncRuntime::new().map_err(|err| map_js_error(&err))?;
         if let Some(limit) = config.limits.memory_limit_bytes {
             runtime.set_memory_limit(limit).await;

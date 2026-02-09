@@ -1159,7 +1159,7 @@ fn e2e_cli_config_paths_honor_env_overrides() {
     );
     // On macOS, temp_dir() is a symlink; on Windows, strip \\?\ prefix.
     let canonical_temp = canon(harness.harness.temp_dir());
-    let project_path = canonical_temp.join(".pi/settings.json");
+    let project_path = canonical_temp.join(".pi").join("settings.json");
     assert_contains(
         &harness.harness,
         &result.stdout,
@@ -1211,7 +1211,7 @@ fn e2e_cli_config_paths_fallback_to_agent_dir() {
     // On macOS, temp_dir() is a symlink; canonicalize to match binary output.
     // On Windows, strip \\?\ prefix.
     let canonical_temp = canon(harness.harness.temp_dir());
-    let project_path = canonical_temp.join(".pi/settings.json");
+    let project_path = canonical_temp.join(".pi").join("settings.json");
     assert_contains(
         &harness.harness,
         &result.stdout,
