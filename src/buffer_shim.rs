@@ -320,42 +320,79 @@ class Buffer extends Uint8Array {
   }
 
   // Read/write integers (LE/BE) — commonly used by extensions
-  readUInt8(offset) { return this[offset || 0]; }
-  readUInt16LE(offset) { offset = offset || 0; return this[offset] | (this[offset + 1] << 8); }
-  readUInt16BE(offset) { offset = offset || 0; return (this[offset] << 8) | this[offset + 1]; }
-  readUInt32LE(offset) {
-    offset = offset || 0;
-    return (this[offset] | (this[offset+1] << 8) | (this[offset+2] << 16)) + this[offset+3] * 0x1000000;
+  readUInt8(offset) {
+    offset = offset >>> 0;
+    if (offset >= this.length) throw new RangeError('Index out of range');
+    return this[offset];
   }
-  readUInt32BE(offset) {
-    offset = offset || 0;
-    return this[offset] * 0x1000000 + ((this[offset+1] << 16) | (this[offset+2] << 8) | this[offset+3]);
-  }
-  readInt8(offset) { const v = this[offset || 0]; return v > 127 ? v - 256 : v; }
 
-  writeUInt8(value, offset) { this[offset || 0] = value & 0xFF; return (offset || 0) + 1; }
+  readUInt16LE(offset) {
+    offset = offset >>> 0;
+    if (offset + 2 > this.length) throw new RangeError('Index out of range');
+    return this[offset] | (this[offset + 1] << 8);
+  }
+
+  readUInt16BE(offset) {
+    offset = offset >>> 0;
+    if (offset + 2 > this.length) throw new RangeError('Index out of range');
+    return (this[offset] << 8) | this[offset + 1];
+  }
+
+  readUInt32LE(offset) {
+    offset = offset >>> 0;
+    if (offset + 4 > this.length) throw new RangeError('Index out of range');
+    return (this[offset] | (this[offset+1] << 8) | (this[offset+2] << 16)) + (this[offset+3] * 0x1000000);
+  }
+
+  readUInt32BE(offset) {
+    offset = offset >>> 0;
+    if (offset + 4 > this.length) throw new RangeError('Index out of range');
+    return (this[offset] * 0x1000000) + ((this[offset+1] << 16) | (this[offset+2] << 8) | this[offset+3]);
+  }
+
+  readInt8(offset) {
+    offset = offset >>> 0;
+    if (offset >= this.length) throw new RangeError('Index out of range');
+    const v = this[offset];
+    return v > 127 ? v - 256 : v;
+  }
+
+  writeUInt8(value, offset) {
+    offset = offset >>> 0;
+    if (offset >= this.length) throw new RangeError('Index out of range');
+    this[offset] = value & 0xFF;
+    return offset + 1;
+  }
+
   writeUInt16LE(value, offset) {
-    offset = offset || 0;
+    offset = offset >>> 0;
+    if (offset + 2 > this.length) throw new RangeError('Index out of range');
     this[offset] = value & 0xFF;
     this[offset + 1] = (value >>> 8) & 0xFF;
     return offset + 2;
   }
+
   writeUInt16BE(value, offset) {
-    offset = offset || 0;
+    offset = offset >>> 0;
+    if (offset + 2 > this.length) throw new RangeError('Index out of range');
     this[offset] = (value >>> 8) & 0xFF;
     this[offset + 1] = value & 0xFF;
     return offset + 2;
   }
+
   writeUInt32LE(value, offset) {
-    offset = offset || 0;
+    offset = offset >>> 0;
+    if (offset + 4 > this.length) throw new RangeError('Index out of range');
     this[offset] = value & 0xFF;
     this[offset+1] = (value >>> 8) & 0xFF;
     this[offset+2] = (value >>> 16) & 0xFF;
     this[offset+3] = (value >>> 24) & 0xFF;
     return offset + 4;
   }
+
   writeUInt32BE(value, offset) {
-    offset = offset || 0;
+    offset = offset >>> 0;
+    if (offset + 4 > this.length) throw new RangeError('Index out of range');
     this[offset] = (value >>> 24) & 0xFF;
     this[offset+1] = (value >>> 16) & 0xFF;
     this[offset+2] = (value >>> 8) & 0xFF;
