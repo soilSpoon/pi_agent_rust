@@ -719,14 +719,21 @@ fn handle_connection(
         if let Some(pos) = find_double_crlf(&buf) {
             break pos;
         }
-        let n = stream.read(scratch)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed before request headers",
-            ));
+        match stream.read(scratch) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before request headers",
+                ));
+            }
+            Ok(n) => buf.extend_from_slice(&scratch[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                // Transient EAGAIN (macOS); retry after a short sleep.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            Err(err) => return Err(err),
         }
-        buf.extend_from_slice(&scratch[..n]);
         if buf.len() > 64 * 1024 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
