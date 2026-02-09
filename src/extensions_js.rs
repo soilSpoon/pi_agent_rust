@@ -5255,6 +5255,12 @@ fn prefix_import_meta_url(module_name: &str, body: &str) -> Vec<u8> {
         format!("file://{module_name}")
     } else if module_name.starts_with("file://") {
         module_name.to_string()
+    } else if module_name.len() > 2
+        && module_name.as_bytes()[1] == b':'
+        && (module_name.as_bytes()[2] == b'/' || module_name.as_bytes()[2] == b'\\')
+    {
+        // Windows absolute path: `C:/Users/...` or `C:\Users\...`
+        format!("file:///{module_name}")
     } else {
         format!("pi://{module_name}")
     };
@@ -8992,7 +8998,10 @@ export default { createInterface, promises };
 export function fileURLToPath(url) {
   const u = String(url ?? '');
   if (u.startsWith('file://')) {
-    return decodeURIComponent(u.slice(7));
+    let p = decodeURIComponent(u.slice(7));
+    // file:///C:/... → C:/... (strip leading / before Windows drive letter)
+    if (p.length >= 3 && p[0] === '/' && p[2] === ':') { p = p.slice(1); }
+    return p;
   }
   return u;
 }
