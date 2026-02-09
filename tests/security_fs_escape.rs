@@ -248,7 +248,8 @@ fn host_read_fallback_denies_outside_workspace() {
     let result = eval_fs(
         r"(() => {
         try {
-            const content = fs.readFileSync('/etc/hostname', 'utf8');
+            // Use /etc/hosts (exists on all POSIX; /etc/hostname is Linux-only)
+            const content = fs.readFileSync('/etc/hosts', 'utf8');
             return content.length > 0 ? 'read_ok' : 'empty';
         } catch (e) {
             return 'ERROR:' + e.message;
@@ -308,8 +309,8 @@ fn read_file_traversal_with_dot_dot() {
     let result = eval_fs(
         r"(() => {
         try {
-            // Attempt to read /etc/hostname via path traversal
-            const content = fs.readFileSync('/fake/../etc/hostname', 'utf8');
+            // Attempt to read /etc/hosts via path traversal (/etc/hosts exists on all POSIX)
+            const content = fs.readFileSync('/fake/../etc/hosts', 'utf8');
             return 'read:' + content.trim().length;
         } catch (e) {
             return 'ERROR:' + e.message;

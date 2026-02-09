@@ -1103,7 +1103,8 @@ mod tool_errors {
             assert!(
                 msg.contains("not found")
                     || msg.contains("No such file")
-                    || msg.contains("does not exist"),
+                    || msg.contains("does not exist")
+                    || msg.contains("cannot find"),
                 "unexpected error: {msg}"
             );
         });
@@ -1234,7 +1235,8 @@ mod tool_errors {
                     assert!(
                         msg.contains("not found")
                             || msg.contains("No such file")
-                            || msg.contains("does not exist"),
+                            || msg.contains("does not exist")
+                            || msg.contains("cannot find"),
                         "unexpected error: {msg}"
                     );
                 }
