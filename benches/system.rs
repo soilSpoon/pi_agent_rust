@@ -20,7 +20,7 @@
 
 use std::env;
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -82,32 +82,105 @@ fn criterion_config() -> Criterion {
 // Binary Path Resolution
 // ============================================================================
 
-fn pi_binary_path() -> PathBuf {
-    // Check for explicit override
-    if let Ok(path) = env::var("PI_BENCH_BINARY") {
-        return PathBuf::from(path);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryKind {
+    Release,
+    Debug,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedBinary {
+    path: PathBuf,
+    kind: BinaryKind,
+}
+
+fn infer_binary_kind(path: &Path) -> BinaryKind {
+    let mut saw_release = false;
+    let mut saw_debug = false;
+    for component in path.components() {
+        let part = component.as_os_str().to_string_lossy();
+        if part == "release" {
+            saw_release = true;
+        } else if part == "debug" {
+            saw_debug = true;
+        }
     }
 
-    // Look for release binary first (more realistic)
+    if saw_release {
+        BinaryKind::Release
+    } else if saw_debug {
+        BinaryKind::Debug
+    } else {
+        BinaryKind::Unknown
+    }
+}
+
+fn target_roots(manifest_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(raw) = env::var("CARGO_TARGET_DIR") {
+        let candidate = PathBuf::from(raw);
+        let resolved = if candidate.is_absolute() {
+            candidate
+        } else {
+            manifest_dir.join(candidate)
+        };
+        roots.push(resolved);
+    }
+
+    let default_target = manifest_dir.join("target");
+    if !roots.contains(&default_target) {
+        roots.push(default_target);
+    }
+
+    roots
+}
+
+fn resolve_pi_binary() -> ResolvedBinary {
+    // Check for explicit override
+    if let Ok(path) = env::var("PI_BENCH_BINARY") {
+        let path = PathBuf::from(path);
+        return ResolvedBinary {
+            kind: infer_binary_kind(&path),
+            path,
+        };
+    }
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let release_path = manifest_dir.join("target/release/pi");
-    if release_path.exists() {
-        return release_path;
+    let target_roots = target_roots(&manifest_dir);
+
+    // Look for release binary first (more realistic)
+    for root in &target_roots {
+        let release_path = root.join("release/pi");
+        if release_path.exists() {
+            return ResolvedBinary {
+                path: release_path,
+                kind: BinaryKind::Release,
+            };
+        }
     }
 
     // Fall back to debug binary
-    let debug_path = manifest_dir.join("target/debug/pi");
-    if debug_path.exists() {
-        return debug_path;
+    for root in &target_roots {
+        let debug_path = root.join("debug/pi");
+        if debug_path.exists() {
+            return ResolvedBinary {
+                path: debug_path,
+                kind: BinaryKind::Debug,
+            };
+        }
     }
 
     // Last resort: hope it's in PATH
-    PathBuf::from("pi")
+    ResolvedBinary {
+        path: PathBuf::from("pi"),
+        kind: BinaryKind::Unknown,
+    }
 }
 
-fn binary_size_bytes() -> Option<u64> {
-    let path = pi_binary_path();
-    std::fs::metadata(&path).ok().map(|m| m.len())
+fn binary_size_bytes(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
 }
 
 // ============================================================================
@@ -116,11 +189,11 @@ fn binary_size_bytes() -> Option<u64> {
 
 /// Measure startup time for `pi --version` (minimal startup path)
 fn bench_startup_version(c: &mut Criterion) {
-    let binary = pi_binary_path();
-    if !binary.exists() && binary != PathBuf::from("pi") {
+    let binary = resolve_pi_binary();
+    if !binary.path.exists() && binary.path != PathBuf::from("pi") {
         eprintln!(
             "[skip] bench_startup_version: binary not found at {}",
-            binary.display()
+            binary.path.display()
         );
         return;
     }
@@ -130,7 +203,7 @@ fn bench_startup_version(c: &mut Criterion) {
 
         // Warm the filesystem cache
         for _ in 0..3 {
-            let _ = Command::new(&binary)
+            let _ = Command::new(&binary.path)
                 .arg("--version")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -140,7 +213,7 @@ fn bench_startup_version(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("version", "warm"), |b| {
             b.iter(|| {
                 let start = Instant::now();
-                let status = Command::new(&binary)
+                let status = Command::new(&binary.path)
                     .arg("--version")
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -156,22 +229,22 @@ fn bench_startup_version(c: &mut Criterion) {
     }
 
     // Log binary size for reference
-    if let Some(size) = binary_size_bytes() {
+    if let Some(size) = binary_size_bytes(&binary.path) {
         let size_mb = size as f64 / 1024.0 / 1024.0;
         eprintln!(
             "[info] binary_size={size_mb:.2}MB path={}",
-            binary.display()
+            binary.path.display()
         );
     }
 }
 
 /// Measure startup time for `pi --help` (loads more code paths)
 fn bench_startup_help(c: &mut Criterion) {
-    let binary = pi_binary_path();
-    if !binary.exists() && binary != PathBuf::from("pi") {
+    let binary = resolve_pi_binary();
+    if !binary.path.exists() && binary.path != PathBuf::from("pi") {
         eprintln!(
             "[skip] bench_startup_help: binary not found at {}",
-            binary.display()
+            binary.path.display()
         );
         return;
     }
@@ -181,7 +254,7 @@ fn bench_startup_help(c: &mut Criterion) {
 
         // Warm the filesystem cache
         for _ in 0..3 {
-            let _ = Command::new(&binary)
+            let _ = Command::new(&binary.path)
                 .arg("--help")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -191,7 +264,7 @@ fn bench_startup_help(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("help", "warm"), |b| {
             b.iter(|| {
                 let start = Instant::now();
-                let status = Command::new(&binary)
+                let status = Command::new(&binary.path)
                     .arg("--help")
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -209,11 +282,11 @@ fn bench_startup_help(c: &mut Criterion) {
 
 /// Measure startup time for `pi --list-models` (exercises provider listing)
 fn bench_startup_list_models(c: &mut Criterion) {
-    let binary = pi_binary_path();
-    if !binary.exists() && binary != PathBuf::from("pi") {
+    let binary = resolve_pi_binary();
+    if !binary.path.exists() && binary.path != PathBuf::from("pi") {
         eprintln!(
             "[skip] bench_startup_list_models: binary not found at {}",
-            binary.display()
+            binary.path.display()
         );
         return;
     }
@@ -223,7 +296,7 @@ fn bench_startup_list_models(c: &mut Criterion) {
 
         // Warm the filesystem cache
         for _ in 0..3 {
-            let _ = Command::new(&binary)
+            let _ = Command::new(&binary.path)
                 .arg("--list-models")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -233,7 +306,7 @@ fn bench_startup_list_models(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("list_models", "warm"), |b| {
             b.iter(|| {
                 let start = Instant::now();
-                let status = Command::new(&binary)
+                let status = Command::new(&binary.path)
                     .arg("--list-models")
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -255,11 +328,11 @@ fn bench_startup_list_models(c: &mut Criterion) {
 
 /// Measure RSS memory for `pi --version` (process exits immediately)
 fn bench_memory_version(c: &mut Criterion) {
-    let binary = pi_binary_path();
-    if !binary.exists() && binary != PathBuf::from("pi") {
+    let binary = resolve_pi_binary();
+    if !binary.path.exists() && binary.path != PathBuf::from("pi") {
         eprintln!(
             "[skip] bench_memory_version: binary not found at {}",
-            binary.display()
+            binary.path.display()
         );
         return;
     }
@@ -269,7 +342,7 @@ fn bench_memory_version(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("version_peak", "spawn"), |b| {
         b.iter(|| {
             // Spawn process and immediately query its memory
-            let mut child = Command::new(&binary)
+            let mut child = Command::new(&binary.path)
                 .arg("--version")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -305,17 +378,29 @@ fn bench_memory_version(c: &mut Criterion) {
 /// Report binary size (not a timing benchmark, just records the value)
 fn bench_binary_size(c: &mut Criterion) {
     let mut group = c.benchmark_group("binary");
+    let binary = resolve_pi_binary();
 
-    if let Some(size) = binary_size_bytes() {
+    if let Some(size) = binary_size_bytes(&binary.path) {
         let size_mb = size as f64 / 1024.0 / 1024.0;
-        eprintln!("[metric] binary_size_mb={size_mb:.2}");
+        eprintln!(
+            "[metric] binary_size_mb={size_mb:.2} path={} kind={:?}",
+            binary.path.display(),
+            binary.kind
+        );
 
-        // Check against budget
-        let budget_mb = 20.0;
-        if size_mb > budget_mb {
-            eprintln!("[WARN] binary size {size_mb:.2}MB exceeds budget {budget_mb:.2}MB");
+        if binary.kind == BinaryKind::Release {
+            // Check release binary against budget.
+            let budget_mb = 20.0;
+            if size_mb > budget_mb {
+                eprintln!("[WARN] binary size {size_mb:.2}MB exceeds budget {budget_mb:.2}MB");
+            } else {
+                eprintln!("[OK] binary size {size_mb:.2}MB within budget {budget_mb:.2}MB");
+            }
         } else {
-            eprintln!("[OK] binary size {size_mb:.2}MB within budget {budget_mb:.2}MB");
+            eprintln!(
+                "[info] skipping release-size budget check for non-release binary ({:?})",
+                binary.kind
+            );
         }
 
         // "Benchmark" that just records the size for criterion tracking
