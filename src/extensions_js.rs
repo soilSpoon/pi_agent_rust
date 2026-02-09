@@ -3487,6 +3487,378 @@ impl VerificationBundle {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Overlay artifact format and lifecycle storage (bd-k5q5.9.6.1)
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of an overlay artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OverlayState {
+    /// Just created, not yet deployed.
+    Staged,
+    /// In canary — serving to a controlled cohort.
+    Canary,
+    /// Promoted to stable after successful canary window.
+    Stable,
+    /// Rolled back due to failure or manual action.
+    RolledBack,
+    /// Superseded by a newer repair.
+    Superseded,
+}
+
+impl OverlayState {
+    /// True if the overlay is currently serving traffic.
+    pub const fn is_active(&self) -> bool {
+        matches!(self, Self::Canary | Self::Stable)
+    }
+
+    /// True if the overlay has reached a terminal state.
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::RolledBack | Self::Superseded)
+    }
+}
+
+impl std::fmt::Display for OverlayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Staged => write!(f, "staged"),
+            Self::Canary => write!(f, "canary"),
+            Self::Stable => write!(f, "stable"),
+            Self::RolledBack => write!(f, "rolled_back"),
+            Self::Superseded => write!(f, "superseded"),
+        }
+    }
+}
+
+/// An overlay artifact bundle: the unit of repair deployment.
+///
+/// Contains the repaired payload, original artifact hash, proof metadata,
+/// policy decisions, and full lineage for auditability.
+#[derive(Debug, Clone)]
+pub struct OverlayArtifact {
+    /// Unique identifier for this overlay.
+    pub overlay_id: String,
+    /// Extension identity.
+    pub extension_id: String,
+    /// Extension version.
+    pub extension_version: String,
+    /// SHA-256 of the original (broken) artifact.
+    pub original_checksum: ArtifactChecksum,
+    /// SHA-256 of the repaired artifact.
+    pub repaired_checksum: ArtifactChecksum,
+    /// Current lifecycle state.
+    pub state: OverlayState,
+    /// Rule that produced this repair.
+    pub rule_id: String,
+    /// Repair mode active when the overlay was created.
+    pub repair_mode: RepairMode,
+    /// Verification bundle summary (pass/fail per layer).
+    pub verification_passed: bool,
+    /// Creation timestamp (unix millis).
+    pub created_at_ms: u64,
+    /// Last state-transition timestamp (unix millis).
+    pub updated_at_ms: u64,
+}
+
+impl OverlayArtifact {
+    /// True if the overlay is currently serving.
+    pub const fn is_active(&self) -> bool {
+        self.state.is_active()
+    }
+}
+
+/// State transition error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayTransitionError {
+    /// Attempted transition is not valid from the current state.
+    InvalidTransition {
+        from: OverlayState,
+        to: OverlayState,
+    },
+    /// Verification must pass before deployment.
+    VerificationRequired,
+}
+
+impl std::fmt::Display for OverlayTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTransition { from, to } => {
+                write!(f, "invalid transition: {from} → {to}")
+            }
+            Self::VerificationRequired => {
+                write!(f, "verification must pass before deployment")
+            }
+        }
+    }
+}
+
+/// Advance an overlay through its lifecycle.
+///
+/// Valid transitions:
+/// - Staged → Canary (requires verification_passed)
+/// - Canary → Stable
+/// - Canary → `RolledBack`
+/// - Stable → `RolledBack`
+/// - Stable → Superseded
+/// - Staged → `RolledBack`
+pub fn transition_overlay(
+    artifact: &mut OverlayArtifact,
+    target: OverlayState,
+    now_ms: u64,
+) -> std::result::Result<(), OverlayTransitionError> {
+    let valid = matches!(
+        (artifact.state, target),
+        (
+            OverlayState::Staged,
+            OverlayState::Canary | OverlayState::RolledBack
+        ) | (
+            OverlayState::Canary,
+            OverlayState::Stable | OverlayState::RolledBack
+        ) | (
+            OverlayState::Stable,
+            OverlayState::RolledBack | OverlayState::Superseded
+        )
+    );
+
+    if !valid {
+        return Err(OverlayTransitionError::InvalidTransition {
+            from: artifact.state,
+            to: target,
+        });
+    }
+
+    // Verification gate for deployment.
+    if target == OverlayState::Canary && !artifact.verification_passed {
+        return Err(OverlayTransitionError::VerificationRequired);
+    }
+
+    artifact.state = target;
+    artifact.updated_at_ms = now_ms;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-extension/version canary routing (bd-k5q5.9.6.2)
+// ---------------------------------------------------------------------------
+
+/// Canary routing decision for a specific request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CanaryRoute {
+    /// Use the original (unrepaired) artifact.
+    Original,
+    /// Use the repaired overlay artifact.
+    Overlay,
+}
+
+impl std::fmt::Display for CanaryRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Original => write!(f, "original"),
+            Self::Overlay => write!(f, "overlay"),
+        }
+    }
+}
+
+/// Canary configuration for a specific extension/version pair.
+#[derive(Debug, Clone)]
+pub struct CanaryConfig {
+    /// Extension identity.
+    pub extension_id: String,
+    /// Extension version.
+    pub extension_version: String,
+    /// Percentage of requests to route to overlay (0–100).
+    pub overlay_percent: u8,
+    /// Whether canary is currently active.
+    pub enabled: bool,
+}
+
+impl CanaryConfig {
+    /// Route a request using a deterministic hash value (0–99).
+    pub const fn route(&self, hash_bucket: u8) -> CanaryRoute {
+        if self.enabled && hash_bucket < self.overlay_percent {
+            CanaryRoute::Overlay
+        } else {
+            CanaryRoute::Original
+        }
+    }
+
+    /// True if all traffic is routed to overlay (100% canary).
+    pub const fn is_full_rollout(&self) -> bool {
+        self.enabled && self.overlay_percent >= 100
+    }
+}
+
+/// Compute a deterministic hash bucket (0–99) from extension ID and environment.
+pub fn compute_canary_bucket(extension_id: &str, environment: &str) -> u8 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(extension_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(environment.as_bytes());
+    let hash = hasher.finalize();
+    // Take first byte modulo 100 for bucket.
+    hash[0] % 100
+}
+
+// ---------------------------------------------------------------------------
+// Health/SLO monitors and automatic rollback triggers (bd-k5q5.9.6.3)
+// ---------------------------------------------------------------------------
+
+/// A health signal observed during canary.
+#[derive(Debug, Clone)]
+pub struct HealthSignal {
+    /// Signal name (e.g., "load_success", "hostcall_error_rate").
+    pub name: String,
+    /// Current value.
+    pub value: f64,
+    /// SLO threshold (value must not exceed this for the signal to be healthy).
+    pub threshold: f64,
+}
+
+impl HealthSignal {
+    /// True if the signal is within SLO bounds.
+    pub fn is_healthy(&self) -> bool {
+        self.value <= self.threshold
+    }
+}
+
+/// SLO verdict for a canary window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SloVerdict {
+    /// All signals within thresholds.
+    Healthy,
+    /// One or more signals violated their SLO.
+    Violated,
+}
+
+impl SloVerdict {
+    /// True if the canary is healthy.
+    pub const fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+}
+
+impl std::fmt::Display for SloVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::Violated => write!(f, "violated"),
+        }
+    }
+}
+
+/// Health assessment report for a canary window.
+#[derive(Debug, Clone)]
+pub struct HealthReport {
+    /// Extension identity.
+    pub extension_id: String,
+    /// Overall verdict.
+    pub verdict: SloVerdict,
+    /// Individual signal assessments.
+    pub signals: Vec<HealthSignal>,
+    /// Signals that violated their SLO.
+    pub violations: Vec<String>,
+}
+
+impl HealthReport {
+    /// True if the canary is healthy.
+    pub const fn is_healthy(&self) -> bool {
+        self.verdict.is_healthy()
+    }
+}
+
+/// Evaluate health signals against SLO thresholds.
+pub fn evaluate_health(
+    extension_id: &str,
+    signals: &[HealthSignal],
+) -> HealthReport {
+    let violations: Vec<String> = signals
+        .iter()
+        .filter(|s| !s.is_healthy())
+        .map(|s| format!("{}: {:.3} > {:.3}", s.name, s.value, s.threshold))
+        .collect();
+
+    let verdict = if violations.is_empty() {
+        SloVerdict::Healthy
+    } else {
+        SloVerdict::Violated
+    };
+
+    HealthReport {
+        extension_id: extension_id.to_string(),
+        verdict,
+        signals: signals.to_vec(),
+        violations,
+    }
+}
+
+/// Automatic rollback trigger: should the canary be rolled back?
+pub const fn should_auto_rollback(health: &HealthReport) -> bool {
+    !health.is_healthy()
+}
+
+// ---------------------------------------------------------------------------
+// Promotion and deterministic rollback workflow (bd-k5q5.9.6.4)
+// ---------------------------------------------------------------------------
+
+/// Promotion decision for a canary overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PromotionDecision {
+    /// Promote to stable — canary window passed.
+    Promote,
+    /// Keep in canary — more observation needed.
+    Hold,
+    /// Rollback — SLO violations detected.
+    Rollback,
+}
+
+impl std::fmt::Display for PromotionDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Promote => write!(f, "promote"),
+            Self::Hold => write!(f, "hold"),
+            Self::Rollback => write!(f, "rollback"),
+        }
+    }
+}
+
+/// Decide whether to promote, hold, or rollback a canary overlay.
+///
+/// Rules:
+/// - If health is violated → Rollback.
+/// - If canary duration has exceeded the window → Promote.
+/// - Otherwise → Hold.
+pub const fn decide_promotion(
+    health: &HealthReport,
+    canary_start_ms: u64,
+    now_ms: u64,
+    canary_window_ms: u64,
+) -> PromotionDecision {
+    if !health.is_healthy() {
+        return PromotionDecision::Rollback;
+    }
+    if now_ms.saturating_sub(canary_start_ms) >= canary_window_ms {
+        return PromotionDecision::Promote;
+    }
+    PromotionDecision::Hold
+}
+
+/// Execute a promotion: transitions overlay to Stable.
+pub fn execute_promotion(
+    artifact: &mut OverlayArtifact,
+    now_ms: u64,
+) -> std::result::Result<(), OverlayTransitionError> {
+    transition_overlay(artifact, OverlayState::Stable, now_ms)
+}
+
+/// Execute a rollback: transitions overlay to `RolledBack`.
+pub fn execute_rollback(
+    artifact: &mut OverlayArtifact,
+    now_ms: u64,
+) -> std::result::Result<(), OverlayTransitionError> {
+    transition_overlay(artifact, OverlayState::RolledBack, now_ms)
+}
+
 #[derive(Debug, Clone)]
 pub struct PiJsRuntimeConfig {
     pub cwd: String,

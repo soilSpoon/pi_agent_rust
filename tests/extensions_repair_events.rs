@@ -15,17 +15,20 @@ use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHa
 use pi::extensions_js::{
     allowed_op_tags_for_mode, apply_proposal, build_approval_request,
     build_golden_manifest, check_approval_requirement, compute_artifact_checksum,
-    compute_capability_proof, compute_confidence, compute_gating_verdict,
-    compute_semantic_parity, detect_conflict, extract_hostcall_surface,
-    replay_conformance_fixtures, resolve_conflicts, select_best_candidate, tolerant_parse,
-    validate_proposal, validate_repaired_artifact, AmbiguitySignal, ApprovalRequirement,
-    CapabilityDelta, CapabilityMonotonicityVerdict, ConformanceFixture,
+    compute_canary_bucket, compute_capability_proof, compute_confidence,
+    compute_gating_verdict, compute_semantic_parity, decide_promotion, detect_conflict,
+    evaluate_health, execute_promotion, execute_rollback, extract_hostcall_surface,
+    replay_conformance_fixtures, resolve_conflicts, select_best_candidate,
+    should_auto_rollback, tolerant_parse, transition_overlay, validate_proposal,
+    validate_repaired_artifact, AmbiguitySignal, ApprovalRequirement, CanaryConfig,
+    CanaryRoute, CapabilityDelta, CapabilityMonotonicityVerdict, ConformanceFixture,
     ConformanceReplayVerdict, ConfidenceReport, ConflictKind, ExtensionRepairEvent,
-    GatingDecision, HostcallCategory, HostcallDelta, IntentGraph, IntentSignal,
-    MonotonicityVerdict, PatchOp, PatchProposal, PiJsRuntimeConfig, PiJsTickStats,
-    ProposalValidationError, RepairMode, RepairPattern, RepairRisk, SemanticDriftSeverity,
-    SemanticParityVerdict, StructuralVerdict, TolerantParseResult, VerificationBundle,
-    REPAIR_REGISTRY_VERSION, REPAIR_RULES,
+    GatingDecision, HealthSignal, HostcallCategory, HostcallDelta, IntentGraph,
+    IntentSignal, MonotonicityVerdict, OverlayArtifact, OverlayState,
+    OverlayTransitionError, PatchOp, PatchProposal, PiJsRuntimeConfig, PiJsTickStats,
+    PromotionDecision, ProposalValidationError, RepairMode, RepairPattern, RepairRisk,
+    SemanticDriftSeverity, SemanticParityVerdict, SloVerdict, StructuralVerdict,
+    TolerantParseResult, VerificationBundle, REPAIR_REGISTRY_VERSION, REPAIR_RULES,
 };
 use pi::tools::ToolRegistry;
 use std::sync::Arc;
@@ -2755,4 +2758,346 @@ fn verification_bundle_multiple_failures() {
     let reasons = bundle.failure_reasons();
     // structural + capability + semantic + conformance = 4
     assert_eq!(reasons.len(), 4);
+}
+
+// ─── Overlay artifact format and lifecycle tests (bd-k5q5.9.6.1) ───────────
+
+fn make_overlay(state: OverlayState, verified: bool) -> OverlayArtifact {
+    OverlayArtifact {
+        overlay_id: "ovl-001".to_string(),
+        extension_id: "ext-a".to_string(),
+        extension_version: "1.0.0".to_string(),
+        original_checksum: "abc123".to_string(),
+        repaired_checksum: "def456".to_string(),
+        state,
+        rule_id: "dist_to_src_v1".to_string(),
+        repair_mode: RepairMode::AutoSafe,
+        verification_passed: verified,
+        created_at_ms: 1000,
+        updated_at_ms: 1000,
+    }
+}
+
+#[test]
+fn overlay_state_display() {
+    assert_eq!(OverlayState::Staged.to_string(), "staged");
+    assert_eq!(OverlayState::Canary.to_string(), "canary");
+    assert_eq!(OverlayState::Stable.to_string(), "stable");
+    assert_eq!(OverlayState::RolledBack.to_string(), "rolled_back");
+    assert_eq!(OverlayState::Superseded.to_string(), "superseded");
+}
+
+#[test]
+fn overlay_state_is_active() {
+    assert!(!OverlayState::Staged.is_active());
+    assert!(OverlayState::Canary.is_active());
+    assert!(OverlayState::Stable.is_active());
+    assert!(!OverlayState::RolledBack.is_active());
+    assert!(!OverlayState::Superseded.is_active());
+}
+
+#[test]
+fn overlay_state_is_terminal() {
+    assert!(!OverlayState::Staged.is_terminal());
+    assert!(!OverlayState::Canary.is_terminal());
+    assert!(!OverlayState::Stable.is_terminal());
+    assert!(OverlayState::RolledBack.is_terminal());
+    assert!(OverlayState::Superseded.is_terminal());
+}
+
+#[test]
+fn overlay_transition_staged_to_canary() {
+    let mut ovl = make_overlay(OverlayState::Staged, true);
+    assert!(transition_overlay(&mut ovl, OverlayState::Canary, 2000).is_ok());
+    assert_eq!(ovl.state, OverlayState::Canary);
+    assert_eq!(ovl.updated_at_ms, 2000);
+}
+
+#[test]
+fn overlay_transition_staged_to_canary_requires_verification() {
+    let mut ovl = make_overlay(OverlayState::Staged, false);
+    let err = transition_overlay(&mut ovl, OverlayState::Canary, 2000).unwrap_err();
+    assert_eq!(err, OverlayTransitionError::VerificationRequired);
+}
+
+#[test]
+fn overlay_transition_canary_to_stable() {
+    let mut ovl = make_overlay(OverlayState::Canary, true);
+    assert!(transition_overlay(&mut ovl, OverlayState::Stable, 3000).is_ok());
+    assert_eq!(ovl.state, OverlayState::Stable);
+}
+
+#[test]
+fn overlay_transition_canary_to_rollback() {
+    let mut ovl = make_overlay(OverlayState::Canary, true);
+    assert!(transition_overlay(&mut ovl, OverlayState::RolledBack, 4000).is_ok());
+    assert_eq!(ovl.state, OverlayState::RolledBack);
+}
+
+#[test]
+fn overlay_transition_stable_to_superseded() {
+    let mut ovl = make_overlay(OverlayState::Stable, true);
+    assert!(transition_overlay(&mut ovl, OverlayState::Superseded, 5000).is_ok());
+    assert_eq!(ovl.state, OverlayState::Superseded);
+}
+
+#[test]
+fn overlay_transition_invalid() {
+    let mut ovl = make_overlay(OverlayState::RolledBack, true);
+    let err = transition_overlay(&mut ovl, OverlayState::Canary, 6000).unwrap_err();
+    assert!(matches!(
+        err,
+        OverlayTransitionError::InvalidTransition { .. }
+    ));
+}
+
+#[test]
+fn overlay_transition_error_display() {
+    let err = OverlayTransitionError::InvalidTransition {
+        from: OverlayState::RolledBack,
+        to: OverlayState::Canary,
+    };
+    assert!(err.to_string().contains("invalid transition"));
+    let err2 = OverlayTransitionError::VerificationRequired;
+    assert!(err2.to_string().contains("verification"));
+}
+
+// ─── Canary routing tests (bd-k5q5.9.6.2) ──────────────────────────────────
+
+#[test]
+fn canary_route_display() {
+    assert_eq!(CanaryRoute::Original.to_string(), "original");
+    assert_eq!(CanaryRoute::Overlay.to_string(), "overlay");
+}
+
+#[test]
+fn canary_config_routes_by_bucket() {
+    let config = CanaryConfig {
+        extension_id: "ext-a".to_string(),
+        extension_version: "1.0.0".to_string(),
+        overlay_percent: 50,
+        enabled: true,
+    };
+    // Bucket < 50 → overlay
+    assert_eq!(config.route(0), CanaryRoute::Overlay);
+    assert_eq!(config.route(49), CanaryRoute::Overlay);
+    // Bucket >= 50 → original
+    assert_eq!(config.route(50), CanaryRoute::Original);
+    assert_eq!(config.route(99), CanaryRoute::Original);
+}
+
+#[test]
+fn canary_config_disabled_routes_original() {
+    let config = CanaryConfig {
+        extension_id: "ext-b".to_string(),
+        extension_version: "1.0.0".to_string(),
+        overlay_percent: 100,
+        enabled: false,
+    };
+    assert_eq!(config.route(0), CanaryRoute::Original);
+}
+
+#[test]
+fn canary_config_full_rollout() {
+    let full = CanaryConfig {
+        extension_id: "ext-c".to_string(),
+        extension_version: "1.0.0".to_string(),
+        overlay_percent: 100,
+        enabled: true,
+    };
+    assert!(full.is_full_rollout());
+
+    let partial = CanaryConfig {
+        extension_id: "ext-c".to_string(),
+        extension_version: "1.0.0".to_string(),
+        overlay_percent: 50,
+        enabled: true,
+    };
+    assert!(!partial.is_full_rollout());
+}
+
+#[test]
+fn canary_bucket_deterministic() {
+    let a = compute_canary_bucket("ext-a", "prod");
+    let b = compute_canary_bucket("ext-a", "prod");
+    assert_eq!(a, b);
+    assert!(a < 100);
+}
+
+#[test]
+fn canary_bucket_differs_by_env() {
+    let prod = compute_canary_bucket("ext-a", "prod");
+    let staging = compute_canary_bucket("ext-a", "staging");
+    // Not guaranteed to differ, but let's check it's valid.
+    assert!(prod < 100);
+    assert!(staging < 100);
+}
+
+// ─── Health/SLO monitor tests (bd-k5q5.9.6.3) ─────────────────────────────
+
+#[test]
+fn health_signal_within_threshold() {
+    let signal = HealthSignal {
+        name: "error_rate".to_string(),
+        value: 0.01,
+        threshold: 0.05,
+    };
+    assert!(signal.is_healthy());
+}
+
+#[test]
+fn health_signal_above_threshold() {
+    let signal = HealthSignal {
+        name: "error_rate".to_string(),
+        value: 0.10,
+        threshold: 0.05,
+    };
+    assert!(!signal.is_healthy());
+}
+
+#[test]
+fn health_evaluate_all_healthy() {
+    let signals = vec![
+        HealthSignal {
+            name: "error_rate".to_string(),
+            value: 0.01,
+            threshold: 0.05,
+        },
+        HealthSignal {
+            name: "latency_p99".to_string(),
+            value: 100.0,
+            threshold: 500.0,
+        },
+    ];
+    let report = evaluate_health("ext-a", &signals);
+    assert!(report.is_healthy());
+    assert_eq!(report.verdict, SloVerdict::Healthy);
+    assert!(report.violations.is_empty());
+}
+
+#[test]
+fn health_evaluate_with_violation() {
+    let signals = vec![
+        HealthSignal {
+            name: "error_rate".to_string(),
+            value: 0.10,
+            threshold: 0.05,
+        },
+        HealthSignal {
+            name: "latency_p99".to_string(),
+            value: 100.0,
+            threshold: 500.0,
+        },
+    ];
+    let report = evaluate_health("ext-b", &signals);
+    assert!(!report.is_healthy());
+    assert_eq!(report.verdict, SloVerdict::Violated);
+    assert_eq!(report.violations.len(), 1);
+    assert!(report.violations[0].contains("error_rate"));
+}
+
+#[test]
+fn slo_verdict_display() {
+    assert_eq!(SloVerdict::Healthy.to_string(), "healthy");
+    assert_eq!(SloVerdict::Violated.to_string(), "violated");
+}
+
+#[test]
+fn auto_rollback_on_violation() {
+    let signals = vec![HealthSignal {
+        name: "errors".to_string(),
+        value: 0.5,
+        threshold: 0.1,
+    }];
+    let report = evaluate_health("ext-c", &signals);
+    assert!(should_auto_rollback(&report));
+}
+
+#[test]
+fn no_rollback_when_healthy() {
+    let signals = vec![HealthSignal {
+        name: "errors".to_string(),
+        value: 0.01,
+        threshold: 0.1,
+    }];
+    let report = evaluate_health("ext-d", &signals);
+    assert!(!should_auto_rollback(&report));
+}
+
+// ─── Promotion and rollback workflow tests (bd-k5q5.9.6.4) ─────────────────
+
+#[test]
+fn promotion_decision_display() {
+    assert_eq!(PromotionDecision::Promote.to_string(), "promote");
+    assert_eq!(PromotionDecision::Hold.to_string(), "hold");
+    assert_eq!(PromotionDecision::Rollback.to_string(), "rollback");
+}
+
+#[test]
+fn decide_promotion_rollback_on_violation() {
+    let signals = vec![HealthSignal {
+        name: "errors".to_string(),
+        value: 0.5,
+        threshold: 0.1,
+    }];
+    let health = evaluate_health("ext-a", &signals);
+    let decision = decide_promotion(&health, 1000, 2000, 500);
+    assert_eq!(decision, PromotionDecision::Rollback);
+}
+
+#[test]
+fn decide_promotion_promote_after_window() {
+    let health = evaluate_health("ext-b", &[]);
+    let decision = decide_promotion(&health, 1000, 2000, 500);
+    assert_eq!(decision, PromotionDecision::Promote);
+}
+
+#[test]
+fn decide_promotion_hold_during_window() {
+    let health = evaluate_health("ext-c", &[]);
+    let decision = decide_promotion(&health, 1000, 1200, 500);
+    assert_eq!(decision, PromotionDecision::Hold);
+}
+
+#[test]
+fn execute_promotion_canary_to_stable() {
+    let mut ovl = make_overlay(OverlayState::Canary, true);
+    assert!(execute_promotion(&mut ovl, 5000).is_ok());
+    assert_eq!(ovl.state, OverlayState::Stable);
+    assert_eq!(ovl.updated_at_ms, 5000);
+}
+
+#[test]
+fn execute_rollback_canary_to_rolled_back() {
+    let mut ovl = make_overlay(OverlayState::Canary, true);
+    assert!(execute_rollback(&mut ovl, 6000).is_ok());
+    assert_eq!(ovl.state, OverlayState::RolledBack);
+}
+
+#[test]
+fn execute_rollback_stable_to_rolled_back() {
+    let mut ovl = make_overlay(OverlayState::Stable, true);
+    assert!(execute_rollback(&mut ovl, 7000).is_ok());
+    assert_eq!(ovl.state, OverlayState::RolledBack);
+}
+
+#[test]
+fn execute_promotion_from_staged_fails() {
+    let mut ovl = make_overlay(OverlayState::Staged, true);
+    assert!(execute_promotion(&mut ovl, 8000).is_err());
+}
+
+#[test]
+fn full_canary_lifecycle() {
+    // staged → canary → stable
+    let mut ovl = make_overlay(OverlayState::Staged, true);
+    assert!(transition_overlay(&mut ovl, OverlayState::Canary, 1000).is_ok());
+    assert!(ovl.is_active());
+    assert!(execute_promotion(&mut ovl, 2000).is_ok());
+    assert_eq!(ovl.state, OverlayState::Stable);
+    assert!(ovl.is_active());
+    // supersede
+    assert!(transition_overlay(&mut ovl, OverlayState::Superseded, 3000).is_ok());
+    assert!(!ovl.is_active());
+    assert!(ovl.state.is_terminal());
 }
