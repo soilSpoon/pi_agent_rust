@@ -212,6 +212,194 @@
         {
           "path": "tests/repro_sse_newline.rs",
           "justification": "Regression reproducer for newline-sensitive SSE parsing behavior."
+        },
+        {
+          "path": "tests/capability_prompt.rs",
+          "justification": "Capability prompt construction and policy text shaping coverage."
+        },
+        {
+          "path": "tests/conformance_comparator.rs",
+          "justification": "Conformance report comparator diff logic and verdict behavior checks."
+        },
+        {
+          "path": "tests/conformance_mock.rs",
+          "justification": "Conformance harness behavior under deterministic mock-style fixture conditions."
+        },
+        {
+          "path": "tests/event_dispatch_latency.rs",
+          "justification": "Event-dispatch latency measurement and regression threshold checks."
+        },
+        {
+          "path": "tests/ext_bench_harness.rs",
+          "justification": "Extension benchmark harness orchestration and result-shape validation."
+        },
+        {
+          "path": "tests/ext_conformance.rs",
+          "justification": "Primary extension conformance integration verification across corpus fixtures."
+        },
+        {
+          "path": "tests/ext_conformance_generated.rs",
+          "justification": "Generated extension conformance cases and fixture integration checks."
+        },
+        {
+          "path": "tests/ext_conformance_guard.rs",
+          "justification": "Conformance guardrail enforcement for required report and pass-rate invariants."
+        },
+        {
+          "path": "tests/ext_conformance_negative.rs",
+          "justification": "Negative-path conformance behavior and failure-surface verification."
+        },
+        {
+          "path": "tests/ext_conformance_selector.rs",
+          "justification": "Conformance selector filtering and suite-target routing checks."
+        },
+        {
+          "path": "tests/ext_conformance_shapes.rs",
+          "justification": "Conformance output schema/shape stability checks for report consumers."
+        },
+        {
+          "path": "tests/ext_entry_scan.rs",
+          "justification": "Extension entry scanning and discovery behavior verification."
+        },
+        {
+          "path": "tests/ext_inclusion_list.rs",
+          "justification": "Extension inclusion-list policy and allowlist selection coverage."
+        },
+        {
+          "path": "tests/ext_load_time_benchmark.rs",
+          "justification": "Extension load-time benchmark execution and budget assertions."
+        },
+        {
+          "path": "tests/ext_preflight_analyzer.rs",
+          "justification": "Extension preflight analysis diagnostics and classification checks."
+        },
+        {
+          "path": "tests/ext_proptest.rs",
+          "justification": "Property-based extension runtime invariants and robustness coverage."
+        },
+        {
+          "path": "tests/ext_provenance_verification.rs",
+          "justification": "Extension provenance verification and policy conformance checks."
+        },
+        {
+          "path": "tests/ext_random_trials.rs",
+          "justification": "Randomized extension trial harness behavior and reproducibility checks."
+        },
+        {
+          "path": "tests/ext_risk_review.rs",
+          "justification": "Extension risk-review artifact generation and rule coverage."
+        },
+        {
+          "path": "tests/extension_code_search.rs",
+          "justification": "Extension code-search indexing/query behavior correctness checks."
+        },
+        {
+          "path": "tests/extension_license.rs",
+          "justification": "Extension license scanning and compliance classification coverage."
+        },
+        {
+          "path": "tests/extension_tiered_corpus.rs",
+          "justification": "Tiered extension corpus loading/selection behavior validation."
+        },
+        {
+          "path": "tests/extension_validation.rs",
+          "justification": "Extension validation pipeline checks for schema and runtime constraints."
+        },
+        {
+          "path": "tests/extensions_concurrent_correctness.rs",
+          "justification": "Concurrent extension execution correctness and race-regression coverage."
+        },
+        {
+          "path": "tests/extensions_event_cancellation.rs",
+          "justification": "Extension event cancellation semantics and propagation behavior checks."
+        },
+        {
+          "path": "tests/extensions_event_wiring.rs",
+          "justification": "Extension event registration/dispatch wiring correctness checks."
+        },
+        {
+          "path": "tests/extensions_fs_shim.rs",
+          "justification": "Filesystem shim behavior consistency and sandbox semantics coverage."
+        },
+        {
+          "path": "tests/extensions_manifest.rs",
+          "justification": "Extension manifest parsing/validation and metadata handling checks."
+        },
+        {
+          "path": "tests/extensions_message_session.rs",
+          "justification": "Message/session extension integration behavior and state handoff checks."
+        },
+        {
+          "path": "tests/extensions_process_shim.rs",
+          "justification": "Process shim runtime behavior and compatibility checks for extensions."
+        },
+        {
+          "path": "tests/extensions_provider_oauth.rs",
+          "justification": "Extension provider OAuth flow integration and failure-path coverage."
+        },
+        {
+          "path": "tests/extensions_url_shim.rs",
+          "justification": "URL shim behavior compatibility and normalization checks."
+        },
+        {
+          "path": "tests/interactive_extension_ui.rs",
+          "justification": "Interactive extension UI flow behavior and render-state checks."
+        },
+        {
+          "path": "tests/lab_runtime_extensions.rs",
+          "justification": "Lab runtime extension integration behavior under deterministic runtime controls."
+        },
+        {
+          "path": "tests/node_child_process_shim.rs",
+          "justification": "Node child_process shim API behavior and sandbox handling checks."
+        },
+        {
+          "path": "tests/node_events_shim.rs",
+          "justification": "Node events shim semantics and emitter behavior compatibility coverage."
+        },
+        {
+          "path": "tests/node_fs_shim.rs",
+          "justification": "Node fs shim path and file-operation compatibility checks."
+        },
+        {
+          "path": "tests/node_shim_integration.rs",
+          "justification": "Cross-shim integration behavior across Node compatibility surfaces."
+        },
+        {
+          "path": "tests/package_manager.rs",
+          "justification": "Package-manager integration behavior and command contract checks."
+        },
+        {
+          "path": "tests/perf_bench_harness.rs",
+          "justification": "Performance benchmark harness orchestration and artifact contract checks."
+        },
+        {
+          "path": "tests/pi_connector_shims.rs",
+          "justification": "Pi connector shim behavior and bridge compatibility checks."
+        },
+        {
+          "path": "tests/repro_config_error.rs",
+          "justification": "Config-error reproducer regression coverage for known failure modes."
+        },
+        {
+          "path": "tests/repro_edit_encoding.rs",
+          "justification": "Edit encoding reproducer regression coverage for text-encoding edge cases."
+        },
+        {
+          "path": "tests/reproduce_bom_bug.rs",
+          "justification": "BOM-related regression reproducer for file parsing/editing behavior."
+        },
+        {
+          "path": "tests/reproduce_edit_whitespace.rs",
+          "justification": "Whitespace edit reproducer regression checks for patch/edit stability."
+        },
+        {
+          "path": "tests/traceability_staleness.rs",
+          "justification": "Governance gate ensuring matrix/classification/file-set staleness stays bounded."
+        },
+        {
+          "path": "tests/tui_snapshot.rs",
+          "justification": "TUI snapshot stability checks for interactive rendering behavior."
         }
       ],
       "e2e_scripts": [
