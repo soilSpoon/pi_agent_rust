@@ -112,6 +112,14 @@ pub struct Cli {
     #[arg(long)]
     pub explain_extension_policy: bool,
 
+    /// Repair policy mode: off, suggest, auto-safe, or auto-strict
+    #[arg(long, value_name = "MODE")]
+    pub repair_policy: Option<String>,
+
+    /// Print the resolved repair policy and exit
+    #[arg(long)]
+    pub explain_repair_policy: bool,
+
     // === Skills ===
     /// Load skill file/directory (can use multiple times)
     #[arg(long, action = clap::ArgAction::Append)]
@@ -701,6 +709,32 @@ mod tests {
     fn explain_extension_policy_flag_parses() {
         let cli = Cli::parse_from(["pi", "--explain-extension-policy"]);
         assert!(cli.explain_extension_policy);
+    }
+
+    // ── 13. Repair policy flag ──────────────────────────────────────
+
+    #[test]
+    fn repair_policy_flag_parses() {
+        let cli = Cli::parse_from(["pi", "--repair-policy", "auto-safe"]);
+        assert_eq!(cli.repair_policy.as_deref(), Some("auto-safe"));
+    }
+
+    #[test]
+    fn repair_policy_flag_off() {
+        let cli = Cli::parse_from(["pi", "--repair-policy", "off"]);
+        assert_eq!(cli.repair_policy.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn repair_policy_flag_absent() {
+        let cli = Cli::parse_from(["pi"]);
+        assert!(cli.repair_policy.is_none());
+    }
+
+    #[test]
+    fn explain_repair_policy_flag_parses() {
+        let cli = Cli::parse_from(["pi", "--explain-repair-policy"]);
+        assert!(cli.explain_repair_policy);
     }
 }
 

@@ -137,11 +137,6 @@ pub enum TruncatedBy {
     Bytes,
 }
 
-enum TailLine<'a> {
-    Borrowed(&'a str),
-    Owned(String),
-}
-
 /// Truncate from the beginning (keep first N lines).
 ///
 /// Uses lazy iteration to avoid allocating a Vec of all line slices upfront.
@@ -231,11 +226,12 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
 
 /// Truncate from the end (keep last N lines).
 ///
-/// Uses `rsplit` for lazy reverse iteration and borrows `&str` slices instead
-/// of cloning each line into a `String`. Only the final join allocates.
+/// Scans line boundaries from the end and tracks a single slice start offset,
+/// avoiding per-line allocation/reversal/join in the common case.
 pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
     let total_bytes = content.len();
-    let total_lines = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
+    let bytes = content.as_bytes();
+    let total_lines = memchr::memchr_iter(b'\n', bytes).count() + 1;
 
     // No truncation needed
     if total_lines <= max_lines && total_bytes <= max_bytes {
@@ -254,49 +250,50 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         };
     }
 
-    let mut collected: Vec<TailLine<'_>> = Vec::new();
-    let mut byte_count: usize = 0;
+    let mut line_count = 0usize;
+    let mut byte_count = 0usize;
+    let mut start_idx = content.len();
+    let mut search_end = content.len();
+    let mut partial_output: Option<String> = None;
     let mut truncated_by = None;
     let mut last_line_partial = false;
 
-    // rsplit iterates lazily from the end — no Vec<&str> of all lines needed.
-    for line in content.rsplit('\n') {
-        let line_bytes = line.len() + usize::from(!collected.is_empty());
-
-        if collected.len() >= max_lines {
+    loop {
+        if line_count >= max_lines {
             truncated_by = Some(TruncatedBy::Lines);
             break;
         }
 
-        if byte_count + line_bytes > max_bytes {
-            // Check if we can include a partial last line
+        let prev_newline = memchr::memrchr(b'\n', &bytes[..search_end]);
+        let line_start = prev_newline.map_or(0, |idx| idx + 1);
+        let added_bytes = (search_end - line_start) + usize::from(line_count > 0);
+
+        if byte_count + added_bytes > max_bytes {
+            // Preserve existing behavior: partial suffix is only allowed when no full
+            // line has been included yet and there is at least one byte available.
             let remaining = max_bytes.saturating_sub(byte_count);
-            if remaining > 0 && collected.is_empty() {
-                let truncated = truncate_string_to_bytes_from_end(line, max_bytes);
-                byte_count = truncated.len();
-                collected.push(TailLine::Owned(truncated));
+            if remaining > 0 && line_count == 0 {
+                let truncated =
+                    truncate_string_to_bytes_from_end(&content[line_start..search_end], max_bytes);
+                line_count = 1;
+                partial_output = Some(truncated);
                 last_line_partial = true;
             }
             truncated_by = Some(TruncatedBy::Bytes);
             break;
         }
 
-        collected.push(TailLine::Borrowed(line));
-        byte_count += line_bytes;
+        line_count += 1;
+        byte_count += added_bytes;
+        start_idx = line_start;
+
+        if line_start == 0 {
+            break;
+        }
+        search_end = line_start - 1;
     }
 
-    collected.reverse();
-    let line_count = collected.len();
-    let mut output = String::with_capacity(byte_count);
-    for (i, tl) in collected.iter().enumerate() {
-        if i > 0 {
-            output.push('\n');
-        }
-        match tl {
-            TailLine::Borrowed(s) => output.push_str(s),
-            TailLine::Owned(s) => output.push_str(s),
-        }
-    }
+    let output = partial_output.unwrap_or_else(|| content[start_idx..].to_string());
     let output_bytes = output.len();
 
     TruncationResult {

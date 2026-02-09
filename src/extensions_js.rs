@@ -15400,8 +15400,10 @@ export default dep;
             )
             .expect("write extension module");
 
-            let mut config = PiJsRuntimeConfig::default();
-            config.repair_mode = RepairMode::AutoStrict;
+            let config = PiJsRuntimeConfig {
+                repair_mode: RepairMode::AutoStrict,
+                ..PiJsRuntimeConfig::default()
+            };
             let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
                 .await
                 .expect("create runtime");
@@ -15454,8 +15456,10 @@ export default dep;
             )
             .expect("write extension module");
 
-            let mut config = PiJsRuntimeConfig::default();
-            config.repair_mode = RepairMode::AutoSafe;
+            let config = PiJsRuntimeConfig {
+                repair_mode: RepairMode::AutoSafe,
+                ..PiJsRuntimeConfig::default()
+            };
             let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
                 .await
                 .expect("create runtime");

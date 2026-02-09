@@ -652,33 +652,134 @@ fn dlopen_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"process\s*\.\s*dlopen\s*\(").expect("dlopen regex"))
 }
 
+const fn is_js_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn parse_top_level_import_specifier(line: &str) -> Option<(String, usize)> {
+    let trimmed = line.trim_start();
+    let leading_ws = line.len().saturating_sub(trimmed.len());
+    let bytes = trimmed.as_bytes();
+
+    if !trimmed.starts_with("import") {
+        return None;
+    }
+
+    let mut idx = "import".len();
+    if bytes.get(idx).is_some_and(|b| is_js_ident_continue(*b)) {
+        return None;
+    }
+
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+
+    if idx >= bytes.len() {
+        return None;
+    }
+
+    // Optional `import type ...`.
+    if trimmed[idx..].starts_with("type") {
+        let after_type = idx + "type".len();
+        if bytes
+            .get(after_type)
+            .is_some_and(|b| is_js_ident_continue(*b))
+        {
+            // Not a standalone `type` keyword.
+        } else {
+            let mut k = after_type;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k > after_type {
+                idx = k;
+            }
+        }
+    }
+
+    if idx >= bytes.len() {
+        return None;
+    }
+
+    // Side-effect import: `import "pkg"`.
+    if matches!(bytes[idx], b'"' | b'\'') {
+        let quote = bytes[idx];
+        let start = idx + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != quote {
+            end += 1;
+        }
+        if end < bytes.len() {
+            let spec = trimmed[start..end].to_string();
+            return Some((spec, leading_ws + start + 1));
+        }
+        return None;
+    }
+
+    // Standard import: `import ... from "pkg"`.
+    let mut search_from = idx;
+    while let Some(rel) = trimmed[search_from..].find("from") {
+        let from_idx = search_from + rel;
+        let after_from = from_idx + "from".len();
+        let before_ok = from_idx == 0 || !is_js_ident_continue(bytes[from_idx - 1]);
+        let after_ok = after_from >= bytes.len() || !is_js_ident_continue(bytes[after_from]);
+        if before_ok && after_ok {
+            let mut k = after_from;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && matches!(bytes[k], b'"' | b'\'') {
+                let quote = bytes[k];
+                let start = k + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != quote {
+                    end += 1;
+                }
+                if end < bytes.len() {
+                    let spec = trimmed[start..end].to_string();
+                    return Some((spec, leading_ws + start + 1));
+                }
+                return None;
+            }
+        }
+        search_from = after_from;
+    }
+
+    None
+}
+
 fn extract_import_specifiers(line: &str) -> Vec<(String, usize)> {
     if !line.contains("import") {
         return Vec::new();
     }
 
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with("import") && !line.contains('(') {
-        return Vec::new();
-    }
-
     let mut out = Vec::new();
 
-    if let Some(caps) = import_from_regex().captures(line) {
-        if let Some(m) = caps.get(1) {
-            out.push((m.as_str().to_string(), m.start() + 1));
+    let top_level = parse_top_level_import_specifier(line);
+    if let Some((specifier, column)) = &top_level {
+        out.push((specifier.clone(), *column));
+    } else {
+        if let Some(caps) = import_from_regex().captures(line) {
+            if let Some(m) = caps.get(1) {
+                out.push((m.as_str().to_string(), m.start() + 1));
+            }
+        }
+
+        if let Some(caps) = import_side_effect_regex().captures(line) {
+            if let Some(m) = caps.get(1) {
+                out.push((m.as_str().to_string(), m.start() + 1));
+            }
         }
     }
 
-    if let Some(caps) = import_side_effect_regex().captures(line) {
-        if let Some(m) = caps.get(1) {
-            out.push((m.as_str().to_string(), m.start() + 1));
-        }
-    }
-
-    for caps in import_dynamic_regex().captures_iter(line) {
-        if let Some(m) = caps.get(1) {
-            out.push((m.as_str().to_string(), m.start() + 1));
+    if line.contains('(') {
+        for caps in import_dynamic_regex().captures_iter(line) {
+            if let Some(m) = caps.get(1) {
+                let candidate = (m.as_str().to_string(), m.start() + 1);
+                if !out.contains(&candidate) {
+                    out.push(candidate);
+                }
+            }
         }
     }
 
@@ -6093,7 +6194,7 @@ async fn load_one_extension(
     // monorepo escape patterns (Pattern 3).
     if let Some(ext_dir) = spec.entry_path.parent() {
         if let Ok(canonical) = std::fs::canonicalize(ext_dir) {
-            runtime.add_extension_root(canonical);
+            runtime.add_extension_root_with_id(canonical, Some(spec.extension_id.as_str()));
         }
     }
 

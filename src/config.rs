@@ -96,6 +96,10 @@ pub struct Config {
     // Extension Policy
     #[serde(alias = "extensionPolicy")]
     pub extension_policy: Option<ExtensionPolicyConfig>,
+
+    // Repair Policy
+    #[serde(alias = "repairPolicy")]
+    pub repair_policy: Option<RepairPolicyConfig>,
 }
 
 /// Extension capability policy configuration.
@@ -124,6 +128,16 @@ pub struct ExtensionPolicyConfig {
     pub allow_dangerous: Option<bool>,
 }
 
+/// Repair policy configuration.
+///
+/// Controls how the agent handles broken or incompatible extensions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepairPolicyConfig {
+    /// Repair mode: "off", "suggest" (default), "auto-safe", "auto-strict".
+    pub mode: Option<String>,
+}
+
 /// Resolved extension policy plus explainability metadata.
 #[derive(Debug, Clone)]
 pub struct ResolvedExtensionPolicy {
@@ -137,6 +151,17 @@ pub struct ResolvedExtensionPolicy {
     pub allow_dangerous: bool,
     /// Final effective policy used by runtime components.
     pub policy: crate::extensions::ExtensionPolicy,
+}
+
+/// Resolved repair policy plus explainability metadata.
+#[derive(Debug, Clone)]
+pub struct ResolvedRepairPolicy {
+    /// Raw mode token selected by precedence resolution.
+    pub requested_mode: String,
+    /// Effective mode after normalization.
+    pub effective_mode: crate::extensions::RepairPolicyMode,
+    /// Source of the selected mode token: cli, env, config, or default.
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -386,6 +411,9 @@ impl Config {
 
             // Extension Policy
             extension_policy: merge_extension_policy(base.extension_policy, other.extension_policy),
+
+            // Repair Policy
+            repair_policy: merge_repair_policy(base.repair_policy, other.repair_policy),
         }
     }
 
@@ -572,6 +600,60 @@ impl Config {
             .policy
     }
 
+    /// Resolve the repair policy from config, CLI override, and env var.
+    ///
+    /// Resolution order (highest precedence first):
+    /// 1. `cli_override` (from `--repair-policy` flag)
+    /// 2. `PI_REPAIR_POLICY` environment variable
+    /// 3. `repair_policy.mode` from settings.json
+    /// 4. Default: "suggest"
+    pub fn resolve_repair_policy_with_metadata(
+        &self,
+        cli_override: Option<&str>,
+    ) -> ResolvedRepairPolicy {
+        use crate::extensions::RepairPolicyMode;
+
+        // Determine mode string with source: CLI > env > config > default
+        let (requested_mode, source) = cli_override.map_or_else(
+            || {
+                std::env::var("PI_REPAIR_POLICY").map_or_else(
+                    |_| {
+                        self.repair_policy
+                            .as_ref()
+                            .and_then(|p| p.mode.clone())
+                            .map_or_else(
+                                || ("suggest".to_string(), "default"),
+                                |value| (value, "config"),
+                            )
+                    },
+                    |value| (value, "env"),
+                )
+            },
+            |value| (value.to_string(), "cli"),
+        );
+
+        let effective_mode = match requested_mode.trim().to_ascii_lowercase().as_str() {
+            "off" => RepairPolicyMode::Off,
+            "auto-safe" => RepairPolicyMode::AutoSafe,
+            "auto-strict" => RepairPolicyMode::AutoStrict,
+            _ => RepairPolicyMode::Suggest, // Fallback to safe default
+        };
+
+        ResolvedRepairPolicy {
+            requested_mode,
+            effective_mode,
+            source,
+        }
+    }
+
+    pub fn resolve_repair_policy(
+        &self,
+        cli_override: Option<&str>,
+    ) -> crate::extensions::RepairPolicyMode {
+        self.resolve_repair_policy_with_metadata(cli_override)
+            .effective_mode
+    }
+
     fn emit_queue_mode_diagnostics(&self) {
         emit_queue_mode_diagnostic("steering_mode", self.steering_mode.as_deref());
         emit_queue_mode_diagnostic("follow_up_mode", self.follow_up_mode.as_deref());
@@ -748,6 +830,20 @@ fn merge_extension_policy(
         (Some(base), Some(other)) => Some(ExtensionPolicyConfig {
             profile: other.profile.or(base.profile),
             allow_dangerous: other.allow_dangerous.or(base.allow_dangerous),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_repair_policy(
+    base: Option<RepairPolicyConfig>,
+    other: Option<RepairPolicyConfig>,
+) -> Option<RepairPolicyConfig> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(RepairPolicyConfig {
+            mode: other.mode.or(base.mode),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1628,5 +1724,88 @@ mod tests {
         let ext_config = config.extension_policy.as_ref().unwrap();
         assert_eq!(ext_config.profile.as_deref(), Some("safe"));
         assert_eq!(ext_config.allow_dangerous, Some(true));
+    }
+
+    // ====================================================================
+    // Repair Policy Config
+    // ====================================================================
+
+    #[test]
+    fn repair_policy_defaults_to_suggest() {
+        let config = Config::default();
+        let policy = config.resolve_repair_policy(None);
+        assert_eq!(policy, crate::extensions::RepairPolicyMode::Suggest);
+    }
+
+    #[test]
+    fn repair_policy_metadata_reports_cli_source() {
+        let config = Config::default();
+        let resolved = config.resolve_repair_policy_with_metadata(Some("off"));
+        assert_eq!(resolved.source, "cli");
+        assert_eq!(resolved.requested_mode, "off");
+        assert_eq!(
+            resolved.effective_mode,
+            crate::extensions::RepairPolicyMode::Off
+        );
+    }
+
+    #[test]
+    fn repair_policy_metadata_unknown_mode_defaults_to_suggest() {
+        let config = Config::default();
+        let resolved = config.resolve_repair_policy_with_metadata(Some("unknown"));
+        assert_eq!(resolved.requested_mode, "unknown");
+        assert_eq!(
+            resolved.effective_mode,
+            crate::extensions::RepairPolicyMode::Suggest
+        );
+    }
+
+    #[test]
+    fn repair_policy_from_settings_json() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "repairPolicy": { "mode": "auto-safe" } }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
+        let policy = config.resolve_repair_policy(None);
+        assert_eq!(policy, crate::extensions::RepairPolicyMode::AutoSafe);
+    }
+
+    #[test]
+    fn repair_policy_cli_overrides_config() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "repairPolicy": { "mode": "off" } }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
+        let policy = config.resolve_repair_policy(Some("auto-strict"));
+        assert_eq!(policy, crate::extensions::RepairPolicyMode::AutoStrict);
+    }
+
+    #[test]
+    fn repair_policy_project_overrides_global() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "repairPolicy": { "mode": "off" } }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{ "repairPolicy": { "mode": "auto-safe" } }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
+        let policy = config.resolve_repair_policy(None);
+        assert_eq!(policy, crate::extensions::RepairPolicyMode::AutoSafe);
     }
 }

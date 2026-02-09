@@ -738,7 +738,10 @@ fn missing_asset_md_returns_empty_string() {
         }
     })()",
     );
-    assert_eq!(result, "EMPTY", "expected empty string for .md, got: {result}");
+    assert_eq!(
+        result, "EMPTY",
+        "expected empty string for .md, got: {result}"
+    );
 }
 
 #[test]
@@ -807,5 +810,8 @@ fn missing_asset_yaml_returns_empty_string() {
         }
     })()",
     );
-    assert_eq!(result, "EMPTY", "expected empty string for .yaml, got: {result}");
+    assert_eq!(
+        result, "EMPTY",
+        "expected empty string for .yaml, got: {result}"
+    );
 }

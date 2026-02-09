@@ -106,6 +106,13 @@ fn main_impl() -> Result<()> {
         return Ok(());
     }
 
+    if cli.explain_repair_policy {
+        let config = Config::load()?;
+        let resolved = config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
+        print_resolved_repair_policy(&resolved)?;
+        return Ok(());
+    }
+
     // List-models is an offline query; avoid loading resources or booting the runtime when possible.
     //
     // IMPORTANT: if extension compat scanning is enabled, or explicit CLI extensions are provided,
@@ -391,6 +398,25 @@ fn print_resolved_extension_policy(resolved: &pi::config::ResolvedExtensionPolic
         "deny_caps": resolved.policy.deny_caps.clone(),
         "dangerous_capabilities": dangerous_capabilities,
         "capability_decisions": capability_decisions,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn print_resolved_repair_policy(resolved: &pi::config::ResolvedRepairPolicy) -> Result<()> {
+    let payload = serde_json::json!({
+        "requested_mode": resolved.requested_mode,
+        "effective_mode": resolved.effective_mode,
+        "source": resolved.source,
+        "modes": {
+            "off": "Disable all repair functionality.",
+            "suggest": "Only suggest fixes in diagnostics (default).",
+            "auto-safe": "Automatically apply safe fixes (e.g., config updates).",
+            "auto-strict": "Automatically apply all fixes including code changes.",
+        },
+        "cli_override": "pi --repair-policy <mode> <your command>",
+        "env_var": "PI_REPAIR_POLICY=<mode>",
     });
 
     println!("{}", serde_json::to_string_pretty(&payload)?);
