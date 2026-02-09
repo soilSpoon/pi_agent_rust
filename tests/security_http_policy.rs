@@ -13,11 +13,17 @@
 use pi::connectors::http::{HttpConnector, HttpConnectorConfig};
 use pi::connectors::{Connector, HostCallPayload};
 use pi::extensions::HostCallErrorCode;
-use serde_json::{Value, json};
+#[cfg(unix)]
+use serde_json::Value;
+use serde_json::json;
 use std::future::Future;
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -58,6 +64,7 @@ fn http_call_with_body(url: &str, method: &str, body: &str) -> HostCallPayload {
     }
 }
 
+#[cfg(unix)]
 fn http_call_with_timeout(url: &str, timeout_ms: u64) -> HostCallPayload {
     HostCallPayload {
         call_id: "call-test".to_string(),
