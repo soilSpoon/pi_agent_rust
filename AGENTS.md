@@ -159,14 +159,14 @@ cargo test conformance
 
 ### Test Categories
 
-| Module | Tests | Purpose |
-|--------|-------|---------|
-| `model` | 4 | Message/content type serialization |
-| `provider` | 2 | Provider trait and Anthropic impl |
-| `tools` | 20+ | Built-in tool behavior |
-| `sse` | 11 | SSE parser correctness |
-| `conformance` | 70+ | Fixture-based tool validation |
-| `agent` | 2 | Agent loop and event handling |
+| Area | Coverage | Purpose |
+|------|----------|---------|
+| `model` | Serialization + conversion tests | Message/content type correctness |
+| `provider_streaming` | Multi-provider fixtures | Streaming + tool-call parity across providers |
+| `tools` | Built-in + conformance fixtures | File/shell/search behavior and truncation/process safety |
+| `session` | JSONL/tree/index/sqlite tests | Persistence, branching, and replay correctness |
+| `extensions` | Runtime/policy/shim/conformance suites | QuickJS extension compatibility and capability controls |
+| `e2e` | End-to-end scenario tests | CLI/agent/rpc workflows and regression coverage |
 
 ---
 
@@ -177,11 +177,15 @@ cargo test conformance
 ### Architecture
 
 ```
-CLI (clap) → Agent Loop → Provider (Anthropic/OpenAI/Gemini) → Streaming Response
-                ↓
-         Tool Execution (read/write/edit/bash/grep/find/ls)
-                ↓
-         TUI Rendering (rich_rust + crossterm)
+CLI (clap) → main/app/config/resources → Agent Session
+                         ↓
+Provider Layer (Anthropic/OpenAI/OpenAI Responses/Gemini/Cohere/Azure + extension providers)
+                         ↓
+Tool Registry (built-ins + extension tools) ↔ Extension Runtime (QuickJS + capability policy)
+                         ↓
+Surfaces: Interactive TUI + RPC/stdin modes
+                         ↓
+Session persistence + index (JSONL, optional SQLite backend)
 ```
 
 ### Key Files
@@ -193,11 +197,21 @@ CLI (clap) → Agent Loop → Provider (Anthropic/OpenAI/Gemini) → Streaming R
 | `src/provider.rs` | Provider trait definition |
 | `src/providers/anthropic.rs` | Anthropic API implementation |
 | `src/providers/openai.rs` | OpenAI API implementation |
+| `src/providers/openai_responses.rs` | OpenAI Responses API implementation |
 | `src/providers/gemini.rs` | Gemini API implementation |
+| `src/providers/cohere.rs` | Cohere API implementation |
 | `src/providers/azure.rs` | Azure OpenAI API implementation |
+| `src/providers/mod.rs` | Provider factory and extension stream-simple bridge |
 | `src/tools.rs` | 7 built-in tools |
+| `src/interactive.rs` | Interactive TUI application state and event loop |
+| `src/rpc.rs` | RPC/stdin server mode |
+| `src/extensions.rs` | Extension protocol, policy, and host integration |
+| `src/extensions_js.rs` | QuickJS runtime bridge and hostcalls |
+| `src/resources.rs` | Skills/prompt/theme/extension resource loading |
+| `src/models.rs` | Built-in and `models.json` registry resolution |
 | `src/model.rs` | Message/content types |
 | `src/session.rs` | JSONL session persistence |
+| `src/session_index.rs` | Session indexing and metadata cache |
 | `src/sse.rs` | SSE parser for streaming |
 | `src/tui.rs` | Terminal UI rendering helpers |
 | `src/config.rs` | Configuration loading |
@@ -208,9 +222,11 @@ CLI (clap) → Agent Loop → Provider (Anthropic/OpenAI/Gemini) → Streaming R
 **Provider Layer:**
 - Abstract `Provider` trait for LLM backends
 - Anthropic implementation with streaming + extended thinking
-- OpenAI implementation with streaming + tool use
+- OpenAI Chat Completions + OpenAI Responses implementations
 - Gemini implementation with streaming + tool use
+- Cohere implementation with streaming + tool use
 - Azure OpenAI implementation (requires resource/deployment config)
+- Extension-provided providers via stream-simple bridge
 - Tool definitions with JSON Schema
 
 **Built-in Tools:**
@@ -226,7 +242,8 @@ CLI (clap) → Agent Loop → Provider (Anthropic/OpenAI/Gemini) → Streaming R
 - JSONL format (version 3)
 - Tree structure for branching
 - Entry types: Message, ModelChange, ThinkingLevel, Compaction, etc.
-- Per-project session directories
+- Per-project session directories + session index metadata
+- Optional SQLite session backend behind `sqlite-sessions` feature flag
 
 ### Migration Strategy
 
@@ -245,9 +262,10 @@ This port uses two key libraries from sibling projects:
    - Theme support
 
 **Current Status:**
-- asupersync is the async runtime (HTTP/TLS/SQLite); SSE parser implemented
-- rich_rust added
-- TUI integration complete (interactive mode)
+- asupersync powers runtime + HTTP/TLS + cancellation + optional SQLite integration
+- rich_rust/charmed_rust stack powers the interactive terminal UI
+- Provider layer includes Anthropic/OpenAI(OpenAI Responses + Chat Completions)/Gemini/Cohere/Azure paths
+- Extension runtime, capability policy, and conformance harness are integrated
 
 ### Performance Targets
 
