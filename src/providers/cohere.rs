@@ -128,7 +128,7 @@ impl Provider for CohereProvider {
                     .api_key
                     .clone()
                     .or_else(|| std::env::var("COHERE_API_KEY").ok())
-                    .ok_or_else(|| Error::config("Missing Cohere API key"))?,
+                    .ok_or_else(|| Error::provider("cohere", "Missing API key for Cohere. Set COHERE_API_KEY or configure in settings."))?,
             )
         };
 
@@ -167,9 +167,10 @@ impl Provider for CohereProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
-            return Err(Error::api(format!(
-                "Cohere API error (HTTP {status}): {body}"
-            )));
+            return Err(Error::provider(
+                "cohere",
+                format!("Cohere API error (HTTP {status}): {body}"),
+            ));
         }
 
         let content_type = response

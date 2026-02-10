@@ -141,7 +141,7 @@ impl Provider for OpenAIResponsesProvider {
                     .api_key
                     .clone()
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                    .ok_or_else(|| Error::config("Missing OpenAI API key"))?,
+                    .ok_or_else(|| Error::provider("openai", "Missing API key for OpenAI. Set OPENAI_API_KEY or configure in settings."))?,
             )
         };
 
@@ -181,9 +181,10 @@ impl Provider for OpenAIResponsesProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
-            return Err(Error::api(format!(
-                "OpenAI API error (HTTP {status}): {body}"
-            )));
+            return Err(Error::provider(
+                "openai",
+                format!("OpenAI API error (HTTP {status}): {body}"),
+            ));
         }
 
         let content_type = response

@@ -24,7 +24,7 @@ use std::pin::Pin;
 // ============================================================================
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
-const DEFAULT_MAX_TOKENS: u32 = 8192;
+pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 // ============================================================================
 // Gemini Provider
@@ -154,7 +154,12 @@ impl Provider for GeminiProvider {
             .clone()
             .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-            .ok_or_else(|| Error::config("Missing Google/Gemini API key"))?;
+            .ok_or_else(|| {
+                Error::provider(
+                    "google",
+                    "Missing API key for Google/Gemini. Set GOOGLE_API_KEY or GEMINI_API_KEY.",
+                )
+            })?;
 
         let request_body = self.build_request(context, options);
         let url = self.streaming_url(&auth_value);
@@ -185,9 +190,10 @@ impl Provider for GeminiProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
-            return Err(Error::api(format!(
-                "Gemini API error (HTTP {status}): {body}"
-            )));
+            return Err(Error::provider(
+                "google",
+                format!("Gemini API error (HTTP {status}): {body}"),
+            ));
         }
 
         // Create SSE stream for streaming responses.
@@ -415,28 +421,28 @@ where
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiRequest {
-    contents: Vec<GeminiContent>,
+    pub(crate) contents: Vec<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system_instruction: Option<GeminiContent>,
+    pub(crate) system_instruction: Option<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<GeminiTool>>,
+    pub(crate) tools: Option<Vec<GeminiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_config: Option<GeminiToolConfig>,
+    pub(crate) tool_config: Option<GeminiToolConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    generation_config: Option<GeminiGenerationConfig>,
+    pub(crate) generation_config: Option<GeminiGenerationConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiContent {
+pub(crate) struct GeminiContent {
     #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<String>,
-    parts: Vec<GeminiPart>,
+    pub(crate) role: Option<String>,
+    pub(crate) parts: Vec<GeminiPart>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
-enum GeminiPart {
+pub(crate) enum GeminiPart {
     Text {
         text: String,
     },
@@ -455,56 +461,56 @@ enum GeminiPart {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiBlob {
-    mime_type: String,
-    data: String,
+pub(crate) struct GeminiBlob {
+    pub(crate) mime_type: String,
+    pub(crate) data: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct GeminiFunctionCall {
-    name: String,
-    args: serde_json::Value,
+pub(crate) struct GeminiFunctionCall {
+    pub(crate) name: String,
+    pub(crate) args: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct GeminiFunctionResponse {
-    name: String,
-    response: serde_json::Value,
+pub(crate) struct GeminiFunctionResponse {
+    pub(crate) name: String,
+    pub(crate) response: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiTool {
-    function_declarations: Vec<GeminiFunctionDeclaration>,
+pub(crate) struct GeminiTool {
+    pub(crate) function_declarations: Vec<GeminiFunctionDeclaration>,
 }
 
 #[derive(Debug, Serialize)]
-struct GeminiFunctionDeclaration {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GeminiToolConfig {
-    function_calling_config: GeminiFunctionCallingConfig,
-}
-
-#[derive(Debug, Serialize)]
-struct GeminiFunctionCallingConfig {
-    mode: String,
+pub(crate) struct GeminiFunctionDeclaration {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) parameters: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiGenerationConfig {
+pub(crate) struct GeminiToolConfig {
+    pub(crate) function_calling_config: GeminiFunctionCallingConfig,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct GeminiFunctionCallingConfig {
+    pub(crate) mode: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
+    pub(crate) max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
+    pub(crate) temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    candidate_count: Option<u32>,
+    pub(crate) candidate_count: Option<u32>,
 }
 
 // ============================================================================
@@ -513,39 +519,39 @@ struct GeminiGenerationConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiStreamResponse {
+pub(crate) struct GeminiStreamResponse {
     #[serde(default)]
-    candidates: Option<Vec<GeminiCandidate>>,
+    pub(crate) candidates: Option<Vec<GeminiCandidate>>,
     #[serde(default)]
-    usage_metadata: Option<GeminiUsageMetadata>,
+    pub(crate) usage_metadata: Option<GeminiUsageMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiCandidate {
+pub(crate) struct GeminiCandidate {
     #[serde(default)]
-    content: Option<GeminiContent>,
+    pub(crate) content: Option<GeminiContent>,
     #[serde(default)]
-    finish_reason: Option<String>,
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(clippy::struct_field_names)]
-struct GeminiUsageMetadata {
+pub(crate) struct GeminiUsageMetadata {
     #[serde(default)]
-    prompt_token_count: Option<u64>,
+    pub(crate) prompt_token_count: Option<u64>,
     #[serde(default)]
-    candidates_token_count: Option<u64>,
+    pub(crate) candidates_token_count: Option<u64>,
     #[serde(default)]
-    total_token_count: Option<u64>,
+    pub(crate) total_token_count: Option<u64>,
 }
 
 // ============================================================================
 // Conversion Functions
 // ============================================================================
 
-fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
+pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
     match message {
         Message::User(user) => vec![GeminiContent {
             role: Some("user".to_string()),
@@ -621,7 +627,7 @@ fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
     }
 }
 
-fn convert_user_content_to_parts(content: &UserContent) -> Vec<GeminiPart> {
+pub(crate) fn convert_user_content_to_parts(content: &UserContent) -> Vec<GeminiPart> {
     match content {
         UserContent::Text(text) => vec![GeminiPart::Text { text: text.clone() }],
         UserContent::Blocks(blocks) => blocks
@@ -642,7 +648,7 @@ fn convert_user_content_to_parts(content: &UserContent) -> Vec<GeminiPart> {
     }
 }
 
-fn convert_tool_to_gemini(tool: &ToolDef) -> GeminiFunctionDeclaration {
+pub(crate) fn convert_tool_to_gemini(tool: &ToolDef) -> GeminiFunctionDeclaration {
     GeminiFunctionDeclaration {
         name: tool.name.clone(),
         description: tool.description.clone(),

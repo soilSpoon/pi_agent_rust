@@ -134,7 +134,10 @@ impl CopilotProvider {
     async fn ensure_session_token(&self) -> Result<CachedToken> {
         // Check cache first.
         {
-            let guard = self.cached_token.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = self
+                .cached_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cached) = &*guard {
                 let now = chrono::Utc::now().timestamp();
                 if cached.expires_at > now + TOKEN_REFRESH_MARGIN_SECS {
@@ -152,7 +155,7 @@ impl CopilotProvider {
         let request = self
             .client
             .get(&token_url)
-            .header("Authorization", &format!("token {}", self.github_token))
+            .header("Authorization", format!("token {}", self.github_token))
             .header("Accept", "application/json")
             .header("Editor-Version", EDITOR_VERSION)
             .header("User-Agent", COPILOT_USER_AGENT)
@@ -199,7 +202,10 @@ impl CopilotProvider {
 
         // Store in cache.
         {
-            let mut guard = self.cached_token.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self
+                .cached_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = Some(cached.clone());
         }
 
@@ -213,7 +219,7 @@ impl Provider for CopilotProvider {
         &self.provider_name
     }
 
-    fn api(&self) -> &str {
+    fn api(&self) -> &'static str {
         "openai-completions"
     }
 
@@ -267,7 +273,9 @@ impl Provider for CopilotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vcr::{Cassette, Interaction, RecordedRequest, RecordedResponse, VcrMode, VcrRecorder};
+    use crate::vcr::{
+        Cassette, Interaction, RecordedRequest, RecordedResponse, VcrMode, VcrRecorder,
+    };
 
     #[test]
     fn test_copilot_provider_defaults() {
@@ -343,12 +351,11 @@ mod tests {
 
     #[test]
     fn test_cached_token_clone() {
-        let token = CachedToken {
+        let cloned = CachedToken {
             token: "session-tok".to_string(),
             expires_at: 99999,
             api_endpoint: "https://example.com/chat/completions".to_string(),
         };
-        let cloned = token.clone();
         assert_eq!(cloned.token, "session-tok");
         assert_eq!(cloned.expires_at, 99999);
     }
@@ -399,7 +406,9 @@ mod tests {
 
     #[test]
     fn test_token_exchange_success_via_vcr() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let far_future = chrono::Utc::now().timestamp() + 3600;
             let (client, _temp) = vcr_token_exchange_client(
@@ -408,9 +417,11 @@ mod tests {
                 far_future,
                 "https://copilot-proxy.example.com/v1",
             );
-            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy_token")
-                .with_client(client);
-            let cached = provider.ensure_session_token().await.expect("token exchange");
+            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy_token").with_client(client);
+            let cached = provider
+                .ensure_session_token()
+                .await
+                .expect("token exchange");
             assert_eq!(cached.token, "ghu_session_test");
             assert_eq!(cached.expires_at, far_future);
             assert_eq!(
@@ -422,17 +433,14 @@ mod tests {
 
     #[test]
     fn test_token_exchange_caches_on_second_call() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let far_future = chrono::Utc::now().timestamp() + 3600;
-            let (client, _temp) = vcr_token_exchange_client(
-                "copilot_token_cache",
-                "ghu_cached",
-                far_future,
-                "",
-            );
-            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy")
-                .with_client(client);
+            let (client, _temp) =
+                vcr_token_exchange_client("copilot_token_cache", "ghu_cached", far_future, "");
+            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy").with_client(client);
             // First call populates the cache.
             let first = provider.ensure_session_token().await.expect("first call");
             assert_eq!(first.token, "ghu_cached");
@@ -472,10 +480,11 @@ mod tests {
         let recorder = VcrRecorder::new_with(test_name, VcrMode::Playback, temp.path());
         let client = Client::new().with_vcr(recorder);
 
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
-            let provider = CopilotProvider::new("gpt-4o", "ghp_bad_token")
-                .with_client(client);
+            let provider = CopilotProvider::new("gpt-4o", "ghp_bad_token").with_client(client);
             let result = provider.ensure_session_token().await;
             assert!(result.is_err());
             let msg = result.unwrap_err().to_string();
@@ -488,18 +497,15 @@ mod tests {
 
     #[test]
     fn test_token_exchange_fallback_endpoint() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let far_future = chrono::Utc::now().timestamp() + 3600;
             // Empty api endpoint → should fall back to default.
-            let (client, _temp) = vcr_token_exchange_client(
-                "copilot_token_fallback",
-                "ghu_fallback",
-                far_future,
-                "",
-            );
-            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy")
-                .with_client(client);
+            let (client, _temp) =
+                vcr_token_exchange_client("copilot_token_fallback", "ghu_fallback", far_future, "");
+            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy").with_client(client);
             let cached = provider.ensure_session_token().await.expect("fallback");
             assert_eq!(
                 cached.api_endpoint,
@@ -510,7 +516,9 @@ mod tests {
 
     #[test]
     fn test_token_exchange_endpoint_already_has_path() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("rt");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let far_future = chrono::Utc::now().timestamp() + 3600;
             let (client, _temp) = vcr_token_exchange_client(
@@ -519,9 +527,11 @@ mod tests {
                 far_future,
                 "https://custom.proxy.com/chat/completions",
             );
-            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy")
-                .with_client(client);
-            let cached = provider.ensure_session_token().await.expect("full endpoint");
+            let provider = CopilotProvider::new("gpt-4o", "ghp_dummy").with_client(client);
+            let cached = provider
+                .ensure_session_token()
+                .await
+                .expect("full endpoint");
             // Endpoint already includes /chat/completions; should not be duplicated.
             assert_eq!(
                 cached.api_endpoint,

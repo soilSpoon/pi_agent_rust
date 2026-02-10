@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn hints_provider_key_hint_azure() {
-        let err = Error::provider("azure_openai", "401 unauthorized");
+        let err = Error::provider("azure-openai", "401 unauthorized");
         let h = err.hints();
         assert!(h.hints.iter().any(|s| s.contains("AZURE_OPENAI_API_KEY")));
     }
@@ -1339,6 +1339,143 @@ mod tests {
         assert!(context_value(&hints, "diagnostic_code").is_none());
     }
 
+    // ── Native provider diagnostic integration tests ─────────────────
+    // Verify that actual provider error messages (as emitted by providers/*.rs
+    // after the Error::config→Error::provider migration) are correctly classified
+    // by the diagnostic taxonomy.
+
+    #[test]
+    fn native_provider_missing_key_anthropic() {
+        let err = Error::provider(
+            "anthropic",
+            "Missing API key for Anthropic. Set ANTHROPIC_API_KEY or use `pi auth`.",
+        );
+        let d = err.auth_diagnostic().expect("diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::MissingApiKey);
+        let hints = err.hints();
+        assert_eq!(context_value(&hints, "provider"), Some("anthropic"));
+        assert!(
+            hints.summary.contains("missing"),
+            "summary: {}",
+            hints.summary
+        );
+    }
+
+    #[test]
+    fn native_provider_missing_key_openai() {
+        let err = Error::provider(
+            "openai",
+            "Missing API key for OpenAI. Set OPENAI_API_KEY or configure in settings.",
+        );
+        let d = err.auth_diagnostic().expect("diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::MissingApiKey);
+    }
+
+    #[test]
+    fn native_provider_missing_key_azure() {
+        let err = Error::provider(
+            "azure-openai",
+            "Missing API key for Azure OpenAI. Set AZURE_OPENAI_API_KEY or configure in settings.",
+        );
+        let d = err.auth_diagnostic().expect("diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::MissingApiKey);
+    }
+
+    #[test]
+    fn native_provider_missing_key_cohere() {
+        let err = Error::provider(
+            "cohere",
+            "Missing API key for Cohere. Set COHERE_API_KEY or configure in settings.",
+        );
+        let d = err.auth_diagnostic().expect("diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::MissingApiKey);
+    }
+
+    #[test]
+    fn native_provider_missing_key_gemini() {
+        let err = Error::provider(
+            "google",
+            "Missing API key for Google/Gemini. Set GOOGLE_API_KEY or GEMINI_API_KEY.",
+        );
+        let d = err.auth_diagnostic().expect("diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::MissingApiKey);
+    }
+
+    #[test]
+    fn native_provider_http_401_anthropic() {
+        let err = Error::provider(
+            "anthropic",
+            "Anthropic API error (HTTP 401): {\"error\":{\"type\":\"authentication_error\"}}",
+        );
+        let d = err.auth_diagnostic().expect("diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::InvalidApiKey);
+        let hints = err.hints();
+        assert!(hints.summary.contains("authentication failed"));
+    }
+
+    #[test]
+    fn native_provider_http_401_openai() {
+        let err = Error::provider(
+            "openai",
+            "OpenAI API error (HTTP 401): Incorrect API key provided",
+        );
+        let d = err.auth_diagnostic().expect("diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::InvalidApiKey);
+    }
+
+    #[test]
+    fn native_provider_http_403_azure() {
+        let err = Error::provider(
+            "azure-openai",
+            "Azure OpenAI API error (HTTP 403): Access denied",
+        );
+        let d = err.auth_diagnostic().expect("diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::InvalidApiKey);
+    }
+
+    #[test]
+    fn native_provider_http_429_quota_openai() {
+        let err = Error::provider("openai", "OpenAI API error (HTTP 429): insufficient_quota");
+        let d = err.auth_diagnostic().expect("diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::QuotaExceeded);
+    }
+
+    #[test]
+    fn native_provider_http_500_no_diagnostic() {
+        // Non-auth HTTP errors should NOT produce auth diagnostics.
+        let err = Error::provider(
+            "anthropic",
+            "Anthropic API error (HTTP 500): Internal server error",
+        );
+        assert!(err.auth_diagnostic().is_none());
+    }
+
+    #[test]
+    fn native_provider_hints_include_provider_context() {
+        let err = Error::provider("cohere", "Cohere API error (HTTP 401): unauthorized");
+        let hints = err.hints();
+        assert_eq!(context_value(&hints, "provider"), Some("cohere"));
+        assert!(context_value(&hints, "details").is_some());
+    }
+
+    #[test]
+    fn native_provider_diagnostic_enriches_hints_context() {
+        let err = Error::provider(
+            "google",
+            "Missing API key for Google/Gemini. Set GOOGLE_API_KEY or GEMINI_API_KEY.",
+        );
+        let hints = err.hints();
+        assert_eq!(
+            context_value(&hints, "diagnostic_code"),
+            Some("auth.missing_api_key")
+        );
+        assert_eq!(
+            context_value(&hints, "redaction_policy"),
+            Some("redact-secrets")
+        );
+        assert!(context_value(&hints, "diagnostic_remediation").is_some());
+    }
+
     #[test]
     fn hints_tool_not_found() {
         let err = Error::tool("bash", "command not found: xyz");
@@ -1427,5 +1564,420 @@ mod tests {
         let err = Error::api("connection reset");
         let h = err.hints();
         assert!(h.summary.contains("API"));
+    }
+
+    // ── E2E cross-provider diagnostic validation ────────────────────
+
+    /// Every provider family's *actual* error message must produce the correct
+    /// `AuthDiagnosticCode`. This matrix validates classifier + message alignment.
+    #[test]
+    fn e2e_all_native_providers_missing_key_diagnostic() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "anthropic",
+                "Missing API key for Anthropic. Set ANTHROPIC_API_KEY or use `pi auth`.",
+            ),
+            (
+                "openai",
+                "Missing API key for OpenAI. Set OPENAI_API_KEY or configure in settings.",
+            ),
+            (
+                "azure-openai",
+                "Missing API key for Azure OpenAI. Set AZURE_OPENAI_API_KEY or configure in settings.",
+            ),
+            (
+                "cohere",
+                "Missing API key for Cohere. Set COHERE_API_KEY or configure in settings.",
+            ),
+            (
+                "google",
+                "Missing API key for Google/Gemini. Set GOOGLE_API_KEY or GEMINI_API_KEY.",
+            ),
+        ];
+        for (provider, message) in cases {
+            let err = Error::provider(*provider, *message);
+            let d = err
+                .auth_diagnostic()
+                .unwrap_or_else(|| panic!("expected MissingApiKey diagnostic for {provider}"));
+            assert_eq!(
+                d.code,
+                AuthDiagnosticCode::MissingApiKey,
+                "wrong code for {provider}: {:?}",
+                d.code
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_all_native_providers_401_diagnostic() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "anthropic",
+                "Anthropic API error (HTTP 401): invalid x-api-key",
+            ),
+            (
+                "openai",
+                "OpenAI API error (HTTP 401): Incorrect API key provided",
+            ),
+            (
+                "azure-openai",
+                "Azure OpenAI API error (HTTP 401): unauthorized",
+            ),
+            ("cohere", "Cohere API error (HTTP 401): unauthorized"),
+            ("google", "Gemini API error (HTTP 401): API key not valid"),
+        ];
+        for (provider, message) in cases {
+            let err = Error::provider(*provider, *message);
+            let d = err
+                .auth_diagnostic()
+                .unwrap_or_else(|| panic!("expected InvalidApiKey diagnostic for {provider}"));
+            assert_eq!(
+                d.code,
+                AuthDiagnosticCode::InvalidApiKey,
+                "wrong code for {provider}: {:?}",
+                d.code
+            );
+        }
+    }
+
+    /// Non-auth HTTP errors (5xx) must NOT produce auth diagnostics.
+    #[test]
+    fn e2e_non_auth_errors_no_diagnostic() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "anthropic",
+                "Anthropic API error (HTTP 500): Internal server error",
+            ),
+            ("openai", "OpenAI API error (HTTP 503): Service unavailable"),
+            ("google", "Gemini API error (HTTP 502): Bad gateway"),
+            ("cohere", "Cohere API error (HTTP 504): Gateway timeout"),
+        ];
+        for (provider, message) in cases {
+            let err = Error::provider(*provider, *message);
+            assert!(
+                err.auth_diagnostic().is_none(),
+                "unexpected diagnostic for {provider} with message: {message}"
+            );
+        }
+    }
+
+    /// All auth diagnostics must carry the `redact-secrets` redaction policy.
+    #[test]
+    fn e2e_all_diagnostic_codes_have_redact_secrets_policy() {
+        let codes = [
+            AuthDiagnosticCode::MissingApiKey,
+            AuthDiagnosticCode::InvalidApiKey,
+            AuthDiagnosticCode::QuotaExceeded,
+            AuthDiagnosticCode::MissingOAuthAuthorizationCode,
+            AuthDiagnosticCode::OAuthTokenExchangeFailed,
+            AuthDiagnosticCode::OAuthTokenRefreshFailed,
+            AuthDiagnosticCode::MissingAzureDeployment,
+            AuthDiagnosticCode::MissingRegion,
+            AuthDiagnosticCode::MissingProject,
+            AuthDiagnosticCode::MissingProfile,
+            AuthDiagnosticCode::MissingEndpoint,
+            AuthDiagnosticCode::MissingCredentialChain,
+            AuthDiagnosticCode::UnknownAuthFailure,
+        ];
+        for code in &codes {
+            assert_eq!(
+                code.redaction_policy(),
+                "redact-secrets",
+                "code {:?} missing redact-secrets policy",
+                code
+            );
+        }
+    }
+
+    /// `hints()` must always include diagnostic enrichment when auth diagnostics
+    /// are present, and the enrichment must include code + remediation + policy.
+    #[test]
+    fn e2e_hints_enrichment_completeness() {
+        let providers: &[(&str, &str)] = &[
+            ("anthropic", "Missing API key for Anthropic"),
+            ("openai", "OpenAI API error (HTTP 401): invalid key"),
+            ("cohere", "insufficient_quota"),
+            ("google", "Missing API key for Google"),
+        ];
+        for (provider, message) in providers {
+            let err = Error::provider(*provider, *message);
+            let hints = err.hints();
+            assert!(
+                context_value(&hints, "diagnostic_code").is_some(),
+                "missing diagnostic_code for {provider}"
+            );
+            assert!(
+                context_value(&hints, "diagnostic_remediation").is_some(),
+                "missing diagnostic_remediation for {provider}"
+            );
+            assert_eq!(
+                context_value(&hints, "redaction_policy"),
+                Some("redact-secrets"),
+                "wrong redaction_policy for {provider}"
+            );
+        }
+    }
+
+    /// Provider context must always appear in hints for provider errors.
+    #[test]
+    fn e2e_hints_always_include_provider_context() {
+        let providers = [
+            "anthropic",
+            "openai",
+            "azure-openai",
+            "cohere",
+            "google",
+            "groq",
+            "deepseek",
+        ];
+        for provider in &providers {
+            let err = Error::provider(*provider, "some error");
+            let hints = err.hints();
+            assert_eq!(
+                context_value(&hints, "provider"),
+                Some(*provider),
+                "missing provider context for {provider}"
+            );
+        }
+    }
+
+    /// Provider aliases must produce the same env key hints as canonical IDs.
+    #[test]
+    fn e2e_alias_env_key_consistency() {
+        let alias_to_canonical: &[(&str, &str)] = &[
+            ("gemini", "google"),
+            ("azure", "azure-openai"),
+            ("copilot", "github-copilot"),
+            ("dashscope", "alibaba"),
+            ("qwen", "alibaba"),
+            ("kimi", "moonshotai"),
+            ("moonshot", "moonshotai"),
+            ("bedrock", "amazon-bedrock"),
+            ("sap", "sap-ai-core"),
+        ];
+        for (alias, canonical) in alias_to_canonical {
+            let alias_keys = crate::provider_metadata::provider_auth_env_keys(alias);
+            let canonical_keys = crate::provider_metadata::provider_auth_env_keys(canonical);
+            assert_eq!(
+                alias_keys, canonical_keys,
+                "alias {alias} env keys differ from canonical {canonical}"
+            );
+        }
+    }
+
+    /// Every native provider's env key list must be non-empty.
+    #[test]
+    fn e2e_all_native_providers_have_env_keys() {
+        let native_providers = [
+            "anthropic",
+            "openai",
+            "google",
+            "cohere",
+            "azure-openai",
+            "amazon-bedrock",
+            "github-copilot",
+            "sap-ai-core",
+        ];
+        for provider in &native_providers {
+            let keys = crate::provider_metadata::provider_auth_env_keys(provider);
+            assert!(!keys.is_empty(), "provider {provider} has no auth env keys");
+        }
+    }
+
+    /// Error messages must never contain raw API key values. This test verifies
+    /// that provider error constructors don't embed secrets.
+    #[test]
+    fn e2e_error_messages_never_contain_secrets() {
+        let fake_key = "sk-proj-FAKE123456789abcdef";
+        // Construct errors the way providers do (from HTTP responses, not from keys).
+        let err1 = Error::provider("openai", "OpenAI API error (HTTP 401): Invalid API key");
+        let err2 = Error::provider("anthropic", "Missing API key for Anthropic");
+        let err3 = Error::auth("OAuth token exchange failed");
+
+        for err in [&err1, &err2, &err3] {
+            let display = err.to_string();
+            assert!(
+                !display.contains(fake_key),
+                "error message contains secret: {display}"
+            );
+            let hints = err.hints();
+            for hint in &hints.hints {
+                assert!(!hint.contains(fake_key), "hint contains secret: {hint}");
+            }
+            for (key, value) in &hints.context {
+                assert!(
+                    !value.contains(fake_key),
+                    "context {key} contains secret: {value}"
+                );
+            }
+        }
+    }
+
+    /// Bedrock credential-chain special handling: "credential" in message +
+    /// "bedrock" in provider must produce `MissingCredentialChain`.
+    #[test]
+    fn e2e_bedrock_credential_chain_diagnostic() {
+        let err = Error::provider("amazon-bedrock", "No credential source configured");
+        let d = err
+            .auth_diagnostic()
+            .expect("expected credential chain diagnostic");
+        assert_eq!(d.code, AuthDiagnosticCode::MissingCredentialChain);
+    }
+
+    /// Auth errors (not provider errors) must also produce diagnostics.
+    #[test]
+    fn e2e_auth_variant_diagnostics() {
+        let cases: &[(&str, AuthDiagnosticCode)] = &[
+            ("Missing API key", AuthDiagnosticCode::MissingApiKey),
+            ("401 unauthorized", AuthDiagnosticCode::InvalidApiKey),
+            ("insufficient_quota", AuthDiagnosticCode::QuotaExceeded),
+            (
+                "Missing authorization code",
+                AuthDiagnosticCode::MissingOAuthAuthorizationCode,
+            ),
+            (
+                "Token exchange failed",
+                AuthDiagnosticCode::OAuthTokenExchangeFailed,
+            ),
+            (
+                "OAuth token refresh failed",
+                AuthDiagnosticCode::OAuthTokenRefreshFailed,
+            ),
+            (
+                "Missing deployment",
+                AuthDiagnosticCode::MissingAzureDeployment,
+            ),
+            ("Missing region", AuthDiagnosticCode::MissingRegion),
+            ("Missing project", AuthDiagnosticCode::MissingProject),
+            ("Missing profile", AuthDiagnosticCode::MissingProfile),
+            ("Missing endpoint", AuthDiagnosticCode::MissingEndpoint),
+            (
+                "credential chain not configured",
+                AuthDiagnosticCode::MissingCredentialChain,
+            ),
+        ];
+        for (message, expected_code) in cases {
+            let err = Error::auth(*message);
+            let d = err
+                .auth_diagnostic()
+                .unwrap_or_else(|| panic!("expected diagnostic for Auth({message})"));
+            assert_eq!(
+                d.code, *expected_code,
+                "wrong code for Auth({message}): {:?}",
+                d.code
+            );
+        }
+    }
+
+    /// Classifier must be case-insensitive.
+    #[test]
+    fn e2e_classifier_case_insensitive() {
+        let variants = ["MISSING API KEY", "Missing Api Key", "missing api key"];
+        for msg in &variants {
+            let err = Error::provider("openai", *msg);
+            let d = err
+                .auth_diagnostic()
+                .unwrap_or_else(|| panic!("no diagnostic for: {msg}"));
+            assert_eq!(
+                d.code,
+                AuthDiagnosticCode::MissingApiKey,
+                "failed for: {msg}"
+            );
+        }
+    }
+
+    /// Non-auth error variants must never produce diagnostics.
+    #[test]
+    fn e2e_non_auth_variants_no_diagnostic() {
+        let errors: Vec<Error> = vec![
+            Error::config("bad json"),
+            Error::session("timeout"),
+            Error::tool("bash", "not found"),
+            Error::validation("missing field"),
+            Error::extension("crash"),
+            Error::api("network error"),
+            Error::Aborted,
+        ];
+        for err in &errors {
+            assert!(
+                err.auth_diagnostic().is_none(),
+                "unexpected diagnostic for: {err}"
+            );
+        }
+    }
+
+    /// Quota-exceeded messages from different providers produce the same code.
+    #[test]
+    fn e2e_quota_messages_cross_provider() {
+        let messages = [
+            "insufficient_quota",
+            "quota exceeded",
+            "billing hard limit reached",
+            "billing_not_active",
+            "not enough credits",
+            "credit balance is too low",
+        ];
+        for msg in &messages {
+            let err = Error::provider("openai", *msg);
+            let d = err
+                .auth_diagnostic()
+                .unwrap_or_else(|| panic!("no diagnostic for: {msg}"));
+            assert_eq!(
+                d.code,
+                AuthDiagnosticCode::QuotaExceeded,
+                "wrong code for: {msg}"
+            );
+        }
+    }
+
+    /// OpenAI-compatible providers must resolve env keys through alias mapping.
+    #[test]
+    fn e2e_openai_compatible_providers_env_keys() {
+        let providers_and_keys: &[(&str, &str)] = &[
+            ("groq", "GROQ_API_KEY"),
+            ("deepinfra", "DEEPINFRA_API_KEY"),
+            ("cerebras", "CEREBRAS_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+            ("mistral", "MISTRAL_API_KEY"),
+            ("deepseek", "DEEPSEEK_API_KEY"),
+            ("perplexity", "PERPLEXITY_API_KEY"),
+            ("xai", "XAI_API_KEY"),
+        ];
+        for (provider, expected_key) in providers_and_keys {
+            let keys = crate::provider_metadata::provider_auth_env_keys(provider);
+            assert!(
+                keys.contains(expected_key),
+                "provider {provider} missing env key {expected_key}, got: {keys:?}"
+            );
+        }
+    }
+
+    /// `provider_key_hint()` uses canonical ID and includes env vars in output.
+    #[test]
+    fn e2e_key_hint_format_consistency() {
+        // Anthropic gets special `/login` hint.
+        let hint = provider_key_hint("anthropic");
+        assert!(hint.contains("ANTHROPIC_API_KEY"), "hint: {hint}");
+        assert!(hint.contains("/login"), "hint: {hint}");
+
+        // Copilot gets `/login` hint.
+        let hint = provider_key_hint("github-copilot");
+        assert!(hint.contains("/login"), "hint: {hint}");
+
+        // OpenAI gets standard format.
+        let hint = provider_key_hint("openai");
+        assert!(hint.contains("OPENAI_API_KEY"), "hint: {hint}");
+        assert!(!hint.contains("/login"), "hint: {hint}");
+
+        // Unknown provider gets fallback.
+        let hint = provider_key_hint("my-custom-proxy");
+        assert!(hint.contains("my-custom-proxy"), "hint: {hint}");
+    }
+
+    /// Empty messages produce no diagnostic (no false positives).
+    #[test]
+    fn e2e_empty_message_no_diagnostic() {
+        let err = Error::provider("openai", "");
+        assert!(err.auth_diagnostic().is_none());
     }
 }

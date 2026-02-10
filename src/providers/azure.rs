@@ -164,7 +164,7 @@ impl Provider for AzureOpenAIProvider {
             .api_key
             .clone()
             .or_else(|| std::env::var("AZURE_OPENAI_API_KEY").ok())
-            .ok_or_else(|| Error::config("Missing Azure OpenAI API key"))?;
+            .ok_or_else(|| Error::provider("azure-openai", "Missing API key for Azure OpenAI. Set AZURE_OPENAI_API_KEY or configure in settings."))?;
 
         let request_body = self.build_request(context, options);
 
@@ -190,9 +190,10 @@ impl Provider for AzureOpenAIProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
-            return Err(Error::api(format!(
-                "Azure OpenAI API error (HTTP {status}): {body}"
-            )));
+            return Err(Error::provider(
+                "azure-openai",
+                format!("Azure OpenAI API error (HTTP {status}): {body}"),
+            ));
         }
 
         // Create SSE stream for streaming responses.

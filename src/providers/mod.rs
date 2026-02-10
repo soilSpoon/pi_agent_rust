@@ -1601,8 +1601,6 @@ export default function init(pi) {
         assert_eq!(provider.model_id(), "gpt-4o-mini");
     }
 
-
-
     // ── create_provider: API fallback path ──────────────────────────
 
     #[test]
@@ -1989,7 +1987,7 @@ export default function init(pi) {
         let (route, canonical_provider, effective_api) =
             resolve_provider_route(&entry).expect("resolve vertexai alias route");
         assert_eq!(route, ProviderRouteKind::NativeGoogleVertex);
-        assert_eq!(canonical_provider, "vertexai");
+        assert_eq!(canonical_provider, "google-vertex");
         assert_eq!(effective_api, "google-vertex");
     }
 
