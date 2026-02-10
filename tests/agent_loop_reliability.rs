@@ -26,14 +26,15 @@ use pi::model::{
 };
 use pi::provider::{Context, Provider, StreamOptions};
 use pi::session::Session;
-use pi::tools::ToolRegistry;
+use pi::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::Write as _;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{self, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -83,6 +84,16 @@ fn assistant_text(msg: &AssistantMessage) -> String {
         .collect()
 }
 
+fn tool_result_text(msg: &ToolResultMessage) -> String {
+    msg.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 const fn event_label(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::AgentStart { .. } => "agent_start",
@@ -106,16 +117,39 @@ struct Timeline {
     aborted_events: usize,
 }
 
-fn capture_timeline() -> (
-    Arc<StdMutex<Timeline>>,
-    impl Fn(AgentEvent) + Send + Sync + 'static,
-) {
-    let tl = Arc::new(StdMutex::new(Timeline::default()));
-    let tl_ref = Arc::clone(&tl);
-    let started_at = Instant::now();
-    let cb = move |event: AgentEvent| {
+const FAULT_CLASS_RECOVERABLE: &str = "recoverable";
+const FAULT_CLASS_FATAL: &str = "fatal";
+
+#[derive(Debug, Serialize)]
+struct FaultTransition {
+    phase: String,
+    elapsed_ms: u128,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FaultEpisodeRecord {
+    schema: &'static str,
+    issue_id: &'static str,
+    remediation_issue: &'static str,
+    test_name: String,
+    fault_name: String,
+    injection_point: String,
+    classification: &'static str,
+    retry_backoff_ms: Vec<u64>,
+    state_transitions: Vec<FaultTransition>,
+    terminal_outcome: String,
+    root_cause_marker: String,
+    replay_command: String,
+}
+
+fn make_timeline_callback(
+    tl: Arc<StdMutex<Timeline>>,
+    started_at: Instant,
+) -> impl Fn(AgentEvent) + Send + Sync + 'static {
+    move |event: AgentEvent| {
         let elapsed_ms = started_at.elapsed().as_millis();
-        let mut guard = tl_ref.lock().expect("lock timeline");
+        let mut guard = tl.lock().expect("lock timeline");
         match &event {
             AgentEvent::ToolExecutionStart { .. } => guard.tool_starts += 1,
             AgentEvent::ToolExecutionEnd { .. } => guard.tool_ends += 1,
@@ -129,7 +163,16 @@ fn capture_timeline() -> (
             "elapsedMs": elapsed_ms,
         }));
         drop(guard);
-    };
+    }
+}
+
+fn capture_timeline() -> (
+    Arc<StdMutex<Timeline>>,
+    impl Fn(AgentEvent) + Send + Sync + 'static,
+) {
+    let tl = Arc::new(StdMutex::new(Timeline::default()));
+    let started_at = Instant::now();
+    let cb = make_timeline_callback(Arc::clone(&tl), started_at);
     (tl, cb)
 }
 
@@ -149,6 +192,14 @@ fn write_log_artifacts(harness: &TestHarness, name: &str) {
         .write_jsonl_logs(&log_path)
         .expect("write jsonl log");
     harness.record_artifact(format!("{name}.log.jsonl"), &log_path);
+}
+
+fn write_fault_episode_artifact(harness: &TestHarness, name: &str, record: &FaultEpisodeRecord) {
+    let path = harness.temp_path(format!("{name}.fault_episode.jsonl"));
+    let mut file = std::fs::File::create(&path).expect("create fault episode artifact");
+    let line = serde_json::to_string(record).expect("serialize fault episode");
+    let _ = writeln!(file, "{line}");
+    harness.record_artifact(format!("{name}.fault_episode.jsonl"), &path);
 }
 
 fn make_session(harness: &TestHarness) -> Arc<asupersync::sync::Mutex<Session>> {
@@ -456,6 +507,212 @@ struct ScriptedReliabilityProvider {
 impl std::fmt::Debug for ScriptedReliabilityProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScriptedReliabilityProvider").finish()
+    }
+}
+
+struct FlakyTimeoutThenSuccessProvider {
+    fail_attempts: usize,
+    success_text: String,
+    stream_calls: AtomicUsize,
+}
+
+impl FlakyTimeoutThenSuccessProvider {
+    fn new(fail_attempts: usize, success_text: &str) -> Self {
+        Self {
+            fail_attempts,
+            success_text: success_text.to_string(),
+            stream_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for FlakyTimeoutThenSuccessProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlakyTimeoutThenSuccessProvider")
+            .field("fail_attempts", &self.fail_attempts)
+            .field("success_text", &self.success_text)
+            .field("stream_calls", &self.stream_calls.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Provider for FlakyTimeoutThenSuccessProvider {
+    fn name(&self) -> &str {
+        "test-provider"
+    }
+
+    fn api(&self) -> &str {
+        "test-api"
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    async fn stream(
+        &self,
+        _context: &Context,
+        _options: &StreamOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        let call_index = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        if call_index < self.fail_attempts {
+            return Err(Error::api(format!(
+                "request timed out while streaming (attempt {})",
+                call_index + 1
+            )));
+        }
+
+        let message = make_assistant(&self.success_text, StopReason::Stop, 24);
+        let events = vec![
+            Ok(StreamEvent::Start {
+                partial: make_partial(""),
+            }),
+            Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+struct StreamContractViolationProvider {
+    stream_calls: AtomicUsize,
+}
+
+impl StreamContractViolationProvider {
+    const fn new() -> Self {
+        Self {
+            stream_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for StreamContractViolationProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamContractViolationProvider")
+            .field("stream_calls", &self.stream_calls.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Provider for StreamContractViolationProvider {
+    fn name(&self) -> &str {
+        "test-provider"
+    }
+
+    fn api(&self) -> &str {
+        "test-api"
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    async fn stream(
+        &self,
+        _context: &Context,
+        _options: &StreamOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaultyWriteInput {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug)]
+struct FaultyPartialWriteTool {
+    cwd: std::path::PathBuf,
+}
+
+impl FaultyPartialWriteTool {
+    fn new(cwd: &std::path::Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for FaultyPartialWriteTool {
+    fn name(&self) -> &str {
+        "faulty_write"
+    }
+
+    fn label(&self) -> &str {
+        "faulty_write"
+    }
+
+    fn description(&self) -> &str {
+        "Inject a partial write failure before persist to validate recovery paths."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: FaultyWriteInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+
+        let path = if std::path::Path::new(&input.path).is_absolute() {
+            std::path::PathBuf::from(&input.path)
+        } else {
+            self.cwd.join(&input.path)
+        };
+        let Some(parent) = path.parent() else {
+            return Err(Error::tool(
+                "faulty_write",
+                format!("Cannot resolve parent for {}", path.display()),
+            ));
+        };
+
+        asupersync::fs::create_dir_all(parent).await.map_err(|e| {
+            Error::tool(
+                "faulty_write",
+                format!("Failed to create parent directories: {e}"),
+            )
+        })?;
+
+        let temp_file = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|e| Error::tool("faulty_write", format!("Failed to create temp file: {e}")))?;
+
+        let bytes = input.content.as_bytes();
+        let cut = bytes.len().saturating_div(2).max(1);
+        asupersync::fs::write(temp_file.path(), &bytes[..cut])
+            .await
+            .map_err(|e| Error::tool("faulty_write", format!("Failed to write temp file: {e}")))?;
+
+        Err(Error::tool(
+            "faulty_write",
+            format!(
+                "Injected partial temp write failure before persist [FAULT-PARTIAL-WRITE]: {}",
+                path.display()
+            ),
+        ))
     }
 }
 
@@ -1432,7 +1689,487 @@ fn tool_call_followed_by_normal_completion() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 10: Empty stream (no events at all) returns error
+// Test 10: Transient timeout + retry/backoff recovers deterministically
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn transient_timeout_retry_backoff_is_recoverable() {
+    let test_name = "reliability_fault_timeout_retry";
+    let harness = TestHarness::new(test_name);
+
+    run_async(async move {
+        let provider = Arc::new(FlakyTimeoutThenSuccessProvider::new(
+            2,
+            "Recovered after transient timeout retry.",
+        ));
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let mut agent_session = make_agent_session(provider_dyn, &harness, 4);
+
+        let tl = Arc::new(StdMutex::new(Timeline::default()));
+        let started_at = Instant::now();
+        let retry_backoff_ms = vec![25_u64, 50_u64];
+        let replay_command =
+            format!("cargo test --test agent_loop_reliability {test_name} -- --nocapture");
+
+        let mut transitions = vec![FaultTransition {
+            phase: "fault_injected".to_string(),
+            elapsed_ms: 0,
+            detail: "provider.stream returns timeout errors for first two attempts".to_string(),
+        }];
+        let mut final_message: Option<AssistantMessage> = None;
+        let mut terminal_outcome = "unreached".to_string();
+
+        for attempt in 0..=retry_backoff_ms.len() {
+            transitions.push(FaultTransition {
+                phase: "attempt".to_string(),
+                elapsed_ms: started_at.elapsed().as_millis(),
+                detail: format!("attempt {} started", attempt + 1),
+            });
+
+            let result = if attempt == 0 {
+                agent_session
+                    .run_text(
+                        "exercise transient timeout path".to_string(),
+                        make_timeline_callback(Arc::clone(&tl), started_at),
+                    )
+                    .await
+            } else {
+                agent_session
+                    .agent
+                    .run_continue_with_abort(
+                        None,
+                        make_timeline_callback(Arc::clone(&tl), started_at),
+                    )
+                    .await
+            };
+
+            match result {
+                Ok(message) => {
+                    terminal_outcome = format!("recovered_on_attempt_{}", attempt + 1);
+                    transitions.push(FaultTransition {
+                        phase: "recovered".to_string(),
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                        detail: format!("assistant stop_reason={:?}", message.stop_reason),
+                    });
+                    final_message = Some(message);
+                    break;
+                }
+                Err(err) => {
+                    let err_text = err.to_string();
+                    transitions.push(FaultTransition {
+                        phase: "attempt_failed".to_string(),
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                        detail: err_text.clone(),
+                    });
+
+                    if attempt == retry_backoff_ms.len() {
+                        terminal_outcome = format!("fatal_after_retries: {err_text}");
+                        break;
+                    }
+
+                    assert!(
+                        err_text.to_ascii_lowercase().contains("timed out"),
+                        "expected timeout error, got: {err_text}"
+                    );
+
+                    let backoff_ms = retry_backoff_ms[attempt];
+                    transitions.push(FaultTransition {
+                        phase: "retry_backoff".to_string(),
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                        detail: format!("sleeping {backoff_ms}ms before retry"),
+                    });
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(backoff_ms),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        let message = final_message.expect("transient timeout should recover with retries");
+        assert_eq!(
+            message.stop_reason,
+            StopReason::Stop,
+            "recovered run should complete normally"
+        );
+        assert!(
+            assistant_text(&message).contains("Recovered after transient timeout retry"),
+            "recovery response should be present"
+        );
+        assert_eq!(
+            provider.stream_calls.load(Ordering::SeqCst),
+            3,
+            "expected two failures + one success"
+        );
+
+        let user_count = agent_session
+            .agent
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::User(_)))
+            .count();
+        assert_eq!(
+            user_count, 1,
+            "retry via continue path should not duplicate user prompts"
+        );
+
+        let record = FaultEpisodeRecord {
+            schema: "pi.reliability.fault_episode.v1",
+            issue_id: "bd-1f42.5.2",
+            remediation_issue: "bd-1f42.5.2",
+            test_name: test_name.to_string(),
+            fault_name: "transient_network_timeout".to_string(),
+            injection_point: "provider.stream".to_string(),
+            classification: FAULT_CLASS_RECOVERABLE,
+            retry_backoff_ms: retry_backoff_ms.clone(),
+            state_transitions: transitions,
+            terminal_outcome,
+            root_cause_marker: "fault.timeout.transient".to_string(),
+            replay_command,
+        };
+        assert_eq!(record.classification, FAULT_CLASS_RECOVERABLE);
+
+        let guard = tl.lock().expect("lock");
+        write_timeline_artifact(&harness, test_name, &guard);
+        drop(guard);
+        write_fault_episode_artifact(&harness, test_name, &record);
+        write_log_artifacts(&harness, test_name);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: Partial-write tool failure remains recoverable with state integrity
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn partial_write_tool_failure_recovers_without_state_corruption() {
+    let test_name = "reliability_fault_partial_write_recovery";
+    let harness = TestHarness::new(test_name);
+    let baseline_content = "stable baseline\n";
+    harness.create_file("target.txt", baseline_content);
+
+    run_async(async move {
+        let target_path = harness.temp_path("target.txt").display().to_string();
+        let first_turn = make_tool_call_message(
+            vec![
+                ToolCall {
+                    id: "faulty-write-1".to_string(),
+                    name: "faulty_write".to_string(),
+                    arguments: json!({
+                        "path": target_path.clone(),
+                        "content": "this payload should never persist"
+                    }),
+                    thought_signature: None,
+                },
+                ToolCall {
+                    id: "read-verify-1".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({
+                        "path": target_path.clone()
+                    }),
+                    thought_signature: None,
+                },
+            ],
+            44,
+        );
+        let first_partial = AssistantMessage {
+            content: Vec::new(),
+            ..first_turn.clone()
+        };
+        let second_turn = make_assistant(
+            "Recovered after injected partial-write failure; state verified.",
+            StopReason::Stop,
+            18,
+        );
+        let second_partial = make_partial("");
+
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedReliabilityProvider::new(vec![
+            vec![
+                StreamEvent::Start {
+                    partial: first_partial,
+                },
+                StreamEvent::Done {
+                    reason: StopReason::ToolUse,
+                    message: first_turn,
+                },
+            ],
+            vec![
+                StreamEvent::Start {
+                    partial: second_partial,
+                },
+                StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: second_turn,
+                },
+            ],
+        ]));
+
+        let cwd = harness.temp_dir().to_path_buf();
+        let mut tools = ToolRegistry::new(&["read"], &cwd, None);
+        tools.extend(std::iter::once(
+            Box::new(FaultyPartialWriteTool::new(&cwd)) as Box<dyn Tool>
+        ));
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                system_prompt: None,
+                max_tool_iterations: 4,
+                stream_options: StreamOptions {
+                    api_key: Some("test-key".to_string()),
+                    ..StreamOptions::default()
+                },
+            },
+        );
+        let session = make_session(&harness);
+        let mut agent_session =
+            AgentSession::new(agent, session, true, ResolvedCompactionSettings::default());
+
+        let (tl, cb) = capture_timeline();
+        let message = agent_session
+            .run_text("exercise partial-write recovery".to_string(), cb)
+            .await
+            .expect("partial-write scenario should recover");
+        assert_eq!(
+            message.stop_reason,
+            StopReason::Stop,
+            "assistant should recover after injected tool failure"
+        );
+
+        let tool_results: Vec<&ToolResultMessage> = agent_session
+            .agent
+            .messages()
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect();
+
+        let faulty = tool_results
+            .iter()
+            .find(|r| r.tool_call_id == "faulty-write-1")
+            .expect("expected faulty_write tool result");
+        assert!(
+            faulty.is_error,
+            "faulty_write should emit an error tool result"
+        );
+        assert!(
+            tool_result_text(faulty).contains("FAULT-PARTIAL-WRITE"),
+            "fault marker should appear in faulty_write output"
+        );
+
+        let read_verify = tool_results
+            .iter()
+            .find(|r| r.tool_call_id == "read-verify-1")
+            .expect("expected read verification tool result");
+        assert!(
+            !read_verify.is_error,
+            "read verification should succeed after faulty write failure"
+        );
+        assert!(
+            tool_result_text(read_verify).contains("stable baseline"),
+            "read verification should confirm baseline content"
+        );
+        assert_eq!(
+            harness.read_file("target.txt"),
+            baseline_content,
+            "target file content must remain unchanged after injected failure"
+        );
+
+        let record = FaultEpisodeRecord {
+            schema: "pi.reliability.fault_episode.v1",
+            issue_id: "bd-1f42.5.2",
+            remediation_issue: "bd-1f42.5.2",
+            test_name: test_name.to_string(),
+            fault_name: "partial_write_before_persist".to_string(),
+            injection_point: "tool.faulty_write.tempfile_pre_persist".to_string(),
+            classification: FAULT_CLASS_RECOVERABLE,
+            retry_backoff_ms: Vec::new(),
+            state_transitions: vec![
+                FaultTransition {
+                    phase: "fault_injected".to_string(),
+                    elapsed_ms: 0,
+                    detail: "faulty_write stops after writing partial tempfile".to_string(),
+                },
+                FaultTransition {
+                    phase: "state_verified".to_string(),
+                    elapsed_ms: 1,
+                    detail: "read tool confirms target file content unchanged".to_string(),
+                },
+                FaultTransition {
+                    phase: "recovered".to_string(),
+                    elapsed_ms: 2,
+                    detail: format!("assistant stop_reason={:?}", message.stop_reason),
+                },
+            ],
+            terminal_outcome: "recovered_with_integrity_preserved".to_string(),
+            root_cause_marker: "fault.partial_write.pre_persist".to_string(),
+            replay_command: format!(
+                "cargo test --test agent_loop_reliability {test_name} -- --nocapture"
+            ),
+        };
+        assert_eq!(record.classification, FAULT_CLASS_RECOVERABLE);
+
+        let guard = tl.lock().expect("lock");
+        write_timeline_artifact(&harness, test_name, &guard);
+        drop(guard);
+        write_fault_episode_artifact(&harness, test_name, &record);
+        write_log_artifacts(&harness, test_name);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: Repeated stream-contract violation is classified as fatal
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stream_contract_violation_after_retries_is_fatal() {
+    let test_name = "reliability_fault_stream_contract_fatal";
+    let harness = TestHarness::new(test_name);
+
+    run_async(async move {
+        let provider = Arc::new(StreamContractViolationProvider::new());
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let mut agent_session = make_agent_session(provider_dyn, &harness, 4);
+
+        let tl = Arc::new(StdMutex::new(Timeline::default()));
+        let started_at = Instant::now();
+        let retry_backoff_ms = vec![15_u64, 30_u64];
+        let replay_command =
+            format!("cargo test --test agent_loop_reliability {test_name} -- --nocapture");
+
+        let mut transitions = vec![FaultTransition {
+            phase: "fault_injected".to_string(),
+            elapsed_ms: 0,
+            detail: "provider emits empty stream (no Start/Done)".to_string(),
+        }];
+        let mut final_error: Option<String> = None;
+
+        for attempt in 0..=retry_backoff_ms.len() {
+            transitions.push(FaultTransition {
+                phase: "attempt".to_string(),
+                elapsed_ms: started_at.elapsed().as_millis(),
+                detail: format!("attempt {} started", attempt + 1),
+            });
+
+            let result = if attempt == 0 {
+                agent_session
+                    .run_text(
+                        "exercise fatal stream-contract path".to_string(),
+                        make_timeline_callback(Arc::clone(&tl), started_at),
+                    )
+                    .await
+            } else {
+                agent_session
+                    .agent
+                    .run_continue_with_abort(
+                        None,
+                        make_timeline_callback(Arc::clone(&tl), started_at),
+                    )
+                    .await
+            };
+
+            match result {
+                Ok(message) => {
+                    panic!(
+                        "fatal stream-contract violation should not recover, got {:?}",
+                        message.stop_reason
+                    );
+                }
+                Err(err) => {
+                    let err_text = err.to_string();
+                    transitions.push(FaultTransition {
+                        phase: "attempt_failed".to_string(),
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                        detail: err_text.clone(),
+                    });
+                    assert!(
+                        err_text.contains("Stream ended without Done event"),
+                        "expected stream-contract error, got: {err_text}"
+                    );
+                    final_error = Some(err_text.clone());
+
+                    if attempt == retry_backoff_ms.len() {
+                        break;
+                    }
+
+                    let backoff_ms = retry_backoff_ms[attempt];
+                    transitions.push(FaultTransition {
+                        phase: "retry_backoff".to_string(),
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                        detail: format!("sleeping {backoff_ms}ms before retry"),
+                    });
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(backoff_ms),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        assert!(
+            final_error.is_some(),
+            "fatal scenario must retain final stream-contract error"
+        );
+        assert_eq!(
+            provider.stream_calls.load(Ordering::SeqCst),
+            3,
+            "expected initial run + two retries"
+        );
+
+        let assistant_count = agent_session
+            .agent
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Assistant(_)))
+            .count();
+        assert_eq!(
+            assistant_count, 0,
+            "empty-stream contract violation should not leave assistant messages"
+        );
+        let user_count = agent_session
+            .agent
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::User(_)))
+            .count();
+        assert_eq!(
+            user_count, 1,
+            "continue retries should not duplicate user prompts"
+        );
+
+        let record = FaultEpisodeRecord {
+            schema: "pi.reliability.fault_episode.v1",
+            issue_id: "bd-1f42.5.2",
+            remediation_issue: "bd-1f42.5.2",
+            test_name: test_name.to_string(),
+            fault_name: "provider_stream_contract_violation".to_string(),
+            injection_point: "provider.stream".to_string(),
+            classification: FAULT_CLASS_FATAL,
+            retry_backoff_ms: retry_backoff_ms.clone(),
+            state_transitions: transitions,
+            terminal_outcome: final_error.unwrap_or_else(|| "unknown".to_string()),
+            root_cause_marker: "fault.stream_contract.empty_stream".to_string(),
+            replay_command,
+        };
+        assert_eq!(record.classification, FAULT_CLASS_FATAL);
+
+        let guard = tl.lock().expect("lock");
+        write_timeline_artifact(&harness, test_name, &guard);
+        drop(guard);
+        write_fault_episode_artifact(&harness, test_name, &record);
+        write_log_artifacts(&harness, test_name);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: Empty stream (no events at all) returns error
 // ---------------------------------------------------------------------------
 
 #[test]

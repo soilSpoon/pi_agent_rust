@@ -17,7 +17,8 @@
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::doc_markdown
+    clippy::doc_markdown,
+    clippy::similar_names
 )]
 
 mod common;
@@ -50,8 +51,7 @@ fn project_root() -> PathBuf {
 fn output_dir() -> PathBuf {
     let base = std::env::var("PERF_REGRESSION_OUTPUT")
         .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| project_root().join("target/perf"));
+        .map_or_else(|| project_root().join("target/perf"), PathBuf::from);
     let _ = std::fs::create_dir_all(&base);
     base
 }
@@ -80,8 +80,7 @@ fn warmup_runs() -> usize {
 fn pi_binary() -> Option<PathBuf> {
     let target_dir = std::env::var("CARGO_TARGET_DIR")
         .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| project_root().join("target"));
+        .map_or_else(|| project_root().join("target"), PathBuf::from);
 
     // Prefer release for perf tests, fall back to debug
     let release = target_dir.join("release/pi");
@@ -153,7 +152,7 @@ fn sha256_short(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
-    format!("{:x}", result)[..16].to_string()
+    format!("{result:x}")[..16].to_string()
 }
 
 // ─── Statistics ──────────────────────────────────────────────────────────────
@@ -379,10 +378,7 @@ fn startup_version_latency() {
     eprintln!("\n=== Startup --version Latency ===");
     eprintln!("  Runs:      {}", stats.count);
     eprintln!("  P50:       {:.1}ms", stats.p50_ms);
-    eprintln!(
-        "  P95:       {:.1}ms (budget: {effective_threshold:.0}ms)",
-        p95
-    );
+    eprintln!("  P95:       {p95:.1}ms (budget: {effective_threshold:.0}ms)");
     eprintln!("  P99:       {:.1}ms", stats.p99_ms);
     eprintln!("  Mean:      {:.1}ms", stats.mean_ms);
     eprintln!("  Stddev:    {:.2}ms", stats.stddev_ms);
@@ -443,7 +439,7 @@ fn startup_help_latency() {
         budget_unit: "ms".to_string(),
         actual_value: p95,
         status: status.to_string(),
-        stats: Some(stats.clone()),
+        stats: Some(stats),
         env,
         timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         baseline_value: None,
@@ -456,7 +452,7 @@ fn startup_help_latency() {
     );
 
     eprintln!("\n=== Startup --help Latency ===");
-    eprintln!("  P95: {:.1}ms (budget: {threshold:.0}ms) — {status}", p95);
+    eprintln!("  P95: {p95:.1}ms (budget: {threshold:.0}ms) — {status}");
 
     assert_eq!(
         status, "PASS",
@@ -581,7 +577,7 @@ fn memory_sustained_load_growth() {
         true,
         sysinfo::ProcessRefreshKind::nothing().with_memory(),
     );
-    let rss_before = system.process(pid).map_or(0, |p| p.memory());
+    let rss_before = system.process(pid).map_or(0, sysinfo::Process::memory);
 
     // Simulate sustained load: allocate and process vectors repeatedly
     let mut accumulator: u64 = 0;
@@ -599,7 +595,7 @@ fn memory_sustained_load_growth() {
         true,
         sysinfo::ProcessRefreshKind::nothing().with_memory(),
     );
-    let rss_after = system.process(pid).map_or(0, |p| p.memory());
+    let rss_after = system.process(pid).map_or(0, sysinfo::Process::memory);
 
     let growth_pct = if rss_before > 0 {
         ((rss_after as f64 - rss_before as f64) / rss_before as f64) * 100.0
@@ -653,8 +649,7 @@ fn binary_size_check() {
 
     let target_dir = std::env::var("CARGO_TARGET_DIR")
         .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| project_root().join("target"));
+        .map_or_else(|| project_root().join("target"), PathBuf::from);
 
     let release_path = target_dir.join("release/pi");
     if !release_path.exists() {
@@ -1153,7 +1148,7 @@ fn update_baseline() {
 
 fn append_jsonl(path: &Path, line: &str) {
     use std::io::Write;
-    let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")));
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

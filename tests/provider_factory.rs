@@ -2,16 +2,20 @@
 
 mod common;
 
-use common::TestHarness;
+use common::{MockHttpResponse, TestHarness};
+use futures::StreamExt;
 use pi::Error;
 use pi::auth::{AuthCredential, AuthStorage};
+use pi::model::{Message, UserContent, UserMessage};
 use pi::models::{ModelEntry, ModelRegistry};
 use pi::provider::{
-    Api, CacheRetention, InputType, KnownProvider, Model, ModelCost, StreamOptions,
+    Api, CacheRetention, Context, InputType, KnownProvider, Model, ModelCost, StreamEvent,
+    StreamOptions, ToolDef,
 };
 use pi::providers::{create_provider, normalize_openai_base, normalize_openai_responses_base};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 fn make_model_entry(provider: &str, model_id: &str, base_url: &str) -> ModelEntry {
     ModelEntry {
@@ -55,6 +59,63 @@ fn make_model_with_cost(cost: ModelCost) -> Model {
         max_tokens: 4096,
         headers: HashMap::new(),
     }
+}
+
+fn text_event_stream_response(body: String) -> MockHttpResponse {
+    MockHttpResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body: body.into_bytes(),
+    }
+}
+
+fn openai_chat_sse_body() -> String {
+    [
+        r#"data: {"choices":[{"delta":{}}]}"#,
+        "",
+        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        "",
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n")
+}
+
+fn openai_responses_sse_body() -> String {
+    [
+        r#"data: {"type":"response.output_text.delta","item_id":"msg_1","content_index":0,"delta":"ok"}"#,
+        "",
+        r#"data: {"type":"response.completed","response":{"incomplete_details":null,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+        "",
+    ]
+    .join("\n")
+}
+
+fn request_header(headers: &[(String, String)], key: &str) -> Option<String> {
+    headers
+        .iter()
+        .rev()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.clone())
+}
+
+fn drive_provider_stream_to_done(
+    provider: Arc<dyn pi::provider::Provider>,
+    context: Context,
+    options: StreamOptions,
+) {
+    common::run_async(async move {
+        let mut stream = provider
+            .stream(&context, &options)
+            .await
+            .expect("provider stream should start");
+        while let Some(event) = stream.next().await {
+            if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                return;
+            }
+        }
+        panic!("provider stream ended before Done event");
+    });
 }
 
 #[test]
@@ -473,6 +534,260 @@ fn schema_metadata_drives_native_anthropic_selection_end_to_end() {
     assert_eq!(provider.name(), "anthropic");
     assert_eq!(provider.api(), "anthropic-messages");
     assert_eq!(provider.model_id(), "claude-schema-default");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn schema_compat_overrides_flow_through_factory_for_openai_completions() {
+    let harness =
+        TestHarness::new("schema_compat_overrides_flow_through_factory_for_openai_completions");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/v1/chat/completions",
+        text_event_stream_response(openai_chat_sse_body()),
+    );
+
+    let auth_path = harness.temp_path("auth.json");
+    let auth = AuthStorage::load(auth_path).expect("load auth storage");
+
+    let models_path = harness.create_file(
+        "models.json",
+        format!(
+            r#"{{
+  "providers": {{
+    "custom-openai": {{
+      "api": "openai-completions",
+      "baseUrl": "{base_url}/v1",
+      "apiKey": "provider-secret-key",
+      "compat": {{
+        "supportsTools": false,
+        "supportsUsageInStreaming": false,
+        "maxTokensField": "max_completion_tokens",
+        "customHeaders": {{
+          "x-provider-routing": "provider-default"
+        }}
+      }},
+      "models": [{{
+        "id": "compat-chat-model",
+        "compat": {{
+          "systemRoleName": "developer",
+          "customHeaders": {{
+            "x-model-routing": "model-override"
+          }}
+        }}
+      }}]
+    }}
+  }}
+}}"#,
+            base_url = server.base_url()
+        ),
+    );
+
+    let registry = ModelRegistry::load(&auth, Some(models_path));
+    assert!(
+        registry.error().is_none(),
+        "unexpected models load error: {:?}",
+        registry.error()
+    );
+
+    let entry = registry
+        .find("custom-openai", "compat-chat-model")
+        .expect("schema should register custom openai model");
+    let compat = entry.compat.as_ref().expect("compat should be present");
+    assert_eq!(
+        compat.max_tokens_field.as_deref(),
+        Some("max_completion_tokens")
+    );
+    assert_eq!(compat.system_role_name.as_deref(), Some("developer"));
+    assert_eq!(compat.supports_tools, Some(false));
+    assert_eq!(compat.supports_usage_in_streaming, Some(false));
+
+    let provider = create_provider(&entry, None).expect("create compat completions provider");
+    let context = Context {
+        system_prompt: Some("You are concise.".to_string()),
+        messages: vec![Message::User(UserMessage {
+            content: UserContent::Text("Ping".to_string()),
+            timestamp: 0,
+        })],
+        tools: vec![ToolDef {
+            name: "search".to_string(),
+            description: "Search docs".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string" }
+                },
+                "required": ["q"]
+            }),
+        }],
+    };
+    let options = StreamOptions {
+        api_key: entry.api_key.clone(),
+        headers: entry.headers.clone(),
+        max_tokens: Some(321),
+        ..Default::default()
+    };
+    drive_provider_stream_to_done(provider, context, options);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one request");
+    let request = &requests[0];
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request_header(&request.headers, "authorization").as_deref(),
+        Some("Bearer provider-secret-key")
+    );
+    assert_eq!(
+        request_header(&request.headers, "x-provider-routing").as_deref(),
+        Some("provider-default")
+    );
+    assert_eq!(
+        request_header(&request.headers, "x-model-routing").as_deref(),
+        Some("model-override")
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("request body should be json");
+    assert_eq!(body["messages"][0]["role"], "developer");
+    assert_eq!(body["max_completion_tokens"], 321);
+    assert!(body.get("max_tokens").is_none());
+    assert_eq!(body["stream_options"]["include_usage"], false);
+    assert!(body.get("tools").is_none());
+
+    let dump = harness.log().dump();
+    assert!(dump.contains("header.authorization = [REDACTED]"));
+    assert!(!dump.contains("provider-secret-key"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn schema_compat_headers_respect_precedence_for_openai_responses() {
+    let harness = TestHarness::new("schema_compat_headers_respect_precedence_for_openai_responses");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/v1/responses",
+        text_event_stream_response(openai_responses_sse_body()),
+    );
+
+    let auth_path = harness.temp_path("auth.json");
+    let auth = AuthStorage::load(auth_path).expect("load auth storage");
+
+    let models_path = harness.create_file(
+        "models.json",
+        format!(
+            r#"{{
+  "providers": {{
+    "custom-responses": {{
+      "api": "openai-responses",
+      "baseUrl": "{base_url}/v1",
+      "apiKey": "responses-secret-key",
+      "headers": {{
+        "x-routing": "request-override"
+      }},
+      "compat": {{
+        "customHeaders": {{
+          "x-routing": "provider-compat",
+          "x-compat-only": "provider-only"
+        }}
+      }},
+      "models": [{{
+        "id": "compat-responses-model",
+        "headers": {{
+          "x-model-header": "request-model"
+        }},
+        "compat": {{
+          "customHeaders": {{
+            "x-routing": "model-compat",
+            "x-model-compat": "model-only"
+          }}
+        }}
+      }}]
+    }}
+  }}
+}}"#,
+            base_url = server.base_url()
+        ),
+    );
+
+    let registry = ModelRegistry::load(&auth, Some(models_path));
+    assert!(
+        registry.error().is_none(),
+        "unexpected models load error: {:?}",
+        registry.error()
+    );
+
+    let entry = registry
+        .find("custom-responses", "compat-responses-model")
+        .expect("schema should register custom responses model");
+    let compat_headers = entry
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.custom_headers.as_ref())
+        .expect("compat headers should be present");
+    assert_eq!(
+        compat_headers.get("x-routing").map(String::as_str),
+        Some("model-compat")
+    );
+    assert_eq!(
+        compat_headers.get("x-compat-only").map(String::as_str),
+        Some("provider-only")
+    );
+    assert_eq!(
+        compat_headers.get("x-model-compat").map(String::as_str),
+        Some("model-only")
+    );
+
+    let provider = create_provider(&entry, None).expect("create compat responses provider");
+    let context = Context {
+        system_prompt: None,
+        messages: vec![Message::User(UserMessage {
+            content: UserContent::Text("Ping".to_string()),
+            timestamp: 0,
+        })],
+        tools: Vec::new(),
+    };
+    let options = StreamOptions {
+        api_key: entry.api_key.clone(),
+        headers: entry.headers.clone(),
+        max_tokens: Some(123),
+        ..Default::default()
+    };
+    drive_provider_stream_to_done(provider, context, options);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one request");
+    let request = &requests[0];
+    assert_eq!(request.path, "/v1/responses");
+    assert_eq!(
+        request_header(&request.headers, "authorization").as_deref(),
+        Some("Bearer responses-secret-key")
+    );
+    assert_eq!(
+        request_header(&request.headers, "x-routing").as_deref(),
+        Some("request-override")
+    );
+    assert_eq!(
+        request_header(&request.headers, "x-compat-only").as_deref(),
+        Some("provider-only")
+    );
+    assert_eq!(
+        request_header(&request.headers, "x-model-compat").as_deref(),
+        Some("model-only")
+    );
+    assert_eq!(
+        request_header(&request.headers, "x-model-header").as_deref(),
+        Some("request-model")
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("request body should be json");
+    assert_eq!(body["max_output_tokens"], 123);
+
+    let dump = harness.log().dump();
+    assert!(dump.contains("header.authorization = [REDACTED]"));
+    assert!(!dump.contains("responses-secret-key"));
 }
 
 #[test]
