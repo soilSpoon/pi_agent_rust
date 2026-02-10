@@ -371,19 +371,31 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 &provider_headers,
                 resolve_headers(model_cfg.headers.as_ref()),
             );
-            let input = model_cfg
-                .input
-                .clone()
-                .unwrap_or_else(|| vec!["text".to_string()]);
-
-            let input_types = input
-                .iter()
-                .filter_map(|i| match i.as_str() {
-                    "text" => Some(InputType::Text),
-                    "image" => Some(InputType::Image),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let default_input_types = routing_defaults
+                .map_or_else(|| vec![InputType::Text], |defaults| defaults.input.to_vec());
+            let input_types = model_cfg.input.as_ref().map_or_else(
+                || default_input_types.clone(),
+                |input| {
+                    input
+                        .iter()
+                        .filter_map(|i| match i.as_str() {
+                            "text" => Some(InputType::Text),
+                            "image" => Some(InputType::Image),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                },
+            );
+            let input_types = if input_types.is_empty() {
+                default_input_types
+            } else {
+                input_types
+            };
+            let default_reasoning = routing_defaults.is_some_and(|defaults| defaults.reasoning);
+            let default_context_window =
+                routing_defaults.map_or(128_000, |defaults| defaults.context_window);
+            let default_max_tokens =
+                routing_defaults.map_or(16_384, |defaults| defaults.max_tokens);
 
             let model = Model {
                 id: model_cfg.id.clone(),
@@ -394,20 +406,16 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 api: model_api_parsed.to_string(),
                 provider: provider_id.clone(),
                 base_url: provider_base.clone(),
-                reasoning: model_cfg.reasoning.unwrap_or(false),
-                input: if input_types.is_empty() {
-                    vec![InputType::Text]
-                } else {
-                    input_types
-                },
+                reasoning: model_cfg.reasoning.unwrap_or(default_reasoning),
+                input: input_types,
                 cost: model_cfg.cost.clone().unwrap_or(ModelCost {
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
                     cache_write: 0.0,
                 }),
-                context_window: model_cfg.context_window.unwrap_or(128_000),
-                max_tokens: model_cfg.max_tokens.unwrap_or(16_384),
+                context_window: model_cfg.context_window.unwrap_or(default_context_window),
+                max_tokens: model_cfg.max_tokens.unwrap_or(default_max_tokens),
                 headers: HashMap::new(),
             };
 
@@ -734,7 +742,49 @@ mod tests {
             .expect("cohere model should be added");
         assert_eq!(cohere.model.api, "cohere-chat");
         assert_eq!(cohere.model.base_url, "https://api.cohere.com/v2");
+        assert!(cohere.model.reasoning);
+        assert_eq!(cohere.model.input, vec![InputType::Text]);
+        assert_eq!(cohere.model.context_window, 128_000);
+        assert_eq!(cohere.model.max_tokens, 8192);
         assert!(!cohere.auth_header);
+    }
+
+    #[test]
+    fn apply_custom_models_uses_schema_defaults_for_native_anthropic_models() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = Vec::new();
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "anthropic".to_string(),
+                ProviderConfig {
+                    models: Some(vec![ModelConfig {
+                        id: "claude-schema-default".to_string(),
+                        ..ModelConfig::default()
+                    }]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config);
+
+        let anthropic = models
+            .iter()
+            .find(|entry| entry.model.provider == "anthropic")
+            .expect("anthropic model should be added");
+        assert_eq!(anthropic.model.api, "anthropic-messages");
+        assert_eq!(
+            anthropic.model.base_url,
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert!(anthropic.model.reasoning);
+        assert_eq!(
+            anthropic.model.input,
+            vec![InputType::Text, InputType::Image]
+        );
+        assert_eq!(anthropic.model.context_window, 200_000);
+        assert_eq!(anthropic.model.max_tokens, 8192);
+        assert!(!anthropic.auth_header);
     }
 
     #[test]

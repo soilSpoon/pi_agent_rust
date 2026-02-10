@@ -2812,12 +2812,15 @@ mod extensions_integration_tests {
 mod abort_tests {
     use super::*;
     use crate::session::Session;
-    use crate::tools::ToolRegistry;
+    use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
     use asupersync::runtime::RuntimeBuilder;
     use async_trait::async_trait;
     use futures::Stream;
+    use serde_json::json;
     use std::path::Path;
     use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicUsize;
     use std::task::{Context as TaskContext, Poll};
 
     struct StartThenPending {
@@ -2912,6 +2915,238 @@ mod abort_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct PhasedProvider {
+        pending_calls: usize,
+        calls: AtomicUsize,
+    }
+
+    impl PhasedProvider {
+        const fn new(pending_calls: usize) -> Self {
+            Self {
+                pending_calls,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn base_message() -> AssistantMessage {
+            AssistantMessage {
+                content: Vec::new(),
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for PhasedProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.pending_calls {
+                return Ok(Box::pin(StartThenPending {
+                    start: Some(StreamEvent::Start {
+                        partial: Self::base_message(),
+                    }),
+                }));
+            }
+
+            let partial = Self::base_message();
+            let mut done = Self::base_message();
+            done.content = vec![ContentBlock::Text(TextContent::new(format!(
+                "resumed-response-{call}"
+            )))];
+
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::Start { partial }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: done,
+                }),
+            ])))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ToolCallProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for ToolCallProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let message = AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "hanging_tool".to_string(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                })],
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 0,
+            };
+
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                StreamEvent::Done {
+                    reason: StopReason::ToolUse,
+                    message,
+                },
+            )])))
+        }
+    }
+
+    #[derive(Debug)]
+    struct HangingTool;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Tool for HangingTool {
+        fn name(&self) -> &str {
+            "hanging_tool"
+        }
+
+        fn label(&self) -> &str {
+            "Hanging Tool"
+        }
+
+        fn description(&self) -> &str {
+            "Never completes unless aborted by the host"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> crate::error::Result<ToolOutput> {
+            futures::future::pending::<()>().await;
+            unreachable!("hanging tool should be aborted by the agent")
+        }
+    }
+
+    fn event_tag(event: &AgentEvent) -> &'static str {
+        match event {
+            AgentEvent::AgentStart { .. } => "agent_start",
+            AgentEvent::AgentEnd { error, .. } => {
+                if error.as_deref() == Some("Aborted") {
+                    "agent_end_aborted"
+                } else {
+                    "agent_end"
+                }
+            }
+            AgentEvent::TurnStart { .. } => "turn_start",
+            AgentEvent::TurnEnd { .. } => "turn_end",
+            AgentEvent::MessageStart { .. } => "message_start",
+            AgentEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => match assistant_message_event.as_ref() {
+                AssistantMessageEvent::Error {
+                    reason: StopReason::Aborted,
+                    ..
+                } => "assistant_error_aborted",
+                AssistantMessageEvent::Done { .. } => "assistant_done",
+                _ => "assistant_update",
+            },
+            AgentEvent::MessageEnd { .. } => "message_end",
+            AgentEvent::ToolExecutionStart { .. } => "tool_start",
+            AgentEvent::ToolExecutionUpdate { .. } => "tool_update",
+            AgentEvent::ToolExecutionEnd { .. } => "tool_end",
+        }
+    }
+
+    fn assert_abort_resume_message_sequence(persisted: &[Message]) {
+        assert_eq!(
+            persisted.len(),
+            6,
+            "expected three user+assistant pairs, got: {persisted:?}"
+        );
+
+        let assistant_states = persisted
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(assistant) => Some(assistant.stop_reason),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assistant_states,
+            vec![StopReason::Aborted, StopReason::Aborted, StopReason::Stop]
+        );
+    }
+
+    fn assert_abort_resume_timeline_boundaries(timeline: &[String]) {
+        assert!(
+            timeline
+                .iter()
+                .any(|event| event == "run0:agent_end_aborted"),
+            "missing aborted boundary for first run: {timeline:?}"
+        );
+        assert!(
+            timeline
+                .iter()
+                .any(|event| event == "run1:agent_end_aborted"),
+            "missing aborted boundary for second run: {timeline:?}"
+        );
+        assert!(
+            timeline.iter().any(|event| event == "run2:agent_end"),
+            "missing successful boundary for resumed run: {timeline:?}"
+        );
+    }
+
     #[test]
     fn abort_interrupts_in_flight_stream() {
         let runtime = RuntimeBuilder::current_thread()
@@ -2983,6 +3218,241 @@ mod abort_tests {
                 .expect("run_text_with_abort");
             assert_eq!(message.stop_reason, StopReason::Aborted);
             assert_eq!(calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn abort_then_resume_preserves_session_history() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let provider = Arc::new(PhasedProvider::new(1));
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let started = Arc::new(Notify::new());
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let started_for_abort = Arc::clone(&started);
+            let abort_join = handle.spawn(async move {
+                started_for_abort.notified().await;
+                abort_handle.abort();
+            });
+
+            let aborted = agent_session
+                .run_text_with_abort("first".to_string(), Some(abort_signal), {
+                    let started = Arc::clone(&started);
+                    move |event| {
+                        if matches!(
+                            event,
+                            AgentEvent::MessageStart {
+                                message: Message::Assistant(_)
+                            }
+                        ) {
+                            started.notify_one();
+                        }
+                    }
+                })
+                .await
+                .expect("first run");
+            abort_join.await;
+
+            assert_eq!(aborted.stop_reason, StopReason::Aborted);
+            assert_eq!(aborted.error_message.as_deref(), Some("Aborted"));
+
+            let resumed = agent_session
+                .run_text("second".to_string(), |_| {})
+                .await
+                .expect("resumed run");
+            assert_eq!(resumed.stop_reason, StopReason::Stop);
+            assert!(resumed.error_message.is_none());
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let persisted = session
+                .lock(cx.cx())
+                .await
+                .expect("lock session")
+                .to_messages_for_current_path();
+
+            assert_eq!(
+                persisted.len(),
+                4,
+                "unexpected message history after abort+resume: {persisted:?}"
+            );
+            assert!(matches!(persisted.first(), Some(Message::User(_))));
+            assert!(matches!(
+                persisted.get(1),
+                Some(Message::Assistant(assistant)) if assistant.stop_reason == StopReason::Aborted
+            ));
+            assert!(matches!(persisted.get(2), Some(Message::User(_))));
+            assert!(matches!(
+                persisted.get(3),
+                Some(Message::Assistant(assistant))
+                    if assistant.stop_reason == StopReason::Stop && assistant.error_message.is_none()
+            ));
+        });
+    }
+
+    #[test]
+    fn repeated_abort_then_resume_has_consistent_timeline_and_state() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let provider = Arc::new(PhasedProvider::new(2));
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let timeline = Arc::new(StdMutex::new(Vec::<String>::new()));
+
+            for run_idx in 0..2 {
+                let started = Arc::new(Notify::new());
+                let (abort_handle, abort_signal) = AbortHandle::new();
+                let started_for_abort = Arc::clone(&started);
+                let abort_join = handle.spawn(async move {
+                    started_for_abort.notified().await;
+                    abort_handle.abort();
+                });
+
+                let run_timeline = Arc::clone(&timeline);
+                let aborted = agent_session
+                    .run_text_with_abort(format!("abort-run-{run_idx}"), Some(abort_signal), {
+                        let started = Arc::clone(&started);
+                        move |event| {
+                            if let Ok(mut events) = run_timeline.lock() {
+                                events.push(format!("run{run_idx}:{}", event_tag(&event)));
+                            }
+                            if matches!(
+                                event,
+                                AgentEvent::MessageStart {
+                                    message: Message::Assistant(_)
+                                }
+                            ) {
+                                started.notify_one();
+                            }
+                        }
+                    })
+                    .await
+                    .expect("aborted run");
+                abort_join.await;
+
+                assert_eq!(
+                    aborted.stop_reason,
+                    StopReason::Aborted,
+                    "run {run_idx} should abort cleanly"
+                );
+            }
+
+            let run_timeline = Arc::clone(&timeline);
+            let resumed = agent_session
+                .run_text("final-run".to_string(), move |event| {
+                    if let Ok(mut events) = run_timeline.lock() {
+                        events.push(format!("run2:{}", event_tag(&event)));
+                    }
+                })
+                .await
+                .expect("final resumed run");
+            assert_eq!(resumed.stop_reason, StopReason::Stop);
+            assert!(resumed.error_message.is_none());
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let persisted = session
+                .lock(cx.cx())
+                .await
+                .expect("lock session")
+                .to_messages_for_current_path();
+
+            assert_abort_resume_message_sequence(&persisted);
+
+            let timeline = timeline.lock().expect("timeline lock").clone();
+            assert_abort_resume_timeline_boundaries(&timeline);
+        });
+    }
+
+    #[test]
+    fn abort_during_tool_execution_records_aborted_tool_result() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let provider = Arc::new(ToolCallProvider);
+            let tools = ToolRegistry::from_tools(vec![Box::new(HangingTool)]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let tool_started = Arc::new(Notify::new());
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let tool_started_for_abort = Arc::clone(&tool_started);
+            let abort_join = handle.spawn(async move {
+                tool_started_for_abort.notified().await;
+                abort_handle.abort();
+            });
+
+            let result = agent_session
+                .run_text_with_abort("trigger tool".to_string(), Some(abort_signal), {
+                    let tool_started = Arc::clone(&tool_started);
+                    move |event| {
+                        if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                            tool_started.notify_one();
+                        }
+                    }
+                })
+                .await
+                .expect("tool-abort run");
+            abort_join.await;
+            assert_eq!(result.stop_reason, StopReason::Aborted);
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let persisted = session
+                .lock(cx.cx())
+                .await
+                .expect("lock session")
+                .to_messages_for_current_path();
+
+            let tool_result = persisted
+                .iter()
+                .find_map(|message| match message {
+                    Message::ToolResult(result) => Some(result),
+                    _ => None,
+                })
+                .expect("expected tool result message");
+            assert!(tool_result.is_error);
+            assert!(
+                tool_result.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text(text) if text.text.contains("Tool execution aborted")
+                    )
+                }),
+                "missing aborted tool marker in tool output: {:?}",
+                tool_result.content
+            );
         });
     }
 }

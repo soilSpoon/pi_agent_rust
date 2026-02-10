@@ -414,6 +414,7 @@ impl std::fmt::Display for ThinkingLevel {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     // ── Helper ─────────────────────────────────────────────────────────
 
@@ -445,6 +446,221 @@ mod tests {
             error_message: None,
             timestamp: 1_700_000_000,
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct EventTransitionState {
+        seen_start: bool,
+        finished: bool,
+        open_text_indices: BTreeSet<usize>,
+        open_thinking_indices: BTreeSet<usize>,
+        open_tool_indices: BTreeSet<usize>,
+    }
+
+    fn event_transition_diag(
+        fixture_id: &str,
+        step: usize,
+        event_type: &str,
+        state: &EventTransitionState,
+        detail: &str,
+    ) -> String {
+        json!({
+            "fixture_id": fixture_id,
+            "seed": "deterministic-static",
+            "env": {
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+            },
+            "step": step,
+            "event_type": event_type,
+            "state_snapshot": {
+                "seen_start": state.seen_start,
+                "finished": state.finished,
+                "open_text_indices": state.open_text_indices.iter().copied().collect::<Vec<_>>(),
+                "open_thinking_indices": state.open_thinking_indices.iter().copied().collect::<Vec<_>>(),
+                "open_tool_indices": state.open_tool_indices.iter().copied().collect::<Vec<_>>(),
+            },
+            "detail": detail,
+        })
+        .to_string()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_event_transitions(
+        fixture_id: &str,
+        events: &[AssistantMessageEvent],
+    ) -> Result<(), String> {
+        let mut state = EventTransitionState::default();
+
+        for (step, event) in events.iter().enumerate() {
+            match event {
+                AssistantMessageEvent::Start { .. } => {
+                    if state.seen_start || state.finished {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "start",
+                            &state,
+                            "start must appear exactly once before done/error",
+                        ));
+                    }
+                    state.seen_start = true;
+                }
+                AssistantMessageEvent::TextStart { content_index, .. } => {
+                    if !state.seen_start || state.finished {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "text_start",
+                            &state,
+                            "text_start before start or after done/error",
+                        ));
+                    }
+                    if !state.open_text_indices.insert(*content_index) {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "text_start",
+                            &state,
+                            "duplicate text_start for same content index",
+                        ));
+                    }
+                }
+                AssistantMessageEvent::TextDelta { content_index, .. } => {
+                    if !state.open_text_indices.contains(content_index) {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "text_delta",
+                            &state,
+                            "text_delta without matching text_start",
+                        ));
+                    }
+                }
+                AssistantMessageEvent::TextEnd { content_index, .. } => {
+                    if !state.open_text_indices.remove(content_index) {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "text_end",
+                            &state,
+                            "text_end without matching text_start",
+                        ));
+                    }
+                }
+                AssistantMessageEvent::ThinkingStart { content_index, .. } => {
+                    if !state.open_thinking_indices.insert(*content_index) {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "thinking_start",
+                            &state,
+                            "duplicate thinking_start for same content index",
+                        ));
+                    }
+                }
+                AssistantMessageEvent::ThinkingDelta { content_index, .. } => {
+                    if !state.open_thinking_indices.contains(content_index) {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "thinking_delta",
+                            &state,
+                            "thinking_delta without matching thinking_start",
+                        ));
+                    }
+                }
+                AssistantMessageEvent::ThinkingEnd { content_index, .. } => {
+                    if !state.open_thinking_indices.remove(content_index) {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "thinking_end",
+                            &state,
+                            "thinking_end without matching thinking_start",
+                        ));
+                    }
+                }
+                AssistantMessageEvent::ToolCallStart { content_index, .. } => {
+                    if !state.open_tool_indices.insert(*content_index) {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "toolcall_start",
+                            &state,
+                            "duplicate toolcall_start for same content index",
+                        ));
+                    }
+                }
+                AssistantMessageEvent::ToolCallDelta { content_index, .. } => {
+                    if !state.open_tool_indices.contains(content_index) {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "toolcall_delta",
+                            &state,
+                            "toolcall_delta without matching toolcall_start",
+                        ));
+                    }
+                }
+                AssistantMessageEvent::ToolCallEnd { content_index, .. } => {
+                    if !state.open_tool_indices.remove(content_index) {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "toolcall_end",
+                            &state,
+                            "toolcall_end without matching toolcall_start",
+                        ));
+                    }
+                }
+                AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => {
+                    if !state.seen_start {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "terminal",
+                            &state,
+                            "done/error before start",
+                        ));
+                    }
+                    if state.finished {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "terminal",
+                            &state,
+                            "multiple terminal events",
+                        ));
+                    }
+                    if !state.open_text_indices.is_empty()
+                        || !state.open_thinking_indices.is_empty()
+                        || !state.open_tool_indices.is_empty()
+                    {
+                        return Err(event_transition_diag(
+                            fixture_id,
+                            step,
+                            "terminal",
+                            &state,
+                            "done/error while content blocks still open",
+                        ));
+                    }
+                    state.finished = true;
+                }
+            }
+        }
+
+        if !state.finished {
+            return Err(event_transition_diag(
+                fixture_id,
+                events.len(),
+                "end_of_stream",
+                &state,
+                "missing terminal done/error event",
+            ));
+        }
+
+        Ok(())
     }
 
     // ── Message enum serialization ─────────────────────────────────────
@@ -959,6 +1175,90 @@ mod tests {
             }
             _ => panic!("expected TextEnd"),
         }
+    }
+
+    #[test]
+    fn assistant_message_event_rejects_malformed_payload() {
+        let malformed = json!({
+            "type": "text_delta",
+            "delta": "hi",
+            "partial": sample_assistant_message()
+        });
+        let encoded = malformed.to_string();
+        let err = serde_json::from_str::<AssistantMessageEvent>(&encoded)
+            .expect_err("text_delta without contentIndex should fail");
+        let diag = json!({
+            "fixture_id": "model-assistant-event-malformed-payload",
+            "seed": "deterministic-static",
+            "expected": "serde error for missing contentIndex",
+            "actual_error": err.to_string(),
+            "payload": malformed,
+        })
+        .to_string();
+        assert!(
+            err.to_string().contains("contentIndex"),
+            "missing contentIndex not reported: {diag}"
+        );
+    }
+
+    #[test]
+    fn assistant_message_event_transitions_accept_valid_sequence() {
+        let partial = sample_assistant_message();
+        let message = sample_assistant_message();
+        let events = vec![
+            AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            },
+            AssistantMessageEvent::TextStart {
+                content_index: 0,
+                partial: partial.clone(),
+            },
+            AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "he".to_string(),
+                partial: partial.clone(),
+            },
+            AssistantMessageEvent::TextEnd {
+                content_index: 0,
+                content: "hello".to_string(),
+                partial,
+            },
+            AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            },
+        ];
+
+        validate_event_transitions("model-event-transition-valid", &events)
+            .expect("valid sequence should pass");
+    }
+
+    #[test]
+    fn assistant_message_event_transitions_reject_out_of_order_delta() {
+        let partial = sample_assistant_message();
+        let message = sample_assistant_message();
+        let events = vec![
+            AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            },
+            AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "hi".to_string(),
+                partial,
+            },
+            AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            },
+        ];
+
+        let err = validate_event_transitions("model-event-transition-out-of-order", &events)
+            .expect_err("out-of-order text_delta should fail");
+        assert!(
+            err.contains("\"fixture_id\":\"model-event-transition-out-of-order\"")
+                && err.contains("text_delta without matching text_start"),
+            "unexpected diagnostic payload: {err}"
+        );
     }
 
     // ── ToolResultMessage optional details ──────────────────────────────
