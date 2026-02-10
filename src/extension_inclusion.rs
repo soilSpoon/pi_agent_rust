@@ -6,6 +6,7 @@
 //! conformance work.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -167,39 +168,49 @@ pub struct InclusionStats {
 /// Classify an extension by its registration types.
 #[must_use]
 pub fn classify_registrations(registrations: &[String]) -> ExtensionCategory {
-    if registrations.len() > 1 {
-        // Check if there are truly distinct categories.
-        let has_tool = registrations.iter().any(|r| r == "registerTool");
-        let has_cmd = registrations
-            .iter()
-            .any(|r| r == "registerCommand" || r == "registerSlashCommand");
-        let has_provider = registrations.iter().any(|r| r == "registerProvider");
-        let has_event = registrations
-            .iter()
-            .any(|r| r == "registerEvent" || r == "registerEventHook");
-        let has_ui = registrations.iter().any(|r| r == "registerMessageRenderer");
+    let has_tool = registrations.iter().any(|r| r == "registerTool");
+    let has_cmd = registrations
+        .iter()
+        .any(|r| r == "registerCommand" || r == "registerSlashCommand");
+    let has_provider = registrations.iter().any(|r| r == "registerProvider");
+    let has_event = registrations
+        .iter()
+        .any(|r| r == "registerEvent" || r == "registerEventHook");
+    let has_ui = registrations.iter().any(|r| r == "registerMessageRenderer");
+    let has_configuration = registrations
+        .iter()
+        .any(|r| r == "registerFlag" || r == "registerShortcut");
 
-        let distinct = [has_tool, has_cmd, has_provider, has_event, has_ui]
-            .iter()
-            .filter(|&&x| x)
-            .count();
-        if distinct > 1 {
-            return ExtensionCategory::Multi;
-        }
+    let distinct = [
+        has_tool,
+        has_cmd,
+        has_provider,
+        has_event,
+        has_ui,
+        has_configuration,
+    ]
+    .iter()
+    .filter(|&&x| x)
+    .count();
+
+    if distinct > 1 {
+        return ExtensionCategory::Multi;
     }
 
-    if registrations.is_empty() {
-        return ExtensionCategory::General;
-    }
-
-    match registrations[0].as_str() {
-        "registerTool" => ExtensionCategory::Tool,
-        "registerCommand" | "registerSlashCommand" => ExtensionCategory::Command,
-        "registerProvider" => ExtensionCategory::Provider,
-        "registerEvent" | "registerEventHook" => ExtensionCategory::EventHook,
-        "registerMessageRenderer" => ExtensionCategory::UiComponent,
-        "registerFlag" | "registerShortcut" => ExtensionCategory::Configuration,
-        _ => ExtensionCategory::General,
+    if has_tool {
+        ExtensionCategory::Tool
+    } else if has_cmd {
+        ExtensionCategory::Command
+    } else if has_provider {
+        ExtensionCategory::Provider
+    } else if has_event {
+        ExtensionCategory::EventHook
+    } else if has_ui {
+        ExtensionCategory::UiComponent
+    } else if has_configuration {
+        ExtensionCategory::Configuration
+    } else {
+        ExtensionCategory::General
     }
 }
 
@@ -213,11 +224,13 @@ pub fn build_rationale(
 ) -> String {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let score_u = score as u32;
-    let tier_reason = match tier {
-        "tier-0" => "Official pi-mono baseline; must-pass conformance target",
-        "tier-1" => format!("High score ({score_u}/100); passes all gates").leak(),
-        "tier-2" => format!("Moderate score ({score_u}/100); stretch conformance target").leak(),
-        _ => "Excluded",
+    let tier_reason: Cow<'_, str> = match tier {
+        "tier-0" => Cow::Borrowed("Official pi-mono baseline; must-pass conformance target"),
+        "tier-1" => Cow::Owned(format!("High score ({score_u}/100); passes all gates")),
+        "tier-2" => Cow::Owned(format!(
+            "Moderate score ({score_u}/100); stretch conformance target"
+        )),
+        _ => Cow::Borrowed("Excluded"),
     };
 
     let cat_reason = match category {
@@ -311,6 +324,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_unknown_then_known_prefers_known_category() {
+        assert_eq!(
+            classify_registrations(&["registerUnknown".into(), "registerProvider".into()]),
+            ExtensionCategory::Provider
+        );
+    }
+
+    #[test]
+    fn classify_configuration_plus_tool_is_multi() {
+        assert_eq!(
+            classify_registrations(&["registerFlag".into(), "registerTool".into()]),
+            ExtensionCategory::Multi
+        );
+    }
+
+    #[test]
     fn rationale_tier0() {
         let r = build_rationale("tier-0", 60.0, &ExtensionCategory::Tool, "official-pi-mono");
         assert!(r.contains("Official pi-mono baseline"));
@@ -323,6 +352,13 @@ mod tests {
         let r = build_rationale("tier-2", 52.0, &ExtensionCategory::Provider, "community");
         assert!(r.contains("52/100"));
         assert!(r.contains("custom provider"));
+    }
+
+    #[test]
+    fn rationale_tier1_includes_score_without_leak_pattern() {
+        let r = build_rationale("tier-1", 87.0, &ExtensionCategory::Tool, "community");
+        assert!(r.contains("87/100"));
+        assert!(r.contains("passes all gates"));
     }
 
     #[test]

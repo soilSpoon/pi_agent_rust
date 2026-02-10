@@ -1,6 +1,6 @@
 {
   "schema": "pi.ext.conformance-matrix.v1",
-  "generated_at": "2026-02-09T17:49:58Z",
+  "generated_at": "2026-02-10T00:30:12Z",
   "task": "bd-2kyq",
   "matrix": [
     {
@@ -17,6 +17,7 @@
       ],
       "exemplar_extensions": [
         "antigravity-image-gen",
+        "subagent",
         "tool-override",
         "truncated-tool"
       ]
@@ -35,6 +36,7 @@
       ],
       "exemplar_extensions": [
         "antigravity-image-gen",
+        "subagent",
         "tool-override",
         "truncated-tool"
       ]
@@ -55,6 +57,7 @@
         "antigravity-image-gen",
         "bash-spawn-hook",
         "shutdown-command",
+        "subagent",
         "truncated-tool"
       ]
     },
@@ -188,7 +191,8 @@
       ],
       "exemplar_extensions": [
         "custom-provider-anthropic",
-        "custom-provider-gitlab-duo"
+        "custom-provider-gitlab-duo",
+        "custom-provider-qwen-cli"
       ]
     },
     {
@@ -460,7 +464,10 @@
           "fail_criteria": "Any registration type fails or capability mismatch"
         }
       ],
-      "exemplar_extensions": []
+      "exemplar_extensions": [
+        "sandbox",
+        "ssh"
+      ]
     },
     {
       "category": "multi",
@@ -474,7 +481,9 @@
           "fail_criteria": "Any registration type fails or capability mismatch"
         }
       ],
-      "exemplar_extensions": []
+      "exemplar_extensions": [
+        "ssh"
+      ]
     },
     {
       "category": "multi",
@@ -488,7 +497,10 @@
           "fail_criteria": "Any registration type fails or capability mismatch"
         }
       ],
-      "exemplar_extensions": []
+      "exemplar_extensions": [
+        "sandbox",
+        "ssh"
+      ]
     },
     {
       "category": "multi",
@@ -530,7 +542,10 @@
           "fail_criteria": "Any registration type fails or capability mismatch"
         }
       ],
-      "exemplar_extensions": []
+      "exemplar_extensions": [
+        "sandbox",
+        "ssh"
+      ]
     },
     {
       "category": "multi",
@@ -558,7 +573,9 @@
           "fail_criteria": "Any registration type fails or capability mismatch"
         }
       ],
-      "exemplar_extensions": []
+      "exemplar_extensions": [
+        "sandbox"
+      ]
     },
     {
       "category": "multi",
@@ -634,11 +651,8 @@
         "pirate",
         "protected-paths",
         "qna",
-        "sandbox",
         "send-user-message",
         "session-name",
-        "ssh",
-        "subagent",
         "summarize",
         "system-prompt-header",
         "timed-confirm",
@@ -679,6 +693,7 @@
       "cell_key": "Tool:Read",
       "fixture_extensions": [
         "antigravity-image-gen",
+        "subagent",
         "tool-override",
         "truncated-tool"
       ],
@@ -689,6 +704,7 @@
       "cell_key": "Tool:Write",
       "fixture_extensions": [
         "antigravity-image-gen",
+        "subagent",
         "tool-override",
         "truncated-tool"
       ],
@@ -701,6 +717,7 @@
         "antigravity-image-gen",
         "bash-spawn-hook",
         "shutdown-command",
+        "subagent",
         "truncated-tool"
       ],
       "min_fixtures": 2,
@@ -762,7 +779,8 @@
       "cell_key": "Provider:Http",
       "fixture_extensions": [
         "custom-provider-anthropic",
-        "custom-provider-gitlab-duo"
+        "custom-provider-gitlab-duo",
+        "custom-provider-qwen-cli"
       ],
       "min_fixtures": 2,
       "coverage_met": true
@@ -898,21 +916,29 @@
     },
     {
       "cell_key": "Multi:Read",
-      "fixture_extensions": [],
+      "fixture_extensions": [
+        "sandbox",
+        "ssh"
+      ],
       "min_fixtures": 2,
-      "coverage_met": false
+      "coverage_met": true
     },
     {
       "cell_key": "Multi:Write",
-      "fixture_extensions": [],
+      "fixture_extensions": [
+        "ssh"
+      ],
       "min_fixtures": 2,
       "coverage_met": false
     },
     {
       "cell_key": "Multi:Exec",
-      "fixture_extensions": [],
+      "fixture_extensions": [
+        "sandbox",
+        "ssh"
+      ],
       "min_fixtures": 2,
-      "coverage_met": false
+      "coverage_met": true
     },
     {
       "cell_key": "Multi:Http",
@@ -928,9 +954,12 @@
     },
     {
       "cell_key": "Multi:Ui",
-      "fixture_extensions": [],
+      "fixture_extensions": [
+        "sandbox",
+        "ssh"
+      ],
       "min_fixtures": 2,
-      "coverage_met": false
+      "coverage_met": true
     },
     {
       "cell_key": "Multi:Log",
@@ -940,7 +969,9 @@
     },
     {
       "cell_key": "Multi:Env",
-      "fixture_extensions": [],
+      "fixture_extensions": [
+        "sandbox"
+      ],
       "min_fixtures": 2,
       "coverage_met": false
     },
@@ -986,11 +1017,8 @@
         "pirate",
         "protected-paths",
         "qna",
-        "sandbox",
         "send-user-message",
         "session-name",
-        "ssh",
-        "subagent",
         "summarize",
         "system-prompt-header",
         "timed-confirm",
@@ -1150,10 +1178,10 @@
   "coverage": {
     "total_cells": 41,
     "required_cells": 25,
-    "covered_cells": 13,
-    "uncovered_required_cells": 13,
+    "covered_cells": 16,
+    "uncovered_required_cells": 10,
     "total_exemplar_extensions": 217,
-    "categories_covered": 6,
+    "categories_covered": 7,
     "capabilities_covered": 7
   }
 }

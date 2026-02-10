@@ -648,16 +648,22 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 let mut stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
                 let mut stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
 
-                let stdout_handle = thread::spawn(move || {
-                    let mut buf = Vec::new();
-                    let _ = stdout.read_to_end(&mut buf);
-                    buf
-                });
-                let stderr_handle = thread::spawn(move || {
-                    let mut buf = Vec::new();
-                    let _ = stderr.read_to_end(&mut buf);
-                    buf
-                });
+                let stdout_handle =
+                    thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
+                        let mut buf = Vec::new();
+                        stdout
+                            .read_to_end(&mut buf)
+                            .map_err(|err| err.to_string())?;
+                        Ok(buf)
+                    });
+                let stderr_handle =
+                    thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
+                        let mut buf = Vec::new();
+                        stderr
+                            .read_to_end(&mut buf)
+                            .map_err(|err| err.to_string())?;
+                        Ok(buf)
+                    });
 
                 let start = Instant::now();
                 let mut killed = false;
@@ -678,8 +684,14 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     thread::sleep(Duration::from_millis(10));
                 };
 
-                let stdout_bytes = stdout_handle.join().unwrap_or_default();
-                let stderr_bytes = stderr_handle.join().unwrap_or_default();
+                let stdout_bytes = stdout_handle
+                    .join()
+                    .map_err(|_| "stdout reader thread panicked".to_string())?
+                    .map_err(|err| format!("Read stdout: {err}"))?;
+                let stderr_bytes = stderr_handle
+                    .join()
+                    .map_err(|_| "stderr reader thread panicked".to_string())?
+                    .map_err(|err| format!("Read stderr: {err}"))?;
 
                 let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
                 let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();

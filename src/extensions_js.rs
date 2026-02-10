@@ -830,7 +830,7 @@ impl PiEventLoop {
 
     pub fn set_timeout(&mut self, delay_ms: u64) -> u64 {
         let timer_id = self.next_timer_id;
-        self.next_timer_id += 1;
+        self.next_timer_id = self.next_timer_id.saturating_add(1);
         let order_seq = self.next_seq();
         let deadline_ms = self.clock.now_ms().saturating_add(delay_ms);
         self.timers.push(std::cmp::Reverse(TimerEntry {
@@ -842,8 +842,15 @@ impl PiEventLoop {
         timer_id
     }
 
-    pub fn clear_timeout(&mut self, timer_id: u64) {
-        self.cancelled_timers.insert(timer_id);
+    pub fn clear_timeout(&mut self, timer_id: u64) -> bool {
+        let pending = self.timers.iter().any(|entry| entry.0.timer_id == timer_id)
+            && !self.cancelled_timers.contains(&timer_id);
+
+        if pending {
+            self.cancelled_timers.insert(timer_id)
+        } else {
+            false
+        }
     }
 
     pub fn tick(
@@ -3942,7 +3949,7 @@ impl AuditLedger {
             summary,
             details,
         });
-        self.next_sequence += 1;
+        self.next_sequence = self.next_sequence.saturating_add(1);
         seq
     }
 
@@ -15234,7 +15241,7 @@ mod tests {
         let mut loop_state = PiEventLoop::new(ClockHandle::new(clock.clone()));
 
         let timer_id = loop_state.set_timeout(5);
-        loop_state.clear_timeout(timer_id);
+        assert!(loop_state.clear_timeout(timer_id));
         clock.set(10);
 
         let mut fired = Vec::new();
@@ -15249,6 +15256,66 @@ mod tests {
 
         assert!(!result.ran_macrotask);
         assert!(fired.is_empty());
+    }
+
+    #[test]
+    fn clear_timeout_nonexistent_returns_false_and_does_not_pollute_cancelled_set() {
+        let clock = Arc::new(ManualClock::new(0));
+        let mut loop_state = PiEventLoop::new(ClockHandle::new(clock));
+
+        assert!(!loop_state.clear_timeout(42));
+        assert!(
+            loop_state.cancelled_timers.is_empty(),
+            "unknown timer ids should not be retained"
+        );
+    }
+
+    #[test]
+    fn clear_timeout_double_cancel_returns_false() {
+        let clock = Arc::new(ManualClock::new(0));
+        let mut loop_state = PiEventLoop::new(ClockHandle::new(clock));
+
+        let timer_id = loop_state.set_timeout(10);
+        assert!(loop_state.clear_timeout(timer_id));
+        assert!(!loop_state.clear_timeout(timer_id));
+    }
+
+    #[test]
+    fn pi_event_loop_timer_id_saturates_at_u64_max() {
+        let clock = Arc::new(ManualClock::new(0));
+        let mut loop_state = PiEventLoop::new(ClockHandle::new(clock));
+        loop_state.next_timer_id = u64::MAX;
+
+        let first = loop_state.set_timeout(10);
+        let second = loop_state.set_timeout(20);
+
+        assert_eq!(first, u64::MAX);
+        assert_eq!(second, u64::MAX);
+    }
+
+    #[test]
+    fn audit_ledger_sequence_saturates_at_u64_max() {
+        let mut ledger = AuditLedger::new();
+        ledger.next_sequence = u64::MAX;
+
+        let first = ledger.append(
+            1_700_000_000_000,
+            "ext-a",
+            AuditEntryKind::Analysis,
+            "first".to_string(),
+            Vec::new(),
+        );
+        let second = ledger.append(
+            1_700_000_000_100,
+            "ext-a",
+            AuditEntryKind::ProposalGenerated,
+            "second".to_string(),
+            Vec::new(),
+        );
+
+        assert_eq!(first, u64::MAX);
+        assert_eq!(second, u64::MAX);
+        assert_eq!(ledger.len(), 2);
     }
 
     #[test]
