@@ -12158,16 +12158,24 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 let mut stderr_pipe =
                                     child.stderr.take().ok_or("Missing stderr pipe")?;
 
-                                let stdout_handle = std::thread::spawn(move || {
-                                    let mut buf = Vec::new();
-                                    let _ = stdout_pipe.read_to_end(&mut buf);
-                                    buf
-                                });
-                                let stderr_handle = std::thread::spawn(move || {
-                                    let mut buf = Vec::new();
-                                    let _ = stderr_pipe.read_to_end(&mut buf);
-                                    buf
-                                });
+                                let stdout_handle = std::thread::spawn(
+                                    move || -> std::result::Result<Vec<u8>, String> {
+                                        let mut buf = Vec::new();
+                                        stdout_pipe
+                                            .read_to_end(&mut buf)
+                                            .map_err(|e| e.to_string())?;
+                                        Ok(buf)
+                                    },
+                                );
+                                let stderr_handle = std::thread::spawn(
+                                    move || -> std::result::Result<Vec<u8>, String> {
+                                        let mut buf = Vec::new();
+                                        stderr_pipe
+                                            .read_to_end(&mut buf)
+                                            .map_err(|e| e.to_string())?;
+                                        Ok(buf)
+                                    },
+                                );
 
                                 let start = Instant::now();
                                 let mut killed = false;
@@ -12186,8 +12194,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     std::thread::sleep(Duration::from_millis(5));
                                 };
 
-                                let stdout_bytes = stdout_handle.join().unwrap_or_default();
-                                let stderr_bytes = stderr_handle.join().unwrap_or_default();
+                                let stdout_bytes = stdout_handle
+                                    .join()
+                                    .map_err(|_| "stdout reader thread panicked".to_string())?
+                                    .map_err(|e| format!("failed to read stdout: {e}"))?;
+                                let stderr_bytes = stderr_handle
+                                    .join()
+                                    .map_err(|_| "stderr reader thread panicked".to_string())?
+                                    .map_err(|e| format!("failed to read stderr: {e}"))?;
 
                                 let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
                                 let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();

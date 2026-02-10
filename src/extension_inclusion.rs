@@ -6,7 +6,9 @@
 //! conformance work.
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -254,6 +256,65 @@ pub fn build_rationale(
     format!("{tier_reason}. {cat_reason}. Source: {source_reason}.")
 }
 
+/// Recursively canonicalize a JSON value by sorting all object keys.
+///
+/// This guarantees stable serialization across platforms and parser insertion
+/// order differences, which is required for deterministic manifest hashing.
+#[must_use]
+pub fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted = map
+                .iter()
+                .map(|(k, v)| (k.clone(), canonicalize_json_value(v)))
+                .collect::<BTreeMap<_, _>>();
+
+            let mut out = serde_json::Map::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                out.insert(k, v);
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_json_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+/// Normalize inclusion-list JSON for stable comparisons and hashing.
+///
+/// The top-level `generated_at` field is intentionally removed so hashes only
+/// change when meaningful manifest content changes.
+#[must_use]
+pub fn normalize_manifest_value(value: &serde_json::Value) -> serde_json::Value {
+    let mut normalized = canonicalize_json_value(value);
+    if let Some(obj) = normalized.as_object_mut() {
+        obj.remove("generated_at");
+    }
+    normalized
+}
+
+/// Compute a stable SHA-256 hash for an inclusion-list JSON string.
+///
+/// Parsing + canonicalization ensures the hash is independent of object key
+/// ordering and line ending differences.
+pub fn normalized_manifest_hash(json: &str) -> Result<String, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    normalized_manifest_hash_from_value(&value)
+}
+
+/// Compute a stable SHA-256 hash from a parsed inclusion-list JSON value.
+pub fn normalized_manifest_hash_from_value(
+    value: &serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    let normalized = normalize_manifest_value(value);
+    let bytes = serde_json::to_vec(&normalized)?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
@@ -434,5 +495,50 @@ mod tests {
         let json = serde_json::to_string(&list).unwrap();
         let back: InclusionList = serde_json::from_str(&json).unwrap();
         assert_eq!(back.schema, "pi.ext.inclusion.v1");
+    }
+
+    #[test]
+    fn normalized_manifest_hash_ignores_generated_at_and_key_order() {
+        let first = serde_json::json!({
+            "schema": "pi.ext.inclusion_list.v1",
+            "generated_at": "2026-02-10T00:00:00Z",
+            "summary": {
+                "tier1_count": 2,
+                "tier2_count": 1
+            },
+            "tier1": [{"id": "a"}, {"id": "b"}]
+        });
+
+        let second = serde_json::json!({
+            "tier1": [{"id": "a"}, {"id": "b"}],
+            "summary": {
+                "tier2_count": 1,
+                "tier1_count": 2
+            },
+            "generated_at": "2030-01-01T12:34:56Z",
+            "schema": "pi.ext.inclusion_list.v1"
+        });
+
+        let first_hash = normalized_manifest_hash_from_value(&first).unwrap();
+        let second_hash = normalized_manifest_hash_from_value(&second).unwrap();
+        assert_eq!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn normalized_manifest_hash_detects_content_changes() {
+        let baseline = serde_json::json!({
+            "schema": "pi.ext.inclusion_list.v1",
+            "generated_at": "2026-02-10T00:00:00Z",
+            "summary": { "tier1_count": 2 }
+        });
+        let changed = serde_json::json!({
+            "schema": "pi.ext.inclusion_list.v1",
+            "generated_at": "2026-02-10T00:00:00Z",
+            "summary": { "tier1_count": 3 }
+        });
+
+        let baseline_hash = normalized_manifest_hash_from_value(&baseline).unwrap();
+        let changed_hash = normalized_manifest_hash_from_value(&changed).unwrap();
+        assert_ne!(baseline_hash, changed_hash);
     }
 }

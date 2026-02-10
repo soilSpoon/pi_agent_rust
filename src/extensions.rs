@@ -1632,7 +1632,9 @@ impl ExtensionPolicy {
     }
 }
 
-pub fn required_capability_for_host_call(call: &HostCallPayload) -> Option<String> {
+pub(crate) fn required_capability_for_host_call_static(
+    call: &HostCallPayload,
+) -> Option<&'static str> {
     let method = call.method.trim();
     if method.is_empty() {
         return None;
@@ -1646,7 +1648,7 @@ pub fn required_capability_for_host_call(call: &HostCallPayload) -> Option<Strin
             .map(str::trim)
             .unwrap_or_default();
         let op = FsOp::parse(op)?;
-        return Some(op.required_capability().to_string());
+        return Some(op.required_capability());
     }
 
     if method.eq_ignore_ascii_case("tool") {
@@ -1664,34 +1666,38 @@ pub fn required_capability_for_host_call(call: &HostCallPayload) -> Option<Strin
             || tool_name.eq_ignore_ascii_case("find")
             || tool_name.eq_ignore_ascii_case("ls")
         {
-            return Some("read".to_string());
+            return Some("read");
         }
         if tool_name.eq_ignore_ascii_case("write") || tool_name.eq_ignore_ascii_case("edit") {
-            return Some("write".to_string());
+            return Some("write");
         }
         if tool_name.eq_ignore_ascii_case("bash") {
-            return Some("exec".to_string());
+            return Some("exec");
         }
-        return Some("tool".to_string());
+        return Some("tool");
     }
 
     if method.eq_ignore_ascii_case("exec") {
-        Some("exec".to_string())
+        Some("exec")
     } else if method.eq_ignore_ascii_case("env") {
-        Some("env".to_string())
+        Some("env")
     } else if method.eq_ignore_ascii_case("http") {
-        Some("http".to_string())
+        Some("http")
     } else if method.eq_ignore_ascii_case("session") {
-        Some("session".to_string())
+        Some("session")
     } else if method.eq_ignore_ascii_case("ui") {
-        Some("ui".to_string())
+        Some("ui")
     } else if method.eq_ignore_ascii_case("events") {
-        Some("events".to_string())
+        Some("events")
     } else if method.eq_ignore_ascii_case("log") {
-        Some("log".to_string())
+        Some("log")
     } else {
         None
     }
+}
+
+pub fn required_capability_for_host_call(call: &HostCallPayload) -> Option<String> {
+    required_capability_for_host_call_static(call).map(str::to_string)
 }
 
 // ============================================================================
@@ -2950,7 +2956,7 @@ fn validate_host_call(payload: &HostCallPayload) -> Result<()> {
         return Err(Error::validation("Host call method is empty"));
     }
 
-    let required = required_capability_for_host_call(payload).ok_or_else(|| {
+    let required = required_capability_for_host_call_static(payload).ok_or_else(|| {
         Error::validation(format!(
             "Unknown or invalid host call method: {}",
             payload.method
@@ -3695,7 +3701,7 @@ mod wasm_host {
                 ));
             }
 
-            let Some(required) = required_capability_for_host_call(&payload) else {
+            let Some(required) = required_capability_for_host_call_static(&payload) else {
                 return Err(Self::host_error_json(
                     HostCallErrorCode::InvalidRequest,
                     format!("Unknown host_call method: {}", payload.method),
@@ -6889,7 +6895,7 @@ pub async fn dispatch_host_call_shared(
 
     let call_id = call.call_id.clone();
     let method = call.method.clone();
-    let capability = required_capability_for_host_call(&call).unwrap_or_else(|| "internal".into());
+    let capability = required_capability_for_host_call_static(&call).unwrap_or("internal");
     let params_hash = hostcall_params_hash(&method, &call.params);
     let started_at = Instant::now();
 
@@ -6897,20 +6903,20 @@ pub async fn dispatch_host_call_shared(
         ctx.runtime_name,
         &call_id,
         ctx.extension_id,
-        &capability,
+        capability,
         &method,
         &params_hash,
         call.timeout_ms,
     );
 
     // Policy check (per-extension overrides applied via extension_id).
-    let policy_check = ctx.policy.evaluate_for(&capability, ctx.extension_id);
+    let policy_check = ctx.policy.evaluate_for(capability, ctx.extension_id);
     let (decision, reason) = match policy_check.decision {
         PolicyDecision::Allow => (PolicyDecision::Allow, policy_check.reason),
         PolicyDecision::Deny => (PolicyDecision::Deny, policy_check.reason),
         PolicyDecision::Prompt => {
             // Check prompt cache, then prompt the user.
-            resolve_shared_policy_prompt(ctx, &capability).await
+            resolve_shared_policy_prompt(ctx, capability).await
         }
     };
 
@@ -6918,7 +6924,7 @@ pub async fn dispatch_host_call_shared(
         ctx.runtime_name,
         &call_id,
         ctx.extension_id,
-        &capability,
+        capability,
         &decision,
         &reason,
         &params_hash,
@@ -6938,7 +6944,7 @@ pub async fn dispatch_host_call_shared(
         ctx.runtime_name,
         &call_id,
         ctx.extension_id,
-        &capability,
+        capability,
         &method,
         &params_hash,
         duration_ms,
