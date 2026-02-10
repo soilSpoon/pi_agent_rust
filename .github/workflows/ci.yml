@@ -277,6 +277,238 @@ jobs:
           fi
           echo "No VCR leaks in unit suite."
 
+      - name: Quarantine expiry guard
+        run: |
+          set -euo pipefail
+          classification="tests/suite_classification.toml"
+          python3 - "$classification" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+          from datetime import date, datetime, timezone
+
+          toml_path = sys.argv[1]
+          with open(toml_path, encoding="utf-8") as fh:
+              content = fh.read()
+
+          # Simple TOML parser: find [quarantine.<name>] sections and extract key=value pairs.
+          section_re = re.compile(r"^\[quarantine\.(\w+)\]\s*$", re.MULTILINE)
+          kv_re = re.compile(r'^(\w+)\s*=\s*"([^"]*)"', re.MULTILINE)
+
+          entries = {}
+          for match in section_re.finditer(content):
+              name = match.group(1)
+              start = match.end()
+              # Find next section or end of file.
+              next_section = re.search(r"^\[", content[start:], re.MULTILINE)
+              end = start + next_section.start() if next_section else len(content)
+              block = content[start:end]
+              fields = {m.group(1): m.group(2) for m in kv_re.finditer(block)}
+              entries[name] = fields
+
+          allowed_categories = {
+              "FLAKE-TIMING",
+              "FLAKE-ENV",
+              "FLAKE-NET",
+              "FLAKE-RES",
+              "FLAKE-EXT",
+              "FLAKE-LOGIC",
+          }
+          max_quarantine_days = 14
+          retry_policy = {
+              "max_auto_retries": 1,
+              "retry_delay_seconds": 5,
+              "retry_scope": "failed-target-only",
+              "second_failure_policy": "deterministic-failure",
+          }
+
+          today = date.today()
+          report = {
+              "schema": "pi.test.quarantine_report.v2",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "policy_version": "2026-02-10",
+              "today": today.isoformat(),
+              "max_quarantine_days": max_quarantine_days,
+              "retry_policy": retry_policy,
+              "active_count": 0,
+              "expiring_soon_count": 0,
+              "expired_count": 0,
+              "category_counts": {},
+              "entries": [],
+              "escalations": [],
+          }
+
+          required_fields = {
+              "category",
+              "owner",
+              "quarantined",
+              "expires",
+              "bead",
+              "evidence",
+              "repro",
+              "reason",
+              "remove_when",
+          }
+          errors = []
+
+          for name, fields in sorted(entries.items()):
+              missing = required_fields - set(fields.keys())
+              if missing:
+                  errors.append(f"quarantine.{name}: missing required fields: {sorted(missing)}")
+                  continue
+
+              category = fields.get("category", "").strip()
+              if category not in allowed_categories:
+                  errors.append(
+                      f"quarantine.{name}: invalid category {category!r}; expected one of {sorted(allowed_categories)}"
+                  )
+                  continue
+
+              try:
+                  quarantined_date = date.fromisoformat(fields["quarantined"])
+              except ValueError:
+                  errors.append(
+                      f"quarantine.{name}: invalid quarantined date: {fields['quarantined']}"
+                  )
+                  continue
+
+              try:
+                  expires_date = date.fromisoformat(fields["expires"])
+              except ValueError:
+                  errors.append(f"quarantine.{name}: invalid expires date: {fields['expires']}")
+                  continue
+
+              quarantine_span_days = (expires_date - quarantined_date).days
+              if quarantine_span_days < 0:
+                  errors.append(
+                      f"quarantine.{name}: expires precedes quarantined ({fields['quarantined']} -> {fields['expires']})"
+                  )
+                  continue
+              if quarantine_span_days > max_quarantine_days:
+                  errors.append(
+                      f"quarantine.{name}: quarantine window {quarantine_span_days}d exceeds max {max_quarantine_days}d"
+                  )
+                  continue
+
+              if not fields.get("evidence", "").strip():
+                  errors.append(f"quarantine.{name}: evidence must reference CI run URL or artifact path")
+                  continue
+              if not fields.get("repro", "").strip():
+                  errors.append(f"quarantine.{name}: repro must include exact reproduction command")
+                  continue
+              if not fields.get("remove_when", "").strip():
+                  errors.append(f"quarantine.{name}: remove_when must define exit criteria")
+                  continue
+
+              days_remaining = (expires_date - today).days
+              if days_remaining < 0:
+                  status = "expired"
+                  report["expired_count"] += 1
+                  report["escalations"].append(
+                      {
+                          "name": name,
+                          "severity": "critical",
+                          "action": "Fix now or remove quarantine entry before merge",
+                          "owner": fields.get("owner", ""),
+                          "bead": fields.get("bead", ""),
+                      }
+                  )
+              elif days_remaining <= 2:
+                  status = "expiring-soon"
+                  report["expiring_soon_count"] += 1
+                  report["active_count"] += 1
+                  report["escalations"].append(
+                      {
+                          "name": name,
+                          "severity": "warning",
+                          "action": "Prepare fix/extension with updated evidence before expiry",
+                          "owner": fields.get("owner", ""),
+                          "bead": fields.get("bead", ""),
+                      }
+                  )
+              else:
+                  status = "active"
+                  report["active_count"] += 1
+
+              report["category_counts"][category] = report["category_counts"].get(category, 0) + 1
+              report["entries"].append({
+                  "name": name,
+                  "category": category,
+                  "owner": fields.get("owner", ""),
+                  "quarantined": fields.get("quarantined", ""),
+                  "expires": fields.get("expires", ""),
+                  "bead": fields.get("bead", ""),
+                  "evidence": fields.get("evidence", ""),
+                  "repro": fields.get("repro", ""),
+                  "reason": fields.get("reason", ""),
+                  "remove_when": fields.get("remove_when", ""),
+                  "status": status,
+                  "quarantine_span_days": quarantine_span_days,
+                  "days_remaining": days_remaining,
+              })
+
+          report_path = pathlib.Path("tests/quarantine_report.json")
+          report_path.write_text(
+              json.dumps(report, indent=2) + "\n", encoding="utf-8"
+          )
+
+          audit_path = pathlib.Path("tests/quarantine_audit.jsonl")
+          audit_lines = []
+          for entry in report["entries"]:
+              audit_lines.append(
+                  json.dumps(
+                      {
+                          "schema": "pi.test.quarantine_audit_entry.v1",
+                          "generated_at": report["generated_at"],
+                          "name": entry["name"],
+                          "category": entry["category"],
+                          "owner": entry["owner"],
+                          "bead": entry["bead"],
+                          "status": entry["status"],
+                          "expires": entry["expires"],
+                          "days_remaining": entry["days_remaining"],
+                          "evidence": entry["evidence"],
+                          "repro": entry["repro"],
+                          "remove_when": entry["remove_when"],
+                      },
+                      sort_keys=True,
+                  )
+              )
+          audit_path.write_text(("\n".join(audit_lines) + "\n") if audit_lines else "", encoding="utf-8")
+
+          print(
+              "Quarantine report:"
+              f" {report['active_count']} active,"
+              f" {report['expiring_soon_count']} expiring-soon,"
+              f" {report['expired_count']} expired."
+          )
+          print(f"  report: {report_path}")
+          print(f"  audit:  {audit_path}")
+
+          if errors:
+              for err in errors:
+                  print(f"ERROR: {err}", file=sys.stderr)
+              sys.exit(1)
+
+          if report["expired_count"] > 0:
+              print("Expired quarantine entries (must fix or extend):", file=sys.stderr)
+              for entry in report["entries"]:
+                  if entry["status"] == "expired":
+                      print(f"  - {entry['name']} (expired {-entry['days_remaining']} days ago, owner: {entry['owner']}, bead: {entry['bead']})", file=sys.stderr)
+              sys.exit(1)
+
+          if report["expiring_soon_count"] > 0:
+              print("Expiring-soon quarantine entries (review and refresh evidence/remove_when):")
+              for entry in report["entries"]:
+                  if entry["status"] == "expiring-soon":
+                      print(
+                          f"  - {entry['name']} (expires in {entry['days_remaining']} day(s), owner: {entry['owner']}, bead: {entry['bead']})"
+                      )
+
+          print("All quarantine entries are within policy bounds.")
+          PY
+
       - name: cargo fmt
         run: cargo fmt --check
 
@@ -648,5 +880,656 @@ jobs:
             pi_agent_rust/tests/e2e_results/**/*.json
             pi_agent_rust/tests/e2e_results/**/*.jsonl
             pi_agent_rust/tests/e2e_results/**/*.log
+            pi_agent_rust/tests/quarantine_report.json
+            pi_agent_rust/tests/quarantine_audit.jsonl
             pi_agent_rust/release_gate_report.json
           if-no-files-found: ignore
+
+  qa_shards_linux:
+    name: qa-shard (${{ matrix.shard.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: unit
+            lane: unit
+            shard_index: 0
+            shard_total: 1
+          - name: integration-0
+            lane: integration
+            shard_index: 0
+            shard_total: 2
+          - name: integration-1
+            lane: integration
+            shard_index: 1
+            shard_total: 2
+          - name: e2e-0
+            lane: e2e
+            shard_index: 0
+            shard_total: 2
+          - name: e2e-1
+            lane: e2e
+            shard_index: 1
+            shard_total: 2
+          - name: extension
+            lane: extension
+            shard_index: 0
+            shard_total: 1
+          - name: security
+            lane: security
+            shard_index: 0
+            shard_total: 1
+          - name: perf
+            lane: perf
+            shard_index: 0
+            shard_total: 1
+    env:
+      CI: "true"
+      VCR_MODE: "playback"
+      VCR_CASSETTE_DIR: "tests/fixtures/vcr"
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      SHARD_ARTIFACT_DIR: ${{ github.workspace }}/pi_agent_rust/tests/e2e_results/ci-shards/${{ matrix.shard.name }}
+      SHARD_CORRELATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard.name }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/pi_agent_rust/target/ci-shards/${{ matrix.shard.name }}
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+    steps:
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+
+      - name: Install system deps (fd, rg)
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pi_agent_rust -> target
+          prefix-key: qa-shards-${{ matrix.shard.name }}
+
+      - name: Execute shard lane
+        run: |
+          set -euxo pipefail
+          mkdir -p "$SHARD_ARTIFACT_DIR"
+          case "${{ matrix.shard.lane }}" in
+            unit)
+              E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR" \
+              CI_CORRELATION_ID="$SHARD_CORRELATION_ID" \
+              ./scripts/e2e/run_all.sh \
+                --profile quick \
+                --skip-lint \
+                --shard-name "${{ matrix.shard.name }}"
+              ;;
+            integration)
+              E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR" \
+              CI_CORRELATION_ID="$SHARD_CORRELATION_ID" \
+              ./scripts/e2e/run_all.sh \
+                --profile ci \
+                --skip-lint \
+                --skip-e2e \
+                --shard-kind unit \
+                --shard-index "${{ matrix.shard.shard_index }}" \
+                --shard-total "${{ matrix.shard.shard_total }}" \
+                --shard-name "${{ matrix.shard.name }}"
+              ;;
+            e2e)
+              E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR" \
+              CI_CORRELATION_ID="$SHARD_CORRELATION_ID" \
+              ./scripts/e2e/run_all.sh \
+                --profile full \
+                --skip-lint \
+                --skip-unit \
+                --shard-kind suite \
+                --shard-index "${{ matrix.shard.shard_index }}" \
+                --shard-total "${{ matrix.shard.shard_total }}" \
+                --shard-name "${{ matrix.shard.name }}"
+              ;;
+            extension)
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              RUST_LOG=info \
+              cargo test --test ext_conformance --features ext-conformance -- --test-threads=1 \
+                2>&1 | tee "$SHARD_ARTIFACT_DIR/output.log"
+              ;;
+            security)
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              RUST_LOG=info \
+              cargo test \
+                --test security_budgets \
+                --test security_fs_escape \
+                --test security_http_policy \
+                -- --test-threads=1 \
+                2>&1 | tee "$SHARD_ARTIFACT_DIR/output.log"
+              ;;
+            perf)
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              RUST_LOG=info \
+              cargo test \
+                --test perf_budgets \
+                --test perf_comparison \
+                --test performance_comparison \
+                -- --test-threads=1 \
+                2>&1 | tee "$SHARD_ARTIFACT_DIR/output.log"
+              ;;
+            *)
+              echo "Unknown shard lane: ${{ matrix.shard.lane }}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Build shard artifact index
+        if: always()
+        env:
+          SHARD_NAME: ${{ matrix.shard.name }}
+          SHARD_LANE: ${{ matrix.shard.lane }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$SHARD_ARTIFACT_DIR"
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(os.environ["SHARD_ARTIFACT_DIR"])
+          index_path = root / "ci-shard-index.json"
+          entries = []
+          for path in sorted(root.rglob("*")):
+              if path.is_file():
+                  entries.append(
+                      {
+                          "path": str(path.relative_to(root)),
+                          "size_bytes": path.stat().st_size,
+                      }
+                  )
+
+          payload = {
+              "schema": "pi.ci.shard_index.v1",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "shard_name": os.environ["SHARD_NAME"],
+              "lane": os.environ["SHARD_LANE"],
+              "correlation_id": os.environ["SHARD_CORRELATION_ID"],
+              "job_status": os.environ.get("JOB_STATUS", "unknown"),
+              "file_count": len(entries),
+              "entries": entries,
+          }
+          index_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+          print(f"wrote shard index: {index_path}")
+          PY
+
+      - name: Upload shard artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-shard-${{ matrix.shard.name }}-${{ github.sha }}
+          path: |
+            pi_agent_rust/tests/e2e_results/ci-shards/${{ matrix.shard.name }}/
+          if-no-files-found: warn
+
+  qa_shard_summary:
+    name: qa-shard-summary
+    runs-on: ubuntu-latest
+    needs: qa_shards_linux
+    if: always()
+    steps:
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-shard-*
+          path: shard-artifacts
+          merge-multiple: false
+
+      - name: Build merged shard index
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import math
+          import os
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def load_json(path):
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:  # pragma: no cover
+                  return {"error": str(exc)}
+
+          def clean_signature(value):
+              text = " ".join(str(value).strip().split())
+              if not text:
+                  return "unknown failure"
+              if len(text) > 240:
+                  return text[:237] + "..."
+              return text
+
+          def extract_failure_signature(log_path):
+              if not log_path.is_file():
+                  return "missing log file"
+              try:
+                  lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+              except Exception as exc:  # pragma: no cover
+                  return clean_signature(f"log read error: {exc}")
+              signal_tokens = (
+                  "error:",
+                  "panicked at",
+                  "assertion failed",
+                  "thread '",
+                  "failed",
+                  "timeout",
+                  "timed out",
+                  "connection reset",
+                  "rate limit",
+              )
+              for line in reversed(lines[-400:]):
+                  lowered = line.lower()
+                  if any(token in lowered for token in signal_tokens):
+                      return clean_signature(line)
+              if lines:
+                  return clean_signature(lines[-1])
+              return "empty log"
+
+          def summarize_balance(samples):
+              if not samples:
+                  return {
+                      "count": 0,
+                      "min": None,
+                      "max": None,
+                      "spread": None,
+                      "ratio_max_to_min": None,
+                  }
+              sample_min = min(samples)
+              sample_max = max(samples)
+              ratio = None
+              if sample_min > 0:
+                  ratio = sample_max / sample_min
+              return {
+                  "count": len(samples),
+                  "min": sample_min,
+                  "max": sample_max,
+                  "spread": sample_max - sample_min,
+                  "ratio_max_to_min": ratio,
+              }
+
+          def percentile(values, pct):
+              if not values:
+                  return None
+              ordered = sorted(float(v) for v in values)
+              if len(ordered) == 1:
+                  return ordered[0]
+              rank = (pct / 100.0) * (len(ordered) - 1)
+              lower = int(math.floor(rank))
+              upper = int(math.ceil(rank))
+              if lower == upper:
+                  return ordered[lower]
+              weight = rank - lower
+              return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+
+          root = Path("shard-artifacts")
+          index_files = sorted(root.rglob("ci-shard-index.json"))
+          shards = []
+          for index_file in index_files:
+              try:
+                  payload = json.loads(index_file.read_text(encoding="utf-8"))
+              except Exception as exc:  # pragma: no cover
+                  payload = {
+                      "schema": "pi.ci.shard_index.v1",
+                      "shard_name": index_file.parent.name,
+                      "lane": "unknown",
+                      "correlation_id": "unknown",
+                      "job_status": "invalid",
+                      "file_count": 0,
+                      "entries": [],
+                      "error": str(exc),
+                  }
+              shard_dir = index_file.parent
+              payload["artifact_source"] = str(shard_dir)
+
+              shard_failure_records = []
+              summary_file = shard_dir / "summary.json"
+              duration_seconds = None
+              if summary_file.is_file():
+                  summary_payload = load_json(summary_file)
+                  if "error" in summary_payload:
+                      payload["summary_error"] = summary_payload["error"]
+                  else:
+                      raw_duration = summary_payload.get("duration_seconds")
+                      if isinstance(raw_duration, (int, float)):
+                          duration_seconds = float(raw_duration)
+                      payload["summary_excerpt"] = {
+                          "profile": summary_payload.get("profile"),
+                          "duration_seconds": duration_seconds,
+                          "total_units": summary_payload.get("total_units"),
+                          "failed_units": summary_payload.get("failed_units"),
+                          "total_suites": summary_payload.get("total_suites"),
+                          "failed_suites": summary_payload.get("failed_suites"),
+                      }
+                      for item in summary_payload.get("unit_targets", []):
+                          if not isinstance(item, dict):
+                              continue
+                          if int(item.get("exit_code", 1)) == 0:
+                              continue
+                          target = str(item.get("target", "unknown"))
+                          rel_log = Path("unit") / target / "output.log"
+                          signature = extract_failure_signature(shard_dir / rel_log)
+                          shard_failure_records.append(
+                              {
+                                  "shard_name": payload.get("shard_name", shard_dir.name),
+                                  "lane": payload.get("lane", "unknown"),
+                                  "scope": "unit_target",
+                                  "name": target,
+                                  "signature": signature,
+                                  "log_path": str(rel_log),
+                                  "artifact_source": str(shard_dir),
+                                  "issue_id": "bd-1f42.6.2",
+                                  "thread_id": "bd-1f42.6.2",
+                              }
+                          )
+                      for item in summary_payload.get("suites", []):
+                          if not isinstance(item, dict):
+                              continue
+                          if int(item.get("exit_code", 1)) == 0:
+                              continue
+                          suite = str(item.get("suite", "unknown"))
+                          rel_log = Path(suite) / "output.log"
+                          signature = extract_failure_signature(shard_dir / rel_log)
+                          shard_failure_records.append(
+                              {
+                                  "shard_name": payload.get("shard_name", shard_dir.name),
+                                  "lane": payload.get("lane", "unknown"),
+                                  "scope": "suite",
+                                  "name": suite,
+                                  "signature": signature,
+                                  "log_path": str(rel_log),
+                                  "artifact_source": str(shard_dir),
+                                  "issue_id": "bd-1f42.6.2",
+                                  "thread_id": "bd-1f42.6.2",
+                              }
+                          )
+              payload["duration_seconds"] = duration_seconds
+
+              manifest_file = shard_dir / "ci_shard_manifest.json"
+              unit_targets = []
+              e2e_suites = []
+              if manifest_file.is_file():
+                  manifest_payload = load_json(manifest_file)
+                  if "error" in manifest_payload:
+                      payload["manifest_error"] = manifest_payload["error"]
+                  else:
+                      selection = manifest_payload.get("selection", {})
+                      maybe_units = selection.get("unit_targets", [])
+                      maybe_suites = selection.get("e2e_suites", [])
+                      if isinstance(maybe_units, list):
+                          unit_targets = [item for item in maybe_units if isinstance(item, str) and item]
+                      if isinstance(maybe_suites, list):
+                          e2e_suites = [item for item in maybe_suites if isinstance(item, str) and item]
+                      payload["manifest_excerpt"] = {
+                          "profile": manifest_payload.get("profile"),
+                          "correlation_id": manifest_payload.get("correlation_id"),
+                          "shard": manifest_payload.get("shard"),
+                          "selection_counts": {
+                              "unit_targets": len(unit_targets),
+                              "e2e_suites": len(e2e_suites),
+                          },
+                      }
+              payload["selection_counts"] = {
+                  "unit_targets": len(unit_targets),
+                  "e2e_suites": len(e2e_suites),
+              }
+
+              if not shard_failure_records and payload.get("job_status") not in {
+                  "success",
+                  "unknown",
+              }:
+                  fallback_log = shard_dir / "output.log"
+                  shard_failure_records.append(
+                      {
+                          "shard_name": payload.get("shard_name", shard_dir.name),
+                          "lane": payload.get("lane", "unknown"),
+                          "scope": "shard",
+                          "name": payload.get("shard_name", shard_dir.name),
+                          "signature": extract_failure_signature(fallback_log),
+                          "log_path": str(fallback_log.relative_to(shard_dir))
+                          if fallback_log.exists()
+                          else "output.log",
+                          "artifact_source": str(shard_dir),
+                          "issue_id": "bd-1f42.6.2",
+                          "thread_id": "bd-1f42.6.2",
+                      }
+                  )
+              payload["failure_records"] = shard_failure_records
+              shards.append(payload)
+
+          lane_counts = {}
+          lane_runtime_samples = {}
+          lane_duration_seconds = {}
+          lane_unit_samples = {}
+          lane_suite_samples = {}
+          correlation_ids = set()
+          duration_rows = []
+          failure_records = []
+          failed = 0
+          for shard in shards:
+              lane = shard.get("lane", "unknown")
+              lane_counts[lane] = lane_counts.get(lane, 0) + 1
+              lane_duration_seconds.setdefault(lane, 0.0)
+              lane_runtime_samples.setdefault(lane, [])
+              lane_unit_samples.setdefault(lane, [])
+              lane_suite_samples.setdefault(lane, [])
+              if shard.get("job_status") not in {"success", "unknown"}:
+                  failed += 1
+              duration = shard.get("duration_seconds")
+              if isinstance(duration, (int, float)):
+                  lane_duration_seconds[lane] += float(duration)
+                  lane_runtime_samples[lane].append(float(duration))
+                  duration_rows.append(
+                      {
+                          "shard_name": shard.get("shard_name", "unknown"),
+                          "lane": lane,
+                          "duration_seconds": float(duration),
+                      }
+                  )
+              selection_counts = shard.get("selection_counts", {})
+              unit_count = selection_counts.get("unit_targets")
+              suite_count = selection_counts.get("e2e_suites")
+              if isinstance(unit_count, int):
+                  lane_unit_samples[lane].append(unit_count)
+              if isinstance(suite_count, int):
+                  lane_suite_samples[lane].append(suite_count)
+              correlation = shard.get("correlation_id")
+              if isinstance(correlation, str) and correlation:
+                  correlation_ids.add(correlation)
+              for failure in shard.get("failure_records", []):
+                  if isinstance(failure, dict):
+                      failure_records.append(failure)
+
+          slowest = max(duration_rows, key=lambda row: row["duration_seconds"], default=None)
+          fastest = min(duration_rows, key=lambda row: row["duration_seconds"], default=None)
+          runtime_samples = [row["duration_seconds"] for row in duration_rows]
+          p95_runtime_seconds = percentile(runtime_samples, 95)
+
+          signature_counter = Counter(
+              failure.get("signature", "unknown failure") for failure in failure_records
+          )
+          top_failure_signatures = []
+          for signature, count in signature_counter.most_common(10):
+              samples = [
+                  failure
+                  for failure in failure_records
+                  if failure.get("signature", "unknown failure") == signature
+              ][:3]
+              top_failure_signatures.append(
+                  {
+                      "signature": signature,
+                      "count": count,
+                      "samples": samples,
+                  }
+              )
+
+          transient_tokens = (
+              "timeout",
+              "timed out",
+              "connection reset",
+              "rate limit",
+              "temporarily unavailable",
+              "broken pipe",
+              "econnreset",
+              "429",
+              "503",
+          )
+          flaky_candidates = [
+              failure
+              for failure in failure_records
+              if any(token in failure.get("signature", "").lower() for token in transient_tokens)
+          ]
+          flake_rate_estimate = (
+              (len(flaky_candidates) / len(failure_records)) if failure_records else 0.0
+          )
+
+          pass_rate = (
+              ((len(shards) - failed) / len(shards))
+              if shards
+              else 0.0
+          )
+
+          lane_balance = {}
+          for lane in sorted(lane_counts):
+              lane_balance[lane] = {
+                  "runtime_seconds": summarize_balance(lane_runtime_samples.get(lane, [])),
+                  "selection_unit_targets": summarize_balance(
+                      lane_unit_samples.get(lane, [])
+                  ),
+                  "selection_e2e_suites": summarize_balance(
+                      lane_suite_samples.get(lane, [])
+                  ),
+              }
+
+          dashboard = {
+              "schema": "pi.ci.test_health_dashboard.v1",
+              "generated_at": now_iso(),
+              "owner_issue_id": "bd-1f42.6.2",
+              "owner_thread_id": "bd-1f42.6.2",
+              "run": {
+                  "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+                  "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+                  "github_sha": os.environ.get("GITHUB_SHA"),
+              },
+              "metrics": {
+                  "total_shards": len(shards),
+                  "failed_shards": failed,
+                  "pass_rate": pass_rate,
+                  "p95_runtime_seconds": p95_runtime_seconds,
+                  "flake_rate_estimate": flake_rate_estimate,
+                  "failure_signature_count": len(failure_records),
+              },
+              "top_failure_signatures": top_failure_signatures,
+              "artifact_links": {
+                  "merged_summary": "ci-shard-summary.json",
+                  "shards": [
+                      {
+                          "shard_name": shard.get("shard_name"),
+                          "lane": shard.get("lane"),
+                          "artifact_source": shard.get("artifact_source"),
+                          "index_file": "ci-shard-index.json",
+                      }
+                      for shard in shards
+                  ],
+              },
+              "methodology": {
+                  "pass_rate": "successful_shards / total_shards",
+                  "p95_runtime_seconds": "p95 across shard duration_seconds",
+                  "flake_rate_estimate": "transient-keyword signature count / total failure signatures",
+                  "top_failure_signatures": "frequency-ranked failure signature extraction from shard logs",
+              },
+          }
+
+          summary = {
+              "schema": "pi.ci.shard_summary.v1",
+              "generated_at": now_iso(),
+              "total_shards": len(shards),
+              "failed_shards": failed,
+              "lane_counts": lane_counts,
+              "runtime": {
+                  "documented_shards": len(duration_rows),
+                  "total_duration_seconds": sum(
+                      row["duration_seconds"] for row in duration_rows
+                  ),
+                  "lane_duration_seconds": lane_duration_seconds,
+                  "slowest_shard": slowest,
+                  "fastest_shard": fastest,
+              },
+              "balance": {"lane_balance": lane_balance},
+              "correlation_ids": sorted(correlation_ids),
+              "dashboard": dashboard["metrics"],
+              "top_failure_signatures": top_failure_signatures,
+              "flake_candidates": flaky_candidates,
+              "shards": shards,
+          }
+
+          summary_out = Path("ci-shard-summary.json")
+          summary_out.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+          print(f"wrote {summary_out}")
+
+          dashboard_out = Path("ci-test-health-dashboard.json")
+          dashboard_out.write_text(
+              json.dumps(dashboard, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(f"wrote {dashboard_out}")
+
+          trend_row = {
+              "schema": "pi.ci.test_health_trend_row.v1",
+              "generated_at": now_iso(),
+              "owner_issue_id": "bd-1f42.6.2",
+              "owner_thread_id": "bd-1f42.6.2",
+              "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "github_sha": os.environ.get("GITHUB_SHA"),
+              "pass_rate": pass_rate,
+              "p95_runtime_seconds": p95_runtime_seconds,
+              "flake_rate_estimate": flake_rate_estimate,
+              "failed_shards": failed,
+              "total_shards": len(shards),
+              "top_failure_signatures": [
+                  entry["signature"] for entry in top_failure_signatures[:5]
+              ],
+              "summary_artifact": "ci-shard-summary.json",
+              "dashboard_artifact": "ci-test-health-dashboard.json",
+          }
+          trend_out = Path("ci-test-health-trend.jsonl")
+          trend_out.write_text(json.dumps(trend_row) + "\n", encoding="utf-8")
+          print(f"wrote {trend_out}")
+          PY
+
+      - name: Upload merged shard summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-shard-summary-${{ github.sha }}
+          path: |
+            ci-shard-summary.json
+            ci-test-health-dashboard.json
+            ci-test-health-trend.jsonl
+          if-no-files-found: error

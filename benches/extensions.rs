@@ -6,6 +6,7 @@
 
 use std::hint::black_box;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -93,6 +94,80 @@ fn artifact_single_file_entry(name: &str) -> PathBuf {
         .join("tests/ext_conformance/artifacts")
         .join(name)
         .join(format!("{name}.ts"))
+}
+
+#[derive(Default)]
+struct BenchSession;
+
+#[async_trait::async_trait]
+impl pi::extensions::ExtensionSession for BenchSession {
+    async fn get_state(&self) -> Value {
+        json!({
+            "sessionFile": "bench-session.jsonl",
+            "sessionName": "bench",
+        })
+    }
+
+    async fn get_messages(&self) -> Vec<pi::session::SessionMessage> {
+        Vec::new()
+    }
+
+    async fn get_entries(&self) -> Vec<Value> {
+        Vec::new()
+    }
+
+    async fn get_branch(&self) -> Vec<Value> {
+        Vec::new()
+    }
+
+    async fn set_name(&self, _name: String) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn append_message(&self, _message: pi::session::SessionMessage) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn append_custom_entry(
+        &self,
+        _custom_type: String,
+        _data: Option<Value>,
+    ) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn set_model(&self, _provider: String, _model_id: String) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn get_model(&self) -> (Option<String>, Option<String>) {
+        (None, None)
+    }
+
+    async fn set_thinking_level(&self, _level: String) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn get_thinking_level(&self) -> Option<String> {
+        None
+    }
+
+    async fn set_label(&self, _target_id: String, _label: Option<String>) -> pi::error::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct BenchUiHandler;
+
+#[async_trait::async_trait]
+impl pi::extension_dispatcher::ExtensionUiHandler for BenchUiHandler {
+    async fn request_ui(
+        &self,
+        _request: pi::extensions::ExtensionUiRequest,
+    ) -> pi::error::Result<Option<pi::extensions::ExtensionUiResponse>> {
+        Ok(None)
+    }
 }
 
 fn bench_extension_policy(c: &mut Criterion) {
@@ -299,6 +374,47 @@ fn bench_protocol_parse_and_validate(c: &mut Criterion) {
             });
         });
     }
+    group.finish();
+}
+
+fn bench_protocol_dispatch(c: &mut Criterion) {
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let runtime = Rc::new(block_on(PiJsRuntime::new()).expect("create PiJsRuntime"));
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let http_connector = Arc::new(pi::connectors::http::HttpConnector::new(
+        pi::connectors::http::HttpConnectorConfig::default(),
+    ));
+    let session: Arc<dyn pi::extensions::ExtensionSession + Send + Sync> = Arc::new(BenchSession);
+    let ui_handler: Arc<dyn pi::extension_dispatcher::ExtensionUiHandler + Send + Sync> =
+        Arc::new(BenchUiHandler);
+    let dispatcher =
+        pi::ExtensionDispatcher::new(runtime, tools, http_connector, session, ui_handler, cwd);
+
+    let host_call = pi::extensions::HostCallPayload {
+        call_id: "bench-call-1".to_string(),
+        capability: "session".to_string(),
+        method: "session".to_string(),
+        params: json!({ "op": "get_state" }),
+        timeout_ms: None,
+        cancel_token: None,
+        context: None,
+    };
+    let message = pi::extensions::ExtensionMessage {
+        id: "bench-msg-1".to_string(),
+        version: pi::extensions::PROTOCOL_VERSION.to_string(),
+        body: pi::extensions::ExtensionBody::HostCall(host_call),
+    };
+
+    let mut group = c.benchmark_group("ext_protocol_dispatch");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("session_get_state", |b| {
+        b.iter(|| {
+            let response =
+                block_on(dispatcher.dispatch_protocol_message(black_box(message.clone())))
+                    .expect("dispatch protocol message");
+            black_box(response);
+        });
+    });
     group.finish();
 }
 
@@ -622,6 +738,7 @@ criterion_group!(
         bench_required_capability_for_host_call,
         bench_dispatch_decision,
         bench_protocol_parse_and_validate,
+        bench_protocol_dispatch,
         bench_extension_load_init,
         bench_extension_tool_call_roundtrip,
         bench_extension_event_hook_dispatch,

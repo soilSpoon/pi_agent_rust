@@ -56,6 +56,15 @@ LOG_LEVEL="${RUST_LOG:-info}"
 PROFILE="${VERIFY_PROFILE:-full}"
 RERUN_FROM=""
 DIFF_FROM="${E2E_DIFF_FROM:-}"
+SHARD_KIND="none"
+SHARD_INDEX_RAW=""
+SHARD_TOTAL_RAW=""
+SHARD_INDEX_JSON="null"
+SHARD_TOTAL_JSON="null"
+SHARD_NAME=""
+SHARD_INDEX=-1
+SHARD_TOTAL=1
+CORRELATION_ID="${CI_CORRELATION_ID:-}"
 
 # ─── Auto-discover targets from suite_classification.toml ─────────────────────
 
@@ -89,6 +98,7 @@ SELECTED_UNIT_TARGETS=()
 LIST_ONLY=false
 LIST_PROFILES=false
 SKIP_UNIT=false
+SKIP_E2E=false
 SKIP_LINT=false
 
 while [[ $# -gt 0 ]]; do
@@ -122,8 +132,37 @@ while [[ $# -gt 0 ]]; do
             SKIP_UNIT=true
             shift
             ;;
+        --skip-e2e)
+            SKIP_E2E=true
+            shift
+            ;;
         --skip-lint)
             SKIP_LINT=true
+            shift
+            ;;
+        --shard-kind)
+            shift
+            SHARD_KIND="$1"
+            shift
+            ;;
+        --shard-index)
+            shift
+            SHARD_INDEX_RAW="$1"
+            shift
+            ;;
+        --shard-total)
+            shift
+            SHARD_TOTAL_RAW="$1"
+            shift
+            ;;
+        --shard-name)
+            shift
+            SHARD_NAME="$1"
+            shift
+            ;;
+        --correlation-id)
+            shift
+            CORRELATION_ID="$1"
             shift
             ;;
         --list)
@@ -137,7 +176,8 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--profile NAME] [--suite NAME]... [--unit-target NAME]..."
             echo "          [--rerun-from SUMMARY_JSON] [--diff-from SUMMARY_JSON]"
-            echo "          [--skip-unit] [--skip-lint]"
+            echo "          [--skip-unit] [--skip-e2e] [--skip-lint]"
+            echo "          [--shard-kind KIND --shard-index N --shard-total M]"
             echo "          [--list] [--list-profiles] [--help]"
             echo ""
             echo "Options:"
@@ -147,7 +187,13 @@ while [[ $# -gt 0 ]]; do
             echo "  --rerun-from PATH    Rerun failed suites from prior summary.json"
             echo "  --diff-from PATH     Compare current run against baseline summary.json"
             echo "  --skip-unit          Skip integration target execution"
+            echo "  --skip-e2e           Skip E2E suite execution"
             echo "  --skip-lint          Skip fmt/clippy lint gates"
+            echo "  --shard-kind KIND    Deterministic shard mode: none|unit|suite|both"
+            echo "  --shard-index N      Zero-based shard index"
+            echo "  --shard-total M      Total shard count"
+            echo "  --shard-name NAME    Optional shard label (default derived from kind/index/total)"
+            echo "  --correlation-id ID  Correlation id written into every artifact manifest"
             echo "  --list               List available E2E suites and exit"
             echo "  --list-profiles      List available verification profiles and exit"
             echo "  --help               Show this help"
@@ -169,6 +215,7 @@ while [[ $# -gt 0 ]]; do
             echo "  CARGO_HOME           Optional cargo home directory (checked by preflight)"
             echo "  VERIFY_MIN_FREE_MB   Minimum free MB for repo/artifact mounts (default: 2048)"
             echo "  VERIFY_MIN_FREE_INODE_PCT Minimum free inode percent required (default: 5)"
+            echo "  CI_CORRELATION_ID    Default correlation id when --correlation-id is not provided"
             exit 0
             ;;
         *)
@@ -254,6 +301,10 @@ if [[ "$SKIP_UNIT" == true ]]; then
     SELECTED_UNIT_TARGETS=()
 fi
 
+if [[ "$SKIP_E2E" == true ]]; then
+    SELECTED_SUITES=()
+fi
+
 if [[ -n "$RERUN_FROM" ]]; then
     if [[ ! -f "$RERUN_FROM" ]]; then
         echo "Rerun summary not found: $RERUN_FROM" >&2
@@ -285,6 +336,92 @@ fi
 if [[ -n "$DIFF_FROM" && ! -f "$DIFF_FROM" ]]; then
     echo "Diff baseline summary not found: $DIFF_FROM" >&2
     exit 1
+fi
+
+if [[ -n "$SHARD_INDEX_RAW" || -n "$SHARD_TOTAL_RAW" ]]; then
+    if [[ -z "$SHARD_INDEX_RAW" || -z "$SHARD_TOTAL_RAW" ]]; then
+        echo "Both --shard-index and --shard-total are required when sharding is enabled." >&2
+        exit 1
+    fi
+fi
+
+if [[ ! "$SHARD_KIND" =~ ^(none|unit|suite|both)$ ]]; then
+    echo "Invalid --shard-kind value: $SHARD_KIND (expected none|unit|suite|both)" >&2
+    exit 1
+fi
+
+if [[ "$SHARD_KIND" != "none" ]]; then
+    if [[ -z "$SHARD_INDEX_RAW" || -z "$SHARD_TOTAL_RAW" ]]; then
+        echo "--shard-kind=$SHARD_KIND requires --shard-index and --shard-total." >&2
+        exit 1
+    fi
+fi
+
+if [[ -n "$SHARD_INDEX_RAW" ]]; then
+    if ! [[ "$SHARD_INDEX_RAW" =~ ^[0-9]+$ ]] || ! [[ "$SHARD_TOTAL_RAW" =~ ^[0-9]+$ ]]; then
+        echo "Shard values must be non-negative integers: index='$SHARD_INDEX_RAW' total='$SHARD_TOTAL_RAW'" >&2
+        exit 1
+    fi
+    SHARD_INDEX="$SHARD_INDEX_RAW"
+    SHARD_TOTAL="$SHARD_TOTAL_RAW"
+    if (( SHARD_TOTAL <= 0 )); then
+        echo "--shard-total must be > 0 (got $SHARD_TOTAL)" >&2
+        exit 1
+    fi
+    if (( SHARD_INDEX >= SHARD_TOTAL )); then
+        echo "--shard-index must be < --shard-total ($SHARD_INDEX >= $SHARD_TOTAL)" >&2
+        exit 1
+    fi
+    SHARD_INDEX_JSON="$SHARD_INDEX"
+    SHARD_TOTAL_JSON="$SHARD_TOTAL"
+    if [[ -z "$SHARD_NAME" ]]; then
+        SHARD_NAME="${SHARD_KIND}-${SHARD_INDEX}-of-${SHARD_TOTAL}"
+    fi
+else
+    SHARD_KIND="none"
+    SHARD_NAME="${SHARD_NAME:-unsharded}"
+fi
+
+if [[ -z "$CORRELATION_ID" ]]; then
+    CORRELATION_ID="${TIMESTAMP}-${SHARD_NAME}"
+fi
+export CI_CORRELATION_ID="$CORRELATION_ID"
+
+if (( ${#SELECTED_UNIT_TARGETS[@]} > 0 )); then
+    mapfile -t SELECTED_UNIT_TARGETS < <(printf '%s\n' "${SELECTED_UNIT_TARGETS[@]}" | awk 'NF' | LC_ALL=C sort -u)
+fi
+if (( ${#SELECTED_SUITES[@]} > 0 )); then
+    mapfile -t SELECTED_SUITES < <(printf '%s\n' "${SELECTED_SUITES[@]}" | awk 'NF' | LC_ALL=C sort -u)
+fi
+
+select_shard_items() {
+    local shard_index="$1"
+    local shard_total="$2"
+    shift 2
+    local items=("$@")
+    local i=0
+    for item in "${items[@]}"; do
+        if (( shard_total <= 1 || (i % shard_total) == shard_index )); then
+            printf '%s\n' "$item"
+        fi
+        i=$((i + 1))
+    done
+}
+
+if [[ "$SHARD_KIND" == "unit" || "$SHARD_KIND" == "both" ]]; then
+    if (( ${#SELECTED_UNIT_TARGETS[@]} > 0 )); then
+        mapfile -t SELECTED_UNIT_TARGETS < <(
+            select_shard_items "$SHARD_INDEX" "$SHARD_TOTAL" "${SELECTED_UNIT_TARGETS[@]}"
+        )
+    fi
+fi
+
+if [[ "$SHARD_KIND" == "suite" || "$SHARD_KIND" == "both" ]]; then
+    if (( ${#SELECTED_SUITES[@]} > 0 )); then
+        mapfile -t SELECTED_SUITES < <(
+            select_shard_items "$SHARD_INDEX" "$SHARD_TOTAL" "${SELECTED_SUITES[@]}"
+        )
+    fi
 fi
 
 RERUN_JSON_VALUE="null"
@@ -421,6 +558,13 @@ capture_env() {
   "parallelism": $PARALLELISM,
   "log_level": "$LOG_LEVEL",
   "artifact_dir": "$ARTIFACT_DIR",
+  "correlation_id": "$CORRELATION_ID",
+  "shard": {
+    "kind": "$SHARD_KIND",
+    "name": "$SHARD_NAME",
+    "index": $SHARD_INDEX_JSON,
+    "total": $SHARD_TOTAL_JSON
+  },
   "cargo_target_dir": "${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}",
   "vcr_mode": "${VCR_MODE:-unset}",
   "unit_targets": $(printf '%s\n' "${SELECTED_UNIT_TARGETS[@]:-}" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))' 2>/dev/null || echo '[]'),
@@ -428,6 +572,30 @@ capture_env() {
 }
 ENVJSON
     echo "[env] Captured environment to $env_file"
+}
+
+write_shard_manifest() {
+    local manifest_file="$ARTIFACT_DIR/ci_shard_manifest.json"
+    cat > "$manifest_file" <<SHARDJSON
+{
+  "schema": "pi.verify.shard_manifest.v1",
+  "generated_at": "$TIMESTAMP",
+  "profile": "$PROFILE",
+  "artifact_dir": "$ARTIFACT_DIR",
+  "correlation_id": "$CORRELATION_ID",
+  "shard": {
+    "kind": "$SHARD_KIND",
+    "name": "$SHARD_NAME",
+    "index": $SHARD_INDEX_JSON,
+    "total": $SHARD_TOTAL_JSON
+  },
+  "selection": {
+    "unit_targets": $(printf '%s\n' "${SELECTED_UNIT_TARGETS[@]:-}" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))' 2>/dev/null || echo '[]'),
+    "e2e_suites": $(printf '%s\n' "${SELECTED_SUITES[@]:-}" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))' 2>/dev/null || echo '[]')
+  }
+}
+SHARDJSON
+    echo "[shard] Manifest written to $manifest_file"
 }
 
 # ─── Lint Gates ──────────────────────────────────────────────────────────────
@@ -787,6 +955,13 @@ write_summary() {
   "rerun_from": $RERUN_JSON_VALUE,
   "diff_from": $DIFF_JSON_VALUE,
   "artifact_dir": "$ARTIFACT_DIR",
+  "correlation_id": "$CORRELATION_ID",
+  "shard": {
+    "kind": "$SHARD_KIND",
+    "name": "$SHARD_NAME",
+    "index": $SHARD_INDEX_JSON,
+    "total": $SHARD_TOTAL_JSON
+  },
   "total_units": $total_units,
   "passed_units": $passed_units,
   "failed_units": $failed_units,
@@ -824,6 +999,8 @@ SUMMARYJSON
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
     echo " Verification Summary (profile: $PROFILE)"
+    echo " Correlation:    $CORRELATION_ID"
+    echo " Shard:          kind=$SHARD_KIND name=$SHARD_NAME index=${SHARD_INDEX_JSON} total=${SHARD_TOTAL_JSON}"
     echo " Lint gates:     $lint_status"
     echo " Lib inline:     $lib_status"
     echo " Integration:    $passed_units/$total_units passed"
@@ -3674,6 +3851,8 @@ main() {
     echo " Profile: $PROFILE"
     echo " Artifact dir: $ARTIFACT_DIR"
     echo " Lint: $(if $SKIP_LINT; then echo 'skip'; else echo 'enabled'; fi)"
+    echo " Correlation id: $CORRELATION_ID"
+    echo " Shard mode: $SHARD_KIND ($SHARD_NAME)"
     echo " Lib inline: enabled"
     echo " Integration targets: ${#SELECTED_UNIT_TARGETS[@]}"
     echo " E2E suites: ${#SELECTED_SUITES[@]}"
@@ -3692,6 +3871,7 @@ main() {
     fi
 
     capture_env
+    write_shard_manifest
 
     local overall_exit=0
 

@@ -9,6 +9,7 @@
 #   e2e  - Full system: real providers, network, or tmux
 #
 # See docs/testing-policy.md for full definitions and rules.
+# Test-double evidence baseline: docs/test_double_inventory.json (bd-1f42.1.1).
 
 [suite.unit]
 files = [
@@ -27,6 +28,7 @@ files = [
     "model_serialization",
     "perf_budgets",
     "perf_comparison",
+    "perf_regression",
     "performance_comparison",
     "scheduler_repro",
     "security_budgets",
@@ -35,6 +37,7 @@ files = [
 
 [suite.vcr]
 files = [
+    "agent_loop_reliability",
     "agent_loop_vcr",
     "auth_oauth_refresh_vcr",
     "bench_scenario_runner",
@@ -112,6 +115,7 @@ files = [
     "provider_streaming",
     "repro_config_error",
     "repro_edit_encoding",
+    "reproduction_truncate",
     "reproduce_bom_bug",
     "reproduce_edit_whitespace",
     "repro_sse_flush",
@@ -132,6 +136,7 @@ files = [
     "streaming_hostcall",
     "traceability_staleness",
     "tools_conformance",
+    "tools_hardened",
     "tui_snapshot",
     "tui_state",
 ]
@@ -156,3 +161,29 @@ files = [
     "e2e_tui",
     "e2e_workflow_preflight",
 ]
+
+# Quarantine: flaky tests with tracked expiry and ownership.
+# See docs/testing-policy.md "Flaky-Test Quarantine and Escalation Policy" for rules.
+#
+# Each entry: [quarantine.<test_stem>]
+#   category     = "FLAKE-TIMING" | "FLAKE-ENV" | "FLAKE-NET" | "FLAKE-RES" | "FLAKE-EXT" | "FLAKE-LOGIC"
+#   owner        = "<AgentName or person>"
+#   quarantined  = "YYYY-MM-DD"
+#   expires      = "YYYY-MM-DD"
+#   bead         = "bd-XXXX"
+#   evidence     = "<CI run URL or artifact path>"
+#   repro        = "<exact reproduction command>"
+#   reason       = "<brief description of non-determinism>"
+#   remove_when  = "<objective condition for removing quarantine>"
+#
+# Example:
+# [quarantine.example_flaky_test]
+# category = "FLAKE-TIMING"
+# owner = "TopazFalcon"
+# quarantined = "2026-02-10"
+# expires = "2026-02-17"
+# bead = "bd-XXXX"
+# evidence = "https://ci.example.com/run/12345"
+# repro = "cargo test example_flaky_test -- --nocapture"
+# reason = "Intermittent timeout on CI due to thread scheduling variance"
+# remove_when = "Two consecutive green CI runs for this test on Linux/macOS/Windows"
