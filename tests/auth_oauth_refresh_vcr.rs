@@ -99,6 +99,8 @@ async fn run_refresh_scenario(
             access_token: old_access.clone(),
             refresh_token: old_refresh.clone(),
             expires: 0,
+            token_url: None,
+            client_id: None,
         },
     );
     auth.save().expect("save auth.json");

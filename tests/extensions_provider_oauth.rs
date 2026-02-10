@@ -293,13 +293,14 @@ fn complete_extension_oauth_exchanges_code_for_tokens() {
                 access_token,
                 refresh_token,
                 expires,
+                ..
             } => {
                 assert_eq!(access_token, "access-abc");
                 assert_eq!(refresh_token, "refresh-xyz");
                 let now = chrono::Utc::now().timestamp_millis();
                 assert!(expires > now, "token should not be immediately expired");
             }
-            other @ AuthCredential::ApiKey { .. } => {
+            other => {
                 unreachable!("expected OAuth credential, got: {other:?}");
             }
         }
@@ -435,7 +436,7 @@ fn complete_extension_oauth_parses_url_callback_input() {
             AuthCredential::OAuth { access_token, .. } => {
                 assert_eq!(access_token, "from-url");
             }
-            other @ AuthCredential::ApiKey { .. } => {
+            other => {
                 unreachable!("expected OAuth credential, got: {other:?}");
             }
         }
@@ -489,6 +490,8 @@ fn refresh_expired_extension_oauth_token_succeeds() {
                 access_token: "old-access".to_string(),
                 refresh_token: "old-refresh".to_string(),
                 expires: 0, // expired
+                token_url: None,
+                client_id: None,
             },
         );
         auth.save().expect("save");
@@ -549,6 +552,8 @@ fn refresh_extension_oauth_skips_anthropic_provider() {
                 access_token: "old".to_string(),
                 refresh_token: "old-ref".to_string(),
                 expires: 0,
+                token_url: None,
+                client_id: None,
             },
         );
         auth.save().expect("save");
@@ -608,6 +613,8 @@ fn refresh_extension_oauth_skips_unexpired_token() {
                 access_token: "valid-token".to_string(),
                 refresh_token: "ref".to_string(),
                 expires: far_future,
+                token_url: None,
+                client_id: None,
             },
         );
         auth.save().expect("save");
@@ -656,6 +663,8 @@ fn refresh_extension_oauth_error_propagated() {
                 access_token: "old".to_string(),
                 refresh_token: "revoked-refresh".to_string(),
                 expires: 0,
+                token_url: None,
+                client_id: None,
             },
         );
         auth.save().expect("save");
@@ -696,6 +705,8 @@ fn oauth_credential_persists_across_reload() {
             access_token: "persisted-access".to_string(),
             refresh_token: "persisted-refresh".to_string(),
             expires: far_future,
+            token_url: None,
+            client_id: None,
         },
     );
     auth.save().expect("save");
@@ -724,6 +735,8 @@ fn resolve_api_key_returns_oauth_access_token() {
             access_token: "oauth-access-token".to_string(),
             refresh_token: "ref".to_string(),
             expires: far_future,
+            token_url: None,
+            client_id: None,
         },
     );
 
@@ -744,6 +757,8 @@ fn resolve_api_key_returns_none_for_expired_oauth() {
             access_token: "expired-access".to_string(),
             refresh_token: "ref".to_string(),
             expires: 0, // expired
+            token_url: None,
+            client_id: None,
         },
     );
 
@@ -765,6 +780,8 @@ fn resolve_api_key_override_takes_precedence_over_oauth() {
             access_token: "oauth-token".to_string(),
             refresh_token: "ref".to_string(),
             expires: far_future,
+            token_url: None,
+            client_id: None,
         },
     );
 
@@ -881,6 +898,8 @@ fn full_wiring_refresh_expired_token_via_mock_server() {
                 access_token: "old-access".to_string(),
                 refresh_token: "old-refresh".to_string(),
                 expires: 0, // expired
+                token_url: None,
+                client_id: None,
             },
         );
 
@@ -922,6 +941,8 @@ fn full_wiring_no_refresh_when_token_valid() {
                 access_token: "still-valid".to_string(),
                 refresh_token: "ref".to_string(),
                 expires: far_future,
+                token_url: None,
+                client_id: None,
             },
         );
 
@@ -957,6 +978,8 @@ fn full_wiring_refresh_skips_providers_without_config() {
                 access_token: "old".to_string(),
                 refresh_token: "old-ref".to_string(),
                 expires: 0,
+                token_url: None,
+                client_id: None,
             },
         );
 

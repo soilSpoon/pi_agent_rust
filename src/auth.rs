@@ -53,6 +53,37 @@ pub enum AuthCredential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
     },
+    /// AWS IAM credentials for providers like Amazon Bedrock.
+    ///
+    /// Supports the standard credential chain: explicit keys → env vars → profile → container
+    /// credentials → web identity token.
+    AwsCredentials {
+        access_key_id: String,
+        secret_access_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+    },
+    /// Bearer token for providers that accept `Authorization: Bearer <token>`.
+    ///
+    /// Used by gateway proxies (Vercel AI Gateway, Helicone, etc.) and services
+    /// that issue pre-authenticated bearer tokens (e.g. `AWS_BEARER_TOKEN_BEDROCK`).
+    BearerToken {
+        token: String,
+    },
+    /// Service key credentials for providers like SAP AI Core that use
+    /// client-credentials OAuth (client_id + client_secret → token_url → bearer).
+    ServiceKey {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_url: Option<String>,
+    },
 }
 
 /// Proactive refresh: attempt refresh this many ms *before* actual expiry.
@@ -211,6 +242,12 @@ impl AuthStorage {
     }
 
     /// Get API key for provider from auth.json.
+    ///
+    /// For `ApiKey` and `BearerToken` variants the key/token is returned directly.
+    /// For `OAuth` the access token is returned only when not expired.
+    /// For `AwsCredentials` the access key ID is returned (callers needing the full
+    /// credential set should use [`get`] instead).
+    /// For `ServiceKey` this returns `None` because a token exchange is required first.
     pub fn api_key(&self, provider: &str) -> Option<String> {
         match self.entries.get(provider) {
             Some(AuthCredential::ApiKey { key }) => Some(key.clone()),
@@ -226,7 +263,11 @@ impl AuthStorage {
                     None
                 }
             }
-            None => None,
+            Some(AuthCredential::BearerToken { token }) => Some(token.clone()),
+            Some(AuthCredential::AwsCredentials { access_key_id, .. }) => {
+                Some(access_key_id.clone())
+            }
+            Some(AuthCredential::ServiceKey { .. }) | None => None,
         }
     }
 
@@ -282,27 +323,54 @@ impl AuthStorage {
         client: &crate::http::client::Client,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        let mut refreshes = Vec::new();
+        let proactive_deadline = now + PROACTIVE_REFRESH_WINDOW_MS;
+        let mut refreshes: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
 
         for (provider, cred) in &self.entries {
             if let AuthCredential::OAuth {
                 refresh_token,
                 expires,
+                token_url,
+                client_id,
                 ..
             } = cred
             {
-                if *expires <= now {
-                    refreshes.push((provider.clone(), refresh_token.clone()));
+                // Proactive refresh: refresh if the token will expire within the
+                // proactive window, not just when already expired.
+                if *expires <= proactive_deadline {
+                    refreshes.push((
+                        provider.clone(),
+                        refresh_token.clone(),
+                        token_url.clone(),
+                        client_id.clone(),
+                    ));
                 }
             }
         }
 
-        for (provider, refresh_token) in refreshes {
+        for (provider, refresh_token, stored_token_url, stored_client_id) in refreshes {
             let refreshed = match provider.as_str() {
                 "anthropic" => {
                     Box::pin(refresh_anthropic_oauth_token(client, &refresh_token)).await?
                 }
-                _ => continue,
+                _ => {
+                    // Try self-contained refresh if the credential stores its own
+                    // token_url and client_id (Copilot, GitLab, etc.).
+                    if let (Some(url), Some(cid)) = (&stored_token_url, &stored_client_id) {
+                        Box::pin(refresh_self_contained_oauth_token(
+                            client,
+                            url,
+                            cid,
+                            &refresh_token,
+                            &provider,
+                        ))
+                        .await?
+                    } else {
+                        // No self-contained metadata — skip. The extension refresh
+                        // path will handle this provider if a config is available.
+                        continue;
+                    }
+                }
             };
             self.entries.insert(provider, refreshed);
             self.save_async().await?;
@@ -322,12 +390,15 @@ impl AuthStorage {
         extension_configs: &HashMap<String, crate::models::OAuthConfig>,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
+        let proactive_deadline = now + PROACTIVE_REFRESH_WINDOW_MS;
         let mut refreshes = Vec::new();
 
         for (provider, cred) in &self.entries {
             if let AuthCredential::OAuth {
                 refresh_token,
                 expires,
+                token_url,
+                client_id,
                 ..
             } = cred
             {
@@ -335,7 +406,12 @@ impl AuthStorage {
                 if provider == "anthropic" {
                     continue;
                 }
-                if *expires <= now {
+                // Skip self-contained credentials — they are refreshed by
+                // refresh_expired_oauth_tokens_with_client instead.
+                if token_url.is_some() && client_id.is_some() {
+                    continue;
+                }
+                if *expires <= proactive_deadline {
                     if let Some(config) = extension_configs.get(provider) {
                         refreshes.push((provider.clone(), refresh_token.clone(), config.clone()));
                     }
@@ -385,6 +461,43 @@ impl AuthStorage {
             )))
         }
     }
+
+    /// Remove OAuth credentials that expired more than `max_age_ms` ago and
+    /// whose refresh token is no longer usable (no stored `token_url`/`client_id`
+    /// and no matching extension config).
+    ///
+    /// Returns the list of pruned provider IDs.
+    pub fn prune_stale_credentials(&mut self, max_age_ms: i64) -> Vec<String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let cutoff = now - max_age_ms;
+        let mut pruned = Vec::new();
+
+        self.entries.retain(|provider, cred| {
+            if let AuthCredential::OAuth {
+                expires,
+                token_url,
+                client_id,
+                ..
+            } = cred
+            {
+                // Only prune tokens that are well past expiry AND have no
+                // self-contained refresh metadata.
+                if *expires < cutoff && token_url.is_none() && client_id.is_none() {
+                    tracing::info!(
+                        event = "pi.auth.prune_stale",
+                        provider = %provider,
+                        expired_at = expires,
+                        "Pruning stale OAuth credential"
+                    );
+                    pruned.push(provider.clone());
+                    return false;
+                }
+            }
+            true
+        });
+
+        pruned
+    }
 }
 
 fn env_key_for_provider(provider: &str) -> Option<&'static str> {
@@ -393,6 +506,230 @@ fn env_key_for_provider(provider: &str) -> Option<&'static str> {
 
 fn env_keys_for_provider(provider: &str) -> &'static [&'static str] {
     provider_auth_env_keys(provider)
+}
+
+// ── AWS Credential Chain ────────────────────────────────────────
+
+/// Resolved AWS credentials ready for Sigv4 signing or bearer auth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AwsResolvedCredentials {
+    /// Standard IAM credentials for Sigv4 signing.
+    Sigv4 {
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: Option<String>,
+        region: String,
+    },
+    /// Bearer token (e.g. `AWS_BEARER_TOKEN_BEDROCK`).
+    Bearer { token: String, region: String },
+}
+
+/// Resolve AWS credentials following the standard precedence chain.
+///
+/// Precedence (first match wins):
+/// 1. `AWS_BEARER_TOKEN_BEDROCK` env var → bearer token auth
+/// 2. `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` env vars → Sigv4
+/// 3. `AWS_PROFILE` env var → profile-based (returns the profile name for external resolution)
+/// 4. Stored `AwsCredentials` in auth.json
+/// 5. Stored `BearerToken` in auth.json (for bedrock)
+///
+/// `region` is resolved from: `AWS_REGION` → `AWS_DEFAULT_REGION` → `"us-east-1"`.
+pub fn resolve_aws_credentials(auth: &AuthStorage) -> Option<AwsResolvedCredentials> {
+    resolve_aws_credentials_with_env(auth, |var| std::env::var(var).ok())
+}
+
+fn resolve_aws_credentials_with_env<F>(
+    auth: &AuthStorage,
+    mut env: F,
+) -> Option<AwsResolvedCredentials>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let region = env("AWS_REGION")
+        .or_else(|| env("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+    // 1. Bearer token from env (AWS Bedrock specific)
+    if let Some(token) = env("AWS_BEARER_TOKEN_BEDROCK") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(AwsResolvedCredentials::Bearer { token, region });
+        }
+    }
+
+    // 2. Explicit IAM credentials from env
+    if let Some(access_key) = env("AWS_ACCESS_KEY_ID") {
+        let access_key = access_key.trim().to_string();
+        if !access_key.is_empty() {
+            if let Some(secret_key) = env("AWS_SECRET_ACCESS_KEY") {
+                let secret_key = secret_key.trim().to_string();
+                if !secret_key.is_empty() {
+                    let session_token = env("AWS_SESSION_TOKEN")
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    return Some(AwsResolvedCredentials::Sigv4 {
+                        access_key_id: access_key,
+                        secret_access_key: secret_key,
+                        session_token,
+                        region,
+                    });
+                }
+            }
+        }
+    }
+
+    // 3. Stored credentials in auth.json
+    let provider = "amazon-bedrock";
+    match auth.get(provider) {
+        Some(AuthCredential::AwsCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region: stored_region,
+        }) => Some(AwsResolvedCredentials::Sigv4 {
+            access_key_id: access_key_id.clone(),
+            secret_access_key: secret_access_key.clone(),
+            session_token: session_token.clone(),
+            region: stored_region.clone().unwrap_or(region),
+        }),
+        Some(AuthCredential::BearerToken { token }) => Some(AwsResolvedCredentials::Bearer {
+            token: token.clone(),
+            region,
+        }),
+        Some(AuthCredential::ApiKey { key }) => {
+            // Legacy: treat stored API key as bearer token for Bedrock
+            Some(AwsResolvedCredentials::Bearer {
+                token: key.clone(),
+                region,
+            })
+        }
+        _ => None,
+    }
+}
+
+// ── SAP AI Core Service Key Resolution ──────────────────────────
+
+/// Resolved SAP AI Core credentials ready for client-credentials token exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SapResolvedCredentials {
+    pub client_id: String,
+    pub client_secret: String,
+    pub token_url: String,
+    pub service_url: String,
+}
+
+/// Resolve SAP AI Core credentials from env vars or stored service key.
+///
+/// Precedence:
+/// 1. `AICORE_SERVICE_KEY` env var (JSON-encoded service key)
+/// 2. Individual env vars: `SAP_AI_CORE_CLIENT_ID`, `SAP_AI_CORE_CLIENT_SECRET`,
+///    `SAP_AI_CORE_TOKEN_URL`, `SAP_AI_CORE_SERVICE_URL`
+/// 3. Stored `ServiceKey` in auth.json
+pub fn resolve_sap_credentials(auth: &AuthStorage) -> Option<SapResolvedCredentials> {
+    resolve_sap_credentials_with_env(auth, |var| std::env::var(var).ok())
+}
+
+fn resolve_sap_credentials_with_env<F>(
+    auth: &AuthStorage,
+    mut env: F,
+) -> Option<SapResolvedCredentials>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    // 1. JSON-encoded service key from env
+    if let Some(key_json) = env("AICORE_SERVICE_KEY") {
+        if let Some(creds) = parse_sap_service_key_json(&key_json) {
+            return Some(creds);
+        }
+    }
+
+    // 2. Individual env vars
+    let client_id = env("SAP_AI_CORE_CLIENT_ID");
+    let client_secret = env("SAP_AI_CORE_CLIENT_SECRET");
+    let token_url = env("SAP_AI_CORE_TOKEN_URL");
+    let service_url = env("SAP_AI_CORE_SERVICE_URL");
+
+    if let (Some(id), Some(secret), Some(turl), Some(surl)) =
+        (client_id, client_secret, token_url, service_url)
+    {
+        let id = id.trim().to_string();
+        let secret = secret.trim().to_string();
+        let turl = turl.trim().to_string();
+        let surl = surl.trim().to_string();
+        if !id.is_empty() && !secret.is_empty() && !turl.is_empty() && !surl.is_empty() {
+            return Some(SapResolvedCredentials {
+                client_id: id,
+                client_secret: secret,
+                token_url: turl,
+                service_url: surl,
+            });
+        }
+    }
+
+    // 3. Stored service key in auth.json
+    let provider = "sap-ai-core";
+    if let Some(AuthCredential::ServiceKey {
+        client_id,
+        client_secret,
+        token_url,
+        service_url,
+    }) = auth.get(provider)
+    {
+        if let (Some(id), Some(secret), Some(turl), Some(surl)) = (
+            client_id.as_ref(),
+            client_secret.as_ref(),
+            token_url.as_ref(),
+            service_url.as_ref(),
+        ) {
+            if !id.is_empty() && !secret.is_empty() && !turl.is_empty() && !surl.is_empty() {
+                return Some(SapResolvedCredentials {
+                    client_id: id.clone(),
+                    client_secret: secret.clone(),
+                    token_url: turl.clone(),
+                    service_url: surl.clone(),
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse a JSON-encoded SAP AI Core service key.
+fn parse_sap_service_key_json(json_str: &str) -> Option<SapResolvedCredentials> {
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let obj = v.as_object()?;
+
+    // SAP service keys use "clientid"/"clientsecret" (no underscore) and
+    // "url" for token URL, "serviceurls.AI_API_URL" for service URL.
+    let client_id = obj
+        .get("clientid")
+        .or_else(|| obj.get("client_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let client_secret = obj
+        .get("clientsecret")
+        .or_else(|| obj.get("client_secret"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let token_url = obj
+        .get("url")
+        .or_else(|| obj.get("token_url"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let service_url = obj
+        .get("serviceurls")
+        .and_then(|v| v.get("AI_API_URL"))
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("service_url").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())?;
+
+    Some(SapResolvedCredentials {
+        client_id: client_id.to_string(),
+        client_secret: client_secret.to_string(),
+        token_url: token_url.to_string(),
+        service_url: service_url.to_string(),
+    })
 }
 
 fn redact_known_secrets(text: &str, secrets: &[&str]) -> String {
@@ -877,6 +1214,53 @@ async fn refresh_extension_oauth_token(
         expires: oauth_expires_at_ms(oauth_response.expires_in),
         token_url: Some(config.token_url.clone()),
         client_id: Some(config.client_id.clone()),
+    })
+}
+
+/// Provider-agnostic OAuth refresh using self-contained credential metadata.
+///
+/// This is called for providers whose [`AuthCredential::OAuth`] stores its own
+/// `token_url` and `client_id` (e.g. Copilot, GitLab), removing the need for
+/// an external config lookup at refresh time.
+async fn refresh_self_contained_oauth_token(
+    client: &crate::http::client::Client,
+    token_url: &str,
+    oauth_client_id: &str,
+    refresh_token: &str,
+    provider: &str,
+) -> Result<AuthCredential> {
+    let request = client.post(token_url).json(&serde_json::json!({
+        "grant_type": "refresh_token",
+        "client_id": oauth_client_id,
+        "refresh_token": refresh_token,
+    }))?;
+
+    let response = Box::pin(request.send())
+        .await
+        .map_err(|e| Error::auth(format!("{provider} token refresh failed: {e}")))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[refresh_token]);
+
+    if !(200..300).contains(&status) {
+        return Err(Error::auth(format!(
+            "{provider} token refresh failed (HTTP {status}): {redacted_text}"
+        )));
+    }
+
+    let oauth_response: OAuthTokenResponse = serde_json::from_str(&text)
+        .map_err(|e| Error::auth(format!("Invalid refresh response from {provider}: {e}")))?;
+
+    Ok(AuthCredential::OAuth {
+        access_token: oauth_response.access_token,
+        refresh_token: oauth_response.refresh_token,
+        expires: oauth_expires_at_ms(oauth_response.expires_in),
+        token_url: Some(token_url.to_string()),
+        client_id: Some(oauth_client_id.to_string()),
     })
 }
 
@@ -1761,6 +2145,8 @@ mod tests {
                     access_token: initial_access.clone(),
                     refresh_token: initial_refresh,
                     expires: 0, // expired
+                    token_url: None,
+                    client_id: None,
                 },
             );
 
@@ -1806,6 +2192,8 @@ mod tests {
                     access_token: initial_access_token.clone(),
                     refresh_token: initial_refresh_token,
                     expires: far_future,
+                    token_url: None,
+                    client_id: None,
                 },
             );
 
@@ -1849,6 +2237,8 @@ mod tests {
                     access_token: initial_access_token.clone(),
                     refresh_token: initial_refresh_token,
                     expires: 0,
+                    token_url: None,
+                    client_id: None,
                 },
             );
 
@@ -1889,6 +2279,8 @@ mod tests {
                     access_token: "old-access".to_string(),
                     refresh_token: "old-refresh".to_string(),
                     expires: 0,
+                    token_url: None,
+                    client_id: None,
                 },
             );
 
@@ -1913,12 +2305,13 @@ mod tests {
                     access_token,
                     refresh_token,
                     expires,
+                    ..
                 } => {
                     assert_eq!(access_token, "new-access");
                     assert_eq!(refresh_token, "new-refresh");
                     assert!(*expires > now);
                 }
-                other @ AuthCredential::ApiKey { .. } => {
+                other => {
                     unreachable!("expected oauth credential, got: {other:?}");
                 }
             }
@@ -1933,7 +2326,7 @@ mod tests {
                     assert_eq!(access_token, "new-access");
                     assert_eq!(refresh_token, "new-refresh");
                 }
-                other @ AuthCredential::ApiKey { .. } => {
+                other => {
                     unreachable!("expected oauth credential, got: {other:?}");
                 }
             }
@@ -1997,6 +2390,8 @@ mod tests {
                     access_token: expected_access_token.clone(),
                     refresh_token: expected_refresh_token.clone(),
                     expires: 9_999_999_999_000,
+                    token_url: None,
+                    client_id: None,
                 },
             );
             auth.save().expect("save");
@@ -2010,12 +2405,13 @@ mod tests {
                 access_token,
                 refresh_token,
                 expires,
+                ..
             } => {
                 assert_eq!(access_token, &expected_access_token);
                 assert_eq!(refresh_token, &expected_refresh_token);
                 assert_eq!(*expires, 9_999_999_999_000);
             }
-            other @ AuthCredential::ApiKey { .. } => {
+            other => {
                 unreachable!("expected OAuth credential, got: {other:?}");
             }
         }
@@ -2038,6 +2434,8 @@ mod tests {
                 access_token: expected_access_token.clone(),
                 refresh_token: expected_refresh_token,
                 expires: far_future,
+                token_url: None,
+                client_id: None,
             },
         );
 
@@ -2063,6 +2461,8 @@ mod tests {
                 access_token: expected_access_token,
                 refresh_token: expected_refresh_token,
                 expires: 0, // expired
+                token_url: None,
+                client_id: None,
             },
         );
 
@@ -2154,7 +2554,7 @@ mod tests {
         assert!(auth.entries.contains_key("anthropic"));
         match auth.get("anthropic").expect("credential") {
             AuthCredential::ApiKey { key } => assert_eq!(key, "sk-test-abc"),
-            other @ AuthCredential::OAuth { .. } => panic!("expected ApiKey, got: {other:?}"),
+            other => panic!("expected ApiKey, got: {other:?}"),
         }
     }
 
@@ -2343,6 +2743,8 @@ mod tests {
                 access_token: "goog-token".to_string(),
                 refresh_token: "goog-refresh".to_string(),
                 expires: far_future,
+                token_url: None,
+                client_id: None,
             },
         );
         auth.save().expect("save");
@@ -2502,7 +2904,17 @@ mod tests {
         let cases: [(&str, &[&str]); 7] = [
             ("gemini", &["GOOGLE_API_KEY", "GEMINI_API_KEY"]),
             ("fireworks-ai", &["FIREWORKS_API_KEY"]),
-            ("bedrock", &["AWS_ACCESS_KEY_ID"]),
+            (
+                "bedrock",
+                &[
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_BEARER_TOKEN_BEDROCK",
+                    "AWS_PROFILE",
+                    "AWS_REGION",
+                ] as &[&str],
+            ),
             ("azure", &["AZURE_OPENAI_API_KEY"]),
             ("vertexai", &["GOOGLE_CLOUD_API_KEY"]),
             ("copilot", &["GITHUB_COPILOT_API_KEY", "GITHUB_TOKEN"]),
@@ -2985,7 +3397,7 @@ mod tests {
             );
 
             // Extract port from token_url to build a matching config.
-            let config = CopilotOAuthConfig {
+            let _config = CopilotOAuthConfig {
                 client_id: "Iv1.test".to_string(),
                 // Use a base URL that generates the test server URL.
                 github_base_url: token_url.trim_end_matches("/token").replace("/token", "").to_string(),
@@ -3005,12 +3417,13 @@ mod tests {
                     access_token,
                     refresh_token,
                     expires,
+                    ..
                 } => {
                     assert_eq!(access_token, "ghu_test_access");
                     assert_eq!(refresh_token, "ghr_test_refresh");
                     assert!(expires > chrono::Utc::now().timestamp_millis());
                 }
-                AuthCredential::ApiKey { .. } => panic!("expected OAuth"),
+                other => panic!("expected OAuth, got: {other:?}"),
             }
         });
     }
@@ -3030,7 +3443,7 @@ mod tests {
                 assert_eq!(access_token, "ghu_test");
                 assert!(refresh_token.is_empty(), "should default to empty");
             }
-            AuthCredential::ApiKey { .. } => panic!("expected OAuth"),
+            other => panic!("expected OAuth, got: {other:?}"),
         }
     }
 
@@ -3051,7 +3464,7 @@ mod tests {
                     "expected far-future expiry"
                 );
             }
-            AuthCredential::ApiKey { .. } => panic!("expected OAuth"),
+            other => panic!("expected OAuth, got: {other:?}"),
         }
     }
 
@@ -3284,6 +3697,8 @@ mod tests {
                 access_token: response.access_token,
                 refresh_token: response.refresh_token,
                 expires: oauth_expires_at_ms(response.expires_in),
+                token_url: None,
+                client_id: None,
             };
 
             match cred {
@@ -3291,12 +3706,13 @@ mod tests {
                     access_token,
                     refresh_token,
                     expires,
+                    ..
                 } => {
                     assert_eq!(access_token, "glpat-test_access");
                     assert_eq!(refresh_token, "glrt-test_refresh");
                     assert!(expires > chrono::Utc::now().timestamp_millis());
                 }
-                AuthCredential::ApiKey { .. } => panic!("expected OAuth"),
+                other => panic!("expected OAuth, got: {other:?}"),
             }
 
             // Also ensure the test server URL was consumed (not left hanging).
@@ -3386,5 +3802,917 @@ mod tests {
             trim_trailing_slash("https://github.com///"),
             "https://github.com"
         );
+    }
+
+    // ── AuthCredential new variant serialization ─────────────────────
+
+    #[test]
+    fn test_aws_credentials_round_trip() {
+        let cred = AuthCredential::AwsCredentials {
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/SECRET".to_string(),
+            session_token: Some("FwoGZX...session".to_string()),
+            region: Some("us-west-2".to_string()),
+        };
+        let json = serde_json::to_string(&cred).expect("serialize");
+        let parsed: AuthCredential = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            AuthCredential::AwsCredentials {
+                access_key_id,
+                secret_access_key,
+                session_token,
+                region,
+            } => {
+                assert_eq!(access_key_id, "AKIAEXAMPLE");
+                assert_eq!(secret_access_key, "wJalrXUtnFEMI/SECRET");
+                assert_eq!(session_token.as_deref(), Some("FwoGZX...session"));
+                assert_eq!(region.as_deref(), Some("us-west-2"));
+            }
+            other => panic!("expected AwsCredentials, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_aws_credentials_without_optional_fields() {
+        let json =
+            r#"{"type":"aws_credentials","access_key_id":"AKIA","secret_access_key":"secret"}"#;
+        let cred: AuthCredential = serde_json::from_str(json).expect("deserialize");
+        match cred {
+            AuthCredential::AwsCredentials {
+                session_token,
+                region,
+                ..
+            } => {
+                assert!(session_token.is_none());
+                assert!(region.is_none());
+            }
+            other => panic!("expected AwsCredentials, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bearer_token_round_trip() {
+        let cred = AuthCredential::BearerToken {
+            token: "my-gateway-token-123".to_string(),
+        };
+        let json = serde_json::to_string(&cred).expect("serialize");
+        let parsed: AuthCredential = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            AuthCredential::BearerToken { token } => {
+                assert_eq!(token, "my-gateway-token-123");
+            }
+            other => panic!("expected BearerToken, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_service_key_round_trip() {
+        let cred = AuthCredential::ServiceKey {
+            client_id: Some("sap-client-id".to_string()),
+            client_secret: Some("sap-secret".to_string()),
+            token_url: Some("https://auth.sap.com/oauth/token".to_string()),
+            service_url: Some("https://api.ai.sap.com".to_string()),
+        };
+        let json = serde_json::to_string(&cred).expect("serialize");
+        let parsed: AuthCredential = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            AuthCredential::ServiceKey {
+                client_id,
+                client_secret,
+                token_url,
+                service_url,
+            } => {
+                assert_eq!(client_id.as_deref(), Some("sap-client-id"));
+                assert_eq!(client_secret.as_deref(), Some("sap-secret"));
+                assert_eq!(
+                    token_url.as_deref(),
+                    Some("https://auth.sap.com/oauth/token")
+                );
+                assert_eq!(service_url.as_deref(), Some("https://api.ai.sap.com"));
+            }
+            other => panic!("expected ServiceKey, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_service_key_without_optional_fields() {
+        let json = r#"{"type":"service_key"}"#;
+        let cred: AuthCredential = serde_json::from_str(json).expect("deserialize");
+        match cred {
+            AuthCredential::ServiceKey {
+                client_id,
+                client_secret,
+                token_url,
+                service_url,
+            } => {
+                assert!(client_id.is_none());
+                assert!(client_secret.is_none());
+                assert!(token_url.is_none());
+                assert!(service_url.is_none());
+            }
+            other => panic!("expected ServiceKey, got: {other:?}"),
+        }
+    }
+
+    // ── api_key() with new variants ──────────────────────────────────
+
+    #[test]
+    fn test_api_key_returns_bearer_token() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut auth = AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "my-gateway",
+            AuthCredential::BearerToken {
+                token: "gw-tok-123".to_string(),
+            },
+        );
+        assert_eq!(auth.api_key("my-gateway").as_deref(), Some("gw-tok-123"));
+    }
+
+    #[test]
+    fn test_api_key_returns_aws_access_key_id() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut auth = AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "amazon-bedrock",
+            AuthCredential::AwsCredentials {
+                access_key_id: "AKIAEXAMPLE".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: None,
+                region: None,
+            },
+        );
+        assert_eq!(
+            auth.api_key("amazon-bedrock").as_deref(),
+            Some("AKIAEXAMPLE")
+        );
+    }
+
+    #[test]
+    fn test_api_key_returns_none_for_service_key() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut auth = AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::ServiceKey {
+                client_id: Some("id".to_string()),
+                client_secret: Some("secret".to_string()),
+                token_url: Some("https://auth.example.com".to_string()),
+                service_url: Some("https://api.example.com".to_string()),
+            },
+        );
+        assert!(auth.api_key("sap-ai-core").is_none());
+    }
+
+    // ── AWS Credential Chain ─────────────────────────────────────────
+
+    fn empty_auth() -> AuthStorage {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_aws_bearer_token_env_wins() {
+        let auth = empty_auth();
+        let result = resolve_aws_credentials_with_env(&auth, |var| match var {
+            "AWS_BEARER_TOKEN_BEDROCK" => Some("bearer-tok-env".to_string()),
+            "AWS_REGION" => Some("eu-west-1".to_string()),
+            "AWS_ACCESS_KEY_ID" => Some("AKIA_SHOULD_NOT_WIN".to_string()),
+            "AWS_SECRET_ACCESS_KEY" => Some("secret".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            result,
+            Some(AwsResolvedCredentials::Bearer {
+                token: "bearer-tok-env".to_string(),
+                region: "eu-west-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_aws_env_sigv4_credentials() {
+        let auth = empty_auth();
+        let result = resolve_aws_credentials_with_env(&auth, |var| match var {
+            "AWS_ACCESS_KEY_ID" => Some("AKIATEST".to_string()),
+            "AWS_SECRET_ACCESS_KEY" => Some("secretTEST".to_string()),
+            "AWS_SESSION_TOKEN" => Some("session123".to_string()),
+            "AWS_REGION" => Some("ap-southeast-1".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            result,
+            Some(AwsResolvedCredentials::Sigv4 {
+                access_key_id: "AKIATEST".to_string(),
+                secret_access_key: "secretTEST".to_string(),
+                session_token: Some("session123".to_string()),
+                region: "ap-southeast-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_aws_env_sigv4_without_session_token() {
+        let auth = empty_auth();
+        let result = resolve_aws_credentials_with_env(&auth, |var| match var {
+            "AWS_ACCESS_KEY_ID" => Some("AKIA".to_string()),
+            "AWS_SECRET_ACCESS_KEY" => Some("secret".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            result,
+            Some(AwsResolvedCredentials::Sigv4 {
+                access_key_id: "AKIA".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: None,
+                region: "us-east-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_aws_default_region_fallback() {
+        let auth = empty_auth();
+        let result = resolve_aws_credentials_with_env(&auth, |var| match var {
+            "AWS_ACCESS_KEY_ID" => Some("AKIA".to_string()),
+            "AWS_SECRET_ACCESS_KEY" => Some("secret".to_string()),
+            "AWS_DEFAULT_REGION" => Some("ca-central-1".to_string()),
+            _ => None,
+        });
+        match result {
+            Some(AwsResolvedCredentials::Sigv4 { region, .. }) => {
+                assert_eq!(region, "ca-central-1");
+            }
+            other => panic!("expected Sigv4, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_aws_stored_credentials_fallback() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut auth = AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "amazon-bedrock",
+            AuthCredential::AwsCredentials {
+                access_key_id: "AKIA_STORED".to_string(),
+                secret_access_key: "secret_stored".to_string(),
+                session_token: None,
+                region: Some("us-west-2".to_string()),
+            },
+        );
+        let result =
+            resolve_aws_credentials_with_env(&auth, |_| -> Option<String> { None });
+        assert_eq!(
+            result,
+            Some(AwsResolvedCredentials::Sigv4 {
+                access_key_id: "AKIA_STORED".to_string(),
+                secret_access_key: "secret_stored".to_string(),
+                session_token: None,
+                region: "us-west-2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_aws_stored_bearer_fallback() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut auth = AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "amazon-bedrock",
+            AuthCredential::BearerToken {
+                token: "stored-bearer".to_string(),
+            },
+        );
+        let result =
+            resolve_aws_credentials_with_env(&auth, |_| -> Option<String> { None });
+        assert_eq!(
+            result,
+            Some(AwsResolvedCredentials::Bearer {
+                token: "stored-bearer".to_string(),
+                region: "us-east-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_aws_env_beats_stored() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut auth = AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "amazon-bedrock",
+            AuthCredential::AwsCredentials {
+                access_key_id: "AKIA_STORED".to_string(),
+                secret_access_key: "stored_secret".to_string(),
+                session_token: None,
+                region: None,
+            },
+        );
+        let result = resolve_aws_credentials_with_env(&auth, |var| match var {
+            "AWS_ACCESS_KEY_ID" => Some("AKIA_ENV".to_string()),
+            "AWS_SECRET_ACCESS_KEY" => Some("env_secret".to_string()),
+            _ => None,
+        });
+        match result {
+            Some(AwsResolvedCredentials::Sigv4 {
+                access_key_id, ..
+            }) => assert_eq!(access_key_id, "AKIA_ENV"),
+            other => panic!("expected Sigv4 from env, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_aws_no_credentials_returns_none() {
+        let auth = empty_auth();
+        let result =
+            resolve_aws_credentials_with_env(&auth, |_| -> Option<String> { None });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_aws_empty_bearer_token_skipped() {
+        let auth = empty_auth();
+        let result = resolve_aws_credentials_with_env(&auth, |var| match var {
+            "AWS_BEARER_TOKEN_BEDROCK" => Some("  ".to_string()),
+            "AWS_ACCESS_KEY_ID" => Some("AKIA".to_string()),
+            "AWS_SECRET_ACCESS_KEY" => Some("secret".to_string()),
+            _ => None,
+        });
+        assert!(matches!(result, Some(AwsResolvedCredentials::Sigv4 { .. })));
+    }
+
+    #[test]
+    fn test_aws_access_key_without_secret_skipped() {
+        let auth = empty_auth();
+        let result = resolve_aws_credentials_with_env(&auth, |var| match var {
+            "AWS_ACCESS_KEY_ID" => Some("AKIA".to_string()),
+            _ => None,
+        });
+        assert!(result.is_none());
+    }
+
+    // ── SAP AI Core Credential Chain ─────────────────────────────────
+
+    #[test]
+    fn test_sap_json_service_key() {
+        let auth = empty_auth();
+        let key_json = serde_json::json!({
+            "clientid": "sap-client",
+            "clientsecret": "sap-secret",
+            "url": "https://auth.sap.example.com/oauth/token",
+            "serviceurls": {
+                "AI_API_URL": "https://api.ai.sap.example.com"
+            }
+        })
+        .to_string();
+        let result = resolve_sap_credentials_with_env(&auth, |var| match var {
+            "AICORE_SERVICE_KEY" => Some(key_json.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            result,
+            Some(SapResolvedCredentials {
+                client_id: "sap-client".to_string(),
+                client_secret: "sap-secret".to_string(),
+                token_url: "https://auth.sap.example.com/oauth/token".to_string(),
+                service_url: "https://api.ai.sap.example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_sap_individual_env_vars() {
+        let auth = empty_auth();
+        let result = resolve_sap_credentials_with_env(&auth, |var| match var {
+            "SAP_AI_CORE_CLIENT_ID" => Some("env-client".to_string()),
+            "SAP_AI_CORE_CLIENT_SECRET" => Some("env-secret".to_string()),
+            "SAP_AI_CORE_TOKEN_URL" => Some("https://token.sap.example.com".to_string()),
+            "SAP_AI_CORE_SERVICE_URL" => {
+                Some("https://service.sap.example.com".to_string())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            result,
+            Some(SapResolvedCredentials {
+                client_id: "env-client".to_string(),
+                client_secret: "env-secret".to_string(),
+                token_url: "https://token.sap.example.com".to_string(),
+                service_url: "https://service.sap.example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_sap_stored_service_key() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut auth = AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::ServiceKey {
+                client_id: Some("stored-id".to_string()),
+                client_secret: Some("stored-secret".to_string()),
+                token_url: Some("https://stored-token.sap.com".to_string()),
+                service_url: Some("https://stored-api.sap.com".to_string()),
+            },
+        );
+        let result =
+            resolve_sap_credentials_with_env(&auth, |_| -> Option<String> { None });
+        assert_eq!(
+            result,
+            Some(SapResolvedCredentials {
+                client_id: "stored-id".to_string(),
+                client_secret: "stored-secret".to_string(),
+                token_url: "https://stored-token.sap.com".to_string(),
+                service_url: "https://stored-api.sap.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_sap_json_key_wins_over_individual_vars() {
+        let key_json = serde_json::json!({
+            "clientid": "json-client",
+            "clientsecret": "json-secret",
+            "url": "https://json-token.example.com",
+            "serviceurls": {"AI_API_URL": "https://json-api.example.com"}
+        })
+        .to_string();
+        let auth = empty_auth();
+        let result = resolve_sap_credentials_with_env(&auth, |var| match var {
+            "AICORE_SERVICE_KEY" => Some(key_json.clone()),
+            "SAP_AI_CORE_CLIENT_ID" => Some("env-client".to_string()),
+            "SAP_AI_CORE_CLIENT_SECRET" => Some("env-secret".to_string()),
+            "SAP_AI_CORE_TOKEN_URL" => {
+                Some("https://env-token.example.com".to_string())
+            }
+            "SAP_AI_CORE_SERVICE_URL" => {
+                Some("https://env-api.example.com".to_string())
+            }
+            _ => None,
+        });
+        assert_eq!(result.unwrap().client_id, "json-client");
+    }
+
+    #[test]
+    fn test_sap_incomplete_individual_vars_returns_none() {
+        let auth = empty_auth();
+        let result = resolve_sap_credentials_with_env(&auth, |var| match var {
+            "SAP_AI_CORE_CLIENT_ID" => Some("id".to_string()),
+            "SAP_AI_CORE_CLIENT_SECRET" => Some("secret".to_string()),
+            "SAP_AI_CORE_TOKEN_URL" => Some("https://token.example.com".to_string()),
+            _ => None,
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sap_invalid_json_falls_through() {
+        let auth = empty_auth();
+        let result = resolve_sap_credentials_with_env(&auth, |var| match var {
+            "AICORE_SERVICE_KEY" => Some("not-valid-json".to_string()),
+            "SAP_AI_CORE_CLIENT_ID" => Some("env-id".to_string()),
+            "SAP_AI_CORE_CLIENT_SECRET" => Some("env-secret".to_string()),
+            "SAP_AI_CORE_TOKEN_URL" => Some("https://token.example.com".to_string()),
+            "SAP_AI_CORE_SERVICE_URL" => Some("https://api.example.com".to_string()),
+            _ => None,
+        });
+        assert_eq!(result.unwrap().client_id, "env-id");
+    }
+
+    #[test]
+    fn test_sap_no_credentials_returns_none() {
+        let auth = empty_auth();
+        let result =
+            resolve_sap_credentials_with_env(&auth, |_| -> Option<String> { None });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sap_json_key_alternate_field_names() {
+        let key_json = serde_json::json!({
+            "client_id": "alt-id",
+            "client_secret": "alt-secret",
+            "token_url": "https://alt-token.example.com",
+            "service_url": "https://alt-api.example.com"
+        })
+        .to_string();
+        let creds = parse_sap_service_key_json(&key_json);
+        assert_eq!(
+            creds,
+            Some(SapResolvedCredentials {
+                client_id: "alt-id".to_string(),
+                client_secret: "alt-secret".to_string(),
+                token_url: "https://alt-token.example.com".to_string(),
+                service_url: "https://alt-api.example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_sap_json_key_missing_required_field_returns_none() {
+        let key_json = serde_json::json!({
+            "clientid": "id",
+            "url": "https://token.example.com",
+            "serviceurls": {"AI_API_URL": "https://api.example.com"}
+        })
+        .to_string();
+        assert!(parse_sap_service_key_json(&key_json).is_none());
+    }
+
+    // ── SAP AI Core metadata ─────────────────────────────────────────
+
+    #[test]
+    fn test_sap_metadata_exists() {
+        let keys = env_keys_for_provider("sap-ai-core");
+        assert!(!keys.is_empty(), "sap-ai-core should have env keys");
+        assert!(keys.contains(&"AICORE_SERVICE_KEY"));
+    }
+
+    #[test]
+    fn test_sap_alias_resolves() {
+        let keys = env_keys_for_provider("sap");
+        assert!(!keys.is_empty(), "sap alias should resolve");
+        assert!(keys.contains(&"AICORE_SERVICE_KEY"));
+    }
+
+    // ── Lifecycle tests (bd-3uqg.7.6) ─────────────────────────────
+
+    #[test]
+    fn test_proactive_refresh_triggers_within_window() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let auth_path = dir.path().join("auth.json");
+
+            // Token expires 5 minutes from now (within the 10-min window).
+            let five_min_from_now = chrono::Utc::now().timestamp_millis() + 5 * 60 * 1000;
+            let token_response =
+                r#"{"access_token":"refreshed","refresh_token":"new-ref","expires_in":3600}"#;
+            let server_url = spawn_json_server(200, token_response);
+
+            let mut auth = AuthStorage {
+                path: auth_path,
+                entries: HashMap::new(),
+            };
+            auth.entries.insert(
+                "copilot".to_string(),
+                AuthCredential::OAuth {
+                    access_token: "about-to-expire".to_string(),
+                    refresh_token: "old-ref".to_string(),
+                    expires: five_min_from_now,
+                    token_url: Some(server_url),
+                    client_id: Some("test-client".to_string()),
+                },
+            );
+
+            let client = crate::http::client::Client::new();
+            auth.refresh_expired_oauth_tokens_with_client(&client)
+                .await
+                .expect("proactive refresh");
+
+            match auth.entries.get("copilot").expect("credential") {
+                AuthCredential::OAuth { access_token, .. } => {
+                    assert_eq!(access_token, "refreshed");
+                }
+                other => panic!("expected OAuth, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_proactive_refresh_skips_tokens_far_from_expiry() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let auth_path = dir.path().join("auth.json");
+
+            let one_hour_from_now = chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000;
+
+            let mut auth = AuthStorage {
+                path: auth_path,
+                entries: HashMap::new(),
+            };
+            auth.entries.insert(
+                "copilot".to_string(),
+                AuthCredential::OAuth {
+                    access_token: "still-good".to_string(),
+                    refresh_token: "ref".to_string(),
+                    expires: one_hour_from_now,
+                    token_url: Some("https://should-not-be-called.example.com/token".to_string()),
+                    client_id: Some("test-client".to_string()),
+                },
+            );
+
+            let client = crate::http::client::Client::new();
+            auth.refresh_expired_oauth_tokens_with_client(&client)
+                .await
+                .expect("no refresh needed");
+
+            match auth.entries.get("copilot").expect("credential") {
+                AuthCredential::OAuth { access_token, .. } => {
+                    assert_eq!(access_token, "still-good");
+                }
+                other => panic!("expected OAuth, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_self_contained_refresh_uses_stored_metadata() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let auth_path = dir.path().join("auth.json");
+
+            let token_response =
+                r#"{"access_token":"new-copilot-token","refresh_token":"new-ref","expires_in":28800}"#;
+            let server_url = spawn_json_server(200, token_response);
+
+            let mut auth = AuthStorage {
+                path: auth_path,
+                entries: HashMap::new(),
+            };
+            auth.entries.insert(
+                "copilot".to_string(),
+                AuthCredential::OAuth {
+                    access_token: "expired-copilot".to_string(),
+                    refresh_token: "old-ref".to_string(),
+                    expires: 0,
+                    token_url: Some(server_url.clone()),
+                    client_id: Some("Iv1.copilot-client".to_string()),
+                },
+            );
+
+            let client = crate::http::client::Client::new();
+            auth.refresh_expired_oauth_tokens_with_client(&client)
+                .await
+                .expect("self-contained refresh");
+
+            match auth.entries.get("copilot").expect("credential") {
+                AuthCredential::OAuth {
+                    access_token,
+                    token_url,
+                    client_id,
+                    ..
+                } => {
+                    assert_eq!(access_token, "new-copilot-token");
+                    assert_eq!(token_url.as_deref(), Some(server_url.as_str()));
+                    assert_eq!(client_id.as_deref(), Some("Iv1.copilot-client"));
+                }
+                other => panic!("expected OAuth, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_self_contained_refresh_skips_when_no_metadata() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let auth_path = dir.path().join("auth.json");
+
+            let mut auth = AuthStorage {
+                path: auth_path,
+                entries: HashMap::new(),
+            };
+            auth.entries.insert(
+                "ext-custom".to_string(),
+                AuthCredential::OAuth {
+                    access_token: "old-ext".to_string(),
+                    refresh_token: "ref".to_string(),
+                    expires: 0,
+                    token_url: None,
+                    client_id: None,
+                },
+            );
+
+            let client = crate::http::client::Client::new();
+            auth.refresh_expired_oauth_tokens_with_client(&client)
+                .await
+                .expect("should succeed by skipping");
+
+            match auth.entries.get("ext-custom").expect("credential") {
+                AuthCredential::OAuth { access_token, .. } => {
+                    assert_eq!(access_token, "old-ext");
+                }
+                other => panic!("expected OAuth, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_extension_refresh_skips_self_contained_credentials() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let auth_path = dir.path().join("auth.json");
+
+            let mut auth = AuthStorage {
+                path: auth_path,
+                entries: HashMap::new(),
+            };
+            auth.entries.insert(
+                "copilot".to_string(),
+                AuthCredential::OAuth {
+                    access_token: "self-contained".to_string(),
+                    refresh_token: "ref".to_string(),
+                    expires: 0,
+                    token_url: Some("https://github.com/login/oauth/access_token".to_string()),
+                    client_id: Some("Iv1.copilot".to_string()),
+                },
+            );
+
+            let client = crate::http::client::Client::new();
+            let mut extension_configs = HashMap::new();
+            extension_configs.insert("copilot".to_string(), sample_oauth_config());
+
+            auth.refresh_expired_extension_oauth_tokens(&client, &extension_configs)
+                .await
+                .expect("should succeed by skipping");
+
+            match auth.entries.get("copilot").expect("credential") {
+                AuthCredential::OAuth { access_token, .. } => {
+                    assert_eq!(access_token, "self-contained");
+                }
+                other => panic!("expected OAuth, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_prune_stale_credentials_removes_old_expired_without_metadata() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let one_day_ms = 24 * 60 * 60 * 1000;
+
+        // Stale: expired 2 days ago, no metadata.
+        auth.entries.insert(
+            "stale-ext".to_string(),
+            AuthCredential::OAuth {
+                access_token: "dead".to_string(),
+                refresh_token: "dead-ref".to_string(),
+                expires: now - 2 * one_day_ms,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        // Not stale: expired 2 days ago but HAS metadata.
+        auth.entries.insert(
+            "copilot".to_string(),
+            AuthCredential::OAuth {
+                access_token: "old-copilot".to_string(),
+                refresh_token: "ref".to_string(),
+                expires: now - 2 * one_day_ms,
+                token_url: Some("https://github.com/login/oauth/access_token".to_string()),
+                client_id: Some("Iv1.copilot".to_string()),
+            },
+        );
+
+        // Not stale: expired recently.
+        auth.entries.insert(
+            "recent-ext".to_string(),
+            AuthCredential::OAuth {
+                access_token: "recent".to_string(),
+                refresh_token: "ref".to_string(),
+                expires: now - 30 * 60 * 1000, // 30 min ago
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        // Not OAuth.
+        auth.entries.insert(
+            "anthropic".to_string(),
+            AuthCredential::ApiKey {
+                key: "sk-test".to_string(),
+            },
+        );
+
+        let pruned = auth.prune_stale_credentials(one_day_ms);
+
+        assert_eq!(pruned, vec!["stale-ext"]);
+        assert!(!auth.entries.contains_key("stale-ext"));
+        assert!(auth.entries.contains_key("copilot"));
+        assert!(auth.entries.contains_key("recent-ext"));
+        assert!(auth.entries.contains_key("anthropic"));
+    }
+
+    #[test]
+    fn test_prune_stale_credentials_no_op_when_all_valid() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+
+        let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        auth.entries.insert(
+            "ext-prov".to_string(),
+            AuthCredential::OAuth {
+                access_token: "valid".to_string(),
+                refresh_token: "ref".to_string(),
+                expires: far_future,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        let pruned = auth.prune_stale_credentials(24 * 60 * 60 * 1000);
+        assert!(pruned.is_empty());
+        assert!(auth.entries.contains_key("ext-prov"));
+    }
+
+    #[test]
+    fn test_credential_serialization_preserves_new_fields() {
+        let cred = AuthCredential::OAuth {
+            access_token: "tok".to_string(),
+            refresh_token: "ref".to_string(),
+            expires: 12345,
+            token_url: Some("https://example.com/token".to_string()),
+            client_id: Some("my-client".to_string()),
+        };
+
+        let json = serde_json::to_string(&cred).expect("serialize");
+        assert!(json.contains("token_url"));
+        assert!(json.contains("client_id"));
+
+        let parsed: AuthCredential = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            AuthCredential::OAuth {
+                token_url,
+                client_id,
+                ..
+            } => {
+                assert_eq!(token_url.as_deref(), Some("https://example.com/token"));
+                assert_eq!(client_id.as_deref(), Some("my-client"));
+            }
+            other => panic!("expected OAuth, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_credential_serialization_omits_none_fields() {
+        let cred = AuthCredential::OAuth {
+            access_token: "tok".to_string(),
+            refresh_token: "ref".to_string(),
+            expires: 12345,
+            token_url: None,
+            client_id: None,
+        };
+
+        let json = serde_json::to_string(&cred).expect("serialize");
+        assert!(!json.contains("token_url"));
+        assert!(!json.contains("client_id"));
+    }
+
+    #[test]
+    fn test_credential_deserialization_defaults_missing_fields() {
+        let json = r#"{"type":"o_auth","access_token":"tok","refresh_token":"ref","expires":12345}"#;
+        let parsed: AuthCredential = serde_json::from_str(json).expect("deserialize");
+        match parsed {
+            AuthCredential::OAuth {
+                token_url,
+                client_id,
+                ..
+            } => {
+                assert!(token_url.is_none());
+                assert!(client_id.is_none());
+            }
+            other => panic!("expected OAuth, got: {other:?}"),
+        }
     }
 }

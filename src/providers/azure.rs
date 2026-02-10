@@ -24,7 +24,7 @@ use std::pin::Pin;
 // Constants
 // ============================================================================
 
-const DEFAULT_API_VERSION: &str = "2024-02-15-preview";
+pub(crate) const DEFAULT_API_VERSION: &str = "2024-02-15-preview";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 // ============================================================================

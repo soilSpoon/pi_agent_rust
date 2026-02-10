@@ -1,5 +1,6 @@
 //! Error types for the Pi application.
 
+use crate::provider_metadata::{canonical_provider_id, provider_auth_env_keys};
 use thiserror::Error;
 
 /// Result type alias using our error type.
@@ -66,6 +67,7 @@ pub enum Error {
 pub enum AuthDiagnosticCode {
     MissingApiKey,
     InvalidApiKey,
+    QuotaExceeded,
     MissingOAuthAuthorizationCode,
     OAuthTokenExchangeFailed,
     OAuthTokenRefreshFailed,
@@ -84,6 +86,7 @@ impl AuthDiagnosticCode {
         match self {
             Self::MissingApiKey => "auth.missing_api_key",
             Self::InvalidApiKey => "auth.invalid_api_key",
+            Self::QuotaExceeded => "auth.quota_exceeded",
             Self::MissingOAuthAuthorizationCode => "auth.oauth.missing_authorization_code",
             Self::OAuthTokenExchangeFailed => "auth.oauth.token_exchange_failed",
             Self::OAuthTokenRefreshFailed => "auth.oauth.token_refresh_failed",
@@ -102,6 +105,9 @@ impl AuthDiagnosticCode {
         match self {
             Self::MissingApiKey => "Set the provider API key env var or run `/login <provider>`.",
             Self::InvalidApiKey => "Rotate or replace the API key and verify provider permissions.",
+            Self::QuotaExceeded => {
+                "Verify billing/quota limits for this API key or organization, then retry."
+            }
             Self::MissingOAuthAuthorizationCode => {
                 "Re-run `/login` and paste a full callback URL or authorization code."
             }
@@ -132,6 +138,7 @@ impl AuthDiagnosticCode {
         match self {
             Self::MissingApiKey
             | Self::InvalidApiKey
+            | Self::QuotaExceeded
             | Self::MissingOAuthAuthorizationCode
             | Self::OAuthTokenExchangeFailed
             | Self::OAuthTokenRefreshFailed
@@ -347,6 +354,7 @@ const fn build_auth_diagnostic(code: AuthDiagnosticCode) -> AuthDiagnostic {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn classify_auth_diagnostic(provider: Option<&str>, message: &str) -> Option<AuthDiagnostic> {
     let lower = message.to_lowercase();
     let provider_lower = provider.map(str::to_lowercase);
@@ -384,13 +392,44 @@ fn classify_auth_diagnostic(provider: Option<&str>, message: &str) -> Option<Aut
             "missing api key",
             "api key not configured",
             "api key is required",
+            "you didn't provide an api key",
+            "no api key provided",
+            "missing bearer",
+            "authorization header missing",
         ],
     ) {
         return Some(build_auth_diagnostic(AuthDiagnosticCode::MissingApiKey));
     }
     if contains_any(
         &lower,
-        &["401", "unauthorized", "403", "forbidden", "invalid api key"],
+        &[
+            "insufficient_quota",
+            "quota exceeded",
+            "quota has been exceeded",
+            "billing hard limit",
+            "billing_not_active",
+            "not enough credits",
+            "credit balance is too low",
+        ],
+    ) {
+        return Some(build_auth_diagnostic(AuthDiagnosticCode::QuotaExceeded));
+    }
+    if contains_any(
+        &lower,
+        &[
+            "401",
+            "unauthorized",
+            "403",
+            "forbidden",
+            "invalid api key",
+            "incorrect api key",
+            "malformed api key",
+            "api key is malformed",
+            "revoked",
+            "deactivated",
+            "disabled api key",
+            "expired api key",
+        ],
     ) {
         return Some(build_auth_diagnostic(AuthDiagnosticCode::InvalidApiKey));
     }
@@ -512,6 +551,7 @@ fn session_hints(message: &str) -> ErrorHints {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn provider_hints(provider: &str, message: &str) -> ErrorHints {
     let lower = message.to_lowercase();
     let key_hint = provider_key_hint(provider);
@@ -520,6 +560,24 @@ fn provider_hints(provider: &str, message: &str) -> ErrorHints {
         ("details", message.to_string()),
     ];
 
+    if contains_any(
+        &lower,
+        &[
+            "missing api key",
+            "you didn't provide an api key",
+            "no api key provided",
+            "authorization header missing",
+        ],
+    ) {
+        return build_hints(
+            "Provider API key is missing.",
+            vec![
+                key_hint,
+                "Set the API key and retry the request.".to_string(),
+            ],
+            context,
+        );
+    }
     if contains_any(
         &lower,
         &["401", "unauthorized", "invalid api key", "api key"],
@@ -536,6 +594,27 @@ fn provider_hints(provider: &str, message: &str) -> ErrorHints {
             vec![
                 "Verify the account has access to the requested model.".to_string(),
                 "Check organization/project permissions for the API key.".to_string(),
+            ],
+            context,
+        );
+    }
+    if contains_any(
+        &lower,
+        &[
+            "insufficient_quota",
+            "quota exceeded",
+            "quota has been exceeded",
+            "billing hard limit",
+            "billing_not_active",
+            "not enough credits",
+            "credit balance is too low",
+        ],
+    ) {
+        return build_hints(
+            "Provider quota or billing limit reached.",
+            vec![
+                "Verify billing/credits and organization quota for this API key.".to_string(),
+                key_hint,
             ],
             context,
         );
@@ -601,15 +680,24 @@ fn provider_hints(provider: &str, message: &str) -> ErrorHints {
 }
 
 fn provider_key_hint(provider: &str) -> String {
-    match provider.to_lowercase().as_str() {
-        "anthropic" => "Set `ANTHROPIC_API_KEY` (or use `/login anthropic`).".to_string(),
-        "openai" => "Set `OPENAI_API_KEY` for OpenAI requests.".to_string(),
-        "gemini" | "google" => "Set `GOOGLE_API_KEY` for Gemini requests.".to_string(),
-        "azure" | "azure_openai" | "azure-openai" => {
-            "Set `AZURE_OPENAI_API_KEY` for Azure OpenAI.".to_string()
+    let canonical = canonical_provider_id(provider).unwrap_or(provider);
+    let env_keys = provider_auth_env_keys(provider);
+    if !env_keys.is_empty() {
+        let key_list = env_keys
+            .iter()
+            .map(|key| format!("`{key}`"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        if canonical == "anthropic" {
+            return format!("Set {key_list} (or use `/login anthropic`).");
         }
-        _ => format!("Check API key configuration for provider `{provider}`."),
+        if canonical == "github-copilot" {
+            return format!("Set {key_list} (or use `/login github-copilot`).");
+        }
+        return format!("Set {key_list} for provider `{canonical}`.");
     }
+
+    format!("Check API key configuration for provider `{provider}`.")
 }
 
 fn auth_hints(message: &str) -> ErrorHints {
@@ -1086,6 +1174,20 @@ mod tests {
     }
 
     #[test]
+    fn hints_provider_key_hint_openrouter() {
+        let err = Error::provider("openrouter", "401 unauthorized");
+        let h = err.hints();
+        assert!(h.hints.iter().any(|s| s.contains("OPENROUTER_API_KEY")));
+    }
+
+    #[test]
+    fn hints_provider_key_hint_alias_dashscope() {
+        let err = Error::provider("dashscope", "401 invalid api key");
+        let h = err.hints();
+        assert!(h.hints.iter().any(|s| s.contains("DASHSCOPE_API_KEY")));
+    }
+
+    #[test]
     fn hints_provider_key_hint_azure() {
         let err = Error::provider("azure_openai", "401 unauthorized");
         let h = err.hints();
@@ -1136,6 +1238,53 @@ mod tests {
         assert_eq!(
             context_value(&hints, "redaction_policy"),
             Some("redact-secrets")
+        );
+    }
+
+    #[test]
+    fn auth_diagnostic_missing_key_phrase_for_oai_provider() {
+        let err = Error::provider(
+            "openrouter",
+            "You didn't provide an API key in the Authorization header",
+        );
+        let diagnostic = err.auth_diagnostic().expect("diagnostic should be present");
+        assert_eq!(diagnostic.code, AuthDiagnosticCode::MissingApiKey);
+        assert_eq!(diagnostic.code.as_str(), "auth.missing_api_key");
+    }
+
+    #[test]
+    fn auth_diagnostic_revoked_key_maps_invalid() {
+        let err = Error::provider("deepseek", "API key revoked for this project");
+        let diagnostic = err.auth_diagnostic().expect("diagnostic should be present");
+        assert_eq!(diagnostic.code, AuthDiagnosticCode::InvalidApiKey);
+        assert_eq!(diagnostic.code.as_str(), "auth.invalid_api_key");
+    }
+
+    #[test]
+    fn auth_diagnostic_quota_exceeded_code_and_context() {
+        let err = Error::provider(
+            "openai",
+            "HTTP 429 insufficient_quota: You exceeded your current quota",
+        );
+        let diagnostic = err.auth_diagnostic().expect("diagnostic should be present");
+        assert_eq!(diagnostic.code, AuthDiagnosticCode::QuotaExceeded);
+        assert_eq!(diagnostic.code.as_str(), "auth.quota_exceeded");
+        assert_eq!(
+            diagnostic.remediation,
+            "Verify billing/quota limits for this API key or organization, then retry."
+        );
+
+        let hints = err.hints();
+        assert_eq!(
+            context_value(&hints, "diagnostic_code"),
+            Some("auth.quota_exceeded")
+        );
+        assert!(
+            hints
+                .hints
+                .iter()
+                .any(|s| s.contains("billing") || s.contains("quota")),
+            "quota/billing guidance should be present"
         );
     }
 

@@ -568,6 +568,297 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         }),
         test_obligations: TEST_REQUIRED,
     },
+    // ── Batch A3: OAI-compatible preset providers ──────────────────────
+    ProviderMetadata {
+        canonical_id: "io-net",
+        aliases: &[],
+        auth_env_keys: &["IOINTELLIGENCE_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.intelligence.io.solutions/api/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "jiekou",
+        aliases: &[],
+        auth_env_keys: &["JIEKOU_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.jiekou.ai/openai",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "lucidquery",
+        aliases: &[],
+        auth_env_keys: &["LUCIDQUERY_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://lucidquery.com/api/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "moark",
+        aliases: &[],
+        auth_env_keys: &["MOARK_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://moark.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "morph",
+        aliases: &[],
+        auth_env_keys: &["MORPH_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.morphllm.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "nano-gpt",
+        aliases: &[],
+        auth_env_keys: &["NANO_GPT_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://nano-gpt.com/api/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "nova",
+        aliases: &[],
+        auth_env_keys: &["NOVA_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.nova.amazon.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "novita-ai",
+        aliases: &[],
+        auth_env_keys: &["NOVITA_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.novita.ai/openai",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "nvidia",
+        aliases: &[],
+        auth_env_keys: &["NVIDIA_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://integrate.api.nvidia.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    // ── Batch A4: OAI-compatible preset providers ──────────────────────
+    ProviderMetadata {
+        canonical_id: "poe",
+        aliases: &[],
+        auth_env_keys: &["POE_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.poe.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "privatemode-ai",
+        aliases: &[],
+        auth_env_keys: &["PRIVATEMODE_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            // Default is localhost; users override via PRIVATEMODE_ENDPOINT env var.
+            base_url: "http://localhost:8080/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "requesty",
+        aliases: &[],
+        auth_env_keys: &["REQUESTY_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://router.requesty.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "submodel",
+        aliases: &[],
+        auth_env_keys: &["SUBMODEL_INSTAGEN_ACCESS_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://llm.submodel.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "synthetic",
+        aliases: &[],
+        auth_env_keys: &["SYNTHETIC_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.synthetic.new/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "vivgrid",
+        aliases: &[],
+        auth_env_keys: &["VIVGRID_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.vivgrid.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "vultr",
+        aliases: &[],
+        auth_env_keys: &["VULTR_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.vultrinference.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "wandb",
+        aliases: &[],
+        auth_env_keys: &["WANDB_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.inference.wandb.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "xiaomi",
+        aliases: &[],
+        auth_env_keys: &["XIAOMI_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.xiaomimimo.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
     // ── Native adapter required providers ────────────────────────────────
     ProviderMetadata {
         canonical_id: "google-vertex",
@@ -580,14 +871,35 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     ProviderMetadata {
         canonical_id: "amazon-bedrock",
         aliases: &["bedrock"],
-        auth_env_keys: &["AWS_ACCESS_KEY_ID"],
+        auth_env_keys: &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_PROFILE",
+            "AWS_REGION",
+        ],
+        onboarding: ProviderOnboardingMode::NativeAdapterRequired,
+        routing_defaults: None,
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "sap-ai-core",
+        aliases: &["sap"],
+        auth_env_keys: &[
+            "AICORE_SERVICE_KEY",
+            "SAP_AI_CORE_CLIENT_ID",
+            "SAP_AI_CORE_CLIENT_SECRET",
+            "SAP_AI_CORE_TOKEN_URL",
+            "SAP_AI_CORE_SERVICE_URL",
+        ],
         onboarding: ProviderOnboardingMode::NativeAdapterRequired,
         routing_defaults: None,
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
         canonical_id: "azure-openai",
-        aliases: &["azure"],
+        aliases: &["azure", "azure-cognitive-services"],
         auth_env_keys: &["AZURE_OPENAI_API_KEY"],
         onboarding: ProviderOnboardingMode::NativeAdapterRequired,
         routing_defaults: None,
@@ -651,6 +963,9 @@ mod tests {
         assert_eq!(google_alias.canonical_id, "google");
         let azure_alias = provider_metadata("azure").expect("azure alias metadata");
         assert_eq!(azure_alias.canonical_id, "azure-openai");
+        let azure_cognitive_alias =
+            provider_metadata("azure-cognitive-services").expect("azure-cognitive alias metadata");
+        assert_eq!(azure_cognitive_alias.canonical_id, "azure-openai");
     }
 
     #[test]
@@ -668,8 +983,22 @@ mod tests {
             provider_auth_env_keys("vertexai"),
             &["GOOGLE_CLOUD_API_KEY"]
         );
-        assert_eq!(provider_auth_env_keys("bedrock"), &["AWS_ACCESS_KEY_ID"]);
+        assert_eq!(
+            provider_auth_env_keys("bedrock"),
+            &[
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_BEARER_TOKEN_BEDROCK",
+                "AWS_PROFILE",
+                "AWS_REGION",
+            ]
+        );
         assert_eq!(provider_auth_env_keys("azure"), &["AZURE_OPENAI_API_KEY"]);
+        assert_eq!(
+            provider_auth_env_keys("azure-cognitive-services"),
+            &["AZURE_OPENAI_API_KEY"]
+        );
         assert_eq!(
             provider_auth_env_keys("copilot"),
             &["GITHUB_COPILOT_API_KEY", "GITHUB_TOKEN"]
@@ -871,11 +1200,267 @@ mod tests {
         assert_eq!(urls.len(), ids.len(), "duplicate base URLs detected");
     }
 
+    // ── Batch A3 tests ────────────────────────────────────────────────
+
+    #[test]
+    fn batch_a3_metadata_resolves_all_nine_providers() {
+        let ids = [
+            "io-net",
+            "jiekou",
+            "lucidquery",
+            "moark",
+            "morph",
+            "nano-gpt",
+            "nova",
+            "novita-ai",
+            "nvidia",
+        ];
+        for id in &ids {
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} not found"));
+            assert_eq!(meta.canonical_id, *id);
+            assert_eq!(
+                meta.onboarding,
+                ProviderOnboardingMode::OpenAICompatiblePreset,
+                "{id} onboarding mode mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_a3_env_keys_match_upstream_registry() {
+        assert_eq!(
+            provider_metadata("io-net").unwrap().auth_env_keys,
+            &["IOINTELLIGENCE_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("jiekou").unwrap().auth_env_keys,
+            &["JIEKOU_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("lucidquery").unwrap().auth_env_keys,
+            &["LUCIDQUERY_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("moark").unwrap().auth_env_keys,
+            &["MOARK_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("morph").unwrap().auth_env_keys,
+            &["MORPH_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("nano-gpt").unwrap().auth_env_keys,
+            &["NANO_GPT_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("nova").unwrap().auth_env_keys,
+            &["NOVA_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("novita-ai").unwrap().auth_env_keys,
+            &["NOVITA_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("nvidia").unwrap().auth_env_keys,
+            &["NVIDIA_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn batch_a3_routing_defaults_use_openai_completions() {
+        let ids = [
+            "io-net",
+            "jiekou",
+            "lucidquery",
+            "moark",
+            "morph",
+            "nano-gpt",
+            "nova",
+            "novita-ai",
+            "nvidia",
+        ];
+        for id in &ids {
+            let defaults =
+                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            assert_eq!(
+                defaults.api, "openai-completions",
+                "{id} api should be openai-completions"
+            );
+            assert!(defaults.auth_header, "{id} auth_header should be true");
+        }
+    }
+
+    #[test]
+    fn batch_a3_base_urls_are_distinct_and_nonempty() {
+        let ids = [
+            "io-net",
+            "jiekou",
+            "lucidquery",
+            "moark",
+            "morph",
+            "nano-gpt",
+            "nova",
+            "novita-ai",
+            "nvidia",
+        ];
+        let mut urls: Vec<&str> = Vec::new();
+        for id in &ids {
+            let defaults =
+                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            assert!(
+                !defaults.base_url.is_empty(),
+                "{id} base_url must not be empty"
+            );
+            assert!(
+                defaults.base_url.starts_with("https://"),
+                "{id} base_url must use HTTPS"
+            );
+            urls.push(defaults.base_url);
+        }
+        urls.sort();
+        urls.dedup();
+        assert_eq!(urls.len(), ids.len(), "duplicate base URLs detected");
+    }
+
     #[test]
     fn fireworks_ai_alias_already_registered() {
         // fireworks-ai is listed in Batch A2 bead but already exists as alias
         // for the "fireworks" canonical entry from the initial metadata set.
         let meta = provider_metadata("fireworks-ai").expect("fireworks-ai alias");
         assert_eq!(meta.canonical_id, "fireworks");
+    }
+
+    // ── Batch A4 tests ────────────────────────────────────────────────
+
+    #[test]
+    fn batch_a4_metadata_resolves_all_nine_providers() {
+        let ids = [
+            "poe",
+            "privatemode-ai",
+            "requesty",
+            "submodel",
+            "synthetic",
+            "vivgrid",
+            "vultr",
+            "wandb",
+            "xiaomi",
+        ];
+        for id in &ids {
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} not found"));
+            assert_eq!(meta.canonical_id, *id);
+            assert_eq!(
+                meta.onboarding,
+                ProviderOnboardingMode::OpenAICompatiblePreset,
+                "{id} onboarding mode mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_a4_env_keys_match_upstream_registry() {
+        assert_eq!(
+            provider_metadata("poe").unwrap().auth_env_keys,
+            &["POE_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("privatemode-ai").unwrap().auth_env_keys,
+            &["PRIVATEMODE_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("requesty").unwrap().auth_env_keys,
+            &["REQUESTY_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("submodel").unwrap().auth_env_keys,
+            &["SUBMODEL_INSTAGEN_ACCESS_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("synthetic").unwrap().auth_env_keys,
+            &["SYNTHETIC_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("vivgrid").unwrap().auth_env_keys,
+            &["VIVGRID_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("vultr").unwrap().auth_env_keys,
+            &["VULTR_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("wandb").unwrap().auth_env_keys,
+            &["WANDB_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("xiaomi").unwrap().auth_env_keys,
+            &["XIAOMI_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn batch_a4_routing_defaults_use_openai_completions() {
+        let ids = [
+            "poe",
+            "privatemode-ai",
+            "requesty",
+            "submodel",
+            "synthetic",
+            "vivgrid",
+            "vultr",
+            "wandb",
+            "xiaomi",
+        ];
+        for id in &ids {
+            let defaults =
+                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            assert_eq!(
+                defaults.api, "openai-completions",
+                "{id} api should be openai-completions"
+            );
+            assert!(defaults.auth_header, "{id} auth_header should be true");
+        }
+    }
+
+    #[test]
+    fn batch_a4_base_urls_are_distinct_and_nonempty() {
+        let ids = [
+            "poe",
+            "privatemode-ai",
+            "requesty",
+            "submodel",
+            "synthetic",
+            "vivgrid",
+            "vultr",
+            "wandb",
+            "xiaomi",
+        ];
+        let mut urls: Vec<&str> = Vec::new();
+        for id in &ids {
+            let defaults =
+                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            assert!(
+                !defaults.base_url.is_empty(),
+                "{id} base_url must not be empty"
+            );
+            // privatemode-ai uses localhost (self-hosted); all others use HTTPS.
+            if *id != "privatemode-ai" {
+                assert!(
+                    defaults.base_url.starts_with("https://"),
+                    "{id} base_url must use HTTPS"
+                );
+            }
+            urls.push(defaults.base_url);
+        }
+        urls.sort();
+        urls.dedup();
+        assert_eq!(urls.len(), ids.len(), "duplicate base URLs detected");
+    }
+
+    #[test]
+    fn v0_not_onboarded_no_api_endpoint() {
+        // v0 (Vercel) has no API endpoint in models.dev; deferred until endpoint is published.
+        assert!(
+            provider_metadata("v0").is_none(),
+            "v0 should not be onboarded yet"
+        );
     }
 }

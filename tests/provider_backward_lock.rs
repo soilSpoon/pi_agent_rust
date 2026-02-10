@@ -830,6 +830,52 @@ fn factory_routes_batch_a2_providers_correctly() {
     }
 }
 
+#[test]
+fn factory_routes_batch_a3_providers_correctly() {
+    use pi::providers::create_provider;
+
+    let cases = [
+        ("io-net", "https://api.intelligence.io.solutions/api/v1"),
+        ("jiekou", "https://api.jiekou.ai/openai"),
+        ("lucidquery", "https://lucidquery.com/api/v1"),
+        ("moark", "https://moark.com/v1"),
+        ("morph", "https://api.morphllm.com/v1"),
+        ("nano-gpt", "https://nano-gpt.com/api/v1"),
+        ("nova", "https://api.nova.amazon.com/v1"),
+        ("novita-ai", "https://api.novita.ai/openai"),
+        ("nvidia", "https://integrate.api.nvidia.com/v1"),
+    ];
+    for (provider, base_url) in &cases {
+        let entry = oai_compat_entry(provider, base_url);
+        let p = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("factory should route {provider}: {e}"));
+        assert_eq!(p.api(), "openai-completions", "{provider} api mismatch");
+    }
+}
+
+#[test]
+fn factory_routes_batch_a4_providers_correctly() {
+    use pi::providers::create_provider;
+
+    let cases = [
+        ("poe", "https://api.poe.com/v1"),
+        ("privatemode-ai", "http://localhost:8080/v1"),
+        ("requesty", "https://router.requesty.ai/v1"),
+        ("submodel", "https://llm.submodel.ai/v1"),
+        ("synthetic", "https://api.synthetic.new/v1"),
+        ("vivgrid", "https://api.vivgrid.com/v1"),
+        ("vultr", "https://api.vultrinference.com/v1"),
+        ("wandb", "https://api.inference.wandb.ai/v1"),
+        ("xiaomi", "https://api.xiaomimimo.com/v1"),
+    ];
+    for (provider, base_url) in &cases {
+        let entry = oai_compat_entry(provider, base_url);
+        let p = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("factory should route {provider}: {e}"));
+        assert_eq!(p.api(), "openai-completions", "{provider} api mismatch");
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Cross-provider: field name differences (locked)
 // ═══════════════════════════════════════════════════════════════════════

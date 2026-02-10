@@ -159,7 +159,7 @@ impl Provider for AnthropicProvider {
             .api_key
             .clone()
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-            .ok_or_else(|| Error::config("Missing Anthropic API key"))?;
+            .ok_or_else(|| Error::provider("anthropic", "Missing Anthropic API key. Set ANTHROPIC_API_KEY or use `pi auth`."))?;
 
         let request_body = self.build_request(context, options);
 
@@ -199,9 +199,10 @@ impl Provider for AnthropicProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
-            return Err(Error::api(format!(
-                "Anthropic API error (HTTP {status}): {body}"
-            )));
+            return Err(Error::provider(
+                "anthropic",
+                format!("Anthropic API error (HTTP {status}): {body}"),
+            ));
         }
 
         // Create SSE stream for streaming responses.

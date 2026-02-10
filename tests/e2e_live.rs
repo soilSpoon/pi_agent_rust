@@ -27,6 +27,7 @@ use pi::config::Config;
 use pi::model::{Message, StopReason, StreamEvent, UserContent, UserMessage};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::provider::{Context, Provider, StreamOptions};
+use pi::provider_metadata::provider_auth_env_keys;
 use pi::providers::anthropic::AnthropicProvider;
 use pi::providers::azure::AzureOpenAIProvider;
 use pi::providers::gemini::GeminiProvider;
@@ -304,17 +305,24 @@ fn provider_config_or_skip(provider: &str, harness: &TestHarness) -> Option<Live
     }
 
     let config = discovery.configs.get(provider).cloned()?;
-    if provider == "azure-openai" {
+    if is_azure_provider(provider) {
         if let Err(reason) = resolve_azure_runtime_config(&config) {
-            eprintln!("SKIPPED: provider 'azure-openai' disabled ({reason})");
+            eprintln!("SKIPPED: provider '{provider}' disabled ({reason})");
             return None;
         }
     }
     Some(config)
 }
 
+fn is_azure_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "azure-openai" | "azure" | "azure-cognitive-services"
+    )
+}
+
 fn required_fields_for_provider_api(provider: &str, api: &str) -> Vec<String> {
-    if provider == "azure-openai" {
+    if is_azure_provider(provider) {
         return vec![
             "model_id".to_string(),
             "api_key".to_string(),
@@ -340,20 +348,77 @@ fn required_fields_for_provider_api(provider: &str, api: &str) -> Vec<String> {
 }
 
 fn provider_env_var_names(provider: &str) -> &'static [&'static str] {
-    match provider {
-        "anthropic" => &["ANTHROPIC_API_KEY"],
-        "openai" => &["OPENAI_API_KEY"],
-        "google" | "gemini" => &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
-        "xai" => &["XAI_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "azure-openai" | "azure" => &["AZURE_OPENAI_API_KEY"],
-        "amazon-bedrock" | "bedrock" => &["AWS_ACCESS_KEY_ID"],
-        "google-vertex" | "vertexai" => &["GOOGLE_CLOUD_API_KEY"],
-        "github-copilot" | "copilot" => &["GITHUB_COPILOT_API_KEY", "GITHUB_TOKEN"],
-        "gitlab" | "gitlab-duo" => &["GITLAB_TOKEN", "GITLAB_API_KEY"],
-        "fireworks" | "fireworks-ai" => &["FIREWORKS_API_KEY"],
-        _ => &[],
+    provider_auth_env_keys(provider)
+}
+
+#[test]
+fn provider_env_var_names_uses_canonical_metadata_for_oai_compat() {
+    assert_eq!(
+        provider_env_var_names("openrouter"),
+        &["OPENROUTER_API_KEY"]
+    );
+    assert_eq!(provider_env_var_names("xai"), &["XAI_API_KEY"]);
+    assert_eq!(provider_env_var_names("deepseek"), &["DEEPSEEK_API_KEY"]);
+    assert_eq!(provider_env_var_names("dashscope"), &["DASHSCOPE_API_KEY"]);
+    assert_eq!(provider_env_var_names("kimi"), &["MOONSHOT_API_KEY"]);
+}
+
+#[test]
+fn provider_env_var_names_support_azure_cognitive_alias() {
+    assert_eq!(provider_env_var_names("azure"), &["AZURE_OPENAI_API_KEY"]);
+    assert_eq!(
+        provider_env_var_names("azure-cognitive-services"),
+        &["AZURE_OPENAI_API_KEY"]
+    );
+}
+
+#[test]
+fn oai_auth_failure_script_matrix_maps_to_taxonomy() {
+    let cases = [
+        (
+            "openrouter",
+            "You didn't provide an API key in the Authorization header",
+            pi::error::AuthDiagnosticCode::MissingApiKey,
+        ),
+        (
+            "xai",
+            "Malformed API key: expected Bearer token format",
+            pi::error::AuthDiagnosticCode::InvalidApiKey,
+        ),
+        (
+            "deepseek",
+            "API key revoked for this project",
+            pi::error::AuthDiagnosticCode::InvalidApiKey,
+        ),
+        (
+            "openai",
+            "HTTP 429 insufficient_quota: You exceeded your current quota",
+            pi::error::AuthDiagnosticCode::QuotaExceeded,
+        ),
+    ];
+
+    for (provider, message, expected_code) in cases {
+        let err = pi::Error::provider(provider, message);
+        let diagnostic = err
+            .auth_diagnostic()
+            .unwrap_or_else(|| panic!("expected auth diagnostic for {provider}: {message}"));
+        assert_eq!(diagnostic.code, expected_code, "provider {provider}");
+
+        let hints = err.hints();
+        assert!(
+            hints
+                .context
+                .iter()
+                .any(|(key, value)| key == "provider" && value == provider),
+            "provider context missing for {provider}"
+        );
+        assert!(
+            hints
+                .context
+                .iter()
+                .any(|(key, _)| key == "diagnostic_code"),
+            "diagnostic_code context missing for {provider}"
+        );
     }
 }
 
@@ -387,7 +452,7 @@ fn provider_model_override_var(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("ANTHROPIC_TEST_MODEL"),
         "openai" => Some("OPENAI_TEST_MODEL"),
-        "azure-openai" => Some("AZURE_OPENAI_DEPLOYMENT"),
+        "azure-openai" | "azure" | "azure-cognitive-services" => Some("AZURE_OPENAI_DEPLOYMENT"),
         "google" => Some("GOOGLE_TEST_MODEL"),
         "openrouter" => Some("OPENROUTER_TEST_MODEL"),
         "xai" => Some("XAI_TEST_MODEL"),
@@ -451,9 +516,12 @@ fn select_model_entry_for_provider(registry: &ModelRegistry, provider: &str) -> 
 
 fn build_provider(config: &LiveProviderConfig) -> Box<dyn Provider> {
     match config.api.as_str() {
-        "openai-completions" if config.provider == "azure-openai" => {
+        "openai-completions" if is_azure_provider(&config.provider) => {
             let runtime = resolve_azure_runtime_config(config).unwrap_or_else(|err| {
-                panic!("azure-openai config resolution failed for live e2e: {err}")
+                panic!(
+                    "azure provider '{}' config resolution failed for live e2e: {err}",
+                    config.provider
+                )
             });
             let mut provider = AzureOpenAIProvider::new(runtime.resource, runtime.deployment);
             if let Some(api_version) = runtime.api_version {
@@ -507,7 +575,10 @@ fn parse_azure_base_url_details(
 
     let resource = url
         .host_str()
-        .and_then(|host| host.strip_suffix(".openai.azure.com"))
+        .and_then(|host| {
+            host.strip_suffix(".openai.azure.com")
+                .or_else(|| host.strip_suffix(".cognitiveservices.azure.com"))
+        })
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
@@ -569,6 +640,16 @@ fn resolve_azure_runtime_config(config: &LiveProviderConfig) -> Result<AzureRunt
         deployment,
         api_version,
     })
+}
+
+#[test]
+fn parse_azure_base_url_details_supports_cognitive_services_host() {
+    let (resource, deployment, api_version) = parse_azure_base_url_details(
+        "https://myresource.cognitiveservices.azure.com/openai/deployments/deploy-123/chat/completions?api-version=2024-10-21",
+    );
+    assert_eq!(resource.as_deref(), Some("myresource"));
+    assert_eq!(deployment.as_deref(), Some("deploy-123"));
+    assert_eq!(api_version.as_deref(), Some("2024-10-21"));
 }
 
 // ---------------------------------------------------------------------------

@@ -47,7 +47,7 @@ Current artifact coverage (`docs/provider-implementation-modes.json`):
 | `openai` | - | `openai-responses` (default), `openai-completions` (compat) | `https://api.openai.com/v1` (normalized to `/responses` or `/chat/completions`) | `Authorization: Bearer` (`OPENAI_API_KEY`) | `native-implemented` | Implemented and dispatchable | unit + contract + live-smoke |
 | `google` | `gemini` | `google-generative-ai` | `https://generativelanguage.googleapis.com/v1beta` | query key (`GOOGLE_API_KEY`, fallback `GEMINI_API_KEY`) | `native-implemented` | Implemented and dispatchable | unit + contract + live-smoke |
 | `cohere` | - | `cohere-chat` | `https://api.cohere.com/v2` (normalized to `/chat`) | `Authorization: Bearer` (`COHERE_API_KEY`) | `native-implemented` | Implemented and dispatchable | unit + contract + live-smoke |
-| `azure-openai` | `azure` | Azure chat/completions path | `https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}` | `api-key` header (`AZURE_OPENAI_API_KEY`) | `native-partial` | Module exists; current factory path intentionally returns config/wiring error | unit + contract + live-smoke (after wiring) |
+| `azure-openai` | `azure`, `azure-cognitive-services` | Azure chat/completions path | `https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}` or `https://{resource}.cognitiveservices.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}` | `api-key` header (`AZURE_OPENAI_API_KEY`) | `native-implemented` | Dispatchable through provider factory with deterministic resource/deployment/api-version resolution from env + model/base_url | unit + contract + live-smoke |
 | `groq` | - | `openai-completions` | `https://api.groq.com/openai/v1` | `Authorization: Bearer` (`GROQ_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
 | `deepinfra` | - | `openai-completions` | `https://api.deepinfra.com/v1/openai` | `Authorization: Bearer` (`DEEPINFRA_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
 | `cerebras` | - | `openai-completions` | `https://api.cerebras.ai/v1` | `Authorization: Bearer` (`CEREBRAS_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
@@ -67,7 +67,6 @@ Provider IDs already recognized in auth/enums but not yet fully dispatchable:
 
 | ID | Current state | User impact | Required follow-up |
 |----|---------------|-------------|--------------------|
-| `azure-openai` | `native-partial` (implementation exists, factory currently returns error) | Requires manual models/config and cannot use normal provider-name routing yet | Factory wiring + config validation + contract/e2e coverage |
 | `google-vertex` (`vertexai`) | `missing` (enum/env mapping only) | Cannot route requests through a dedicated Vertex path | Add metadata + provider routing + tests |
 | `amazon-bedrock` (`bedrock`) | `missing` (enum/env mapping only) | No Bedrock dispatch path despite enum/env references | Add native or adapter implementation + tests |
 | `github-copilot` (`copilot`) | `missing` (enum/env mapping only) | No runtime provider selection path | Decide implementation mode + add tests/docs |
@@ -75,7 +74,7 @@ Provider IDs already recognized in auth/enums but not yet fully dispatchable:
 ## Already-Covered vs Missing Snapshot
 
 Covered now:
-- 4 native dispatchable providers: `anthropic`, `openai`, `google`, `cohere`.
+- 5 native dispatchable providers: `anthropic`, `openai`, `google`, `cohere`, `azure-openai`.
 - 12 OpenAI-compatible preset providers dispatchable via fallback adapters:
   `groq`, `deepinfra`, `cerebras`, `openrouter`, `mistral`, `moonshotai`, `dashscope`,
   `deepseek`, `fireworks`, `togetherai`, `perplexity`, `xai`.
@@ -83,7 +82,6 @@ Covered now:
   `moonshot`/`kimi` -> `moonshotai`, and `alibaba`/`qwen` -> `dashscope`.
 
 Not fully covered yet:
-- 1 partial native path: `azure-openai`.
 - 3 recognized-but-missing paths: `google-vertex`, `amazon-bedrock`, `github-copilot`.
 - Additional upstream IDs from `models.dev + opencode + code` remain to be classified in the
   frozen upstream snapshot workflow (`bd-3uqg.1.1`).

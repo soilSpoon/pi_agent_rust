@@ -791,23 +791,40 @@ fn schema_compat_headers_respect_precedence_for_openai_responses() {
 }
 
 #[test]
-fn create_provider_rejects_azure_without_deployment() {
-    let harness = TestHarness::new("create_provider_rejects_azure_without_deployment");
+fn create_provider_azure_openai_routes_natively() {
+    let harness = TestHarness::new("create_provider_azure_openai_routes_natively");
     let entry = make_model_entry("azure-openai", "gpt-4o", "https://example.openai.azure.com");
-    let err = create_provider(&entry, None)
-        .err()
-        .expect("expected azure-openai error");
-    harness.log().info_ctx("provider", "azure error", |ctx| {
-        ctx.push(("error".to_string(), err.to_string()));
+    let provider = create_provider(&entry, None).expect("azure-openai provider");
+    harness.log().info_ctx("provider", "azure route", |ctx| {
+        ctx.push(("name".to_string(), provider.name().to_string()));
+        ctx.push(("api".to_string(), provider.api().to_string()));
+        ctx.push(("model".to_string(), provider.model_id().to_string()));
     });
+    assert_eq!(provider.name(), "azure");
+    assert_eq!(provider.api(), "azure-openai");
+    assert!(!provider.model_id().is_empty());
+}
 
-    match err {
-        Error::Provider { provider, message } => {
-            assert_eq!(provider, "azure-openai");
-            assert!(message.contains("resource+deployment"));
-        }
-        other => unreachable!("unexpected error: {other}"),
-    }
+#[test]
+fn create_provider_azure_cognitive_services_alias_routes_natively() {
+    let harness =
+        TestHarness::new("create_provider_azure_cognitive_services_alias_routes_natively");
+    let entry = make_model_entry(
+        "azure-cognitive-services",
+        "gpt-4o-mini",
+        "https://example.cognitiveservices.azure.com",
+    );
+    let provider = create_provider(&entry, None).expect("azure-cognitive-services provider");
+    harness
+        .log()
+        .info_ctx("provider", "azure cognitive route", |ctx| {
+            ctx.push(("name".to_string(), provider.name().to_string()));
+            ctx.push(("api".to_string(), provider.api().to_string()));
+            ctx.push(("model".to_string(), provider.model_id().to_string()));
+        });
+    assert_eq!(provider.name(), "azure");
+    assert_eq!(provider.api(), "azure-openai");
+    assert!(!provider.model_id().is_empty());
 }
 
 #[test]

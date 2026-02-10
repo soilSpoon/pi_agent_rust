@@ -36,6 +36,7 @@ use pi::http::client::Client;
 use pi::model::{Message, StreamEvent, ThinkingLevel, Usage, UserContent, UserMessage};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::provider::{Context, Provider, StreamOptions};
+use pi::provider_metadata::provider_auth_env_keys;
 use pi::providers::anthropic::AnthropicProvider;
 use pi::providers::gemini::GeminiProvider;
 use pi::providers::openai::OpenAIProvider;
@@ -920,21 +921,7 @@ const LIVE_E2E_REDACTED_VALUE: &str = "[REDACTED]";
 
 #[must_use]
 fn provider_api_key_env_vars(provider: &str) -> &'static [&'static str] {
-    match provider {
-        "anthropic" => &["ANTHROPIC_API_KEY"],
-        "openai" => &["OPENAI_API_KEY"],
-        "google" | "gemini" => &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
-        "xai" => &["XAI_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "azure-openai" | "azure" => &["AZURE_OPENAI_API_KEY"],
-        "amazon-bedrock" | "bedrock" => &["AWS_ACCESS_KEY_ID"],
-        "google-vertex" | "vertexai" => &["GOOGLE_CLOUD_API_KEY"],
-        "github-copilot" | "copilot" => &["GITHUB_COPILOT_API_KEY", "GITHUB_TOKEN"],
-        "gitlab" | "gitlab-duo" => &["GITLAB_TOKEN", "GITLAB_API_KEY"],
-        "fireworks" | "fireworks-ai" => &["FIREWORKS_API_KEY"],
-        _ => &[],
-    }
+    provider_auth_env_keys(provider)
 }
 
 #[must_use]
@@ -1510,6 +1497,7 @@ pub async fn run_live_provider_target(
     let mut final_summary = LiveStreamSummary::default();
     let mut final_error: Option<String> = None;
     let mut final_response_status: Option<u16> = None;
+    let mut final_auth_diagnostic: Option<pi::error::AuthDiagnostic> = None;
     let mut final_status = "failed".to_string();
 
     for attempt in 1..=LIVE_E2E_MAX_ATTEMPTS {
@@ -1568,6 +1556,10 @@ pub async fn run_live_provider_target(
         let summary_error = summary_result
             .err()
             .or_else(|| summary.stream_error.clone());
+        let attempt_auth_diagnostic = summary_error.as_ref().and_then(|error_message| {
+            pi::Error::provider(entry.model.provider.as_str(), error_message.as_str())
+                .auth_diagnostic()
+        });
         let http_failure = response_status.is_some_and(|status| !(200..300).contains(&status));
         let has_failure = summary_error.is_some() || http_failure;
 
@@ -1603,12 +1595,27 @@ pub async fn run_live_provider_target(
                 if let Some(error) = &summary_error {
                     ctx.push(("error".into(), error.clone()));
                 }
+                if let Some(diagnostic) = attempt_auth_diagnostic {
+                    ctx.push((
+                        "diagnostic_code".into(),
+                        diagnostic.code.as_str().to_string(),
+                    ));
+                    ctx.push((
+                        "diagnostic_remediation".into(),
+                        diagnostic.remediation.to_string(),
+                    ));
+                    ctx.push((
+                        "redaction_policy".into(),
+                        diagnostic.redaction_policy.to_string(),
+                    ));
+                }
             });
 
         final_trace = trace;
         final_summary = summary;
         final_error = summary_error.clone();
         final_response_status = response_status;
+        final_auth_diagnostic = attempt_auth_diagnostic;
         final_status = if has_failure {
             "failed".to_string()
         } else {
@@ -1639,6 +1646,12 @@ pub async fn run_live_provider_target(
                     }
                     if let Some(error) = &summary_error {
                         ctx.push(("error".into(), error.clone()));
+                    }
+                    if let Some(diagnostic) = attempt_auth_diagnostic {
+                        ctx.push((
+                            "diagnostic_code".into(),
+                            diagnostic.code.as_str().to_string(),
+                        ));
                     }
                 },
             );
@@ -1674,6 +1687,20 @@ pub async fn run_live_provider_target(
             }
             if let Some(error) = &final_error {
                 ctx.push(("error".into(), error.clone()));
+            }
+            if let Some(diagnostic) = final_auth_diagnostic {
+                ctx.push((
+                    "diagnostic_code".into(),
+                    diagnostic.code.as_str().to_string(),
+                ));
+                ctx.push((
+                    "diagnostic_remediation".into(),
+                    diagnostic.remediation.to_string(),
+                ));
+                ctx.push((
+                    "redaction_policy".into(),
+                    diagnostic.redaction_policy.to_string(),
+                ));
             }
         });
 
@@ -1809,5 +1836,20 @@ mod tests {
         let dump = harness.log().dump();
         assert!(dump.contains("header.authorization = [REDACTED]"));
         assert!(!dump.contains("secret-token"));
+    }
+
+    #[test]
+    fn test_provider_api_key_env_vars_use_metadata_aliases() {
+        assert_eq!(
+            provider_api_key_env_vars("openrouter"),
+            &["OPENROUTER_API_KEY"]
+        );
+        assert_eq!(provider_api_key_env_vars("xai"), &["XAI_API_KEY"]);
+        assert_eq!(provider_api_key_env_vars("deepseek"), &["DEEPSEEK_API_KEY"]);
+        assert_eq!(
+            provider_api_key_env_vars("dashscope"),
+            &["DASHSCOPE_API_KEY"]
+        );
+        assert_eq!(provider_api_key_env_vars("kimi"), &["MOONSHOT_API_KEY"]);
     }
 }

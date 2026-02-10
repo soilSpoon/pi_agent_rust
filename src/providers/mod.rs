@@ -20,6 +20,7 @@ use serde_json::Value;
 use std::env;
 use std::pin::Pin;
 use std::sync::Arc;
+use url::Url;
 
 pub mod anthropic;
 pub mod azure;
@@ -69,7 +70,7 @@ enum ProviderRouteKind {
     NativeOpenAIResponses,
     NativeCohere,
     NativeGoogle,
-    NativeAzureUnsupported,
+    NativeAzure,
     ApiAnthropicMessages,
     ApiOpenAICompletions,
     ApiOpenAIResponses,
@@ -85,7 +86,7 @@ impl ProviderRouteKind {
             Self::NativeOpenAIResponses => "native:openai-responses",
             Self::NativeCohere => "native:cohere",
             Self::NativeGoogle => "native:google",
-            Self::NativeAzureUnsupported => "native:azure-openai-unsupported",
+            Self::NativeAzure => "native:azure-openai",
             Self::ApiAnthropicMessages => "api:anthropic-messages",
             Self::ApiOpenAICompletions => "api:openai-completions",
             Self::ApiOpenAIResponses => "api:openai-responses",
@@ -116,7 +117,7 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
         }
         "cohere" => ProviderRouteKind::NativeCohere,
         "google" => ProviderRouteKind::NativeGoogle,
-        "azure-openai" => ProviderRouteKind::NativeAzureUnsupported,
+        "azure-openai" | "azure" | "azure-cognitive-services" => ProviderRouteKind::NativeAzure,
         _ => match effective_api.as_str() {
             "anthropic-messages" => ProviderRouteKind::ApiAnthropicMessages,
             "openai-completions" => ProviderRouteKind::ApiOpenAICompletions,
@@ -133,6 +134,132 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
     };
 
     Ok((route, canonical_provider.to_string(), effective_api))
+}
+
+const AZURE_OPENAI_RESOURCE_ENV: &str = "AZURE_OPENAI_RESOURCE";
+const AZURE_OPENAI_DEPLOYMENT_ENV: &str = "AZURE_OPENAI_DEPLOYMENT";
+const AZURE_OPENAI_API_VERSION_ENV: &str = "AZURE_OPENAI_API_VERSION";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AzureProviderRuntime {
+    resource: String,
+    deployment: String,
+    api_version: String,
+    endpoint_url: String,
+}
+
+fn trim_non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn parse_azure_resource_from_host(host: &str) -> Option<String> {
+    host.strip_suffix(".openai.azure.com")
+        .or_else(|| host.strip_suffix(".cognitiveservices.azure.com"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn parse_azure_base_url_details(
+    base_url: &str,
+) -> Result<(String, Option<String>, Option<String>)> {
+    let url = Url::parse(base_url)
+        .map_err(|err| Error::config(format!("Invalid Azure base_url '{base_url}': {err}")))?;
+    let host = url.host_str().map(ToString::to_string).ok_or_else(|| {
+        Error::config(format!(
+            "Azure base_url is missing host information: '{base_url}'"
+        ))
+    })?;
+
+    let mut deployment = None;
+    if let Some(segments) = url.path_segments() {
+        let mut iter = segments;
+        while let Some(segment) = iter.next() {
+            if segment == "deployments" {
+                deployment = iter
+                    .next()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string);
+                break;
+            }
+        }
+    }
+
+    let api_version = url
+        .query_pairs()
+        .find(|(key, _)| key == "api-version")
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.trim().is_empty());
+
+    Ok((host, deployment, api_version))
+}
+
+fn resolve_azure_provider_runtime(entry: &ModelEntry) -> Result<AzureProviderRuntime> {
+    resolve_azure_provider_runtime_with_env(entry, |name| env::var(name).ok())
+}
+
+fn resolve_azure_provider_runtime_with_env<F>(
+    entry: &ModelEntry,
+    mut env_lookup: F,
+) -> Result<AzureProviderRuntime>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let base_url = entry.model.base_url.trim();
+    if base_url.is_empty() {
+        return Err(Error::config(format!(
+            "Missing Azure base_url for provider '{}'; expected https://<resource>.openai.azure.com or https://<resource>.cognitiveservices.azure.com",
+            entry.model.provider
+        )));
+    }
+
+    let (host, base_deployment, base_api_version) = parse_azure_base_url_details(base_url)?;
+    let host_resource = parse_azure_resource_from_host(&host);
+    let env_resource = trim_non_empty(env_lookup(AZURE_OPENAI_RESOURCE_ENV));
+    let resource = env_resource.or(host_resource).ok_or_else(|| {
+        Error::config(format!(
+            "Unable to resolve Azure resource for provider '{}'; set {AZURE_OPENAI_RESOURCE_ENV} or use an Azure host in base_url ('{base_url}')",
+            entry.model.provider
+        ))
+    })?;
+
+    let env_deployment = trim_non_empty(env_lookup(AZURE_OPENAI_DEPLOYMENT_ENV));
+    let model_deployment = {
+        let model_id = entry.model.id.trim();
+        (!model_id.is_empty()).then(|| model_id.to_string())
+    };
+    let deployment = env_deployment
+        .or(model_deployment)
+        .or(base_deployment)
+        .ok_or_else(|| {
+            Error::config(format!(
+                "Unable to resolve Azure deployment for provider '{}'; set {AZURE_OPENAI_DEPLOYMENT_ENV}, provide a non-empty model id, or include '/deployments/<name>' in base_url ('{base_url}')",
+                entry.model.provider
+            ))
+        })?;
+
+    let api_version = trim_non_empty(env_lookup(AZURE_OPENAI_API_VERSION_ENV))
+        .or(base_api_version)
+        .unwrap_or_else(|| azure::DEFAULT_API_VERSION.to_string());
+
+    let endpoint_host = if parse_azure_resource_from_host(&host).is_some() {
+        host
+    } else {
+        format!("{resource}.openai.azure.com")
+    };
+    let endpoint_url = format!(
+        "https://{endpoint_host}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    );
+
+    Ok(AzureProviderRuntime {
+        resource,
+        deployment,
+        api_version,
+        endpoint_url,
+    })
 }
 
 impl ExtensionStreamSimpleProvider {
@@ -571,10 +698,15 @@ pub fn create_provider(
                 .with_compat(entry.compat.clone())
                 .with_client(client),
         )),
-        ProviderRouteKind::NativeAzureUnsupported => Err(Error::provider(
-            "azure-openai",
-            "Azure OpenAI provider requires resource+deployment; configure via models.json",
-        )),
+        ProviderRouteKind::NativeAzure => {
+            let runtime = resolve_azure_provider_runtime(entry)?;
+            Ok(Arc::new(
+                azure::AzureOpenAIProvider::new(runtime.resource, runtime.deployment)
+                    .with_api_version(runtime.api_version)
+                    .with_endpoint_url(runtime.endpoint_url)
+                    .with_client(client),
+            ))
+        }
     }
 }
 
@@ -1194,6 +1326,59 @@ export default function init(pi) {
         assert_eq!(effective_api, "openai");
     }
 
+    #[test]
+    fn resolve_provider_route_uses_native_azure_route_for_cognitive_alias() {
+        let entry = model_entry(
+            "azure-cognitive-services",
+            "openai-completions",
+            "gpt-4o-mini",
+            "https://myresource.cognitiveservices.azure.com",
+        );
+        let (route, canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve azure cognitive route");
+        assert_eq!(route, ProviderRouteKind::NativeAzure);
+        assert_eq!(canonical_provider, "azure-openai");
+        assert_eq!(effective_api, "openai-completions");
+    }
+
+    #[test]
+    fn resolve_azure_provider_runtime_supports_openai_host() {
+        let entry = model_entry(
+            "azure-openai",
+            "openai-completions",
+            "gpt-4o",
+            "https://myresource.openai.azure.com",
+        );
+        let runtime =
+            resolve_azure_provider_runtime_with_env(&entry, |_| None).expect("resolve runtime");
+        assert_eq!(runtime.resource, "myresource");
+        assert_eq!(runtime.deployment, "gpt-4o");
+        assert_eq!(runtime.api_version, "2024-02-15-preview");
+        assert_eq!(
+            runtime.endpoint_url,
+            "https://myresource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview"
+        );
+    }
+
+    #[test]
+    fn resolve_azure_provider_runtime_supports_cognitive_services_host() {
+        let entry = model_entry(
+            "azure-cognitive-services",
+            "openai-completions",
+            "gpt-4o-mini",
+            "https://myresource.cognitiveservices.azure.com/openai/deployments/custom/chat/completions?api-version=2024-10-21",
+        );
+        let runtime =
+            resolve_azure_provider_runtime_with_env(&entry, |_| None).expect("resolve runtime");
+        assert_eq!(runtime.resource, "myresource");
+        assert_eq!(runtime.deployment, "gpt-4o-mini");
+        assert_eq!(runtime.api_version, "2024-10-21");
+        assert_eq!(
+            runtime.endpoint_url,
+            "https://myresource.cognitiveservices.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2024-10-21"
+        );
+    }
+
     // ── create_provider: built-in provider selection ─────────────────
 
     #[test]
@@ -1271,21 +1456,31 @@ export default function init(pi) {
     }
 
     #[test]
-    fn create_provider_azure_openai_returns_error() {
+    fn create_provider_azure_openai_by_name() {
         let entry = model_entry(
             "azure-openai",
             "openai-completions",
             "gpt-4o",
             "https://myresource.openai.azure.com",
         );
-        let Err(err) = create_provider(&entry, None) else {
-            panic!("azure should fail");
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("resource+deployment"),
-            "expected resource+deployment message, got: {msg}"
+        let provider = create_provider(&entry, None).expect("azure provider");
+        assert_eq!(provider.name(), "azure");
+        assert_eq!(provider.api(), "azure-openai");
+        assert!(!provider.model_id().is_empty());
+    }
+
+    #[test]
+    fn create_provider_azure_cognitive_services_alias_by_name() {
+        let entry = model_entry(
+            "azure-cognitive-services",
+            "openai-completions",
+            "gpt-4o-mini",
+            "https://myresource.cognitiveservices.azure.com",
         );
+        let provider = create_provider(&entry, None).expect("azure cognitive provider");
+        assert_eq!(provider.name(), "azure");
+        assert_eq!(provider.api(), "azure-openai");
+        assert!(!provider.model_id().is_empty());
     }
 
     // ── create_provider: API fallback path ──────────────────────────

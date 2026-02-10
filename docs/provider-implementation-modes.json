@@ -459,17 +459,17 @@
       "provider_id": "io-net",
       "canonical_id": "io-net",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A3 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "jiekou",
       "canonical_id": "jiekou",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A3 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "kimi-for-coding",
@@ -507,9 +507,9 @@
       "provider_id": "lucidquery",
       "canonical_id": "lucidquery",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A3 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "minimax",
@@ -555,9 +555,9 @@
       "provider_id": "moark",
       "canonical_id": "moark",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A3 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "modelscope",
@@ -587,17 +587,17 @@
       "provider_id": "morph",
       "canonical_id": "morph",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A3 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "nano-gpt",
       "canonical_id": "nano-gpt",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A3 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "nebius",
@@ -611,25 +611,25 @@
       "provider_id": "nova",
       "canonical_id": "nova",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A3 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "novita-ai",
       "canonical_id": "novita-ai",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A3 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "nvidia",
       "canonical_id": "nvidia",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A3 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "ollama",
@@ -691,25 +691,25 @@
       "provider_id": "poe",
       "canonical_id": "poe",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A4 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "privatemode-ai",
       "canonical_id": "privatemode-ai",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A4 onboarding: self-hosted (localhost default); users set PRIVATEMODE_ENDPOINT to override."
     },
     {
       "provider_id": "requesty",
       "canonical_id": "requesty",
       "id_kind": "canonical",
-      "profile": "gateway-wrapper-high-risk",
-      "current_runtime_status": "missing",
-      "rationale": "Router/gateway style integration requires wrapper-level traceability and error attribution."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A4 onboarding: gateway-style router but exposes standard OAI-compatible endpoint. Canonical metadata, env-key, and routing defaults added."
     },
     {
       "provider_id": "sap-ai-core",
@@ -747,17 +747,17 @@
       "provider_id": "submodel",
       "canonical_id": "submodel",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A4 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "synthetic",
       "canonical_id": "synthetic",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A4 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "togetherai",
@@ -811,25 +811,25 @@
       "provider_id": "vivgrid",
       "canonical_id": "vivgrid",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A4 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "vultr",
       "canonical_id": "vultr",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A4 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "wandb",
       "canonical_id": "wandb",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A4 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "xai",
@@ -843,9 +843,9 @@
       "provider_id": "xiaomi",
       "canonical_id": "xiaomi",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No validated protocol/auth route in current runtime."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A4 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "zai",
@@ -943,18 +943,18 @@
     "classification_profile_counts": {
       "native-established": 4,
       "native-new-high-risk": 11,
-      "oai-compatible-preset": 28,
-      "gateway-wrapper-high-risk": 6,
-      "deferred-watchlist": 40,
+      "oai-compatible-preset": 46,
+      "gateway-wrapper-high-risk": 5,
+      "deferred-watchlist": 23,
       "alias-forwarder": 10
     },
     "bucket_counts": {
       "native-adapter-required": 15,
-      "openai-compatible-preset": 28,
-      "gateway-wrapper-routing": 6,
-      "deferred": 50
+      "openai-compatible-preset": 46,
+      "gateway-wrapper-routing": 5,
+      "deferred": 33
     },
-    "high_risk_provider_count": 17,
+    "high_risk_provider_count": 16,
     "high_risk_provider_ids": [
       "amazon-bedrock",
       "azure",
@@ -969,7 +969,6 @@
       "ollama",
       "ollama-cloud",
       "opencode",
-      "requesty",
       "sap-ai-core",
       "vercel",
       "zenmux"
