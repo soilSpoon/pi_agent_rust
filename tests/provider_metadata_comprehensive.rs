@@ -214,27 +214,39 @@ fn oai_compatible_providers_have_routing_defaults() {
 }
 
 #[test]
-fn native_adapter_providers_have_no_routing_defaults() {
+fn native_adapter_providers_routing_defaults_are_consistent() {
+    // Native adapter providers MAY have routing_defaults (for context_window,
+    // max_tokens, etc.) but their base_url is typically empty because they
+    // construct URLs from provider-specific config (project/region/deployment).
     for meta in PROVIDER_METADATA {
         if meta.onboarding == ProviderOnboardingMode::NativeAdapterRequired {
-            assert!(
-                meta.routing_defaults.is_none(),
-                "native-adapter provider '{}' should not have routing_defaults",
-                meta.canonical_id
-            );
+            if let Some(defaults) = &meta.routing_defaults {
+                // Native providers with routing_defaults should have an
+                // API identifier (non-empty).
+                assert!(
+                    !defaults.api.is_empty(),
+                    "native-adapter provider '{}' has routing_defaults but empty api",
+                    meta.canonical_id
+                );
+            }
         }
     }
 }
 
 #[test]
 fn all_oai_compatible_base_urls_are_nonempty() {
+    // Native providers (BuiltInNative, NativeAdapterRequired) may have empty
+    // base_url because they construct endpoints from provider-specific config.
+    // Only OpenAI-compatible presets require a non-empty base_url.
     for meta in PROVIDER_METADATA {
-        if let Some(defaults) = &meta.routing_defaults {
-            assert!(
-                !defaults.base_url.is_empty(),
-                "provider '{}' has empty base_url",
-                meta.canonical_id
-            );
+        if meta.onboarding == ProviderOnboardingMode::OpenAICompatiblePreset {
+            if let Some(defaults) = &meta.routing_defaults {
+                assert!(
+                    !defaults.base_url.is_empty(),
+                    "OAI-compatible provider '{}' has empty base_url",
+                    meta.canonical_id
+                );
+            }
         }
     }
 }
@@ -244,6 +256,10 @@ fn all_oai_compatible_base_urls_are_unique() {
     let mut url_to_provider: HashMap<&str, &str> = HashMap::new();
     for meta in PROVIDER_METADATA {
         if let Some(defaults) = &meta.routing_defaults {
+            // Skip empty base_urls (native providers construct URLs differently).
+            if defaults.base_url.is_empty() {
+                continue;
+            }
             if let Some(prev) = url_to_provider.insert(defaults.base_url, meta.canonical_id) {
                 panic!(
                     "base_url '{}' used by both '{}' and '{}'",
@@ -262,6 +278,11 @@ fn oai_compatible_defaults_use_known_api_family() {
         "anthropic-messages",
         "cohere-chat",
         "google-generative-ai",
+        // Native provider API families:
+        "google-vertex",
+        "bedrock-converse-stream",
+        "gitlab-chat",
+        "copilot-openai",
     ];
     for meta in PROVIDER_METADATA {
         if let Some(defaults) = &meta.routing_defaults {
@@ -359,6 +380,7 @@ fn factory_dispatches_every_oai_compatible_provider() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn factory_dispatches_native_established_providers() {
     use pi::providers::create_provider;
 
@@ -572,7 +594,7 @@ fn generate_canonical_id_alias_table_json() {
     let readback = std::fs::read_to_string(path).expect("read back");
     let parsed: Value = serde_json::from_str(&readback).expect("parse back");
     assert_eq!(
-        parsed["total_providers"].as_u64().unwrap() as usize,
+        usize::try_from(parsed["total_providers"].as_u64().unwrap()).unwrap(),
         PROVIDER_METADATA.len()
     );
 }
