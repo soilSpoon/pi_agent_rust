@@ -24,10 +24,14 @@ use url::Url;
 
 pub mod anthropic;
 pub mod azure;
+pub mod bedrock;
 pub mod cohere;
+pub mod copilot;
 pub mod gemini;
+pub mod gitlab;
 pub mod openai;
 pub mod openai_responses;
+pub mod vertex;
 
 fn vcr_client_if_enabled() -> Result<Option<Client>> {
     if env::var(VCR_ENV_MODE).is_err() {
@@ -70,7 +74,11 @@ enum ProviderRouteKind {
     NativeOpenAIResponses,
     NativeCohere,
     NativeGoogle,
+    NativeGoogleVertex,
+    NativeBedrock,
     NativeAzure,
+    NativeCopilot,
+    NativeGitlab,
     ApiAnthropicMessages,
     ApiOpenAICompletions,
     ApiOpenAIResponses,
@@ -86,7 +94,11 @@ impl ProviderRouteKind {
             Self::NativeOpenAIResponses => "native:openai-responses",
             Self::NativeCohere => "native:cohere",
             Self::NativeGoogle => "native:google",
+            Self::NativeGoogleVertex => "native:google-vertex",
+            Self::NativeBedrock => "native:amazon-bedrock",
             Self::NativeAzure => "native:azure-openai",
+            Self::NativeCopilot => "native:github-copilot",
+            Self::NativeGitlab => "native:gitlab",
             Self::ApiAnthropicMessages => "api:anthropic-messages",
             Self::ApiOpenAICompletions => "api:openai-completions",
             Self::ApiOpenAIResponses => "api:openai-responses",
@@ -117,13 +129,19 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
         }
         "cohere" => ProviderRouteKind::NativeCohere,
         "google" => ProviderRouteKind::NativeGoogle,
+        "google-vertex" | "vertexai" => ProviderRouteKind::NativeGoogleVertex,
+        "amazon-bedrock" | "bedrock" => ProviderRouteKind::NativeBedrock,
         "azure-openai" | "azure" | "azure-cognitive-services" => ProviderRouteKind::NativeAzure,
+        "github-copilot" | "copilot" => ProviderRouteKind::NativeCopilot,
+        "gitlab" | "gitlab-duo" => ProviderRouteKind::NativeGitlab,
         _ => match effective_api.as_str() {
             "anthropic-messages" => ProviderRouteKind::ApiAnthropicMessages,
             "openai-completions" => ProviderRouteKind::ApiOpenAICompletions,
             "openai-responses" => ProviderRouteKind::ApiOpenAIResponses,
             "cohere-chat" => ProviderRouteKind::ApiCohereChat,
             "google-generative-ai" => ProviderRouteKind::ApiGoogleGenerativeAi,
+            "google-vertex" => ProviderRouteKind::NativeGoogleVertex,
+            "bedrock-converse-stream" => ProviderRouteKind::NativeBedrock,
             _ => {
                 return Err(Error::provider(
                     &entry.model.provider,
@@ -698,6 +716,24 @@ pub fn create_provider(
                 .with_compat(entry.compat.clone())
                 .with_client(client),
         )),
+        ProviderRouteKind::NativeGoogleVertex => {
+            let runtime = vertex::resolve_vertex_provider_runtime(entry)?;
+            Ok(Arc::new(
+                vertex::VertexProvider::new(runtime.model)
+                    .with_project(runtime.project)
+                    .with_location(runtime.location)
+                    .with_publisher(runtime.publisher)
+                    .with_compat(entry.compat.clone())
+                    .with_client(client),
+            ))
+        }
+        ProviderRouteKind::NativeBedrock => Ok(Arc::new(
+            bedrock::BedrockProvider::new(&entry.model.id)
+                .with_provider_name(&entry.model.provider)
+                .with_base_url(&entry.model.base_url)
+                .with_compat(entry.compat.clone())
+                .with_client(client),
+        )),
         ProviderRouteKind::NativeAzure => {
             let runtime = resolve_azure_provider_runtime(entry)?;
             Ok(Arc::new(
@@ -707,6 +743,30 @@ pub fn create_provider(
                     .with_client(client),
             ))
         }
+        ProviderRouteKind::NativeCopilot => {
+            let github_token = env::var("GITHUB_COPILOT_API_KEY")
+                .or_else(|_| env::var("GITHUB_TOKEN"))
+                .map_err(|_| {
+                    Error::auth(
+                        "GitHub Copilot requires GITHUB_COPILOT_API_KEY or GITHUB_TOKEN to be set",
+                    )
+                })?;
+            let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
+                .with_provider_name(&entry.model.provider)
+                .with_compat(entry.compat.clone())
+                .with_client(client);
+            if !entry.model.base_url.is_empty() {
+                provider = provider.with_github_api_base(&entry.model.base_url);
+            }
+            Ok(Arc::new(provider))
+        }
+        ProviderRouteKind::NativeGitlab => Ok(Arc::new(
+            gitlab::GitLabProvider::new(&entry.model.id)
+                .with_provider_name(&entry.model.provider)
+                .with_base_url(&entry.model.base_url)
+                .with_compat(entry.compat.clone())
+                .with_client(client),
+        )),
     }
 }
 
@@ -1327,6 +1387,36 @@ export default function init(pi) {
     }
 
     #[test]
+    fn resolve_provider_route_cloudflare_workers_defaults_to_openai_completions() {
+        let entry = model_entry(
+            "cloudflare-workers-ai",
+            "",
+            "@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-account/ai/v1",
+        );
+        let (route, canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve cloudflare workers route");
+        assert_eq!(route, ProviderRouteKind::ApiOpenAICompletions);
+        assert_eq!(canonical_provider, "cloudflare-workers-ai");
+        assert_eq!(effective_api, "openai-completions");
+    }
+
+    #[test]
+    fn resolve_provider_route_cloudflare_gateway_defaults_to_openai_completions() {
+        let entry = model_entry(
+            "cloudflare-ai-gateway",
+            "",
+            "gpt-4o-mini",
+            "https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/openai",
+        );
+        let (route, canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve cloudflare gateway route");
+        assert_eq!(route, ProviderRouteKind::ApiOpenAICompletions);
+        assert_eq!(canonical_provider, "cloudflare-ai-gateway");
+        assert_eq!(effective_api, "openai-completions");
+    }
+
+    #[test]
     fn resolve_provider_route_uses_native_azure_route_for_cognitive_alias() {
         let entry = model_entry(
             "azure-cognitive-services",
@@ -1483,6 +1573,36 @@ export default function init(pi) {
         assert!(!provider.model_id().is_empty());
     }
 
+    #[test]
+    fn create_provider_cloudflare_workers_ai_by_name() {
+        let entry = model_entry(
+            "cloudflare-workers-ai",
+            "",
+            "@cf/meta/llama-3.1-8b-instruct",
+            "https://api.cloudflare.com/client/v4/accounts/test-account/ai/v1",
+        );
+        let provider = create_provider(&entry, None).expect("cloudflare workers provider");
+        assert_eq!(provider.name(), "cloudflare-workers-ai");
+        assert_eq!(provider.api(), "openai-completions");
+        assert_eq!(provider.model_id(), "@cf/meta/llama-3.1-8b-instruct");
+    }
+
+    #[test]
+    fn create_provider_cloudflare_ai_gateway_by_name() {
+        let entry = model_entry(
+            "cloudflare-ai-gateway",
+            "",
+            "gpt-4o-mini",
+            "https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/openai",
+        );
+        let provider = create_provider(&entry, None).expect("cloudflare gateway provider");
+        assert_eq!(provider.name(), "cloudflare-ai-gateway");
+        assert_eq!(provider.api(), "openai-completions");
+        assert_eq!(provider.model_id(), "gpt-4o-mini");
+    }
+
+
+
     // ── create_provider: API fallback path ──────────────────────────
 
     #[test]
@@ -1544,6 +1664,22 @@ export default function init(pi) {
         );
         let provider = create_provider(&entry, None).expect("fallback google provider");
         assert_eq!(provider.model_id(), "custom-gemini");
+    }
+
+    #[test]
+    fn resolve_provider_route_copilot_routes_correctly() {
+        let entry = model_entry("github-copilot", "", "gpt-4o", "");
+        let (route, canonical, _api) = resolve_provider_route(&entry).expect("copilot route");
+        assert_eq!(route, ProviderRouteKind::NativeCopilot);
+        assert_eq!(canonical, "github-copilot");
+    }
+
+    #[test]
+    fn resolve_provider_route_copilot_alias_routes_correctly() {
+        let entry = model_entry("copilot", "", "gpt-4o", "");
+        let (route, canonical, _api) = resolve_provider_route(&entry).expect("copilot alias route");
+        assert_eq!(route, ProviderRouteKind::NativeCopilot);
+        assert_eq!(canonical, "github-copilot");
     }
 
     #[test]
@@ -1825,6 +1961,94 @@ export default function init(pi) {
         assert_eq!(provider.model_id(), "custom-gemini");
     }
 
+    // ── bd-3uqg.3.1: Google Vertex AI provider routing ──────────────
+
+    #[test]
+    fn resolve_provider_route_google_vertex_routes_to_native() {
+        let entry = model_entry(
+            "google-vertex",
+            "google-vertex",
+            "gemini-2.0-flash",
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash",
+        );
+        let (route, canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve google-vertex route");
+        assert_eq!(route, ProviderRouteKind::NativeGoogleVertex);
+        assert_eq!(canonical_provider, "google-vertex");
+        assert_eq!(effective_api, "google-vertex");
+    }
+
+    #[test]
+    fn resolve_provider_route_vertexai_alias_routes_to_native() {
+        let entry = model_entry(
+            "vertexai",
+            "google-vertex",
+            "gemini-2.0-flash",
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash",
+        );
+        let (route, canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve vertexai alias route");
+        assert_eq!(route, ProviderRouteKind::NativeGoogleVertex);
+        assert_eq!(canonical_provider, "vertexai");
+        assert_eq!(effective_api, "google-vertex");
+    }
+
+    #[test]
+    fn resolve_provider_route_google_vertex_api_fallback() {
+        // Unknown provider but google-vertex API should still route correctly
+        let entry = model_entry(
+            "custom-vertex",
+            "google-vertex",
+            "gemini-2.0-flash",
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash",
+        );
+        let (route, _canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve google-vertex fallback");
+        assert_eq!(route, ProviderRouteKind::NativeGoogleVertex);
+        assert_eq!(effective_api, "google-vertex");
+    }
+
+    #[test]
+    fn create_provider_google_vertex_from_full_url() {
+        let entry = model_entry(
+            "google-vertex",
+            "google-vertex",
+            "gemini-2.0-flash",
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash",
+        );
+        let provider = create_provider(&entry, None).expect("google-vertex from full URL");
+        assert_eq!(provider.name(), "google-vertex");
+        assert_eq!(provider.api(), "google-vertex");
+        assert_eq!(provider.model_id(), "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn create_provider_google_vertex_anthropic_publisher() {
+        let entry = model_entry(
+            "google-vertex",
+            "google-vertex",
+            "claude-sonnet-4-5",
+            "https://us-east5-aiplatform.googleapis.com/v1/projects/my-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5",
+        );
+        let provider =
+            create_provider(&entry, None).expect("google-vertex with anthropic publisher");
+        assert_eq!(provider.name(), "google-vertex");
+        assert_eq!(provider.model_id(), "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn create_provider_google_vertex_accepts_compat_config() {
+        let entry = model_entry_with_compat(
+            "google-vertex",
+            "google-vertex",
+            "gemini-2.0-flash",
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash",
+            compat_with_custom_headers(),
+        );
+        let provider = create_provider(&entry, None).expect("google-vertex with compat");
+        assert_eq!(provider.name(), "google-vertex");
+    }
+
     #[test]
     fn create_provider_compat_none_accepted_by_all_routes() {
         // Verify None compat doesn't break anything (regression guard)
@@ -1841,6 +2065,11 @@ export default function init(pi) {
                 "google",
                 "google-generative-ai",
                 "https://generativelanguage.googleapis.com",
+            ),
+            (
+                "google-vertex",
+                "google-vertex",
+                "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/test-model",
             ),
         ];
         for (provider, api, base_url) in routes {
