@@ -1,8 +1,9 @@
 //! `OpenAI` Responses API provider streaming tests (VCR playback/recording).
 
 use super::{
-    ScenarioExpectation, StreamExpectations, assert_stream_expectations, cassette_root,
-    collect_events, log_summary, user_text, vcr_mode, vcr_strict,
+    ScenarioExpectation, StreamExpectations, assert_error_translation, assert_stream_expectations,
+    assert_tool_schema_fidelity, cassette_root, collect_events, log_summary,
+    record_stream_contract_artifact, user_text, vcr_mode, vcr_strict,
 };
 use crate::common::TestHarness;
 use pi::http::client::Client;
@@ -115,24 +116,33 @@ async fn run_scenario(scenario: Scenario) {
             let summary = super::summarize_events(&outcome);
             log_summary(&harness, scenario.name, &summary);
             assert_stream_expectations(&harness, scenario.name, &summary, &expectations);
+            assert_tool_schema_fidelity(
+                &harness,
+                scenario.name,
+                &scenario.tools,
+                &summary.tool_calls,
+            );
+            record_stream_contract_artifact(
+                &harness,
+                "openai-responses",
+                scenario.name,
+                scenario.description,
+                &summary,
+            );
         }
         ScenarioExpectation::Error(expectation) => {
             let Err(err) = provider.stream(&context, &options).await else {
                 panic!("expected error, got success");
             };
             let message = err.to_string();
-            let needle = format!("HTTP {}", expectation.status);
-            assert!(
-                message.contains(&needle),
-                "expected error to contain '{needle}', got '{message}'"
+            assert_error_translation(
+                &harness,
+                "openai-responses",
+                scenario.name,
+                scenario.description,
+                &expectation,
+                &message,
             );
-            if let Some(fragment) = expectation.contains {
-                assert!(
-                    message.contains(fragment),
-                    "expected error to contain '{fragment}', got '{message}'"
-                );
-            }
-            harness.log().info("error", message);
         }
     }
 }

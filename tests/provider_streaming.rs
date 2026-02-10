@@ -19,7 +19,9 @@ use pi::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, ToolResultMessage,
     Usage, UserContent, UserMessage,
 };
+use pi::provider::ToolDef;
 use pi::vcr::VcrMode;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fmt::Write as _;
@@ -319,6 +321,124 @@ pub(crate) fn assert_stream_expectations(
             "{scenario}: expected stop reason in {allowed:?}, got {reason:?}"
         );
     }
+}
+
+pub(crate) fn assert_tool_schema_fidelity(
+    harness: &TestHarness,
+    scenario: &str,
+    tool_defs: &[ToolDef],
+    tool_calls: &[ToolCall],
+) {
+    if tool_calls.is_empty() {
+        return;
+    }
+
+    for tool_call in tool_calls {
+        let Some(tool_def) = tool_defs.iter().find(|tool| tool.name == tool_call.name) else {
+            panic!(
+                "{scenario}: tool call '{}' has no matching schema definition",
+                tool_call.name
+            );
+        };
+        let validator = jsonschema::draft202012::options()
+            .should_validate_formats(true)
+            .build(&tool_def.parameters)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{scenario}: invalid JSON schema for tool '{}': {err}",
+                    tool_call.name
+                )
+            });
+        if let Err(err) = validator.validate(&tool_call.arguments) {
+            panic!(
+                "{scenario}: tool '{}' arguments failed schema validation: {err}; arguments={}",
+                tool_call.name, tool_call.arguments
+            );
+        }
+    }
+
+    harness
+        .log()
+        .info_ctx("contract", "Tool schema fidelity verified", |ctx| {
+            ctx.push(("scenario".into(), scenario.to_string()));
+            ctx.push(("tool_calls".into(), tool_calls.len().to_string()));
+        });
+}
+
+pub(crate) fn record_stream_contract_artifact(
+    harness: &TestHarness,
+    provider: &str,
+    scenario: &str,
+    description: &str,
+    summary: &StreamSummary,
+) {
+    let file_name = format!("{provider}_{scenario}.contract.json");
+    let path = harness.temp_path(&file_name);
+    let payload = json!({
+        "schema": "pi.test.provider_contract.v1",
+        "provider": provider,
+        "scenario": scenario,
+        "description": description,
+        "event_count": summary.event_count,
+        "has_start": summary.has_start,
+        "has_done": summary.has_done,
+        "has_error_event": summary.has_error_event,
+        "timeline": &summary.timeline,
+        "stop_reason": summary.stop_reason.as_ref().map(|reason| format!("{reason:?}")),
+        "text_sha256": sha256_hex(summary.text.as_bytes()),
+        "thinking_sha256": sha256_hex(summary.thinking.as_bytes()),
+        "text_chars": summary.text.chars().count(),
+        "thinking_chars": summary.thinking.chars().count(),
+        "tool_call_count": summary.tool_calls.len(),
+        "tool_call_ids": summary.tool_calls.iter().map(|call| call.id.clone()).collect::<Vec<_>>(),
+        "tool_call_names": summary.tool_calls.iter().map(|call| call.name.clone()).collect::<Vec<_>>(),
+        "stream_error": summary.stream_error.as_deref(),
+    });
+    let serialized = serde_json::to_string_pretty(&payload)
+        .unwrap_or_else(|_| "{\"schema\":\"serialization_error\"}".to_string());
+    std::fs::write(&path, serialized)
+        .unwrap_or_else(|err| panic!("write stream contract artifact {}: {err}", path.display()));
+    harness.record_artifact(format!("contract/{file_name}"), &path);
+}
+
+pub(crate) fn assert_error_translation(
+    harness: &TestHarness,
+    provider: &str,
+    scenario: &str,
+    description: &str,
+    expectation: &ErrorExpectation,
+    message: &str,
+) {
+    let needle = format!("HTTP {}", expectation.status);
+    assert!(
+        message.contains(&needle),
+        "{scenario}: expected error to contain '{needle}', got '{message}'"
+    );
+    if let Some(fragment) = expectation.contains {
+        assert!(
+            message.contains(fragment),
+            "{scenario}: expected error to contain '{fragment}', got '{message}'"
+        );
+    }
+    harness.log().info("error", message);
+
+    let file_name = format!("{provider}_{scenario}.error-contract.json");
+    let path = harness.temp_path(&file_name);
+    let payload = json!({
+        "schema": "pi.test.provider_error_translation.v1",
+        "provider": provider,
+        "scenario": scenario,
+        "description": description,
+        "expected_status": expectation.status,
+        "expected_fragment": expectation.contains,
+        "message": message,
+        "contains_http_status": message.contains(&needle),
+    });
+    let serialized = serde_json::to_string_pretty(&payload)
+        .unwrap_or_else(|_| "{\"schema\":\"serialization_error\"}".to_string());
+    std::fs::write(&path, serialized)
+        .unwrap_or_else(|err| panic!("write error translation artifact {}: {err}", path.display()));
+    harness.record_artifact(format!("contract/{file_name}"), &path);
 }
 
 pub(crate) fn user_text(text: &str) -> Message {

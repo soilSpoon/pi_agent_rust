@@ -6,9 +6,11 @@
 mod common;
 
 use common::{
-    LIVE_SHORT_PROMPT, LiveE2eRegistry, LiveProviderTarget, TestHarness, check_cost_budget,
-    ci_e2e_tests_enabled, default_cost_thresholds, find_unredacted_keys, run_live_provider_target,
-    validate_jsonl, write_live_provider_runs_jsonl,
+    LIVE_E2E_EXECUTION_MODE, LIVE_E2E_MAX_ATTEMPTS, LIVE_E2E_REPLAY_BOUNDARY,
+    LIVE_E2E_RETRY_BACKOFF_MS, LIVE_E2E_TRACE_ORIGIN, LIVE_SHORT_PROMPT, LiveE2eRegistry,
+    LiveProviderTarget, TestHarness, check_cost_budget, ci_e2e_tests_enabled,
+    default_cost_thresholds, find_unredacted_keys, run_live_provider_target, validate_jsonl,
+    write_live_provider_runs_jsonl,
 };
 use pi::model::Usage;
 use pi::provider::ModelCost;
@@ -92,6 +94,12 @@ struct LiveProviderResultRecord {
     tool_calls: usize,
     stop_reason: Option<String>,
     usage: Usage,
+    attempts: u32,
+    retry_backoff_ms: Vec<u64>,
+    credential_source: Option<String>,
+    execution_mode: String,
+    replay_boundary: String,
+    trace_origin: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +354,74 @@ fn validate_live_result_records(records: &[LiveProviderResultRecord], expected: 
             index + 1,
             record.status
         );
+        assert_eq!(
+            record.execution_mode,
+            LIVE_E2E_EXECUTION_MODE,
+            "unexpected execution mode at line {}",
+            index + 1
+        );
+        assert_eq!(
+            record.replay_boundary,
+            LIVE_E2E_REPLAY_BOUNDARY,
+            "unexpected replay boundary at line {}",
+            index + 1
+        );
+        assert_eq!(
+            record.trace_origin,
+            LIVE_E2E_TRACE_ORIGIN,
+            "unexpected trace origin at line {}",
+            index + 1
+        );
+
+        let attempts = usize::try_from(record.attempts).unwrap_or(usize::MAX);
+        let expected_backoffs = attempts.saturating_sub(1);
+        assert!(
+            record.retry_backoff_ms.len() <= expected_backoffs,
+            "retry backoff count exceeds attempts at line {}",
+            index + 1
+        );
+        if attempts > 1 {
+            assert!(
+                !record.retry_backoff_ms.is_empty(),
+                "missing retry backoff schedule at line {}",
+                index + 1
+            );
+        }
+        for (retry_index, backoff_ms) in record.retry_backoff_ms.iter().enumerate() {
+            let expected_ms =
+                LIVE_E2E_RETRY_BACKOFF_MS[retry_index.min(LIVE_E2E_RETRY_BACKOFF_MS.len() - 1)];
+            assert_eq!(
+                *backoff_ms,
+                expected_ms,
+                "unexpected retry backoff at line {} retry {}",
+                index + 1,
+                retry_index + 1
+            );
+        }
+
+        if record.status == "skipped" {
+            assert_eq!(
+                record.attempts,
+                0,
+                "skipped runs should report zero attempts at line {}",
+                index + 1
+            );
+        } else {
+            assert!(
+                (1..=LIVE_E2E_MAX_ATTEMPTS).contains(&attempts),
+                "attempt count out of range at line {}: {}",
+                index + 1,
+                record.attempts
+            );
+            assert!(
+                record
+                    .credential_source
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "non-skipped runs must report credential_source at line {}",
+                index + 1
+            );
+        }
     }
 }
 
@@ -466,6 +542,12 @@ fn e2e_live_provider_harness_smoke() {
                     tool_calls: run.tool_calls,
                     stop_reason: run.stop_reason.clone(),
                     usage: run.usage.clone(),
+                    attempts: run.attempts,
+                    retry_backoff_ms: run.retry_backoff_ms.clone(),
+                    credential_source: run.credential_source.clone(),
+                    execution_mode: run.execution_mode.clone(),
+                    replay_boundary: run.replay_boundary.clone(),
+                    trace_origin: run.trace_origin.clone(),
                 })
                 .collect();
             let run_contract_path = harness_ref.temp_path("live_provider_results.contract.jsonl");

@@ -897,6 +897,107 @@ fn write_response(stream: &mut TcpStream, response: &MockHttpResponse) -> std::i
 pub const LIVE_E2E_GATE_ENV: &str = "CI_E2E_TESTS";
 pub const LIVE_E2E_TIMEOUT: Duration = Duration::from_secs(30);
 pub const LIVE_SHORT_PROMPT: &str = "Say just the word hello.";
+pub const LIVE_E2E_EXECUTION_MODE: &str = "live_record";
+pub const LIVE_E2E_TRACE_ORIGIN: &str = "vcr_last_interaction";
+pub const LIVE_E2E_REPLAY_BOUNDARY: &str = "live_request_then_vcr_trace_extract";
+pub const LIVE_E2E_MAX_ATTEMPTS: usize = 3;
+pub const LIVE_E2E_RETRYABLE_HTTP_STATUS: [u16; 7] = [408, 429, 500, 502, 503, 504, 529];
+pub const LIVE_E2E_RETRY_BACKOFF_MS: [u64; 2] = [500, 1_500];
+
+const LIVE_E2E_REDACTION_KEY_FRAGMENTS: [&str; 10] = [
+    "api_key",
+    "api-key",
+    "authorization",
+    "bearer",
+    "cookie",
+    "credential",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+];
+const LIVE_E2E_REDACTED_VALUE: &str = "[REDACTED]";
+
+#[must_use]
+fn provider_api_key_env_vars(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "openai" => &["OPENAI_API_KEY"],
+        "google" => &["GOOGLE_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "azure-openai" => &["AZURE_OPENAI_API_KEY"],
+        _ => &[],
+    }
+}
+
+#[must_use]
+fn is_live_sensitive_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    LIVE_E2E_REDACTION_KEY_FRAGMENTS
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+}
+
+#[must_use]
+fn redact_sensitive_header_pairs(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .map(|(key, value)| {
+            if is_live_sensitive_key(&key) {
+                (key, LIVE_E2E_REDACTED_VALUE.to_string())
+            } else {
+                (key, value)
+            }
+        })
+        .collect()
+}
+
+#[must_use]
+fn is_retryable_status(status: u16) -> bool {
+    LIVE_E2E_RETRYABLE_HTTP_STATUS.contains(&status)
+}
+
+#[must_use]
+fn is_retryable_error(error_message: Option<&str>) -> bool {
+    let Some(error_message) = error_message else {
+        return false;
+    };
+    let lower = error_message.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "econnreset",
+        "econnrefused",
+        "eagain",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+#[must_use]
+fn retry_backoff_for_attempt(attempt: usize) -> Duration {
+    let idx = attempt
+        .saturating_sub(1)
+        .min(LIVE_E2E_RETRY_BACKOFF_MS.len().saturating_sub(1));
+    Duration::from_millis(LIVE_E2E_RETRY_BACKOFF_MS[idx])
+}
+
+#[must_use]
+fn should_retry_live_attempt(
+    attempt: usize,
+    response_status: Option<u16>,
+    error_message: Option<&str>,
+) -> bool {
+    if attempt >= LIVE_E2E_MAX_ATTEMPTS {
+        return false;
+    }
+    response_status.is_some_and(is_retryable_status) || is_retryable_error(error_message)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct LiveProviderTarget {
@@ -966,10 +1067,37 @@ impl LiveE2eRegistry {
     }
 
     #[must_use]
+    pub fn resolve_api_key_with_source(&self, entry: &ModelEntry) -> Option<(String, String)> {
+        for env_var in provider_api_key_env_vars(&entry.model.provider) {
+            if let Ok(value) = env::var(env_var) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some((value.to_string(), format!("env:{env_var}")));
+                }
+            }
+        }
+
+        if let Some(value) = self.auth.api_key(&entry.model.provider) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some((value.to_string(), "auth_store".to_string()));
+            }
+        }
+
+        if let Some(value) = &entry.api_key {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some((value.to_string(), "models_json".to_string()));
+            }
+        }
+
+        None
+    }
+
+    #[must_use]
     pub fn resolve_api_key(&self, entry: &ModelEntry) -> Option<String> {
-        self.auth
-            .resolve_api_key(&entry.model.provider, None)
-            .or_else(|| entry.api_key.clone())
+        self.resolve_api_key_with_source(entry)
+            .map(|(api_key, _source)| api_key)
     }
 
     #[must_use]
@@ -982,7 +1110,7 @@ impl LiveE2eRegistry {
             let model_id = model_id.trim();
             if !model_id.is_empty() {
                 if let Some(entry) = self.registry.find(target.provider, model_id) {
-                    if self.resolve_api_key(&entry).is_some() {
+                    if self.resolve_api_key_with_source(&entry).is_some() {
                         return Some(entry);
                     }
                 }
@@ -992,7 +1120,7 @@ impl LiveE2eRegistry {
 
         for model_id in target.preferred_models {
             if let Some(entry) = self.registry.find(target.provider, model_id) {
-                if self.resolve_api_key(&entry).is_some() {
+                if self.resolve_api_key_with_source(&entry).is_some() {
                     return Some(entry);
                 }
             }
@@ -1043,6 +1171,12 @@ pub struct LiveProviderRun {
     pub tool_calls: usize,
     pub stop_reason: Option<String>,
     pub usage: Usage,
+    pub attempts: u32,
+    pub retry_backoff_ms: Vec<u64>,
+    pub credential_source: Option<String>,
+    pub execution_mode: String,
+    pub replay_boundary: String,
+    pub trace_origin: String,
 }
 
 #[must_use]
@@ -1328,10 +1462,16 @@ pub async fn run_live_provider_target(
             tool_calls: 0,
             stop_reason: None,
             usage: Usage::default(),
+            attempts: 0,
+            retry_backoff_ms: Vec::new(),
+            credential_source: None,
+            execution_mode: LIVE_E2E_EXECUTION_MODE.to_string(),
+            replay_boundary: LIVE_E2E_REPLAY_BOUNDARY.to_string(),
+            trace_origin: LIVE_E2E_TRACE_ORIGIN.to_string(),
         };
     };
 
-    let Some(api_key) = registry.resolve_api_key(&entry) else {
+    let Some((api_key, credential_source)) = registry.resolve_api_key_with_source(&entry) else {
         return LiveProviderRun {
             provider: target.provider.to_string(),
             model: Some(entry.model.id.clone()),
@@ -1350,100 +1490,184 @@ pub async fn run_live_provider_target(
             tool_calls: 0,
             stop_reason: None,
             usage: Usage::default(),
+            attempts: 0,
+            retry_backoff_ms: Vec::new(),
+            credential_source: None,
+            execution_mode: LIVE_E2E_EXECUTION_MODE.to_string(),
+            replay_boundary: LIVE_E2E_REPLAY_BOUNDARY.to_string(),
+            trace_origin: LIVE_E2E_TRACE_ORIGIN.to_string(),
         };
     };
 
-    let cassette_name = format!("live-e2e-{}-{}", entry.model.provider, entry.model.id);
-    let recorder = VcrRecorder::new_with(&cassette_name, VcrMode::Record, vcr_dir);
-    let cassette_path = recorder.cassette_path().to_path_buf();
-    let client = Client::new().with_vcr(recorder);
+    let mut attempt_count = 0u32;
+    let mut retry_backoff_ms = Vec::new();
+    let mut final_trace = LiveHttpTrace::default();
+    let mut final_summary = LiveStreamSummary::default();
+    let mut final_error: Option<String> = None;
+    let mut final_response_status: Option<u16> = None;
+    let mut final_status = "failed".to_string();
 
-    harness
-        .log()
-        .info_ctx("live_e2e", "Invoking live provider call", |ctx| {
-            ctx.push(("provider".into(), entry.model.provider.clone()));
-            ctx.push(("model".into(), entry.model.id.clone()));
-            ctx.push(("api".into(), entry.model.api.clone()));
-            ctx.push(("timeout_s".into(), LIVE_E2E_TIMEOUT.as_secs().to_string()));
-            ctx.push(("prompt".into(), target.prompt.to_string()));
-            ctx.push(("vcr_path".into(), cassette_path.display().to_string()));
+    for attempt in 1..=LIVE_E2E_MAX_ATTEMPTS {
+        attempt_count = u32::try_from(attempt).unwrap_or(u32::MAX);
+        let cassette_name = format!(
+            "live-e2e-{}-{}-attempt-{}",
+            entry.model.provider, entry.model.id, attempt
+        );
+        let recorder = VcrRecorder::new_with(&cassette_name, VcrMode::Record, vcr_dir);
+        let cassette_path = recorder.cassette_path().to_path_buf();
+        let client = Client::new().with_vcr(recorder);
+
+        harness
+            .log()
+            .info_ctx("live_e2e", "Invoking live provider call", |ctx| {
+                ctx.push(("provider".into(), entry.model.provider.clone()));
+                ctx.push(("model".into(), entry.model.id.clone()));
+                ctx.push(("api".into(), entry.model.api.clone()));
+                ctx.push(("attempt".into(), attempt.to_string()));
+                ctx.push(("max_attempts".into(), LIVE_E2E_MAX_ATTEMPTS.to_string()));
+                ctx.push(("timeout_s".into(), LIVE_E2E_TIMEOUT.as_secs().to_string()));
+                ctx.push(("prompt".into(), target.prompt.to_string()));
+                ctx.push(("credential_source".into(), credential_source.clone()));
+                ctx.push(("execution_mode".into(), LIVE_E2E_EXECUTION_MODE.to_string()));
+                ctx.push((
+                    "replay_boundary".into(),
+                    LIVE_E2E_REPLAY_BOUNDARY.to_string(),
+                ));
+                ctx.push(("trace_origin".into(), LIVE_E2E_TRACE_ORIGIN.to_string()));
+                ctx.push(("vcr_path".into(), cassette_path.display().to_string()));
+            });
+
+        let provider = match create_live_provider(&entry, client) {
+            Ok(provider) => provider,
+            Err(err) => {
+                final_error = Some(format!("provider construction failed: {err}"));
+                final_status = "failed".to_string();
+                break;
+            }
+        };
+
+        let context = build_live_context(target.prompt);
+        let options = build_live_stream_options(&entry, api_key.clone());
+        let summary_result =
+            collect_live_stream_summary(provider, context, options, LIVE_E2E_TIMEOUT).await;
+        let mut trace = load_vcr_trace(&cassette_path).unwrap_or_default();
+        trace.request_headers = redact_sensitive_header_pairs(trace.request_headers);
+
+        let response_status = trace.response_status.or_else(|| {
+            summary_result
+                .as_ref()
+                .err()
+                .and_then(|message| parse_http_status(message))
         });
+        let summary = summary_result.clone().unwrap_or_default();
+        let summary_error = summary_result
+            .err()
+            .or_else(|| summary.stream_error.clone());
+        let http_failure = response_status.is_some_and(|status| !(200..300).contains(&status));
+        let has_failure = summary_error.is_some() || http_failure;
 
-    let provider = match create_live_provider(&entry, client) {
-        Ok(provider) => provider,
-        Err(err) => {
-            return LiveProviderRun {
-                provider: entry.model.provider.clone(),
-                model: Some(entry.model.id.clone()),
-                api: Some(entry.model.api.clone()),
-                status: "failed".to_string(),
-                skip_reason: None,
-                error: Some(format!("provider construction failed: {err}")),
-                elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                response_status: None,
-                request_url: None,
-                request_headers: Vec::new(),
-                request_body_bytes: None,
-                event_count: 0,
-                text_chars: 0,
-                thinking_chars: 0,
-                tool_calls: 0,
-                stop_reason: None,
-                usage: Usage::default(),
-            };
+        harness
+            .log()
+            .info_ctx("live_e2e", "Provider attempt completed", |ctx| {
+                ctx.push(("provider".into(), entry.model.provider.clone()));
+                ctx.push(("model".into(), entry.model.id.clone()));
+                ctx.push(("attempt".into(), attempt.to_string()));
+                ctx.push((
+                    "status".into(),
+                    if has_failure { "failed" } else { "passed" }.to_string(),
+                ));
+                if let Some(status) = response_status {
+                    ctx.push(("response_status".into(), status.to_string()));
+                }
+                if let Some(url) = &trace.request_url {
+                    ctx.push(("request_url".into(), url.clone()));
+                }
+                if let Some(bytes) = trace.request_body_bytes {
+                    ctx.push(("request_body_bytes".into(), bytes.to_string()));
+                }
+                ctx.push(("events".into(), summary.event_count.to_string()));
+                ctx.push(("tool_calls".into(), summary.tool_calls.to_string()));
+                ctx.push(("text_chars".into(), summary.text_chars.to_string()));
+                ctx.push(("thinking_chars".into(), summary.thinking_chars.to_string()));
+                ctx.push(("usage_input".into(), summary.usage.input.to_string()));
+                ctx.push(("usage_output".into(), summary.usage.output.to_string()));
+                ctx.push(("usage_total".into(), summary.usage.total_tokens.to_string()));
+                if let Some(reason) = &summary.stop_reason {
+                    ctx.push(("stop_reason".into(), reason.clone()));
+                }
+                if let Some(error) = &summary_error {
+                    ctx.push(("error".into(), error.clone()));
+                }
+            });
+
+        final_trace = trace;
+        final_summary = summary;
+        final_error = summary_error.clone();
+        final_response_status = response_status;
+        final_status = if has_failure {
+            "failed".to_string()
+        } else {
+            "passed".to_string()
+        };
+
+        if !has_failure {
+            break;
         }
-    };
 
-    let context = build_live_context(target.prompt);
-    let options = build_live_stream_options(&entry, api_key);
-    let summary_result =
-        collect_live_stream_summary(provider, context, options, LIVE_E2E_TIMEOUT).await;
-    let trace = load_vcr_trace(&cassette_path).unwrap_or_default();
+        if should_retry_live_attempt(attempt, response_status, summary_error.as_deref()) {
+            let backoff = retry_backoff_for_attempt(attempt);
+            let backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
+            retry_backoff_ms.push(backoff_ms);
+
+            harness.log().with_context(
+                LogLevel::Warn,
+                "live_e2e",
+                "Transient failure; scheduling retry",
+                |ctx| {
+                    ctx.push(("provider".into(), entry.model.provider.clone()));
+                    ctx.push(("model".into(), entry.model.id.clone()));
+                    ctx.push(("attempt".into(), attempt.to_string()));
+                    ctx.push(("next_attempt".into(), (attempt + 1).to_string()));
+                    ctx.push(("backoff_ms".into(), backoff_ms.to_string()));
+                    if let Some(status) = response_status {
+                        ctx.push(("response_status".into(), status.to_string()));
+                    }
+                    if let Some(error) = &summary_error {
+                        ctx.push(("error".into(), error.clone()));
+                    }
+                },
+            );
+
+            asupersync::time::sleep(asupersync::time::wall_now(), backoff).await;
+            continue;
+        }
+
+        break;
+    }
 
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let response_status = trace.response_status.or_else(|| {
-        summary_result
-            .as_ref()
-            .err()
-            .and_then(|message| parse_http_status(message))
-    });
-    let summary = summary_result.clone().unwrap_or_default();
-    let summary_error = summary_result
-        .err()
-        .or_else(|| summary.stream_error.clone());
-    let http_failure = response_status.is_some_and(|status| !(200..300).contains(&status));
-    let has_failure = summary_error.is_some() || http_failure;
-
     harness
         .log()
         .info_ctx("live_e2e", "Provider call completed", |ctx| {
             ctx.push(("provider".into(), entry.model.provider.clone()));
             ctx.push(("model".into(), entry.model.id.clone()));
-            ctx.push((
-                "status".into(),
-                if has_failure { "failed" } else { "passed" }.to_string(),
-            ));
+            ctx.push(("status".into(), final_status.clone()));
+            ctx.push(("attempts".into(), attempt_count.to_string()));
             ctx.push(("elapsed_ms".into(), elapsed_ms.to_string()));
-            if let Some(status) = response_status {
+            ctx.push(("credential_source".into(), credential_source.clone()));
+            ctx.push(("execution_mode".into(), LIVE_E2E_EXECUTION_MODE.to_string()));
+            ctx.push((
+                "replay_boundary".into(),
+                LIVE_E2E_REPLAY_BOUNDARY.to_string(),
+            ));
+            ctx.push(("trace_origin".into(), LIVE_E2E_TRACE_ORIGIN.to_string()));
+            if !retry_backoff_ms.is_empty() {
+                ctx.push(("retry_backoff_ms".into(), format!("{retry_backoff_ms:?}")));
+            }
+            if let Some(status) = final_response_status {
                 ctx.push(("response_status".into(), status.to_string()));
             }
-            if let Some(url) = &trace.request_url {
-                ctx.push(("request_url".into(), url.clone()));
-            }
-            if let Some(bytes) = trace.request_body_bytes {
-                ctx.push(("request_body_bytes".into(), bytes.to_string()));
-            }
-            ctx.push(("events".into(), summary.event_count.to_string()));
-            ctx.push(("tool_calls".into(), summary.tool_calls.to_string()));
-            ctx.push(("text_chars".into(), summary.text_chars.to_string()));
-            ctx.push(("thinking_chars".into(), summary.thinking_chars.to_string()));
-            ctx.push(("usage_input".into(), summary.usage.input.to_string()));
-            ctx.push(("usage_output".into(), summary.usage.output.to_string()));
-            ctx.push(("usage_total".into(), summary.usage.total_tokens.to_string()));
-            if let Some(reason) = &summary.stop_reason {
-                ctx.push(("stop_reason".into(), reason.clone()));
-            }
-            if let Some(error) = &summary_error {
+            if let Some(error) = &final_error {
                 ctx.push(("error".into(), error.clone()));
             }
         });
@@ -1452,24 +1676,26 @@ pub async fn run_live_provider_target(
         provider: entry.model.provider.clone(),
         model: Some(entry.model.id.clone()),
         api: Some(entry.model.api.clone()),
-        status: if has_failure {
-            "failed".to_string()
-        } else {
-            "passed".to_string()
-        },
+        status: final_status,
         skip_reason: None,
-        error: summary_error,
+        error: final_error,
         elapsed_ms,
-        response_status,
-        request_url: trace.request_url,
-        request_headers: trace.request_headers,
-        request_body_bytes: trace.request_body_bytes,
-        event_count: summary.event_count,
-        text_chars: summary.text_chars,
-        thinking_chars: summary.thinking_chars,
-        tool_calls: summary.tool_calls,
-        stop_reason: summary.stop_reason,
-        usage: summary.usage,
+        response_status: final_response_status,
+        request_url: final_trace.request_url,
+        request_headers: final_trace.request_headers,
+        request_body_bytes: final_trace.request_body_bytes,
+        event_count: final_summary.event_count,
+        text_chars: final_summary.text_chars,
+        thinking_chars: final_summary.thinking_chars,
+        tool_calls: final_summary.tool_calls,
+        stop_reason: final_summary.stop_reason,
+        usage: final_summary.usage,
+        attempts: attempt_count,
+        retry_backoff_ms,
+        credential_source: Some(credential_source),
+        execution_mode: LIVE_E2E_EXECUTION_MODE.to_string(),
+        replay_boundary: LIVE_E2E_REPLAY_BOUNDARY.to_string(),
+        trace_origin: LIVE_E2E_TRACE_ORIGIN.to_string(),
     }
 }
 

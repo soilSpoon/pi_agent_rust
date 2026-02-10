@@ -11,10 +11,17 @@
 //! - Tier-2 (STRETCH): scored candidates not yet vendored
 
 use pi::conformance::snapshot::SourceTier;
+use pi::extension_inclusion::{normalize_manifest_value, normalized_manifest_hash_from_value};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use similar::TextDiff;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const EXPECTED_MANIFEST_HASH: &str =
+    "07dc31ad981de9a09c4c9e6f2f78b8c2c39e081481b07d1d1a2670e87dc6c5e9";
+const MANIFEST_REPORT_DIR: &str = "tests/ext_conformance/reports/inclusion_manifest";
 
 // ── Input types ────────────────────────────────────────────────────────
 
@@ -265,6 +272,43 @@ fn rationale_for(source_tier: &str, license: &str, score: Option<f64>) -> String
     }
 }
 
+fn report_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(MANIFEST_REPORT_DIR)
+}
+
+fn write_manifest_artifacts(
+    repo_root: &Path,
+    committed: &str,
+    generated: &str,
+    committed_hash: &str,
+    generated_hash: &str,
+    diff: Option<&str>,
+) {
+    let dir = report_dir(repo_root);
+    fs::create_dir_all(&dir).expect("create inclusion-manifest report directory");
+
+    fs::write(dir.join("committed.json"), committed).expect("write committed manifest artifact");
+    fs::write(dir.join("generated.json"), generated).expect("write generated manifest artifact");
+
+    let hash_report = json!({
+        "schema": "pi.ext.inclusion_manifest_hash.v1",
+        "expected_hash": EXPECTED_MANIFEST_HASH,
+        "committed_hash": committed_hash,
+        "generated_hash": generated_hash,
+        "hash_matches_expected": committed_hash == EXPECTED_MANIFEST_HASH,
+        "generated_matches_committed": committed_hash == generated_hash,
+    });
+    fs::write(
+        dir.join("hashes.json"),
+        serde_json::to_string_pretty(&hash_report).expect("serialize hash report"),
+    )
+    .expect("write inclusion manifest hash report");
+
+    if let Some(diff) = diff {
+        fs::write(dir.join("diff.patch"), diff).expect("write inclusion manifest diff");
+    }
+}
+
 // ── Main test ──────────────────────────────────────────────────────────
 
 #[test]
@@ -474,10 +518,52 @@ fn generate_inclusion_list() {
         exclusion_notes,
     };
 
-    // Write output
-    let json = serde_json::to_string_pretty(&inclusion_list).expect("serialize inclusion list");
     let output_path = repo_root.join("docs/extension-inclusion-list.json");
-    fs::write(&output_path, &json).expect("write inclusion list");
+    let generated_json =
+        serde_json::to_string_pretty(&inclusion_list).expect("serialize inclusion list");
+    let committed_json = fs::read_to_string(&output_path).expect("read committed inclusion list");
+
+    // Optional local update mode for maintainers intentionally regenerating
+    // the canonical manifest.
+    if std::env::var_os("PI_WRITE_INCLUSION_LIST").is_some() {
+        fs::write(&output_path, format!("{generated_json}\n"))
+            .expect("overwrite committed inclusion list");
+    }
+
+    let generated_value: Value =
+        serde_json::from_str(&generated_json).expect("parse generated inclusion list");
+    let committed_value: Value =
+        serde_json::from_str(&committed_json).expect("parse committed inclusion list");
+
+    let generated_normalized = normalize_manifest_value(&generated_value);
+    let committed_normalized = normalize_manifest_value(&committed_value);
+
+    let generated_hash = normalized_manifest_hash_from_value(&generated_value)
+        .expect("hash generated inclusion list");
+    let committed_hash = normalized_manifest_hash_from_value(&committed_value)
+        .expect("hash committed inclusion list");
+
+    let generated_normalized_json = serde_json::to_string_pretty(&generated_normalized)
+        .expect("serialize normalized generated inclusion list");
+    let committed_normalized_json = serde_json::to_string_pretty(&committed_normalized)
+        .expect("serialize normalized committed inclusion list");
+    let diff = TextDiff::from_lines(&committed_normalized_json, &generated_normalized_json)
+        .unified_diff()
+        .header(
+            "docs/extension-inclusion-list.json (committed)",
+            "docs/extension-inclusion-list.json (generated)",
+        )
+        .to_string();
+    let has_diff = !diff.trim().is_empty();
+
+    write_manifest_artifacts(
+        repo_root,
+        &committed_json,
+        &generated_json,
+        &committed_hash,
+        &generated_hash,
+        if has_diff { Some(diff.as_str()) } else { None },
+    );
 
     // Print summary
     eprintln!(
@@ -493,7 +579,25 @@ fn generate_inclusion_list() {
         total_must_pass,
         inclusion_list.summary.tier2_count,
         inclusion_list.exclusion_notes.len(),
-        output_path.display()
+        output_path.display(),
+    );
+
+    assert!(
+        !has_diff,
+        "Canonical extension manifest drift detected. \
+         Run `PI_WRITE_INCLUSION_LIST=1 cargo test --test ext_inclusion_list -- --nocapture`, \
+         review `docs/extension-inclusion-list.json`, and re-run tests.\n\n{diff}"
+    );
+
+    assert_eq!(
+        committed_hash, EXPECTED_MANIFEST_HASH,
+        "Committed extension manifest hash changed. \
+         Update EXPECTED_MANIFEST_HASH only after reviewing intentional manifest updates."
+    );
+    assert_eq!(
+        generated_hash, EXPECTED_MANIFEST_HASH,
+        "Generated extension manifest hash does not match pinned expected hash. \
+         This indicates non-deterministic generation or unreviewed source input changes."
     );
 
     // Assertions

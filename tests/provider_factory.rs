@@ -4,7 +4,8 @@ mod common;
 
 use common::TestHarness;
 use pi::Error;
-use pi::models::ModelEntry;
+use pi::auth::{AuthCredential, AuthStorage};
+use pi::models::{ModelEntry, ModelRegistry};
 use pi::provider::{
     Api, CacheRetention, InputType, KnownProvider, Model, ModelCost, StreamOptions,
 };
@@ -346,6 +347,132 @@ fn create_provider_falls_back_to_api_anthropic_messages() {
     assert_eq!(provider.name(), "anthropic");
     assert_eq!(provider.api(), "anthropic-messages");
     assert_eq!(provider.model_id(), "claude-test");
+}
+
+#[test]
+fn schema_metadata_drives_alias_provider_selection_end_to_end() {
+    let harness = TestHarness::new("schema_metadata_drives_alias_provider_selection_end_to_end");
+    let auth_path = harness.temp_path("auth.json");
+    let mut auth = AuthStorage::load(auth_path).expect("load auth storage");
+    auth.set(
+        "moonshotai",
+        AuthCredential::ApiKey {
+            key: "moonshot-schema-key".to_string(),
+        },
+    );
+    auth.save().expect("save auth storage");
+
+    let models_path = harness.create_file(
+        "models.json",
+        r#"{
+  "providers": {
+    "kimi": {
+      "models": [{ "id": "kimi-k2-instruct" }]
+    }
+  }
+}"#,
+    );
+
+    let registry = ModelRegistry::load(&auth, Some(models_path));
+    assert!(
+        registry.error().is_none(),
+        "unexpected models load error: {:?}",
+        registry.error()
+    );
+
+    let entry = registry
+        .find("kimi", "kimi-k2-instruct")
+        .expect("schema should register kimi model");
+    harness
+        .log()
+        .info_ctx("scenario", "resolved schema-driven model", |ctx| {
+            ctx.push(("provider".to_string(), entry.model.provider.clone()));
+            ctx.push(("model".to_string(), entry.model.id.clone()));
+            ctx.push(("api".to_string(), entry.model.api.clone()));
+            ctx.push(("base_url".to_string(), entry.model.base_url.clone()));
+        });
+    assert_eq!(entry.model.api, "openai-completions");
+    assert_eq!(entry.model.base_url, "https://api.moonshot.ai/v1");
+    assert_eq!(entry.api_key.as_deref(), Some("moonshot-schema-key"));
+    assert!(entry.auth_header);
+
+    let provider = create_provider(&entry, None).expect("create provider from schema-driven entry");
+    harness
+        .log()
+        .info_ctx("scenario", "selected provider implementation", |ctx| {
+            ctx.push(("name".to_string(), provider.name().to_string()));
+            ctx.push(("api".to_string(), provider.api().to_string()));
+            ctx.push(("model".to_string(), provider.model_id().to_string()));
+        });
+    assert_eq!(provider.name(), "kimi");
+    assert_eq!(provider.api(), "openai-completions");
+    assert_eq!(provider.model_id(), "kimi-k2-instruct");
+}
+
+#[test]
+fn schema_metadata_drives_native_anthropic_selection_end_to_end() {
+    let harness = TestHarness::new("schema_metadata_drives_native_anthropic_selection_end_to_end");
+    let auth_path = harness.temp_path("auth.json");
+    let mut auth = AuthStorage::load(auth_path).expect("load auth storage");
+    auth.set(
+        "anthropic",
+        AuthCredential::ApiKey {
+            key: "anthropic-schema-key".to_string(),
+        },
+    );
+    auth.save().expect("save auth storage");
+
+    let models_path = harness.create_file(
+        "models.json",
+        r#"{
+  "providers": {
+    "anthropic": {
+      "models": [{ "id": "claude-schema-default" }]
+    }
+  }
+}"#,
+    );
+
+    let registry = ModelRegistry::load(&auth, Some(models_path));
+    assert!(
+        registry.error().is_none(),
+        "unexpected models load error: {:?}",
+        registry.error()
+    );
+
+    let entry = registry
+        .find("anthropic", "claude-schema-default")
+        .expect("schema should register anthropic model");
+    harness
+        .log()
+        .info_ctx("scenario", "resolved native schema-driven model", |ctx| {
+            ctx.push(("provider".to_string(), entry.model.provider.clone()));
+            ctx.push(("model".to_string(), entry.model.id.clone()));
+            ctx.push(("api".to_string(), entry.model.api.clone()));
+            ctx.push(("base_url".to_string(), entry.model.base_url.clone()));
+            ctx.push(("max_tokens".to_string(), entry.model.max_tokens.to_string()));
+        });
+    assert_eq!(entry.model.api, "anthropic-messages");
+    assert_eq!(
+        entry.model.base_url,
+        "https://api.anthropic.com/v1/messages"
+    );
+    assert_eq!(entry.model.max_tokens, 8192);
+    assert!(!entry.auth_header);
+
+    let provider = create_provider(&entry, None).expect("create native provider from schema entry");
+    harness.log().info_ctx(
+        "scenario",
+        "selected native provider implementation",
+        |ctx| {
+            ctx.push(("name".to_string(), provider.name().to_string()));
+            ctx.push(("api".to_string(), provider.api().to_string()));
+            ctx.push(("model".to_string(), provider.model_id().to_string()));
+        },
+    );
+    assert_eq!(provider.name(), "anthropic");
+    assert_eq!(provider.api(), "anthropic-messages");
+    assert_eq!(provider.model_id(), "claude-schema-default");
 }
 
 #[test]
