@@ -101,6 +101,138 @@ pi --provider cloudflare-ai-gateway --model gpt-4o-mini -p "Say hello"
 Expected check:
 - Factory resolves to `openai-completions` route for these providers (see `../tests/provider_factory.rs`).
 
+Wave A verification lock for the preset family (`bd-3uqg.4.4`):
+- `wave_a_presets_resolve_openai_compat_defaults_and_factory_route`
+- `wave_a_openai_compat_streams_use_chat_completions_path_and_bearer_auth`
+
+### 2a) Alias migration example (`fireworks-ai` -> `fireworks`)
+
+Legacy config (still supported):
+
+```json
+{
+  "providers": {
+    "fireworks-ai": {
+      "models": [
+        { "id": "accounts/fireworks/models/llama-v3p3-70b-instruct" }
+      ]
+    }
+  }
+}
+```
+
+Recommended config (canonical):
+
+```json
+{
+  "providers": {
+    "fireworks": {
+      "models": [
+        { "id": "accounts/fireworks/models/llama-v3p3-70b-instruct" }
+      ]
+    }
+  }
+}
+```
+
+Migration behavior guarantees:
+- Both IDs resolve to `openai-completions` with base `https://api.fireworks.ai/inference/v1`.
+- Both IDs use the same auth env mapping (`FIREWORKS_API_KEY`).
+- Alias parity is lock-tested in `fireworks_ai_alias_migration_matches_fireworks_canonical_defaults`.
+
+### 2b) Wave B1 canonical IDs (regional + coding-plan)
+
+Batch B1 lock tests (`bd-3uqg.5.2`):
+- `wave_b1_presets_resolve_metadata_defaults_and_factory_route`
+- `wave_b1_alibaba_cn_openai_compat_streams_use_chat_completions_path_and_bearer_auth`
+- `wave_b1_anthropic_compat_streams_use_messages_path_and_x_api_key`
+- `wave_b1_family_coherence_with_existing_moonshot_and_alibaba_mappings`
+
+Representative smoke/e2e checks (`provider_native_verify`):
+- `wave_b1_smoke::b1_alibaba_cn_{simple_text,tool_call_single,error_auth_401}`
+- `wave_b1_smoke::b1_kimi_for_coding_{simple_text,tool_call_single,error_auth_401}`
+- `wave_b1_smoke::b1_minimax_{simple_text,tool_call_single,error_auth_401}`
+- Command: `cargo test --test provider_native_verify b1_ -- --nocapture`
+- Generated fixtures:
+  `tests/fixtures/vcr/verify_alibaba-cn_*.json`,
+  `tests/fixtures/vcr/verify_kimi-for-coding_*.json`,
+  `tests/fixtures/vcr/verify_minimax_*.json`.
+
+Key mapping decisions:
+- `kimi` remains an alias of canonical `moonshotai`.
+- `kimi-for-coding` is distinct and routes to Anthropic-compatible path with `KIMI_API_KEY`.
+- `alibaba-cn` is distinct from `alibaba`/`dashscope` and uses CN DashScope base URL.
+- `minimax*` variants are distinct canonical IDs with shared family auth/env mapping:
+  `MINIMAX_API_KEY` for global, `MINIMAX_CN_API_KEY` for CN.
+
+Representative `models.json` snippet:
+
+```json
+{
+  "providers": {
+    "alibaba-cn": {
+      "models": [{ "id": "qwen-plus" }]
+    },
+    "kimi-for-coding": {
+      "models": [{ "id": "k2p5" }]
+    },
+    "minimax-coding-plan": {
+      "models": [{ "id": "MiniMax-M2.1" }]
+    }
+  }
+}
+```
+
+### 2c) Wave B2 canonical IDs (regional + cloud OpenAI-compatible)
+
+Batch B2 lock tests (`bd-3uqg.5.1`):
+- `wave_b2_presets_resolve_metadata_defaults_and_factory_route`
+- `wave_b2_openai_compat_streams_use_chat_completions_path_and_bearer_auth`
+- `wave_b2_moonshot_cn_and_global_moonshot_mapping_are_distinct`
+
+Representative smoke/e2e checks (`provider_native_verify`):
+- `wave_b2_smoke::b2_modelscope_{simple_text,tool_call_single,error_auth_401}`
+- `wave_b2_smoke::b2_moonshotai_cn_{simple_text,tool_call_single,error_auth_401}`
+- `wave_b2_smoke::b2_nebius_{simple_text,tool_call_single,error_auth_401}`
+- `wave_b2_smoke::b2_ovhcloud_{simple_text,tool_call_single,error_auth_401}`
+- `wave_b2_smoke::b2_scaleway_{simple_text,tool_call_single,error_auth_401}`
+- Command: `cargo test --test provider_native_verify b2_ -- --nocapture`
+- Generated fixtures:
+  `tests/fixtures/vcr/verify_modelscope_*.json`,
+  `tests/fixtures/vcr/verify_moonshotai-cn_*.json`,
+  `tests/fixtures/vcr/verify_nebius_*.json`,
+  `tests/fixtures/vcr/verify_ovhcloud_*.json`,
+  `tests/fixtures/vcr/verify_scaleway_*.json`.
+
+Key mapping decisions:
+- `modelscope`, `nebius`, `ovhcloud`, and `scaleway` are onboarded as canonical OpenAI-compatible preset IDs.
+- `moonshotai-cn` is a distinct canonical regional ID and does not alias to `moonshotai`.
+- `moonshotai` and `moonshotai-cn` intentionally share `MOONSHOT_API_KEY` while retaining distinct base URLs.
+
+Representative `models.json` snippet:
+
+```json
+{
+  "providers": {
+    "modelscope": {
+      "models": [{ "id": "ZhipuAI/GLM-4.5" }]
+    },
+    "moonshotai-cn": {
+      "models": [{ "id": "kimi-k2-0905-preview" }]
+    },
+    "nebius": {
+      "models": [{ "id": "NousResearch/hermes-4-70b" }]
+    },
+    "ovhcloud": {
+      "models": [{ "id": "mixtral-8x7b-instruct-v0.1" }]
+    },
+    "scaleway": {
+      "models": [{ "id": "qwen3-235b-a22b-instruct-2507" }]
+    }
+  }
+}
+```
+
 ### 3) Azure OpenAI (`azure-openai` / aliases `azure`, `azure-cognitive-services`)
 
 ```json

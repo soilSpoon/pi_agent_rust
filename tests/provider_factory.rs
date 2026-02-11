@@ -12,6 +12,9 @@ use pi::provider::{
     Api, CacheRetention, Context, InputType, KnownProvider, Model, ModelCost, StreamEvent,
     StreamOptions, ToolDef,
 };
+use pi::provider_metadata::{
+    canonical_provider_id, provider_auth_env_keys, provider_routing_defaults,
+};
 use pi::providers::{create_provider, normalize_openai_base, normalize_openai_responses_base};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -91,6 +94,18 @@ fn openai_responses_sse_body() -> String {
     .join("\n")
 }
 
+fn anthropic_messages_sse_body() -> String {
+    [
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+        "",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+        "",
+        r#"data: {"type":"message_stop"}"#,
+        "",
+    ]
+    .join("\n")
+}
+
 fn request_header(headers: &[(String, String)], key: &str) -> Option<String> {
     headers
         .iter()
@@ -117,6 +132,97 @@ fn drive_provider_stream_to_done(
         panic!("provider stream ended before Done event");
     });
 }
+
+const WAVE_A_PRESET_CASES: [(&str, &str); 13] = [
+    ("groq", "https://api.groq.com/openai/v1"),
+    ("deepinfra", "https://api.deepinfra.com/v1/openai"),
+    ("cerebras", "https://api.cerebras.ai/v1"),
+    ("openrouter", "https://openrouter.ai/api/v1"),
+    ("mistral", "https://api.mistral.ai/v1"),
+    ("moonshotai", "https://api.moonshot.ai/v1"),
+    (
+        "dashscope",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    ),
+    ("deepseek", "https://api.deepseek.com"),
+    ("fireworks", "https://api.fireworks.ai/inference/v1"),
+    ("togetherai", "https://api.together.xyz/v1"),
+    ("perplexity", "https://api.perplexity.ai"),
+    ("xai", "https://api.x.ai/v1"),
+    ("fireworks-ai", "https://api.fireworks.ai/inference/v1"),
+];
+
+const WAVE_B1_PRESET_CASES: [(&str, &str, &str, bool); 6] = [
+    (
+        "alibaba-cn",
+        "openai-completions",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        true,
+    ),
+    (
+        "kimi-for-coding",
+        "anthropic-messages",
+        "https://api.kimi.com/coding/v1/messages",
+        false,
+    ),
+    (
+        "minimax",
+        "anthropic-messages",
+        "https://api.minimax.io/anthropic/v1/messages",
+        false,
+    ),
+    (
+        "minimax-cn",
+        "anthropic-messages",
+        "https://api.minimaxi.com/anthropic/v1/messages",
+        false,
+    ),
+    (
+        "minimax-coding-plan",
+        "anthropic-messages",
+        "https://api.minimax.io/anthropic/v1/messages",
+        false,
+    ),
+    (
+        "minimax-cn-coding-plan",
+        "anthropic-messages",
+        "https://api.minimaxi.com/anthropic/v1/messages",
+        false,
+    ),
+];
+
+const WAVE_B2_PRESET_CASES: [(&str, &str, &str, bool); 5] = [
+    (
+        "modelscope",
+        "openai-completions",
+        "https://api-inference.modelscope.cn/v1",
+        true,
+    ),
+    (
+        "moonshotai-cn",
+        "openai-completions",
+        "https://api.moonshot.cn/v1",
+        true,
+    ),
+    (
+        "nebius",
+        "openai-completions",
+        "https://api.tokenfactory.nebius.com/v1",
+        true,
+    ),
+    (
+        "ovhcloud",
+        "openai-completions",
+        "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        true,
+    ),
+    (
+        "scaleway",
+        "openai-completions",
+        "https://api.scaleway.ai/v1",
+        true,
+    ),
+];
 
 #[test]
 fn normalize_openai_base_appends_for_plain_host() {
@@ -972,6 +1078,533 @@ fn create_provider_cloudflare_ai_gateway_routes_via_openai_compat() {
     assert_eq!(provider.name(), "cloudflare-ai-gateway");
     assert_eq!(provider.api(), "openai-completions");
     assert_eq!(provider.model_id(), "gpt-4o-mini");
+}
+
+#[test]
+fn wave_a_presets_resolve_openai_compat_defaults_and_factory_route() {
+    let harness =
+        TestHarness::new("wave_a_presets_resolve_openai_compat_defaults_and_factory_route");
+    for (provider_id, expected_base_url) in WAVE_A_PRESET_CASES {
+        let defaults = provider_routing_defaults(provider_id)
+            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+        harness
+            .log()
+            .info_ctx("wave_a.defaults", "metadata defaults", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("api".to_string(), defaults.api.to_string()));
+                ctx.push(("base_url".to_string(), defaults.base_url.to_string()));
+                ctx.push(("auth_header".to_string(), defaults.auth_header.to_string()));
+            });
+        assert_eq!(defaults.api, "openai-completions");
+        assert_eq!(defaults.base_url, expected_base_url);
+        assert!(defaults.auth_header);
+
+        let mut entry = make_model_entry(provider_id, "wave-a-default-model", expected_base_url);
+        entry.model.api.clear();
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+        harness
+            .log()
+            .info_ctx("wave_a.factory", "factory route", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("name".to_string(), provider.name().to_string()));
+                ctx.push(("api".to_string(), provider.api().to_string()));
+            });
+        assert_eq!(provider.name(), provider_id);
+        assert_eq!(provider.api(), "openai-completions");
+        assert_eq!(provider.model_id(), "wave-a-default-model");
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn wave_a_openai_compat_streams_use_chat_completions_path_and_bearer_auth() {
+    let harness =
+        TestHarness::new("wave_a_openai_compat_streams_use_chat_completions_path_and_bearer_auth");
+    for (index, (provider_id, _)) in WAVE_A_PRESET_CASES.into_iter().enumerate() {
+        let server = harness.start_mock_http_server();
+        let path_prefix = format!("/wave-a/{index}/{}", provider_id.replace('-', "_"));
+        let expected_path = format!("{path_prefix}/chat/completions");
+        server.add_route(
+            "POST",
+            &expected_path,
+            text_event_stream_response(openai_chat_sse_body()),
+        );
+
+        let mut entry = make_model_entry(
+            provider_id,
+            "wave-a-stream-model",
+            &format!("{}{}", server.base_url(), path_prefix),
+        );
+        entry.model.api.clear();
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider should stream-route {provider_id}: {e}"));
+
+        let api_key = format!("wave-a-token-{index}");
+        let context = Context {
+            system_prompt: Some("Be concise.".to_string()),
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some(api_key.clone()),
+            max_tokens: Some(64),
+            ..Default::default()
+        };
+        drive_provider_stream_to_done(provider, context, options);
+
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request for {provider_id}"
+        );
+        let request = &requests[0];
+        harness
+            .log()
+            .info_ctx("wave_a.stream", "request lock", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("path".to_string(), request.path.clone()));
+                ctx.push((
+                    "authorization".to_string(),
+                    request_header(&request.headers, "authorization").unwrap_or_default(),
+                ));
+            });
+        assert_eq!(request.path, expected_path);
+        let expected_auth = format!("Bearer {api_key}");
+        assert_eq!(
+            request_header(&request.headers, "authorization").as_deref(),
+            Some(expected_auth.as_str())
+        );
+        assert_eq!(
+            request_header(&request.headers, "content-type").as_deref(),
+            Some("application/json")
+        );
+    }
+}
+
+#[test]
+fn wave_b1_presets_resolve_metadata_defaults_and_factory_route() {
+    let harness = TestHarness::new("wave_b1_presets_resolve_metadata_defaults_and_factory_route");
+    for (provider_id, expected_api, expected_base_url, expected_auth_header) in WAVE_B1_PRESET_CASES
+    {
+        let defaults = provider_routing_defaults(provider_id)
+            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+        harness
+            .log()
+            .info_ctx("wave_b1.defaults", "metadata defaults", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("api".to_string(), defaults.api.to_string()));
+                ctx.push(("base_url".to_string(), defaults.base_url.to_string()));
+                ctx.push(("auth_header".to_string(), defaults.auth_header.to_string()));
+            });
+        assert_eq!(defaults.api, expected_api);
+        assert_eq!(defaults.base_url, expected_base_url);
+        assert_eq!(defaults.auth_header, expected_auth_header);
+        assert_eq!(canonical_provider_id(provider_id), Some(provider_id));
+
+        let mut entry = make_model_entry(provider_id, "wave-b1-default-model", expected_base_url);
+        entry.model.api.clear();
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+        harness
+            .log()
+            .info_ctx("wave_b1.factory", "factory route", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("name".to_string(), provider.name().to_string()));
+                ctx.push(("api".to_string(), provider.api().to_string()));
+            });
+        if expected_api == "anthropic-messages" {
+            assert_eq!(provider.name(), "anthropic");
+        } else {
+            assert_eq!(provider.name(), provider_id);
+        }
+        assert_eq!(provider.api(), expected_api);
+        assert_eq!(provider.model_id(), "wave-b1-default-model");
+    }
+}
+
+#[test]
+fn wave_b1_alibaba_cn_openai_compat_streams_use_chat_completions_path_and_bearer_auth() {
+    let harness = TestHarness::new(
+        "wave_b1_alibaba_cn_openai_compat_streams_use_chat_completions_path_and_bearer_auth",
+    );
+    let server = harness.start_mock_http_server();
+    let path_prefix = "/wave-b1/alibaba_cn";
+    let expected_path = format!("{path_prefix}/chat/completions");
+    server.add_route(
+        "POST",
+        &expected_path,
+        text_event_stream_response(openai_chat_sse_body()),
+    );
+
+    let mut entry = make_model_entry(
+        "alibaba-cn",
+        "wave-b1-alibaba-cn-model",
+        &format!("{}{}", server.base_url(), path_prefix),
+    );
+    entry.model.api.clear();
+    let provider = create_provider(&entry, None).expect("create_provider should route alibaba-cn");
+    assert_eq!(provider.api(), "openai-completions");
+
+    let api_key = "wave-b1-alibaba-cn-token".to_string();
+    let context = Context {
+        system_prompt: Some("Be concise.".to_string()),
+        messages: vec![Message::User(UserMessage {
+            content: UserContent::Text("Ping".to_string()),
+            timestamp: 0,
+        })],
+        tools: Vec::new(),
+    };
+    let options = StreamOptions {
+        api_key: Some(api_key.clone()),
+        max_tokens: Some(64),
+        ..Default::default()
+    };
+    drive_provider_stream_to_done(provider, context, options);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one request");
+    let request = &requests[0];
+    assert_eq!(request.path, expected_path);
+    let expected_auth = format!("Bearer {api_key}");
+    assert_eq!(
+        request_header(&request.headers, "authorization").as_deref(),
+        Some(expected_auth.as_str())
+    );
+    assert_eq!(
+        request_header(&request.headers, "content-type").as_deref(),
+        Some("application/json")
+    );
+}
+
+#[test]
+fn wave_b1_anthropic_compat_streams_use_messages_path_and_x_api_key() {
+    let harness =
+        TestHarness::new("wave_b1_anthropic_compat_streams_use_messages_path_and_x_api_key");
+    for (index, (provider_id, expected_api, _, expected_auth_header)) in
+        WAVE_B1_PRESET_CASES.into_iter().enumerate()
+    {
+        if expected_api != "anthropic-messages" {
+            continue;
+        }
+        let server = harness.start_mock_http_server();
+        let expected_path = format!("/wave-b1/{index}/{}", provider_id.replace('-', "_"));
+        server.add_route(
+            "POST",
+            &expected_path,
+            text_event_stream_response(anthropic_messages_sse_body()),
+        );
+
+        let mut entry = make_model_entry(
+            provider_id,
+            "wave-b1-anthropic-model",
+            &format!("{}{}", server.base_url(), expected_path),
+        );
+        entry.model.api.clear();
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+        assert_eq!(provider.name(), "anthropic");
+        assert_eq!(provider.api(), "anthropic-messages");
+
+        let api_key = format!("wave-b1-anthropic-token-{index}");
+        let context = Context {
+            system_prompt: Some("Be concise.".to_string()),
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some(api_key.clone()),
+            max_tokens: Some(64),
+            ..Default::default()
+        };
+        drive_provider_stream_to_done(provider, context, options);
+
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request for {provider_id}"
+        );
+        let request = &requests[0];
+        assert_eq!(request.path, expected_path);
+        assert_eq!(
+            request_header(&request.headers, "x-api-key").as_deref(),
+            Some(api_key.as_str())
+        );
+        assert_eq!(
+            request_header(&request.headers, "content-type").as_deref(),
+            Some("application/json")
+        );
+        assert!(
+            !expected_auth_header,
+            "anthropic fallbacks should not use bearer auth"
+        );
+    }
+}
+
+#[test]
+fn wave_b1_family_coherence_with_existing_moonshot_and_alibaba_mappings() {
+    let harness =
+        TestHarness::new("wave_b1_family_coherence_with_existing_moonshot_and_alibaba_mappings");
+    harness
+        .log()
+        .info_ctx("wave_b1.coherence", "canonical mapping", |ctx| {
+            ctx.push((
+                "kimi_alias".to_string(),
+                canonical_provider_id("kimi")
+                    .unwrap_or("missing")
+                    .to_string(),
+            ));
+            ctx.push((
+                "kimi_for_coding".to_string(),
+                canonical_provider_id("kimi-for-coding")
+                    .unwrap_or("missing")
+                    .to_string(),
+            ));
+            ctx.push((
+                "alibaba".to_string(),
+                canonical_provider_id("alibaba")
+                    .unwrap_or("missing")
+                    .to_string(),
+            ));
+            ctx.push((
+                "alibaba_cn".to_string(),
+                canonical_provider_id("alibaba-cn")
+                    .unwrap_or("missing")
+                    .to_string(),
+            ));
+        });
+    assert_eq!(canonical_provider_id("kimi"), Some("moonshotai"));
+    assert_eq!(
+        canonical_provider_id("kimi-for-coding"),
+        Some("kimi-for-coding")
+    );
+    assert_eq!(canonical_provider_id("alibaba"), Some("alibaba"));
+    assert_eq!(canonical_provider_id("alibaba-cn"), Some("alibaba-cn"));
+
+    let alibaba = provider_routing_defaults("alibaba").expect("alibaba defaults");
+    let alibaba_cn = provider_routing_defaults("alibaba-cn").expect("alibaba-cn defaults");
+    assert_eq!(provider_auth_env_keys("alibaba"), &["DASHSCOPE_API_KEY"]);
+    assert_eq!(provider_auth_env_keys("alibaba-cn"), &["DASHSCOPE_API_KEY"]);
+    assert_ne!(alibaba.base_url, alibaba_cn.base_url);
+}
+
+#[test]
+fn wave_b2_presets_resolve_metadata_defaults_and_factory_route() {
+    let harness = TestHarness::new("wave_b2_presets_resolve_metadata_defaults_and_factory_route");
+    for (provider_id, expected_api, expected_base_url, expected_auth_header) in WAVE_B2_PRESET_CASES
+    {
+        let defaults = provider_routing_defaults(provider_id)
+            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+        harness
+            .log()
+            .info_ctx("wave_b2.defaults", "metadata defaults", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("api".to_string(), defaults.api.to_string()));
+                ctx.push(("base_url".to_string(), defaults.base_url.to_string()));
+                ctx.push(("auth_header".to_string(), defaults.auth_header.to_string()));
+            });
+        assert_eq!(defaults.api, expected_api);
+        assert_eq!(defaults.base_url, expected_base_url);
+        assert_eq!(defaults.auth_header, expected_auth_header);
+        assert_eq!(canonical_provider_id(provider_id), Some(provider_id));
+
+        let mut entry = make_model_entry(provider_id, "wave-b2-default-model", expected_base_url);
+        entry.model.api.clear();
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+        harness
+            .log()
+            .info_ctx("wave_b2.factory", "factory route", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("name".to_string(), provider.name().to_string()));
+                ctx.push(("api".to_string(), provider.api().to_string()));
+            });
+        assert_eq!(provider.name(), provider_id);
+        assert_eq!(provider.api(), expected_api);
+        assert_eq!(provider.model_id(), "wave-b2-default-model");
+    }
+}
+
+#[test]
+fn wave_b2_openai_compat_streams_use_chat_completions_path_and_bearer_auth() {
+    let harness =
+        TestHarness::new("wave_b2_openai_compat_streams_use_chat_completions_path_and_bearer_auth");
+    for (index, (provider_id, expected_api, _, expected_auth_header)) in
+        WAVE_B2_PRESET_CASES.into_iter().enumerate()
+    {
+        let server = harness.start_mock_http_server();
+        let path_prefix = format!("/wave-b2/{index}/{}", provider_id.replace('-', "_"));
+        let expected_path = format!("{path_prefix}/chat/completions");
+        server.add_route(
+            "POST",
+            &expected_path,
+            text_event_stream_response(openai_chat_sse_body()),
+        );
+
+        let mut entry = make_model_entry(
+            provider_id,
+            "wave-b2-openai-model",
+            &format!("{}{}", server.base_url(), path_prefix),
+        );
+        entry.model.api.clear();
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+        assert_eq!(provider.api(), expected_api);
+
+        let api_key = format!("wave-b2-openai-token-{index}");
+        let context = Context {
+            system_prompt: Some("Be concise.".to_string()),
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some(api_key.clone()),
+            max_tokens: Some(64),
+            ..Default::default()
+        };
+        drive_provider_stream_to_done(provider, context, options);
+
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request for {provider_id}"
+        );
+        let request = &requests[0];
+        assert_eq!(request.path, expected_path);
+        let expected_auth = format!("Bearer {api_key}");
+        assert_eq!(
+            request_header(&request.headers, "authorization").as_deref(),
+            Some(expected_auth.as_str())
+        );
+        assert_eq!(
+            request_header(&request.headers, "content-type").as_deref(),
+            Some("application/json")
+        );
+        assert!(
+            expected_auth_header,
+            "openai-compatible B2 providers should use bearer auth"
+        );
+    }
+}
+
+#[test]
+fn wave_b2_moonshot_cn_and_global_moonshot_mapping_are_distinct() {
+    let global_defaults = provider_routing_defaults("moonshotai").expect("moonshotai defaults");
+    let cn_defaults = provider_routing_defaults("moonshotai-cn").expect("moonshotai-cn defaults");
+
+    assert_eq!(canonical_provider_id("moonshot"), Some("moonshotai"));
+    assert_eq!(
+        canonical_provider_id("moonshotai-cn"),
+        Some("moonshotai-cn")
+    );
+    assert_eq!(provider_auth_env_keys("moonshotai"), &["MOONSHOT_API_KEY"]);
+    assert_eq!(
+        provider_auth_env_keys("moonshotai-cn"),
+        &["MOONSHOT_API_KEY"]
+    );
+    assert_ne!(global_defaults.base_url, cn_defaults.base_url);
+    assert_eq!(global_defaults.api, "openai-completions");
+    assert_eq!(cn_defaults.api, "openai-completions");
+}
+
+#[test]
+fn fireworks_ai_alias_migration_matches_fireworks_canonical_defaults() {
+    let harness =
+        TestHarness::new("fireworks_ai_alias_migration_matches_fireworks_canonical_defaults");
+
+    let fireworks_defaults =
+        provider_routing_defaults("fireworks").expect("fireworks defaults should exist");
+    let alias_defaults = provider_routing_defaults("fireworks-ai")
+        .expect("fireworks-ai alias defaults should exist");
+    harness
+        .log()
+        .info_ctx("alias", "fireworks migration", |ctx| {
+            ctx.push((
+                "canonical".to_string(),
+                canonical_provider_id("fireworks")
+                    .unwrap_or("missing")
+                    .to_string(),
+            ));
+            ctx.push((
+                "alias".to_string(),
+                canonical_provider_id("fireworks-ai")
+                    .unwrap_or("missing")
+                    .to_string(),
+            ));
+            ctx.push((
+                "canonical_base".to_string(),
+                fireworks_defaults.base_url.to_string(),
+            ));
+            ctx.push((
+                "alias_base".to_string(),
+                alias_defaults.base_url.to_string(),
+            ));
+        });
+    assert_eq!(canonical_provider_id("fireworks"), Some("fireworks"));
+    assert_eq!(canonical_provider_id("fireworks-ai"), Some("fireworks"));
+    assert_eq!(fireworks_defaults.api, alias_defaults.api);
+    assert_eq!(fireworks_defaults.base_url, alias_defaults.base_url);
+    assert_eq!(
+        provider_auth_env_keys("fireworks"),
+        provider_auth_env_keys("fireworks-ai")
+    );
+
+    let auth_path = harness.temp_path("auth.json");
+    let mut auth = AuthStorage::load(auth_path).expect("load auth storage");
+    auth.set(
+        "fireworks",
+        AuthCredential::ApiKey {
+            key: "fireworks-schema-key".to_string(),
+        },
+    );
+    auth.save().expect("save auth storage");
+
+    let models_path = harness.create_file(
+        "models.json",
+        r#"{
+  "providers": {
+    "fireworks-ai": {
+      "models": [{ "id": "accounts/fireworks/models/llama-v3p3-70b-instruct" }]
+    }
+  }
+}"#,
+    );
+    let registry = ModelRegistry::load(&auth, Some(models_path));
+    assert!(
+        registry.error().is_none(),
+        "unexpected models load error: {:?}",
+        registry.error()
+    );
+    let entry = registry
+        .find(
+            "fireworks-ai",
+            "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        )
+        .expect("fireworks-ai schema model should load");
+    assert_eq!(entry.model.provider, "fireworks-ai");
+    assert_eq!(entry.model.api, "openai-completions");
+    assert_eq!(
+        entry.model.base_url,
+        "https://api.fireworks.ai/inference/v1"
+    );
+    assert_eq!(entry.api_key.as_deref(), Some("fireworks-schema-key"));
+    assert!(entry.auth_header);
+
+    let provider = create_provider(&entry, None).expect("create fireworks-ai provider");
+    assert_eq!(provider.name(), "fireworks-ai");
+    assert_eq!(provider.api(), "openai-completions");
 }
 
 #[test]

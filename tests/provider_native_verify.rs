@@ -2102,6 +2102,834 @@ mod openai_smoke {
 // Azure OpenAI Provider Smoke Tests
 // ============================================================================
 
+// ============================================================================
+// SAP AI Core Provider Smoke Tests
+// ============================================================================
+
+mod sap_ai_core_smoke {
+    use super::*;
+    use pi::providers::openai::OpenAIProvider;
+
+    const TEST_DEPLOYMENT: &str = "verify-deployment";
+    const SERVICE_URL: &str = "https://api.ai.sap.example.com";
+
+    fn sap_url() -> String {
+        format!("{SERVICE_URL}/v2/inference/deployments/{TEST_DEPLOYMENT}/chat/completions")
+    }
+
+    fn cassette_name(tag: &str) -> String {
+        format!("verify_sap_ai_core_{tag}")
+    }
+
+    fn ensure_fixture(tag: &str, scenario: &CanonicalScenario) -> PathBuf {
+        let dir = cassette_root();
+        let name = cassette_name(tag);
+        let path = dir.join(format!("{name}.json"));
+
+        if should_generate_fixture(&path, &name) {
+            let response = match &scenario.expectation {
+                CanonicalExpectation::Error(e) => RecordedResponse {
+                    status: e.status,
+                    headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body_chunks: vec![
+                        serde_json::to_string(&openai_error_body(e.status)).unwrap_or_default(),
+                    ],
+                    body_chunks_base64: None,
+                },
+                CanonicalExpectation::Stream(exp) => {
+                    if exp.min_tool_calls > 0 {
+                        let tool_name = scenario.tools.first().map_or("echo", |t| t.name.as_str());
+                        openai_tool_response(
+                            TEST_DEPLOYMENT,
+                            tool_name,
+                            &json!({"text": "verification test"}),
+                        )
+                    } else if exp.require_unicode {
+                        openai_text_response(TEST_DEPLOYMENT, "日本語テスト — émojis: 🦀🔥")
+                    } else {
+                        openai_text_response(
+                            TEST_DEPLOYMENT,
+                            "Hello from the verification harness.",
+                        )
+                    }
+                }
+            };
+
+            let cassette = Cassette {
+                version: "1.0".to_string(),
+                test_name: name,
+                recorded_at: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                interactions: vec![Interaction {
+                    request: RecordedRequest {
+                        method: "POST".to_string(),
+                        url: sap_url(),
+                        headers: vec![
+                            ("Authorization".to_string(), "Bearer [REDACTED]".to_string()),
+                            ("Content-Type".to_string(), "application/json".to_string()),
+                        ],
+                        body: None,
+                        body_text: None,
+                    },
+                    response,
+                }],
+            };
+            write_cassette(&path, &cassette);
+        }
+
+        path
+    }
+
+    fn build_provider(tag: &str) -> OpenAIProvider {
+        let cassette_dir = cassette_root();
+        let name = cassette_name(tag);
+        let recorder = VcrRecorder::new_with(&name, vcr_mode(), &cassette_dir);
+        let client = Client::new().with_vcr(recorder);
+        OpenAIProvider::new(TEST_DEPLOYMENT)
+            .with_provider_name("sap-ai-core")
+            .with_base_url(sap_url())
+            .with_client(client)
+    }
+
+    #[test]
+    fn sap_ai_core_simple_text() {
+        let scenarios = canonical_scenarios();
+        let scenario = scenarios.iter().find(|s| s.tag == "simple_text").unwrap();
+        ensure_fixture("simple_text", scenario);
+        let provider = build_provider("simple_text");
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new("verify_sap_ai_core_simple_text");
+                run_canonical_scenario(&provider, scenario, &harness).await;
+            });
+    }
+
+    #[test]
+    fn sap_ai_core_unicode_text() {
+        let scenarios = canonical_scenarios();
+        let scenario = scenarios.iter().find(|s| s.tag == "unicode_text").unwrap();
+        ensure_fixture("unicode_text", scenario);
+        let provider = build_provider("unicode_text");
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new("verify_sap_ai_core_unicode_text");
+                run_canonical_scenario(&provider, scenario, &harness).await;
+            });
+    }
+
+    #[test]
+    fn sap_ai_core_tool_call_single() {
+        let scenarios = canonical_scenarios();
+        let scenario = scenarios
+            .iter()
+            .find(|s| s.tag == "tool_call_single")
+            .unwrap();
+        ensure_fixture("tool_call_single", scenario);
+        let provider = build_provider("tool_call_single");
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new("verify_sap_ai_core_tool_call_single");
+                run_canonical_scenario(&provider, scenario, &harness).await;
+            });
+    }
+
+    #[test]
+    fn sap_ai_core_error_auth_401() {
+        let scenarios = canonical_scenarios();
+        let scenario = scenarios
+            .iter()
+            .find(|s| s.tag == "error_auth_401")
+            .unwrap();
+        ensure_fixture("error_auth_401", scenario);
+        let provider = build_provider("error_auth_401");
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new("verify_sap_ai_core_error_auth_401");
+                run_canonical_scenario(&provider, scenario, &harness).await;
+            });
+    }
+
+    #[test]
+    fn sap_ai_core_error_bad_request_400() {
+        let scenarios = canonical_scenarios();
+        let scenario = scenarios
+            .iter()
+            .find(|s| s.tag == "error_bad_request_400")
+            .unwrap();
+        ensure_fixture("error_bad_request_400", scenario);
+        let provider = build_provider("error_bad_request_400");
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new("verify_sap_ai_core_error_bad_request_400");
+                run_canonical_scenario(&provider, scenario, &harness).await;
+            });
+    }
+
+    #[test]
+    fn sap_ai_core_error_rate_limit_429() {
+        let scenarios = canonical_scenarios();
+        let scenario = scenarios
+            .iter()
+            .find(|s| s.tag == "error_rate_limit_429")
+            .unwrap();
+        ensure_fixture("error_rate_limit_429", scenario);
+        let provider = build_provider("error_rate_limit_429");
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new("verify_sap_ai_core_error_rate_limit_429");
+                run_canonical_scenario(&provider, scenario, &harness).await;
+            });
+    }
+}
+
+// ============================================================================
+// Wave B1 Representative Smoke Tests (regional + coding-plan presets)
+// ============================================================================
+
+mod wave_b1_smoke {
+    use super::*;
+    use pi::providers::anthropic::AnthropicProvider;
+    use pi::providers::openai::OpenAIProvider;
+
+    const ALIBABA_CN_PROVIDER: &str = "alibaba-cn";
+    const ALIBABA_CN_MODEL: &str = "qwen-plus";
+    const ALIBABA_CN_URL: &str =
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+
+    const KIMI_FOR_CODING_PROVIDER: &str = "kimi-for-coding";
+    const KIMI_FOR_CODING_MODEL: &str = "k2p5";
+    const KIMI_FOR_CODING_URL: &str = "https://api.kimi.com/coding/v1/messages";
+
+    const MINIMAX_PROVIDER: &str = "minimax";
+    const MINIMAX_MODEL: &str = "MiniMax-M2.1";
+    const MINIMAX_URL: &str = "https://api.minimax.io/anthropic/v1/messages";
+
+    fn scenario_by_tag(tag: &str) -> CanonicalScenario {
+        canonical_scenarios()
+            .into_iter()
+            .find(|s| s.tag == tag)
+            .unwrap_or_else(|| panic!("missing canonical scenario: {tag}"))
+    }
+
+    fn openai_cassette_name(provider_id: &str, tag: &str) -> String {
+        format!("verify_{provider_id}_{tag}")
+    }
+
+    fn ensure_openai_fixture(
+        provider_id: &str,
+        model: &str,
+        url: &str,
+        scenario: &CanonicalScenario,
+    ) -> PathBuf {
+        let dir = cassette_root();
+        let name = openai_cassette_name(provider_id, scenario.tag);
+        let path = dir.join(format!("{name}.json"));
+
+        if should_generate_fixture(&path, &name) {
+            let response = match &scenario.expectation {
+                CanonicalExpectation::Error(e) => RecordedResponse {
+                    status: e.status,
+                    headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body_chunks: vec![
+                        serde_json::to_string(&openai_error_body(e.status)).unwrap_or_default(),
+                    ],
+                    body_chunks_base64: None,
+                },
+                CanonicalExpectation::Stream(exp) => {
+                    if exp.min_tool_calls > 0 {
+                        let tool_name = scenario.tools.first().map_or("echo", |t| t.name.as_str());
+                        openai_tool_response(
+                            model,
+                            tool_name,
+                            &json!({"text": "verification test"}),
+                        )
+                    } else if exp.require_unicode {
+                        openai_text_response(model, "日本語テスト — émojis: 🦀🔥")
+                    } else {
+                        openai_text_response(model, "Hello from the verification harness.")
+                    }
+                }
+            };
+
+            let cassette = Cassette {
+                version: "1.0".to_string(),
+                test_name: name,
+                recorded_at: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                interactions: vec![Interaction {
+                    request: RecordedRequest {
+                        method: "POST".to_string(),
+                        url: url.to_string(),
+                        headers: vec![
+                            ("Authorization".to_string(), "Bearer [REDACTED]".to_string()),
+                            ("Content-Type".to_string(), "application/json".to_string()),
+                        ],
+                        body: None,
+                        body_text: None,
+                    },
+                    response,
+                }],
+            };
+            write_cassette(&path, &cassette);
+        }
+
+        path
+    }
+
+    fn build_openai_provider(
+        provider_id: &str,
+        model: &str,
+        url: &str,
+        tag: &str,
+    ) -> OpenAIProvider {
+        let cassette_dir = cassette_root();
+        let name = openai_cassette_name(provider_id, tag);
+        let recorder = VcrRecorder::new_with(&name, vcr_mode(), &cassette_dir);
+        let client = Client::new().with_vcr(recorder);
+        OpenAIProvider::new(model)
+            .with_provider_name(provider_id)
+            .with_base_url(url)
+            .with_client(client)
+    }
+
+    fn anthropic_cassette_name(provider_id: &str, tag: &str) -> String {
+        format!("verify_{provider_id}_{tag}")
+    }
+
+    fn anthropic_text_sse(model: &str, text: &str) -> RecordedResponse {
+        let msg_start = format!(
+            "event: message_start\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_verify_b1_001",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 20, "output_tokens": 1}
+                }
+            }))
+            .unwrap_or_default()
+        );
+        let block_start = format!(
+            "event: content_block_start\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }))
+            .unwrap_or_default()
+        );
+        let block_delta = format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text}
+            }))
+            .unwrap_or_default()
+        );
+        let block_stop = format!(
+            "event: content_block_stop\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_stop",
+                "index": 0
+            }))
+            .unwrap_or_default()
+        );
+        let msg_delta = format!(
+            "event: message_delta\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": Value::Null},
+                "usage": {"output_tokens": 10}
+            }))
+            .unwrap_or_default()
+        );
+        let msg_stop = format!(
+            "event: message_stop\ndata: {}\n\n",
+            serde_json::to_string(&json!({"type": "message_stop"})).unwrap_or_default()
+        );
+
+        RecordedResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body_chunks: vec![
+                msg_start,
+                block_start,
+                block_delta,
+                block_stop,
+                msg_delta,
+                msg_stop,
+            ],
+            body_chunks_base64: None,
+        }
+    }
+
+    fn anthropic_tool_sse(model: &str, tool_name: &str, tool_args: &Value) -> RecordedResponse {
+        let args_str = serde_json::to_string(tool_args).unwrap_or_else(|_| "{}".to_string());
+        let msg_start = format!(
+            "event: message_start\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_verify_b1_002",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 25, "output_tokens": 1}
+                }
+            }))
+            .unwrap_or_default()
+        );
+        let block_start = format!(
+            "event: content_block_start\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": format!("toolu_verify_b1_{tool_name}"),
+                    "name": tool_name,
+                    "input": {}
+                }
+            }))
+            .unwrap_or_default()
+        );
+        let block_delta = format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": args_str}
+            }))
+            .unwrap_or_default()
+        );
+        let block_stop = format!(
+            "event: content_block_stop\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_stop",
+                "index": 0
+            }))
+            .unwrap_or_default()
+        );
+        let msg_delta = format!(
+            "event: message_delta\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": Value::Null},
+                "usage": {"output_tokens": 12}
+            }))
+            .unwrap_or_default()
+        );
+        let msg_stop = format!(
+            "event: message_stop\ndata: {}\n\n",
+            serde_json::to_string(&json!({"type": "message_stop"})).unwrap_or_default()
+        );
+
+        RecordedResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body_chunks: vec![
+                msg_start,
+                block_start,
+                block_delta,
+                block_stop,
+                msg_delta,
+                msg_stop,
+            ],
+            body_chunks_base64: None,
+        }
+    }
+
+    fn ensure_anthropic_fixture(
+        provider_id: &str,
+        model: &str,
+        url: &str,
+        scenario: &CanonicalScenario,
+    ) -> PathBuf {
+        let dir = cassette_root();
+        let name = anthropic_cassette_name(provider_id, scenario.tag);
+        let path = dir.join(format!("{name}.json"));
+
+        if should_generate_fixture(&path, &name) {
+            let response = match &scenario.expectation {
+                CanonicalExpectation::Error(e) => RecordedResponse {
+                    status: e.status,
+                    headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body_chunks: vec![
+                        serde_json::to_string(&json!({
+                            "type": "error",
+                            "error": {
+                                "type": "authentication_error",
+                                "message": format!("Simulated error {}", e.status)
+                            }
+                        }))
+                        .unwrap_or_default(),
+                    ],
+                    body_chunks_base64: None,
+                },
+                CanonicalExpectation::Stream(exp) => {
+                    if exp.min_tool_calls > 0 {
+                        let tool_name = scenario.tools.first().map_or("echo", |t| t.name.as_str());
+                        anthropic_tool_sse(model, tool_name, &json!({"text": "verification test"}))
+                    } else if exp.require_unicode {
+                        anthropic_text_sse(model, "日本語テスト — émojis: 🦀🔥")
+                    } else {
+                        anthropic_text_sse(model, "Hello from the verification harness.")
+                    }
+                }
+            };
+
+            let cassette = Cassette {
+                version: "1.0".to_string(),
+                test_name: name,
+                recorded_at: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                interactions: vec![Interaction {
+                    request: RecordedRequest {
+                        method: "POST".to_string(),
+                        url: url.to_string(),
+                        headers: vec![
+                            ("Content-Type".to_string(), "application/json".to_string()),
+                            ("X-API-Key".to_string(), "[REDACTED]".to_string()),
+                            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+                        ],
+                        body: None,
+                        body_text: None,
+                    },
+                    response,
+                }],
+            };
+            write_cassette(&path, &cassette);
+        }
+
+        path
+    }
+
+    fn build_anthropic_provider(
+        provider_id: &str,
+        model: &str,
+        url: &str,
+        tag: &str,
+    ) -> AnthropicProvider {
+        let cassette_dir = cassette_root();
+        let name = anthropic_cassette_name(provider_id, tag);
+        let recorder = VcrRecorder::new_with(&name, vcr_mode(), &cassette_dir);
+        let client = Client::new().with_vcr(recorder);
+        AnthropicProvider::new(model)
+            .with_base_url(url)
+            .with_client(client)
+    }
+
+    pub fn run_openai_case(provider_id: &str, model: &str, url: &str, tag: &str) {
+        let scenario = scenario_by_tag(tag);
+        ensure_openai_fixture(provider_id, model, url, &scenario);
+        let provider = build_openai_provider(provider_id, model, url, tag);
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new(format!("verify_{provider_id}_{tag}"));
+                run_canonical_scenario(&provider, &scenario, &harness).await;
+            });
+    }
+
+    fn run_anthropic_case(provider_id: &str, model: &str, url: &str, tag: &str) {
+        let scenario = scenario_by_tag(tag);
+        ensure_anthropic_fixture(provider_id, model, url, &scenario);
+        let provider = build_anthropic_provider(provider_id, model, url, tag);
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new(format!("verify_{provider_id}_{tag}"));
+                run_canonical_scenario(&provider, &scenario, &harness).await;
+            });
+    }
+
+    #[test]
+    fn b1_alibaba_cn_simple_text() {
+        run_openai_case(
+            ALIBABA_CN_PROVIDER,
+            ALIBABA_CN_MODEL,
+            ALIBABA_CN_URL,
+            "simple_text",
+        );
+    }
+
+    #[test]
+    fn b1_alibaba_cn_tool_call_single() {
+        run_openai_case(
+            ALIBABA_CN_PROVIDER,
+            ALIBABA_CN_MODEL,
+            ALIBABA_CN_URL,
+            "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b1_alibaba_cn_error_auth_401() {
+        run_openai_case(
+            ALIBABA_CN_PROVIDER,
+            ALIBABA_CN_MODEL,
+            ALIBABA_CN_URL,
+            "error_auth_401",
+        );
+    }
+
+    #[test]
+    fn b1_kimi_for_coding_simple_text() {
+        run_anthropic_case(
+            KIMI_FOR_CODING_PROVIDER,
+            KIMI_FOR_CODING_MODEL,
+            KIMI_FOR_CODING_URL,
+            "simple_text",
+        );
+    }
+
+    #[test]
+    fn b1_kimi_for_coding_tool_call_single() {
+        run_anthropic_case(
+            KIMI_FOR_CODING_PROVIDER,
+            KIMI_FOR_CODING_MODEL,
+            KIMI_FOR_CODING_URL,
+            "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b1_kimi_for_coding_error_auth_401() {
+        run_anthropic_case(
+            KIMI_FOR_CODING_PROVIDER,
+            KIMI_FOR_CODING_MODEL,
+            KIMI_FOR_CODING_URL,
+            "error_auth_401",
+        );
+    }
+
+    #[test]
+    fn b1_minimax_simple_text() {
+        run_anthropic_case(MINIMAX_PROVIDER, MINIMAX_MODEL, MINIMAX_URL, "simple_text");
+    }
+
+    #[test]
+    fn b1_minimax_tool_call_single() {
+        run_anthropic_case(
+            MINIMAX_PROVIDER,
+            MINIMAX_MODEL,
+            MINIMAX_URL,
+            "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b1_minimax_error_auth_401() {
+        run_anthropic_case(
+            MINIMAX_PROVIDER,
+            MINIMAX_MODEL,
+            MINIMAX_URL,
+            "error_auth_401",
+        );
+    }
+}
+
+// ============================================================================
+// Wave B2 Representative Smoke Tests (regional + cloud presets)
+// ============================================================================
+
+mod wave_b2_smoke {
+    const MODELSCOPE_PROVIDER: &str = "modelscope";
+    const MODELSCOPE_MODEL: &str = "ZhipuAI/GLM-4.5";
+    const MODELSCOPE_URL: &str = "https://api-inference.modelscope.cn/v1/chat/completions";
+
+    const MOONSHOT_CN_PROVIDER: &str = "moonshotai-cn";
+    const MOONSHOT_CN_MODEL: &str = "kimi-k2-0905-preview";
+    const MOONSHOT_CN_URL: &str = "https://api.moonshot.cn/v1/chat/completions";
+
+    const NEBIUS_PROVIDER: &str = "nebius";
+    const NEBIUS_MODEL: &str = "NousResearch/hermes-4-70b";
+    const NEBIUS_URL: &str = "https://api.tokenfactory.nebius.com/v1/chat/completions";
+
+    const OVHCLOUD_PROVIDER: &str = "ovhcloud";
+    const OVHCLOUD_MODEL: &str = "mixtral-8x7b-instruct-v0.1";
+    const OVHCLOUD_URL: &str = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions";
+
+    const SCALEWAY_PROVIDER: &str = "scaleway";
+    const SCALEWAY_MODEL: &str = "qwen3-235b-a22b-instruct-2507";
+    const SCALEWAY_URL: &str = "https://api.scaleway.ai/v1/chat/completions";
+
+    fn run_case(provider_id: &str, model: &str, url: &str, tag: &str) {
+        super::wave_b1_smoke::run_openai_case(provider_id, model, url, tag);
+    }
+
+    #[test]
+    fn b2_modelscope_simple_text() {
+        run_case(
+            MODELSCOPE_PROVIDER,
+            MODELSCOPE_MODEL,
+            MODELSCOPE_URL,
+            "simple_text",
+        );
+    }
+
+    #[test]
+    fn b2_modelscope_tool_call_single() {
+        run_case(
+            MODELSCOPE_PROVIDER,
+            MODELSCOPE_MODEL,
+            MODELSCOPE_URL,
+            "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b2_modelscope_error_auth_401() {
+        run_case(
+            MODELSCOPE_PROVIDER,
+            MODELSCOPE_MODEL,
+            MODELSCOPE_URL,
+            "error_auth_401",
+        );
+    }
+
+    #[test]
+    fn b2_moonshotai_cn_simple_text() {
+        run_case(
+            MOONSHOT_CN_PROVIDER,
+            MOONSHOT_CN_MODEL,
+            MOONSHOT_CN_URL,
+            "simple_text",
+        );
+    }
+
+    #[test]
+    fn b2_moonshotai_cn_tool_call_single() {
+        run_case(
+            MOONSHOT_CN_PROVIDER,
+            MOONSHOT_CN_MODEL,
+            MOONSHOT_CN_URL,
+            "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b2_moonshotai_cn_error_auth_401() {
+        run_case(
+            MOONSHOT_CN_PROVIDER,
+            MOONSHOT_CN_MODEL,
+            MOONSHOT_CN_URL,
+            "error_auth_401",
+        );
+    }
+
+    #[test]
+    fn b2_nebius_simple_text() {
+        run_case(NEBIUS_PROVIDER, NEBIUS_MODEL, NEBIUS_URL, "simple_text");
+    }
+
+    #[test]
+    fn b2_nebius_tool_call_single() {
+        run_case(
+            NEBIUS_PROVIDER,
+            NEBIUS_MODEL,
+            NEBIUS_URL,
+            "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b2_nebius_error_auth_401() {
+        run_case(NEBIUS_PROVIDER, NEBIUS_MODEL, NEBIUS_URL, "error_auth_401");
+    }
+
+    #[test]
+    fn b2_ovhcloud_simple_text() {
+        run_case(
+            OVHCLOUD_PROVIDER,
+            OVHCLOUD_MODEL,
+            OVHCLOUD_URL,
+            "simple_text",
+        );
+    }
+
+    #[test]
+    fn b2_ovhcloud_tool_call_single() {
+        run_case(
+            OVHCLOUD_PROVIDER,
+            OVHCLOUD_MODEL,
+            OVHCLOUD_URL,
+            "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b2_ovhcloud_error_auth_401() {
+        run_case(
+            OVHCLOUD_PROVIDER,
+            OVHCLOUD_MODEL,
+            OVHCLOUD_URL,
+            "error_auth_401",
+        );
+    }
+
+    #[test]
+    fn b2_scaleway_simple_text() {
+        run_case(
+            SCALEWAY_PROVIDER,
+            SCALEWAY_MODEL,
+            SCALEWAY_URL,
+            "simple_text",
+        );
+    }
+
+    #[test]
+    fn b2_scaleway_tool_call_single() {
+        run_case(
+            SCALEWAY_PROVIDER,
+            SCALEWAY_MODEL,
+            SCALEWAY_URL,
+            "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b2_scaleway_error_auth_401() {
+        run_case(
+            SCALEWAY_PROVIDER,
+            SCALEWAY_MODEL,
+            SCALEWAY_URL,
+            "error_auth_401",
+        );
+    }
+}
+
 mod azure_smoke {
     use super::*;
     use pi::providers::azure::AzureOpenAIProvider;

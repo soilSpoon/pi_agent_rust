@@ -254,6 +254,12 @@ fn all_oai_compatible_base_urls_are_nonempty() {
 #[test]
 fn all_oai_compatible_base_urls_are_unique() {
     let mut url_to_provider: HashMap<&str, &str> = HashMap::new();
+    let shared_endpoint_pairs: HashSet<(&str, &str)> = HashSet::from([
+        ("minimax", "minimax-coding-plan"),
+        ("minimax-coding-plan", "minimax"),
+        ("minimax-cn", "minimax-cn-coding-plan"),
+        ("minimax-cn-coding-plan", "minimax-cn"),
+    ]);
     for meta in PROVIDER_METADATA {
         if let Some(defaults) = &meta.routing_defaults {
             // Skip empty base_urls (native providers construct URLs differently).
@@ -261,9 +267,12 @@ fn all_oai_compatible_base_urls_are_unique() {
                 continue;
             }
             if let Some(prev) = url_to_provider.insert(defaults.base_url, meta.canonical_id) {
-                panic!(
+                assert!(
+                    shared_endpoint_pairs.contains(&(prev, meta.canonical_id)),
                     "base_url '{}' used by both '{}' and '{}'",
-                    defaults.base_url, prev, meta.canonical_id
+                    defaults.base_url,
+                    prev,
+                    meta.canonical_id
                 );
             }
         }

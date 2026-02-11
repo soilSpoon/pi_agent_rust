@@ -1327,6 +1327,98 @@ mod tests {
     }
 
     #[test]
+    fn ad_hoc_batch_b1_defaults_resolve_expected_routes() {
+        let alibaba_cn =
+            ad_hoc_provider_defaults("alibaba-cn").expect("expected defaults for alibaba-cn");
+        assert_eq!(alibaba_cn.api, "openai-completions");
+        assert!(alibaba_cn.auth_header);
+        assert!(alibaba_cn.base_url.contains("dashscope.aliyuncs.com"));
+
+        let kimi_for_coding = ad_hoc_provider_defaults("kimi-for-coding")
+            .expect("expected defaults for kimi-for-coding");
+        assert_eq!(kimi_for_coding.api, "anthropic-messages");
+        assert!(!kimi_for_coding.auth_header);
+        assert!(kimi_for_coding.base_url.contains("api.kimi.com/coding"));
+
+        for provider in [
+            "minimax",
+            "minimax-cn",
+            "minimax-coding-plan",
+            "minimax-cn-coding-plan",
+        ] {
+            let defaults =
+                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            assert_eq!(defaults.api, "anthropic-messages");
+            assert!(!defaults.auth_header);
+            assert!(defaults.base_url.contains("api.minimax"));
+        }
+    }
+
+    #[test]
+    fn ad_hoc_batch_b2_defaults_resolve_expected_routes() {
+        let cases = [
+            ("modelscope", "https://api-inference.modelscope.cn/v1"),
+            ("moonshotai-cn", "https://api.moonshot.cn/v1"),
+            ("nebius", "https://api.tokenfactory.nebius.com/v1"),
+            (
+                "ovhcloud",
+                "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+            ),
+            ("scaleway", "https://api.scaleway.ai/v1"),
+        ];
+        for (provider, expected_base_url) in &cases {
+            let defaults =
+                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            assert_eq!(defaults.api, "openai-completions");
+            assert!(defaults.auth_header);
+            assert_eq!(defaults.base_url, *expected_base_url);
+        }
+    }
+
+    #[test]
+    fn ad_hoc_kimi_alias_and_kimi_for_coding_remain_distinct() {
+        assert_eq!(canonical_provider_id("kimi"), Some("moonshotai"));
+        assert_eq!(
+            canonical_provider_id("kimi-for-coding"),
+            Some("kimi-for-coding")
+        );
+
+        let kimi_alias = ad_hoc_provider_defaults("kimi").expect("kimi alias defaults");
+        let kimi_for_coding =
+            ad_hoc_provider_defaults("kimi-for-coding").expect("kimi-for-coding defaults");
+        assert!(kimi_alias.base_url.contains("moonshot.ai"));
+        assert!(kimi_for_coding.base_url.contains("api.kimi.com"));
+        assert_ne!(kimi_alias.base_url, kimi_for_coding.base_url);
+        assert_ne!(kimi_alias.api, kimi_for_coding.api);
+    }
+
+    #[test]
+    fn ad_hoc_alibaba_cn_is_distinct_from_alibaba_family_aliases() {
+        let alibaba = ad_hoc_provider_defaults("alibaba").expect("alibaba defaults");
+        let alibaba_cn = ad_hoc_provider_defaults("alibaba-cn").expect("alibaba-cn defaults");
+        assert_eq!(canonical_provider_id("dashscope"), Some("alibaba"));
+        assert_eq!(canonical_provider_id("alibaba-cn"), Some("alibaba-cn"));
+        assert_eq!(alibaba.api, "openai-completions");
+        assert_eq!(alibaba_cn.api, "openai-completions");
+        assert_ne!(alibaba.base_url, alibaba_cn.base_url);
+    }
+
+    #[test]
+    fn ad_hoc_moonshot_cn_is_distinct_from_global_moonshot_aliases() {
+        let moonshot_global = ad_hoc_provider_defaults("moonshot").expect("moonshot defaults");
+        let moonshot_cn =
+            ad_hoc_provider_defaults("moonshotai-cn").expect("moonshotai-cn defaults");
+        assert_eq!(canonical_provider_id("moonshot"), Some("moonshotai"));
+        assert_eq!(
+            canonical_provider_id("moonshotai-cn"),
+            Some("moonshotai-cn")
+        );
+        assert_eq!(moonshot_global.api, "openai-completions");
+        assert_eq!(moonshot_cn.api, "openai-completions");
+        assert_ne!(moonshot_global.base_url, moonshot_cn.base_url);
+    }
+
+    #[test]
     fn ad_hoc_unknown_returns_none() {
         assert!(ad_hoc_provider_defaults("unknown-provider").is_none());
         assert!(ad_hoc_provider_defaults("").is_none());

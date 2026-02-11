@@ -859,6 +859,184 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         }),
         test_obligations: TEST_REQUIRED,
     },
+    // ── Batch B1: Regional + coding-plan providers ─────────────────────
+    ProviderMetadata {
+        canonical_id: "alibaba-cn",
+        aliases: &[],
+        auth_env_keys: &["DASHSCOPE_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "kimi-for-coding",
+        aliases: &[],
+        auth_env_keys: &["KIMI_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "anthropic-messages",
+            base_url: "https://api.kimi.com/coding/v1/messages",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT_IMAGE,
+            context_window: 262_144,
+            max_tokens: 32_768,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "minimax",
+        aliases: &[],
+        auth_env_keys: &["MINIMAX_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "anthropic-messages",
+            base_url: "https://api.minimax.io/anthropic/v1/messages",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 204_800,
+            max_tokens: 131_072,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "minimax-cn",
+        aliases: &[],
+        auth_env_keys: &["MINIMAX_CN_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "anthropic-messages",
+            base_url: "https://api.minimaxi.com/anthropic/v1/messages",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 204_800,
+            max_tokens: 131_072,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "minimax-coding-plan",
+        aliases: &[],
+        auth_env_keys: &["MINIMAX_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "anthropic-messages",
+            base_url: "https://api.minimax.io/anthropic/v1/messages",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 204_800,
+            max_tokens: 131_072,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "minimax-cn-coding-plan",
+        aliases: &[],
+        auth_env_keys: &["MINIMAX_CN_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "anthropic-messages",
+            base_url: "https://api.minimaxi.com/anthropic/v1/messages",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 204_800,
+            max_tokens: 131_072,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    // ── Batch B2: Regional + cloud providers ────────────────────────────
+    ProviderMetadata {
+        canonical_id: "modelscope",
+        aliases: &[],
+        auth_env_keys: &["MODELSCOPE_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api-inference.modelscope.cn/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 131_072,
+            max_tokens: 98_304,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "moonshotai-cn",
+        aliases: &[],
+        auth_env_keys: &["MOONSHOT_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.moonshot.cn/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 262_144,
+            max_tokens: 262_144,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "nebius",
+        aliases: &[],
+        auth_env_keys: &["NEBIUS_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.tokenfactory.nebius.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 8192,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "ovhcloud",
+        aliases: &[],
+        auth_env_keys: &["OVHCLOUD_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 32_768,
+            max_tokens: 32_768,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "scaleway",
+        aliases: &[],
+        auth_env_keys: &["SCALEWAY_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.scaleway.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 260_000,
+            max_tokens: 8192,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
     // ── Cloudflare provider IDs (gateway + workers-ai) ────────────────────
     ProviderMetadata {
         canonical_id: "cloudflare-ai-gateway",
@@ -1552,6 +1730,191 @@ mod tests {
         urls.sort_unstable();
         urls.dedup();
         assert_eq!(urls.len(), ids.len(), "duplicate base URLs detected");
+    }
+
+    #[test]
+    fn batch_b1_metadata_resolves_all_six_providers() {
+        let ids = [
+            "alibaba-cn",
+            "kimi-for-coding",
+            "minimax",
+            "minimax-cn",
+            "minimax-coding-plan",
+            "minimax-cn-coding-plan",
+        ];
+        for id in &ids {
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} metadata missing"));
+            assert_eq!(meta.canonical_id, *id);
+            assert_eq!(
+                meta.onboarding,
+                ProviderOnboardingMode::OpenAICompatiblePreset
+            );
+        }
+    }
+
+    #[test]
+    fn batch_b1_env_keys_match_expected_families() {
+        assert_eq!(
+            provider_metadata("alibaba-cn").unwrap().auth_env_keys,
+            &["DASHSCOPE_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("kimi-for-coding").unwrap().auth_env_keys,
+            &["KIMI_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("minimax").unwrap().auth_env_keys,
+            &["MINIMAX_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("minimax-cn").unwrap().auth_env_keys,
+            &["MINIMAX_CN_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("minimax-coding-plan")
+                .unwrap()
+                .auth_env_keys,
+            &["MINIMAX_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("minimax-cn-coding-plan")
+                .unwrap()
+                .auth_env_keys,
+            &["MINIMAX_CN_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn batch_b1_routing_defaults_match_expected_api_families() {
+        let alibaba_cn = provider_routing_defaults("alibaba-cn").expect("alibaba-cn defaults");
+        assert_eq!(alibaba_cn.api, "openai-completions");
+        assert!(alibaba_cn.auth_header);
+        assert!(alibaba_cn.base_url.contains("dashscope.aliyuncs.com"));
+
+        let kimi = provider_routing_defaults("kimi-for-coding").expect("kimi-for-coding defaults");
+        assert_eq!(kimi.api, "anthropic-messages");
+        assert!(!kimi.auth_header);
+        assert!(kimi.base_url.contains("api.kimi.com/coding"));
+
+        for id in [
+            "minimax",
+            "minimax-cn",
+            "minimax-coding-plan",
+            "minimax-cn-coding-plan",
+        ] {
+            let defaults =
+                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            assert_eq!(defaults.api, "anthropic-messages");
+            assert!(!defaults.auth_header);
+        }
+    }
+
+    #[test]
+    fn batch_b1_family_coherence_is_explicit() {
+        let alibaba_global = provider_routing_defaults("alibaba").expect("alibaba defaults");
+        let alibaba_cn = provider_routing_defaults("alibaba-cn").expect("alibaba-cn defaults");
+        assert_eq!(alibaba_global.api, "openai-completions");
+        assert_eq!(alibaba_cn.api, "openai-completions");
+        assert_ne!(alibaba_global.base_url, alibaba_cn.base_url);
+
+        let kimi_alias = canonical_provider_id("kimi").expect("kimi alias");
+        let kimi_coding = canonical_provider_id("kimi-for-coding").expect("kimi-for-coding");
+        assert_eq!(kimi_alias, "moonshotai");
+        assert_eq!(kimi_coding, "kimi-for-coding");
+
+        let minimax = provider_routing_defaults("minimax").expect("minimax defaults");
+        let minimax_cp =
+            provider_routing_defaults("minimax-coding-plan").expect("minimax-coding-plan");
+        assert_eq!(minimax.base_url, minimax_cp.base_url);
+
+        let minimax_cn = provider_routing_defaults("minimax-cn").expect("minimax-cn defaults");
+        let minimax_cn_cp = provider_routing_defaults("minimax-cn-coding-plan")
+            .expect("minimax-cn-coding-plan defaults");
+        assert_eq!(minimax_cn.base_url, minimax_cn_cp.base_url);
+        assert_ne!(minimax.base_url, minimax_cn.base_url);
+    }
+
+    #[test]
+    fn batch_b2_metadata_resolves_all_five_providers() {
+        let ids = [
+            "modelscope",
+            "moonshotai-cn",
+            "nebius",
+            "ovhcloud",
+            "scaleway",
+        ];
+        for id in &ids {
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} metadata missing"));
+            assert_eq!(meta.canonical_id, *id);
+            assert_eq!(
+                meta.onboarding,
+                ProviderOnboardingMode::OpenAICompatiblePreset
+            );
+        }
+    }
+
+    #[test]
+    fn batch_b2_env_keys_match_expected() {
+        assert_eq!(
+            provider_metadata("modelscope").unwrap().auth_env_keys,
+            &["MODELSCOPE_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("moonshotai-cn").unwrap().auth_env_keys,
+            &["MOONSHOT_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("nebius").unwrap().auth_env_keys,
+            &["NEBIUS_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("ovhcloud").unwrap().auth_env_keys,
+            &["OVHCLOUD_API_KEY"]
+        );
+        assert_eq!(
+            provider_metadata("scaleway").unwrap().auth_env_keys,
+            &["SCALEWAY_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn batch_b2_routing_defaults_use_openai_completions_and_bearer_auth() {
+        let ids = [
+            ("modelscope", "api-inference.modelscope.cn"),
+            ("moonshotai-cn", "api.moonshot.cn"),
+            ("nebius", "api.tokenfactory.nebius.com"),
+            ("ovhcloud", "oai.endpoints.kepler.ai.cloud.ovh.net"),
+            ("scaleway", "api.scaleway.ai"),
+        ];
+        for (id, expected_host) in &ids {
+            let defaults =
+                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            assert_eq!(defaults.api, "openai-completions");
+            assert!(defaults.auth_header);
+            assert!(defaults.base_url.contains(expected_host));
+        }
+    }
+
+    #[test]
+    fn batch_b2_moonshot_cn_and_global_moonshot_stay_distinct() {
+        let moonshot_global =
+            provider_routing_defaults("moonshotai").expect("moonshotai defaults missing");
+        let moonshot_cn =
+            provider_routing_defaults("moonshotai-cn").expect("moonshotai-cn defaults missing");
+
+        assert_eq!(canonical_provider_id("moonshot"), Some("moonshotai"));
+        assert_eq!(
+            canonical_provider_id("moonshotai-cn"),
+            Some("moonshotai-cn")
+        );
+        assert_eq!(provider_auth_env_keys("moonshotai"), &["MOONSHOT_API_KEY"]);
+        assert_eq!(
+            provider_auth_env_keys("moonshotai-cn"),
+            &["MOONSHOT_API_KEY"]
+        );
+        assert_eq!(moonshot_global.api, "openai-completions");
+        assert_eq!(moonshot_cn.api, "openai-completions");
+        assert_ne!(moonshot_global.base_url, moonshot_cn.base_url);
     }
 
     #[test]

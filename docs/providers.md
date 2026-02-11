@@ -48,6 +48,110 @@ Current artifact coverage (`docs/provider-implementation-modes.json`):
 - Live parity smoke lane: [`tests/e2e_cross_provider_parity.rs`](../tests/e2e_cross_provider_parity.rs)
 - Live provider integration lane: [`tests/e2e_live.rs`](../tests/e2e_live.rs)
 
+## Wave A Parity Verification (`bd-3uqg.4.4`)
+
+Unit + request-shape verification for all currently tracked Wave A OpenAI-compatible preset IDs:
+`groq`, `deepinfra`, `cerebras`, `openrouter`, `mistral`, `moonshotai`, `dashscope`, `deepseek`,
+`fireworks`, `togetherai`, `perplexity`, `xai`, plus migration alias `fireworks-ai`.
+
+Verification artifacts:
+- Default/factory lock: [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_a_presets_resolve_openai_compat_defaults_and_factory_route`)
+- Streaming path/auth lock: [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_a_openai_compat_streams_use_chat_completions_path_and_bearer_auth`)
+- Alias migration lock: [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`fireworks_ai_alias_migration_matches_fireworks_canonical_defaults`)
+
+Provider-by-provider status (local verification via `cargo test --test provider_factory -- --nocapture`):
+
+| Provider ID | Defaults + factory route lock | Streaming path/auth lock | Status |
+|-------------|-------------------------------|--------------------------|--------|
+| `groq` | yes | yes | pass |
+| `deepinfra` | yes | yes | pass |
+| `cerebras` | yes | yes | pass |
+| `openrouter` | yes | yes | pass |
+| `mistral` | yes | yes | pass |
+| `moonshotai` | yes | yes | pass |
+| `dashscope` | yes | yes | pass |
+| `deepseek` | yes | yes | pass |
+| `fireworks` | yes | yes | pass |
+| `togetherai` | yes | yes | pass |
+| `perplexity` | yes | yes | pass |
+| `xai` | yes | yes | pass |
+| `fireworks-ai` (alias) | yes | yes | pass |
+
+Migration mapping decisions:
+- `fireworks-ai` remains accepted as an alias of canonical `fireworks`.
+- Route and auth behavior are parity-locked between `fireworks` and `fireworks-ai`.
+- No compatibility shim layer is introduced; canonical configs should use `fireworks` going forward.
+
+## Wave B1 Onboarding Verification (`bd-3uqg.5.2`)
+
+Batch B1 provider IDs integrated and lock-tested:
+`alibaba-cn`, `kimi-for-coding`, `minimax`, `minimax-cn`, `minimax-coding-plan`, `minimax-cn-coding-plan`.
+
+Verification artifacts:
+- Metadata + factory route lock: [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b1_presets_resolve_metadata_defaults_and_factory_route`)
+- OpenAI-compatible stream path/auth lock (`alibaba-cn`): [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b1_alibaba_cn_openai_compat_streams_use_chat_completions_path_and_bearer_auth`)
+- Anthropic-compatible stream path/auth lock (`kimi-for-coding`, `minimax*`): [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b1_anthropic_compat_streams_use_messages_path_and_x_api_key`)
+- Family coherence lock (`moonshot`/`kimi` alias vs `kimi-for-coding`, `alibaba` vs `alibaba-cn`): [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b1_family_coherence_with_existing_moonshot_and_alibaba_mappings`)
+- Representative smoke/e2e artifacts (offline VCR harness): [`tests/provider_native_verify.rs`](../tests/provider_native_verify.rs) (`wave_b1_smoke::b1_alibaba_cn_*`, `wave_b1_smoke::b1_kimi_for_coding_*`, `wave_b1_smoke::b1_minimax_*`) with fixtures under [`tests/fixtures/vcr/verify_alibaba-cn_*.json`](../tests/fixtures/vcr/verify_alibaba-cn_simple_text.json), [`tests/fixtures/vcr/verify_kimi-for-coding_*.json`](../tests/fixtures/vcr/verify_kimi-for-coding_simple_text.json), and [`tests/fixtures/vcr/verify_minimax_*.json`](../tests/fixtures/vcr/verify_minimax_simple_text.json)
+
+Provider-by-provider status (local verification via `cargo test --test provider_factory -- --nocapture`):
+
+| Provider ID | API family | Route lock | Stream/auth lock | Status |
+|-------------|------------|------------|------------------|--------|
+| `alibaba-cn` | `openai-completions` | yes | yes | pass |
+| `kimi-for-coding` | `anthropic-messages` | yes | yes | pass |
+| `minimax` | `anthropic-messages` | yes | yes | pass |
+| `minimax-cn` | `anthropic-messages` | yes | yes | pass |
+| `minimax-coding-plan` | `anthropic-messages` | yes | yes | pass |
+| `minimax-cn-coding-plan` | `anthropic-messages` | yes | yes | pass |
+
+Representative smoke/e2e verification run:
+- `cargo test --test provider_native_verify b1_ -- --nocapture`
+- Passed: `b1_alibaba_cn_{simple_text,tool_call_single,error_auth_401}`,
+  `b1_kimi_for_coding_{simple_text,tool_call_single,error_auth_401}`,
+  `b1_minimax_{simple_text,tool_call_single,error_auth_401}`.
+
+Canonical mapping decisions:
+- `kimi` remains an alias of canonical `moonshotai`.
+- `kimi-for-coding` is a distinct canonical ID and does not alias to `moonshotai`.
+- `alibaba-cn` is distinct from `alibaba`/`dashscope`/`qwen` and uses CN DashScope routing defaults.
+- `minimax-cn`, `minimax-coding-plan`, and `minimax-cn-coding-plan` inherit representative smoke coverage via
+  shared family behavior plus explicit route/auth lock tests.
+
+## Wave B2 Onboarding Verification (`bd-3uqg.5.1`)
+
+Batch B2 provider IDs integrated and lock-tested:
+`modelscope`, `moonshotai-cn`, `nebius`, `ovhcloud`, `scaleway`.
+
+Verification artifacts:
+- Metadata + factory route lock: [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b2_presets_resolve_metadata_defaults_and_factory_route`)
+- OpenAI-compatible stream path/auth lock: [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b2_openai_compat_streams_use_chat_completions_path_and_bearer_auth`)
+- Family coherence lock (`moonshotai`/`moonshot` aliases vs `moonshotai-cn`): [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b2_moonshot_cn_and_global_moonshot_mapping_are_distinct`)
+- Representative smoke/e2e artifacts (offline VCR harness): [`tests/provider_native_verify.rs`](../tests/provider_native_verify.rs) (`wave_b2_smoke::b2_modelscope_*`, `wave_b2_smoke::b2_moonshotai_cn_*`, `wave_b2_smoke::b2_nebius_*`, `wave_b2_smoke::b2_ovhcloud_*`, `wave_b2_smoke::b2_scaleway_*`) with fixtures under [`tests/fixtures/vcr/verify_modelscope_*.json`](../tests/fixtures/vcr/verify_modelscope_simple_text.json), [`tests/fixtures/vcr/verify_moonshotai-cn_*.json`](../tests/fixtures/vcr/verify_moonshotai-cn_simple_text.json), [`tests/fixtures/vcr/verify_nebius_*.json`](../tests/fixtures/vcr/verify_nebius_simple_text.json), [`tests/fixtures/vcr/verify_ovhcloud_*.json`](../tests/fixtures/vcr/verify_ovhcloud_simple_text.json), and [`tests/fixtures/vcr/verify_scaleway_*.json`](../tests/fixtures/vcr/verify_scaleway_simple_text.json)
+
+Provider-by-provider status (local verification via `cargo test --test provider_factory -- --nocapture`):
+
+| Provider ID | API family | Route lock | Stream/auth lock | Status |
+|-------------|------------|------------|------------------|--------|
+| `modelscope` | `openai-completions` | yes | yes | pass |
+| `moonshotai-cn` | `openai-completions` | yes | yes | pass |
+| `nebius` | `openai-completions` | yes | yes | pass |
+| `ovhcloud` | `openai-completions` | yes | yes | pass |
+| `scaleway` | `openai-completions` | yes | yes | pass |
+
+Representative smoke/e2e verification run:
+- `cargo test --test provider_native_verify b2_ -- --nocapture`
+- Passed: `b2_modelscope_{simple_text,tool_call_single,error_auth_401}`,
+  `b2_moonshotai_cn_{simple_text,tool_call_single,error_auth_401}`,
+  `b2_nebius_{simple_text,tool_call_single,error_auth_401}`,
+  `b2_ovhcloud_{simple_text,tool_call_single,error_auth_401}`,
+  `b2_scaleway_{simple_text,tool_call_single,error_auth_401}`.
+
+Canonical mapping decisions:
+- `modelscope`, `nebius`, `ovhcloud`, and `scaleway` are canonical OpenAI-compatible preset IDs.
+- `moonshotai-cn` is a distinct canonical regional ID and does not alias to `moonshotai`.
+- `moonshotai` and `moonshotai-cn` intentionally share `MOONSHOT_API_KEY` while retaining distinct base URLs.
+
 ## Canonical Provider Matrix (Current Baseline + Evidence Links)
 
 | Canonical ID | Aliases | Capability flags | API family | Base URL template | Auth mode | Mode | Runtime status | Verification evidence (unit + e2e) |
@@ -64,12 +168,23 @@ Current artifact coverage (`docs/provider-implementation-modes.json`):
 | `openrouter` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://openrouter.ai/api/v1` | `Authorization: Bearer` (`OPENROUTER_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [e2e](../tests/e2e_cross_provider_parity.rs) |
 | `mistral` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.mistral.ai/v1` | `Authorization: Bearer` (`MISTRAL_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
 | `moonshotai` | `moonshot`, `kimi` | text (+ OAI-compatible tools) | `openai-completions` | `https://api.moonshot.ai/v1` | `Authorization: Bearer` (`MOONSHOT_API_KEY`) | `oai-compatible-preset` (`moonshot`,`kimi` are `alias-only`) | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [alias-roundtrip](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
+| `moonshotai-cn` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.moonshot.cn/v1` | `Authorization: Bearer` (`MOONSHOT_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_moonshotai-cn_simple_text.json) |
+| `kimi-for-coding` | - | text + image (Anthropic-compatible) | `anthropic-messages` | `https://api.kimi.com/coding/v1/messages` | `x-api-key` (`KIMI_API_KEY`) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_kimi-for-coding_simple_text.json) |
 | `dashscope` | `alibaba`, `qwen` | text (+ OAI-compatible tools) | `openai-completions` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `Authorization: Bearer` (`DASHSCOPE_API_KEY`) | `oai-compatible-preset` (`alibaba`,`qwen` are `alias-only`) | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
+| `alibaba-cn` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `Authorization: Bearer` (`DASHSCOPE_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_alibaba-cn_simple_text.json) |
+| `modelscope` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api-inference.modelscope.cn/v1` | `Authorization: Bearer` (`MODELSCOPE_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_modelscope_simple_text.json) |
+| `nebius` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.tokenfactory.nebius.com/v1` | `Authorization: Bearer` (`NEBIUS_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_nebius_simple_text.json) |
+| `ovhcloud` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1` | `Authorization: Bearer` (`OVHCLOUD_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_ovhcloud_simple_text.json) |
+| `scaleway` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.scaleway.ai/v1` | `Authorization: Bearer` (`SCALEWAY_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_scaleway_simple_text.json) |
 | `deepseek` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.deepseek.com` | `Authorization: Bearer` (`DEEPSEEK_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [e2e](../tests/e2e_cross_provider_parity.rs) |
 | `fireworks` | `fireworks-ai` | text (+ OAI-compatible tools) | `openai-completions` | `https://api.fireworks.ai/inference/v1` | `Authorization: Bearer` (`FIREWORKS_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
 | `togetherai` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.together.xyz/v1` | `Authorization: Bearer` (`TOGETHER_API_KEY`, alt `TOGETHER_AI_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
 | `perplexity` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.perplexity.ai` | `Authorization: Bearer` (`PERPLEXITY_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
 | `xai` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.x.ai/v1` | `Authorization: Bearer` (`XAI_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [e2e](../tests/e2e_cross_provider_parity.rs) |
+| `minimax` | - | text (Anthropic-compatible) | `anthropic-messages` | `https://api.minimax.io/anthropic/v1/messages` | `x-api-key` (`MINIMAX_API_KEY`) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_minimax_simple_text.json) |
+| `minimax-cn` | - | text (Anthropic-compatible) | `anthropic-messages` | `https://api.minimaxi.com/anthropic/v1/messages` | `x-api-key` (`MINIMAX_CN_API_KEY`) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), family representative smoke via [`verify_minimax_simple_text.json`](../tests/fixtures/vcr/verify_minimax_simple_text.json) |
+| `minimax-coding-plan` | - | text (Anthropic-compatible) | `anthropic-messages` | `https://api.minimax.io/anthropic/v1/messages` | `x-api-key` (`MINIMAX_API_KEY`) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), family representative smoke via [`verify_minimax_simple_text.json`](../tests/fixtures/vcr/verify_minimax_simple_text.json) |
+| `minimax-cn-coding-plan` | - | text (Anthropic-compatible) | `anthropic-messages` | `https://api.minimaxi.com/anthropic/v1/messages` | `x-api-key` (`MINIMAX_CN_API_KEY`) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), family representative smoke via [`verify_minimax_simple_text.json`](../tests/fixtures/vcr/verify_minimax_simple_text.json) |
 
 ## Missing/Partial IDs in Current Runtime
 
@@ -90,6 +205,11 @@ Covered now:
 - 12 OpenAI-compatible preset providers dispatchable via fallback adapters:
   `groq`, `deepinfra`, `cerebras`, `openrouter`, `mistral`, `moonshotai`, `dashscope`,
   `deepseek`, `fireworks`, `togetherai`, `perplexity`, `xai`.
+- 6 Wave B1 regional/coding-plan providers are now dispatchable with preset fallback defaults:
+  `alibaba-cn` via `openai-completions`; `kimi-for-coding`, `minimax`, `minimax-cn`,
+  `minimax-coding-plan`, `minimax-cn-coding-plan` via `anthropic-messages`.
+- 5 Wave B2 regional/cloud providers are now dispatchable with preset fallback defaults:
+  `modelscope`, `moonshotai-cn`, `nebius`, `ovhcloud`, and `scaleway` via `openai-completions`.
 - Alias coverage built into preset defaults:
   `moonshot`/`kimi` -> `moonshotai`, and `alibaba`/`qwen` -> `dashscope`.
 
