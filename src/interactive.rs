@@ -4711,6 +4711,194 @@ impl FrameTimingStats {
     }
 }
 
+// ============================================================================
+// Memory pressure monitoring (PERF-6)
+// ============================================================================
+
+/// Memory pressure level based on RSS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryLevel {
+    /// RSS < 50MB — no action needed.
+    Normal,
+    /// 50MB <= RSS < 100MB — log warning, show in /session.
+    Warning,
+    /// 100MB <= RSS < 200MB — progressive tool output collapse.
+    Pressure,
+    /// RSS >= 200MB — truncate old messages, force degraded rendering.
+    Critical,
+}
+
+impl MemoryLevel {
+    fn from_rss_bytes(rss: usize) -> Self {
+        const MB: usize = 1_000_000;
+        if rss >= 200 * MB {
+            Self::Critical
+        } else if rss >= 100 * MB {
+            Self::Pressure
+        } else if rss >= 50 * MB {
+            Self::Warning
+        } else {
+            Self::Normal
+        }
+    }
+}
+
+/// Abstraction for reading RSS, injectable for testing.
+trait RssReader: Send {
+    fn read_rss_bytes(&self) -> Option<usize>;
+}
+
+/// Reads RSS from /proc/self/statm on Linux.
+struct ProcSelfRssReader;
+
+/// Page size in bytes. Hardcoded to 4096 (standard for x86_64/aarch64 Linux)
+/// to avoid unsafe libc::sysconf — crate uses `#![forbid(unsafe_code)]`.
+const PROC_PAGE_SIZE: usize = 4096;
+
+impl RssReader for ProcSelfRssReader {
+    fn read_rss_bytes(&self) -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            // /proc/self/statm: "total_pages resident_pages shared_pages ..."
+            let content = std::fs::read_to_string("/proc/self/statm").ok()?;
+            let resident_pages: usize = content.split_whitespace().nth(1)?.parse().ok()?;
+            Some(resident_pages * PROC_PAGE_SIZE)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+}
+
+/// Hysteresis threshold: stop collapsing when RSS drops below this.
+const MEMORY_RELIEF_BYTES: usize = 80_000_000;
+
+/// Maximum messages retained when Critical truncation triggers.
+const CRITICAL_KEEP_MESSAGES: usize = 30;
+
+/// Memory monitor that drives progressive conversation management.
+pub struct MemoryMonitor {
+    reader: Box<dyn RssReader>,
+    last_sample: std::time::Instant,
+    sample_interval: std::time::Duration,
+    current_rss_bytes: usize,
+    peak_rss_bytes: usize,
+    level: MemoryLevel,
+    /// Index into messages vec: next tool output to collapse.
+    next_collapse_index: usize,
+    /// Whether progressive collapse is in progress.
+    collapsing: bool,
+    /// When the last collapse action was performed (rate-limit to 1/sec).
+    last_collapse: std::time::Instant,
+    /// Whether Critical truncation has already been applied this session.
+    truncated: bool,
+}
+
+impl MemoryMonitor {
+    fn new(reader: Box<dyn RssReader>) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            reader,
+            last_sample: now,
+            sample_interval: std::time::Duration::from_secs(5),
+            current_rss_bytes: 0,
+            peak_rss_bytes: 0,
+            level: MemoryLevel::Normal,
+            next_collapse_index: 0,
+            collapsing: false,
+            last_collapse: now,
+            truncated: false,
+        }
+    }
+
+    fn new_default() -> Self {
+        Self::new(Box::new(ProcSelfRssReader))
+    }
+
+    /// Sample RSS if the interval has elapsed. Returns true if level changed.
+    fn maybe_sample(&mut self) -> bool {
+        if self.last_sample.elapsed() < self.sample_interval {
+            return false;
+        }
+        self.last_sample = std::time::Instant::now();
+        let Some(rss) = self.reader.read_rss_bytes() else {
+            return false;
+        };
+        self.current_rss_bytes = rss;
+        if rss > self.peak_rss_bytes {
+            self.peak_rss_bytes = rss;
+        }
+        let new_level = MemoryLevel::from_rss_bytes(rss);
+        let changed = new_level != self.level;
+        if changed {
+            match new_level {
+                MemoryLevel::Warning => {
+                    tracing::warn!(
+                        rss_mb = rss / 1_000_000,
+                        "Memory pressure: Warning level reached"
+                    );
+                }
+                MemoryLevel::Pressure => {
+                    tracing::warn!(
+                        rss_mb = rss / 1_000_000,
+                        "Memory pressure: Pressure level — starting progressive collapse"
+                    );
+                    self.collapsing = true;
+                }
+                MemoryLevel::Critical => {
+                    tracing::error!(
+                        rss_mb = rss / 1_000_000,
+                        "Memory pressure: Critical level — truncating conversation"
+                    );
+                }
+                MemoryLevel::Normal => {
+                    tracing::info!(
+                        rss_mb = rss / 1_000_000,
+                        "Memory pressure relieved — back to Normal"
+                    );
+                    self.collapsing = false;
+                }
+            }
+            self.level = new_level;
+        }
+        changed
+    }
+
+    /// Re-sample RSS immediately (used after collapse actions).
+    fn resample_now(&mut self) {
+        if let Some(rss) = self.reader.read_rss_bytes() {
+            self.current_rss_bytes = rss;
+            if rss > self.peak_rss_bytes {
+                self.peak_rss_bytes = rss;
+            }
+            self.level = MemoryLevel::from_rss_bytes(rss);
+            if rss < MEMORY_RELIEF_BYTES {
+                self.collapsing = false;
+            }
+        }
+    }
+
+    /// Format memory stats for /session display.
+    #[allow(clippy::cast_precision_loss)]
+    fn summary(&self) -> String {
+        let current_mb = self.current_rss_bytes as f64 / 1_000_000.0;
+        let peak_mb = self.peak_rss_bytes as f64 / 1_000_000.0;
+        let level_str = match self.level {
+            MemoryLevel::Normal => "Normal",
+            MemoryLevel::Warning => "Warning",
+            MemoryLevel::Pressure => "Pressure (collapsing old outputs...)",
+            MemoryLevel::Critical => "CRITICAL",
+        };
+        format!("Memory: {current_mb:.1}MB (peak {peak_mb:.1}MB) [{level_str}]")
+    }
+
+    /// Whether Critical-level rendering degradation should be forced.
+    const fn should_force_degraded(&self) -> bool {
+        matches!(self.level, MemoryLevel::Critical)
+    }
+}
+
 /// The main interactive TUI application model.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(bubbletea::Model)]
@@ -4821,6 +5009,9 @@ pub struct PiApp {
 
     // Frame timing telemetry (PERF-3)
     frame_timing: FrameTimingStats,
+
+    // Memory pressure monitoring (PERF-6)
+    memory_monitor: MemoryMonitor,
 }
 
 /// Autocomplete dropdown state.
@@ -12528,10 +12719,7 @@ mod tests {
         auth.save().expect("save credential");
 
         let loaded = crate::auth::AuthStorage::load(auth_path).expect("reload auth");
-        assert_eq!(
-            loaded.api_key("google").as_deref(),
-            Some("gemini-test-key")
-        );
+        assert_eq!(loaded.api_key("google").as_deref(), Some("gemini-test-key"));
         assert!(loaded.get("gemini").is_none());
     }
 
