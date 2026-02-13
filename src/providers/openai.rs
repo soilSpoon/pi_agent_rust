@@ -141,6 +141,48 @@ impl OpenAIProvider {
         }
     }
 
+    fn build_request_json(
+        &self,
+        context: &Context,
+        options: &StreamOptions,
+    ) -> Result<serde_json::Value> {
+        let request = self.build_request(context, options);
+        let mut value = serde_json::to_value(request)
+            .map_err(|e| Error::api(format!("Failed to serialize OpenAI request: {e}")))?;
+        self.apply_openrouter_routing_overrides(&mut value)?;
+        Ok(value)
+    }
+
+    fn apply_openrouter_routing_overrides(&self, request: &mut serde_json::Value) -> Result<()> {
+        if !self.provider.eq_ignore_ascii_case("openrouter") {
+            return Ok(());
+        }
+
+        let Some(routing) = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.open_router_routing.as_ref())
+        else {
+            return Ok(());
+        };
+
+        let Some(request_obj) = request.as_object_mut() else {
+            return Err(Error::api(
+                "OpenAI request body must serialize to a JSON object",
+            ));
+        };
+        let Some(routing_obj) = routing.as_object() else {
+            return Err(Error::config(
+                "openRouterRouting must be a JSON object when configured",
+            ));
+        };
+
+        for (key, value) in routing_obj {
+            request_obj.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+
     /// Build the messages array with system prompt prepended using the given role name.
     fn build_messages_with_role(context: &Context, system_role: &str) -> Vec<OpenAIMessage> {
         let mut messages = Vec::new();
@@ -197,11 +239,16 @@ impl Provider for OpenAIProvider {
                     .api_key
                     .clone()
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                    .ok_or_else(|| Error::provider("openai", "Missing API key for OpenAI. Set OPENAI_API_KEY or configure in settings."))?,
+                    .ok_or_else(|| {
+                        Error::provider(
+                            &self.provider,
+                            "Missing API key for OpenAI. Set OPENAI_API_KEY or configure in settings.",
+                        )
+                    })?,
             )
         };
 
-        let request_body = self.build_request(context, options);
+        let request_body = self.build_request_json(context, options)?;
 
         // Note: Content-Type is set by .json() below; setting it here too
         // produces a duplicate header that OpenAI's server rejects.
@@ -238,7 +285,7 @@ impl Provider for OpenAIProvider {
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::provider(
-                "openai",
+                &self.provider,
                 format!("OpenAI API error (HTTP {status}): {body}"),
             ));
         }
@@ -405,6 +452,16 @@ where
             self.partial.usage.total_tokens = usage.total_tokens;
         }
 
+        if let Some(error) = chunk.error {
+            self.partial.stop_reason = StopReason::Error;
+            if let Some(message) = error.message {
+                let message = message.trim();
+                if !message.is_empty() {
+                    self.partial.error_message = Some(message.to_string());
+                }
+            }
+        }
+
         // Process choices
         if let Some(choice) = chunk.choices.into_iter().next() {
             if !self.started
@@ -450,7 +507,7 @@ where
             self.partial.stop_reason = match reason.as_str() {
                 "length" => StopReason::Length,
                 "tool_calls" => StopReason::ToolUse,
-                "content_filter" => StopReason::Error,
+                "content_filter" | "error" => StopReason::Error,
                 _ => StopReason::Stop,
             };
 
@@ -670,6 +727,8 @@ struct OpenAIStreamChunk {
     choices: Vec<OpenAIChoice>,
     #[serde(default)]
     usage: Option<OpenAIUsage>,
+    #[serde(default)]
+    error: Option<OpenAIChunkError>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -711,6 +770,12 @@ struct OpenAIUsage {
     #[serde(default)]
     completion_tokens: Option<u64>,
     total_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIChunkError {
+    #[serde(default)]
+    message: Option<String>,
 }
 
 // ============================================================================
@@ -1082,6 +1147,66 @@ mod tests {
                 .any(|event| matches!(event, StreamEvent::ToolCallStart { .. })),
             "expected tool call start event"
         );
+    }
+
+    #[test]
+    fn test_stream_maps_finish_reason_error_to_stop_reason_error() {
+        let events = vec![
+            json!({
+                "choices": [{ "delta": {}, "finish_reason": "error" }],
+                "error": { "message": "upstream provider timeout" }
+            }),
+            Value::String("[DONE]".to_string()),
+        ];
+
+        let out = collect_events(&events);
+        let done = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { reason, message } => Some((reason, message)),
+                _ => None,
+            })
+            .expect("done event");
+        assert_eq!(*done.0, StopReason::Error);
+        assert_eq!(
+            done.1.error_message.as_deref(),
+            Some("upstream provider timeout")
+        );
+    }
+
+    #[test]
+    fn test_build_request_applies_openrouter_routing_overrides() {
+        let provider = OpenAIProvider::new("openai/gpt-4o-mini")
+            .with_provider_name("openrouter")
+            .with_compat(Some(CompatConfig {
+                open_router_routing: Some(json!({
+                    "models": ["openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet"],
+                    "provider": {
+                        "order": ["openai", "anthropic"],
+                        "allow_fallbacks": false
+                    },
+                    "route": "fallback"
+                })),
+                ..CompatConfig::default()
+            }));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions::default();
+
+        let request = provider
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert_eq!(request["model"], "openai/gpt-4o-mini");
+        assert_eq!(request["route"], "fallback");
+        assert_eq!(request["provider"]["allow_fallbacks"], false);
+        assert_eq!(request["models"][0], "openai/gpt-4o-mini");
+        assert_eq!(request["models"][1], "anthropic/claude-3.5-sonnet");
     }
 
     #[test]
