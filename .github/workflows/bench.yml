@@ -92,6 +92,9 @@ jobs:
         env:
           PI_BENCH_BINARY: target/release/pi
 
+      - name: Run TUI performance benchmarks (PERF-8/9)
+        run: cargo bench --bench tui_perf -- --noplot --save-baseline pr
+
       - name: Generate PiJS workload perf data (JSONL)
         run: |
           set -euxo pipefail
@@ -124,6 +127,20 @@ jobs:
               fi
             done
           fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### TUI Rendering (PERF-8)" >> $GITHUB_STEP_SUMMARY
+          for group in build_conversation_content view viewport_operations markdown_rendering; do
+            if [ -d "target/criterion/$group" ]; then
+              echo "**$group**" >> $GITHUB_STEP_SUMMARY
+              for dir in target/criterion/"$group"/*/; do
+                name=$(basename "$dir")
+                if [ -f "$dir/new/estimates.json" ]; then
+                  mean=$(jq -r '.mean.point_estimate' "$dir/new/estimates.json" 2>/dev/null || echo "N/A")
+                  echo "- $name: ${mean}ns" >> $GITHUB_STEP_SUMMARY
+                fi
+              done
+            fi
+          done
 
       - name: Perf budget gate
         run: cargo test --test perf_budgets -- --nocapture
@@ -171,11 +188,15 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-compare-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install critcmp
+        run: cargo install critcmp
+
       - name: Build and benchmark main
         working-directory: main-branch
         run: |
           cargo build --release
           cargo bench --bench tools -- --noplot --save-baseline main 2>/dev/null || true
+          cargo bench --bench tui_perf -- --noplot --save-baseline main 2>/dev/null || true
 
       - name: Copy main baseline to PR target dir
         run: |
@@ -191,3 +212,23 @@ jobs:
         run: |
           cargo build --release
           cargo bench --bench tools -- --noplot --baseline main 2>/dev/null || echo "Baseline comparison skipped"
+          cargo bench --bench tui_perf -- --noplot --baseline main 2>/dev/null || echo "TUI baseline comparison skipped"
+
+      - name: Compare TUI performance (fail on >20% regression)
+        working-directory: pr-branch
+        env:
+          PERF_REGRESSION_THRESHOLD: ${{ vars.PERF_REGRESSION_THRESHOLD || '20' }}
+        run: |
+          set -euo pipefail
+          echo "## TUI Performance Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Run critcmp with threshold
+          if critcmp main pr --threshold "${PERF_REGRESSION_THRESHOLD}" 2>/dev/null; then
+            echo "✅ No TUI performance regressions detected (threshold: ${PERF_REGRESSION_THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ TUI performance regression detected (>${PERF_REGRESSION_THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
+            # Show detailed comparison
+            critcmp main pr 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
+            exit 1
+          fi
