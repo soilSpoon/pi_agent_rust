@@ -2778,11 +2778,12 @@ mod wave_b1_smoke {
         }
     }
 
-    fn anthropic_multi_tool_sse(model: &str, tools: &[ToolDef]) -> RecordedResponse {
-        let tool0 = tools.first().expect("need at least 1 tool");
-        let tool1 = tools.get(1).unwrap_or(tool0);
-        let args0 = super::synthesize_tool_args(tool0);
-        let args1 = super::synthesize_tool_args(tool1);
+    #[allow(clippy::too_many_lines)]
+    fn anthropic_multi_tool_sse(model: &str, tool_defs: &[ToolDef]) -> RecordedResponse {
+        let first_tool = tool_defs.first().expect("need at least 1 tool");
+        let second_tool = tool_defs.get(1).unwrap_or(first_tool);
+        let args0 = super::synthesize_tool_args(first_tool);
+        let args1 = super::synthesize_tool_args(second_tool);
         let args0_str = serde_json::to_string(&args0).unwrap_or_else(|_| "{}".to_string());
         let args1_str = serde_json::to_string(&args1).unwrap_or_else(|_| "{}".to_string());
 
@@ -2810,8 +2811,8 @@ mod wave_b1_smoke {
                 "index": 0,
                 "content_block": {
                     "type": "tool_use",
-                    "id": format!("toolu_verify_b1_{}", tool0.name),
-                    "name": tool0.name,
+                    "id": format!("toolu_verify_b1_{}", first_tool.name),
+                    "name": first_tool.name,
                     "input": {}
                 }
             }))
@@ -2841,8 +2842,8 @@ mod wave_b1_smoke {
                 "index": 1,
                 "content_block": {
                     "type": "tool_use",
-                    "id": format!("toolu_verify_b1_{}", tool1.name),
-                    "name": tool1.name,
+                    "id": format!("toolu_verify_b1_{}", second_tool.name),
+                    "name": second_tool.name,
                     "input": {}
                 }
             }))
