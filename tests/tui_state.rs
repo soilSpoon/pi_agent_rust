@@ -2581,6 +2581,61 @@ fn tui_state_slash_scoped_models_set_persists_and_scopes_ctrlp() {
 }
 
 #[test]
+fn tui_state_slash_scoped_models_no_matches_warns_and_ctrlp_falls_back() {
+    let harness =
+        TestHarness::new("tui_state_slash_scoped_models_no_matches_warns_and_ctrlp_falls_back");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    let google = make_model_entry(
+        "google",
+        "gemini-a",
+        "https://generativeai.googleapis.com/v1beta/models",
+    );
+
+    let model_scope = Vec::new();
+    let available_models = vec![anthropic.clone(), openai, google];
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    type_text(&harness, &mut app, "/scoped-models does-not-match/*");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(
+        &harness,
+        &step,
+        "Scoped models updated: 0 matched; cycling will use all available models",
+    );
+
+    let settings = read_project_settings_json(&harness);
+    assert_eq!(
+        settings
+            .get("enabled_models")
+            .and_then(|value| value.as_array())
+            .map(|array| { array.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>() }),
+        Some(vec!["does-not-match/*"])
+    );
+
+    let step = press_ctrlp(&harness, &mut app);
+    assert_after_contains(
+        &harness,
+        &step,
+        "No scoped models matched; cycling all available models. Switched model: google/gemini-a",
+    );
+}
+
+#[test]
 fn tui_state_slash_scoped_models_clear_persists_and_restores_all_models() {
     let harness =
         TestHarness::new("tui_state_slash_scoped_models_clear_persists_and_restores_all_models");

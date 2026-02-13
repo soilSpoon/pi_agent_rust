@@ -123,23 +123,25 @@ impl PiApp {
     /// If `follow_tail` is true the viewport is scrolled to the very bottom;
     /// otherwise the current scroll position is preserved.
     fn refresh_conversation_viewport(&mut self, follow_tail: bool) {
+        let vp_start = if self.frame_timing.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let content = self.build_conversation_content();
-        // Trim trailing blank/whitespace-only lines so that "scroll to
-        // bottom" lands on the last meaningful content line, not on the
-        // trailing padding the markdown renderer inserts after paragraphs.
         let trimmed = content.trim_end();
-        // Temporarily align the viewport's internal height to what view()
-        // actually renders.  The stored height (from conversation_viewport_height)
-        // can be larger because it doesn't account for conditional chrome
-        // (scroll indicator, status message, tool bar).  Without this the
-        // viewport's max_y_offset clamp in set_y_offset/goto_bottom is too
-        // conservative and the last meaningful line(s) get clipped.
         let effective = self.view_effective_conversation_height().max(1);
         self.conversation_viewport.height = effective;
         self.conversation_viewport.set_content(trimmed);
         if follow_tail {
             self.conversation_viewport.goto_bottom();
             self.follow_stream_tail = true;
+        }
+
+        if let Some(start) = vp_start {
+            self.frame_timing
+                .record_viewport_sync(micros_as_u64(start.elapsed().as_micros()));
         }
     }
 
@@ -535,11 +537,14 @@ impl PiApp {
             "$0.0000".to_string()
         };
 
-        format!(
+        let mut info = format!(
             "Session info:\n  file: {file}\n  id: {id}\n  name: {name}\n  model: {model}\n  thinking: {thinking}\n  messageCount: {message_count}\n  tokens: {total_tokens}\n  cost: {cost_str}",
             id = session.header.id,
             model = self.model,
-        )
+        );
+        info.push_str("\n\n");
+        info.push_str(&self.frame_timing.summary());
+        info
     }
 
     fn format_settings_summary(&self) -> String {
@@ -2072,6 +2077,44 @@ fn build_content_blocks_for_input(text: &str, images: &[ImageContent]) -> Vec<Co
     content
 }
 
+fn normalize_api_key_input(raw: &str) -> std::result::Result<String, String> {
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err("API key cannot be empty".to_string());
+    }
+    if key.chars().any(char::is_whitespace) {
+        return Err("API key must not contain whitespace".to_string());
+    }
+    Ok(key.to_string())
+}
+
+fn normalize_auth_provider_input(raw: &str) -> String {
+    let provider = raw.trim().to_ascii_lowercase();
+    crate::provider_metadata::canonical_provider_id(&provider)
+        .unwrap_or(provider.as_str())
+        .to_string()
+}
+
+fn api_key_login_prompt(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some(
+            "API key login: openai\n\n\
+Paste your OpenAI API key to save it in auth.json.\n\
+Get a key from platform.openai.com/api-keys.\n\
+Rotate/revoke keys from that dashboard if compromised.\n\n\
+Your input will be treated as sensitive and is not added to message history.",
+        ),
+        "google" => Some(
+            "API key login: google/gemini\n\n\
+Paste your Google Gemini API key to save it in auth.json under google.\n\
+Get a key from ai.google.dev/gemini-api/docs/api-key.\n\
+Rotate/revoke keys from Google AI Studio if compromised.\n\n\
+Your input will be treated as sensitive and is not added to message history.",
+        ),
+        _ => None,
+    }
+}
+
 async fn dispatch_input_event(
     manager: &ExtensionManager,
     text: String,
@@ -3335,8 +3378,8 @@ impl SlashCommand {
     pub const fn help_text() -> &'static str {
         r"Available commands:
   /help, /h, /?      - Show this help message
-  /login [provider]  - OAuth login (currently: anthropic)
-  /logout [provider] - Remove stored OAuth credentials
+  /login [provider]  - Login/setup credentials (OAuth or API key, provider-specific)
+  /logout [provider] - Remove stored credentials
   /clear, /cls       - Clear conversation history
   /model, /m [id|provider/id] - Show or change the current model
   /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh)
@@ -4453,6 +4496,189 @@ impl HistoryList {
     }
 }
 
+// ============================================================================
+// Frame Timing Telemetry (PERF-3)
+// ============================================================================
+
+/// Safely convert `Duration::as_micros()` (u128) to u64 with saturation.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn micros_as_u64(micros: u128) -> u64 {
+    micros.min(u128::from(u64::MAX)) as u64
+}
+
+/// Microsecond-precision frame timing stats for TUI performance measurement.
+///
+/// Uses interior mutability (`RefCell`/`Cell`) because `view(&self)` cannot
+/// take `&mut self` (the `bubbletea::Model` trait requires `&self` for `view`).
+/// This is safe because the TUI event loop is single-threaded.
+///
+/// Gated behind `PI_PERF_TELEMETRY=1` environment variable.  When disabled,
+/// no `Instant::now()` calls are made — zero runtime overhead.
+pub struct FrameTimingStats {
+    frame_times_us: std::cell::RefCell<VecDeque<u64>>,
+    content_build_times_us: std::cell::RefCell<VecDeque<u64>>,
+    viewport_sync_times_us: std::cell::RefCell<VecDeque<u64>>,
+    update_times_us: VecDeque<u64>,
+    total_frames: std::cell::Cell<u64>,
+    budget_exceeded_count: std::cell::Cell<u64>,
+    enabled: bool,
+}
+
+const FRAME_TIMING_WINDOW: usize = 60;
+const FRAME_BUDGET_US: u64 = 16_667;
+
+impl FrameTimingStats {
+    fn new() -> Self {
+        let enabled =
+            std::env::var_os("PI_PERF_TELEMETRY").map_or(false, |v| v == "1" || v == "true");
+        Self {
+            frame_times_us: std::cell::RefCell::new(VecDeque::with_capacity(FRAME_TIMING_WINDOW)),
+            content_build_times_us: std::cell::RefCell::new(VecDeque::with_capacity(
+                FRAME_TIMING_WINDOW,
+            )),
+            viewport_sync_times_us: std::cell::RefCell::new(VecDeque::with_capacity(
+                FRAME_TIMING_WINDOW,
+            )),
+            update_times_us: VecDeque::with_capacity(FRAME_TIMING_WINDOW),
+            total_frames: std::cell::Cell::new(0),
+            budget_exceeded_count: std::cell::Cell::new(0),
+            enabled,
+        }
+    }
+
+    fn record_frame(&self, elapsed_us: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut times = self.frame_times_us.borrow_mut();
+        if times.len() >= FRAME_TIMING_WINDOW {
+            times.pop_front();
+        }
+        times.push_back(elapsed_us);
+        let total = self.total_frames.get() + 1;
+        self.total_frames.set(total);
+        if elapsed_us > FRAME_BUDGET_US {
+            self.budget_exceeded_count
+                .set(self.budget_exceeded_count.get() + 1);
+        }
+        if total % FRAME_TIMING_WINDOW as u64 == 0 {
+            drop(times);
+            self.emit_stats();
+        }
+    }
+
+    fn record_content_build(&self, elapsed_us: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut times = self.content_build_times_us.borrow_mut();
+        if times.len() >= FRAME_TIMING_WINDOW {
+            times.pop_front();
+        }
+        times.push_back(elapsed_us);
+    }
+
+    fn record_viewport_sync(&self, elapsed_us: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut times = self.viewport_sync_times_us.borrow_mut();
+        if times.len() >= FRAME_TIMING_WINDOW {
+            times.pop_front();
+        }
+        times.push_back(elapsed_us);
+    }
+
+    fn record_update(&mut self, elapsed_us: u64) {
+        if !self.enabled {
+            return;
+        }
+        if self.update_times_us.len() >= FRAME_TIMING_WINDOW {
+            self.update_times_us.pop_front();
+        }
+        self.update_times_us.push_back(elapsed_us);
+    }
+
+    fn percentiles(times: &VecDeque<u64>) -> (u64, u64, u64) {
+        if times.is_empty() {
+            return (0, 0, 0);
+        }
+        let mut sorted: Vec<u64> = times.iter().copied().collect();
+        sorted.sort_unstable();
+        let len = sorted.len();
+        let p50 = sorted[len / 2];
+        let p95 = sorted[(len * 95 / 100).min(len - 1)];
+        let p99 = sorted[(len * 99 / 100).min(len - 1)];
+        (p50, p95, p99)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn emit_stats(&self) {
+        let frame = Self::percentiles(&self.frame_times_us.borrow());
+        let content = Self::percentiles(&self.content_build_times_us.borrow());
+        let viewport = Self::percentiles(&self.viewport_sync_times_us.borrow());
+        let total = self.total_frames.get();
+        let exceeded = self.budget_exceeded_count.get();
+        let window = self.frame_times_us.borrow().len();
+        let recent_exceeded = self
+            .frame_times_us
+            .borrow()
+            .iter()
+            .filter(|&&t| t > FRAME_BUDGET_US)
+            .count();
+        tracing::debug!(
+            "[perf] frame p50={:.1}ms p95={:.1}ms p99={:.1}ms | \
+             content p50={:.1}ms p95={:.1}ms p99={:.1}ms | \
+             viewport p50={:.1}ms p95={:.1}ms p99={:.1}ms | \
+             budget_exceeded={recent_exceeded}/{window} (total={exceeded}/{total})",
+            frame.0 as f64 / 1000.0,
+            frame.1 as f64 / 1000.0,
+            frame.2 as f64 / 1000.0,
+            content.0 as f64 / 1000.0,
+            content.1 as f64 / 1000.0,
+            content.2 as f64 / 1000.0,
+            viewport.0 as f64 / 1000.0,
+            viewport.1 as f64 / 1000.0,
+            viewport.2 as f64 / 1000.0,
+        );
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn summary(&self) -> String {
+        if !self.enabled {
+            return String::from("Frame telemetry disabled (set PI_PERF_TELEMETRY=1 to enable)");
+        }
+        let frame = Self::percentiles(&self.frame_times_us.borrow());
+        let content = Self::percentiles(&self.content_build_times_us.borrow());
+        let viewport = Self::percentiles(&self.viewport_sync_times_us.borrow());
+        let update = Self::percentiles(&self.update_times_us);
+        let total = self.total_frames.get();
+        let exceeded = self.budget_exceeded_count.get();
+        format!(
+            "Frame timing (last {FRAME_TIMING_WINDOW} frames):\n  \
+             view()   p50={:.1}ms  p95={:.1}ms  p99={:.1}ms\n  \
+             content  p50={:.1}ms  p95={:.1}ms  p99={:.1}ms\n  \
+             viewport p50={:.1}ms  p95={:.1}ms  p99={:.1}ms\n  \
+             update() p50={:.1}ms  p95={:.1}ms  p99={:.1}ms\n  \
+             Budget exceeded: {exceeded}/{total} frames (>{:.1}ms)",
+            frame.0 as f64 / 1000.0,
+            frame.1 as f64 / 1000.0,
+            frame.2 as f64 / 1000.0,
+            content.0 as f64 / 1000.0,
+            content.1 as f64 / 1000.0,
+            content.2 as f64 / 1000.0,
+            viewport.0 as f64 / 1000.0,
+            viewport.1 as f64 / 1000.0,
+            viewport.2 as f64 / 1000.0,
+            update.0 as f64 / 1000.0,
+            update.1 as f64 / 1000.0,
+            update.2 as f64 / 1000.0,
+            FRAME_BUDGET_US as f64 / 1000.0,
+        )
+    }
+}
+
 /// The main interactive TUI application model.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(bubbletea::Model)]
@@ -4523,7 +4749,7 @@ pub struct PiApp {
     // Status message (for slash command feedback)
     status_message: Option<String>,
 
-    // OAuth login flow state (awaiting code paste)
+    // Login flow state (awaiting sensitive credential input)
     pending_oauth: Option<PendingOAuth>,
 
     // Extension system
@@ -4560,6 +4786,9 @@ pub struct PiApp {
 
     // Model selector overlay (Ctrl+L)
     model_selector: Option<crate::model_selector::ModelSelectorOverlay>,
+
+    // Frame timing telemetry (PERF-3)
+    frame_timing: FrameTimingStats,
 }
 
 /// Autocomplete dropdown state.
@@ -5088,9 +5317,16 @@ impl SessionPickerOverlay {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingLoginKind {
+    OAuth,
+    ApiKey,
+}
+
 #[derive(Debug, Clone)]
 struct PendingOAuth {
     provider: String,
+    kind: PendingLoginKind,
     verifier: String,
     /// OAuth config for extension-registered providers (None for built-in like anthropic).
     oauth_config: Option<OAuthConfig>,
@@ -5559,6 +5795,7 @@ impl PiApp {
             capability_prompt: None,
             branch_picker: None,
             model_selector: None,
+            frame_timing: FrameTimingStats::new(),
         };
 
         if let Some(manager) = app.extensions.clone() {
@@ -5633,6 +5870,22 @@ impl PiApp {
     /// Handle messages (keyboard input, async events, etc.).
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, msg: Message) -> Option<Cmd> {
+        let update_start = if self.frame_timing.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let result = self.update_inner(msg);
+        if let Some(start) = update_start {
+            self.frame_timing
+                .record_update(micros_as_u64(start.elapsed().as_micros()));
+        }
+        result
+    }
+
+    /// Inner update handler (extracted for frame timing instrumentation).
+    #[allow(clippy::too_many_lines)]
+    fn update_inner(&mut self, msg: Message) -> Option<Cmd> {
         // Handle our custom Pi messages
         if let Some(pi_msg) = msg.downcast_ref::<PiMsg>() {
             return self.handle_pi_message(pi_msg.clone());
@@ -5997,6 +6250,12 @@ impl PiApp {
     /// Render the view.
     #[allow(clippy::too_many_lines)]
     fn view(&self) -> String {
+        let view_start = if self.frame_timing.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let mut output = String::new();
 
         // Header
@@ -6015,7 +6274,16 @@ impl PiApp {
         // what refresh_conversation_viewport() stored — this keeps the
         // y_offset from goto_bottom() aligned with the visible lines.
         let conversation_content = {
+            let content_start = if self.frame_timing.enabled {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let raw = self.build_conversation_content();
+            if let Some(start) = content_start {
+                self.frame_timing
+                    .record_content_build(micros_as_u64(start.elapsed().as_micros()));
+            }
             raw.trim_end().to_string()
         };
 
@@ -6158,7 +6426,14 @@ impl PiApp {
         // Clamp the output to `term_height` rows so the terminal never
         // scrolls in the alternate-screen buffer.
         let output = clamp_to_terminal_height(output, self.term_height);
-        normalize_raw_terminal_newlines(output)
+        let output = normalize_raw_terminal_newlines(output);
+
+        if let Some(start) = view_start {
+            self.frame_timing
+                .record_frame(micros_as_u64(start.elapsed().as_micros()));
+        }
+
+        output
     }
 
     fn handle_capability_prompt_key(&mut self, key: &KeyMsg) -> Option<Cmd> {
@@ -8610,6 +8885,7 @@ impl PiApp {
         let event_tx = self.event_tx.clone();
         let PendingOAuth {
             provider,
+            kind,
             verifier,
             oauth_config,
         } = pending;
@@ -8626,23 +8902,30 @@ impl PiApp {
                 }
             };
 
-            let credential = if provider == "anthropic" {
-                Box::pin(crate::auth::complete_anthropic_oauth(
-                    &code_input,
-                    &verifier,
-                ))
-                .await
-            } else if let Some(config) = &oauth_config {
-                Box::pin(crate::auth::complete_extension_oauth(
-                    config,
-                    &code_input,
-                    &verifier,
-                ))
-                .await
-            } else {
-                Err(crate::error::Error::auth(format!(
-                    "OAuth provider not supported: {provider}"
-                )))
+            let credential = match kind {
+                PendingLoginKind::ApiKey => normalize_api_key_input(&code_input)
+                    .map(|key| crate::auth::AuthCredential::ApiKey { key })
+                    .map_err(crate::error::Error::auth),
+                PendingLoginKind::OAuth => {
+                    if provider == "anthropic" {
+                        Box::pin(crate::auth::complete_anthropic_oauth(
+                            &code_input,
+                            &verifier,
+                        ))
+                        .await
+                    } else if let Some(config) = &oauth_config {
+                        Box::pin(crate::auth::complete_extension_oauth(
+                            config,
+                            &code_input,
+                            &verifier,
+                        ))
+                        .await
+                    } else {
+                        Err(crate::error::Error::auth(format!(
+                            "OAuth provider not supported: {provider}"
+                        )))
+                    }
+                }
             };
 
             let credential = match credential {
@@ -8659,9 +8942,17 @@ impl PiApp {
                 return;
             }
 
-            let _ = event_tx.try_send(PiMsg::System(format!(
-                "OAuth login successful for {provider}. Credentials saved to auth.json."
-            )));
+            let status = match kind {
+                PendingLoginKind::ApiKey => {
+                    format!("API key saved for {provider}. Credentials saved to auth.json.")
+                }
+                PendingLoginKind::OAuth => {
+                    format!(
+                        "OAuth login successful for {provider}. Credentials saved to auth.json."
+                    )
+                }
+            };
+            let _ = event_tx.try_send(PiMsg::System(status));
         });
 
         None
@@ -8852,11 +9143,16 @@ impl PiApp {
             .as_ref()
             .is_some_and(|patterns| !patterns.is_empty());
         let use_scope = scope_configured || !self.model_scope.is_empty();
+        let mut fell_back_to_available = false;
         let mut candidates = if use_scope {
             self.model_scope.clone()
         } else {
             self.available_models.clone()
         };
+        if use_scope && candidates.is_empty() {
+            candidates.clone_from(&self.available_models);
+            fell_back_to_available = true;
+        }
 
         candidates.sort_by(|a, b| {
             let left = format!("{}/{}", a.model.provider, a.model.id);
@@ -8866,11 +9162,7 @@ impl PiApp {
         candidates.dedup_by(|left, right| model_entry_matches(left, right));
 
         if candidates.is_empty() {
-            self.status_message = Some(if use_scope {
-                "No models in scope".to_string()
-            } else {
-                "No models available".to_string()
-            });
+            self.status_message = Some("No models available".to_string());
             return;
         }
 
@@ -8894,7 +9186,7 @@ impl PiApp {
         let next = candidates[next_index].clone();
 
         if model_entry_matches(&next, &self.model_entry) {
-            self.status_message = Some(if use_scope {
+            self.status_message = Some(if use_scope && !fell_back_to_available {
                 "Only one model in scope".to_string()
             } else {
                 "Only one model available".to_string()
@@ -8935,7 +9227,14 @@ impl PiApp {
             "{}/{}",
             self.model_entry.model.provider, self.model_entry.model.id
         );
-        self.status_message = Some(format!("Switched model: {}", self.model));
+        self.status_message = Some(if fell_back_to_available {
+            format!(
+                "No scoped models matched; cycling all available models. Switched model: {}",
+                self.model
+            )
+        } else {
+            format!("Switched model: {}", self.model)
+        });
     }
 
     fn quit_cmd(&mut self) -> Cmd {
@@ -9386,12 +9685,32 @@ impl PiApp {
                     return None;
                 }
 
-                let provider = if args.is_empty() {
+                let requested_provider = if args.is_empty() {
                     self.model_entry.model.provider.clone()
                 } else {
                     args.to_string()
                 };
-                let provider = provider.trim().to_ascii_lowercase();
+                let provider = normalize_auth_provider_input(&requested_provider);
+
+                if let Some(prompt) = api_key_login_prompt(&provider) {
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: prompt.to_string(),
+                        thinking: None,
+                        collapsed: false,
+                    });
+                    self.scroll_to_bottom();
+                    self.pending_oauth = Some(PendingOAuth {
+                        provider,
+                        kind: PendingLoginKind::ApiKey,
+                        verifier: String::new(),
+                        oauth_config: None,
+                    });
+                    self.input_mode = InputMode::SingleLine;
+                    self.set_input_height(3);
+                    self.input.focus();
+                    return None;
+                }
 
                 // Look up OAuth config: built-in (anthropic) or extension-registered.
                 let oauth_result = if provider == "anthropic" {
@@ -9401,14 +9720,20 @@ impl PiApp {
                     let ext_oauth = self
                         .available_models
                         .iter()
-                        .find(|m| m.model.provider == provider)
+                        .find(|m| {
+                            let model_provider = m.model.provider.as_str();
+                            let canonical =
+                                crate::provider_metadata::canonical_provider_id(model_provider)
+                                    .unwrap_or(model_provider);
+                            canonical == provider
+                        })
                         .and_then(|m| m.oauth_config.clone());
                     if let Some(config) = ext_oauth {
                         crate::auth::start_extension_oauth(&provider, &config)
                             .map(|info| (info, Some(config)))
                     } else {
                         self.status_message = Some(format!(
-                            "OAuth login not supported for {provider} (no OAuth config)"
+                            "Login not supported for {provider} (no built-in flow or OAuth config)"
                         ));
                         return None;
                     }
@@ -9438,6 +9763,7 @@ impl PiApp {
                         self.scroll_to_bottom();
                         self.pending_oauth = Some(PendingOAuth {
                             provider: info.provider,
+                            kind: PendingLoginKind::OAuth,
                             verifier: info.verifier,
                             oauth_config: ext_config,
                         });
@@ -9458,12 +9784,12 @@ impl PiApp {
                     return None;
                 }
 
-                let provider = if args.is_empty() {
+                let requested_provider = if args.is_empty() {
                     self.model_entry.model.provider.clone()
                 } else {
                     args.to_string()
                 };
-                let provider = provider.trim().to_ascii_lowercase();
+                let provider = normalize_auth_provider_input(&requested_provider);
 
                 let auth_path = crate::config::Config::auth_path();
                 match crate::auth::AuthStorage::load(auth_path) {
@@ -9475,10 +9801,10 @@ impl PiApp {
                         }
                         if removed {
                             self.status_message =
-                                Some(format!("Removed OAuth credentials for {provider}."));
+                                Some(format!("Removed stored credentials for {provider}."));
                         } else {
                             self.status_message =
-                                Some(format!("No OAuth credentials for {provider}."));
+                                Some(format!("No stored credentials for {provider}."));
                         }
                     }
                     Err(err) => {
@@ -9753,6 +10079,12 @@ impl PiApp {
                 self.config.enabled_models = Some(patterns.clone());
 
                 let match_count = self.model_scope.len();
+                let status = if match_count == 0 {
+                    "Scoped models updated: 0 matched; cycling will use all available models"
+                        .to_string()
+                } else {
+                    format!("Scoped models updated: {match_count} matched")
+                };
                 let global_dir = Config::global_dir();
                 let patch = json!({ "enabled_models": patterns });
                 if let Err(err) = Config::patch_settings_with_roots(
@@ -9762,12 +10094,9 @@ impl PiApp {
                     patch,
                 ) {
                     tracing::warn!("Failed to persist enabled_models: {err}");
-                    self.status_message = Some(format!(
-                        "Scoped models updated: {match_count} matched (not saved: {err})"
-                    ));
+                    self.status_message = Some(format!("{status} (not saved: {err})"));
                 } else {
-                    self.status_message =
-                        Some(format!("Scoped models updated: {match_count} matched"));
+                    self.status_message = Some(status);
                 }
                 None
             }
@@ -12111,6 +12440,45 @@ mod tests {
         assert!(blocks.is_empty());
     }
 
+    #[test]
+    fn normalize_api_key_input_trims_outer_whitespace() {
+        let parsed = normalize_api_key_input("  sk-test-123  ").expect("should parse");
+        assert_eq!(parsed, "sk-test-123");
+    }
+
+    #[test]
+    fn normalize_api_key_input_rejects_empty() {
+        let err = normalize_api_key_input("   ").expect_err("should fail");
+        assert!(err.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn normalize_api_key_input_rejects_internal_whitespace() {
+        let err = normalize_api_key_input("sk test").expect_err("should fail");
+        assert!(err.contains("must not contain whitespace"));
+    }
+
+    #[test]
+    fn normalize_auth_provider_input_maps_gemini_alias() {
+        assert_eq!(normalize_auth_provider_input("gemini"), "google");
+        assert_eq!(normalize_auth_provider_input(" GOOGLE "), "google");
+    }
+
+    #[test]
+    fn api_key_login_prompt_supports_openai_and_google() {
+        let openai_prompt = api_key_login_prompt("openai").expect("openai prompt");
+        assert!(openai_prompt.contains("platform.openai.com/api-keys"));
+        let google_prompt = api_key_login_prompt("google").expect("google prompt");
+        assert!(google_prompt.contains("google/gemini"));
+    }
+
+    #[test]
+    fn slash_help_mentions_generic_login_flow() {
+        let help = SlashCommand::help_text();
+        assert!(help.contains("/login [provider]  - Login/setup credentials"));
+        assert!(help.contains("/logout [provider] - Remove stored credentials"));
+    }
+
     // --- next_non_whitespace_token tests ---
 
     #[test]
@@ -12373,5 +12741,131 @@ mod tests {
         let patterns = vec!["*".to_string()];
         let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
         assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // FrameTimingStats unit tests (PERF-3)
+    // ========================================================================
+
+    fn make_stats(enabled: bool) -> FrameTimingStats {
+        FrameTimingStats {
+            frame_times_us: std::cell::RefCell::new(VecDeque::new()),
+            content_build_times_us: std::cell::RefCell::new(VecDeque::new()),
+            viewport_sync_times_us: std::cell::RefCell::new(VecDeque::new()),
+            update_times_us: VecDeque::new(),
+            total_frames: std::cell::Cell::new(0),
+            budget_exceeded_count: std::cell::Cell::new(0),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn frame_timing_disabled_by_default() {
+        let stats = make_stats(false);
+        stats.record_frame(5000);
+        assert_eq!(stats.total_frames.get(), 0);
+        assert!(stats.frame_times_us.borrow().is_empty());
+    }
+
+    #[test]
+    fn frame_timing_records_when_enabled() {
+        let stats = make_stats(true);
+        stats.record_frame(5000);
+        stats.record_frame(10_000);
+        stats.record_frame(20_000);
+        assert_eq!(stats.total_frames.get(), 3);
+        assert_eq!(stats.budget_exceeded_count.get(), 1);
+        assert_eq!(stats.frame_times_us.borrow().len(), 3);
+    }
+
+    #[test]
+    fn frame_timing_content_build_records() {
+        let stats = make_stats(true);
+        stats.record_content_build(1500);
+        stats.record_content_build(2500);
+        assert_eq!(stats.content_build_times_us.borrow().len(), 2);
+    }
+
+    #[test]
+    fn frame_timing_viewport_sync_records() {
+        let stats = make_stats(true);
+        stats.record_viewport_sync(800);
+        stats.record_viewport_sync(1200);
+        assert_eq!(stats.viewport_sync_times_us.borrow().len(), 2);
+    }
+
+    #[test]
+    fn frame_timing_update_records() {
+        let mut stats = make_stats(true);
+        stats.record_update(500);
+        stats.record_update(1000);
+        assert_eq!(stats.update_times_us.len(), 2);
+    }
+
+    #[test]
+    fn frame_timing_rolling_window_evicts_oldest() {
+        let stats = make_stats(true);
+        for i in 0..=FRAME_TIMING_WINDOW as u64 {
+            stats.record_frame(i * 100);
+        }
+        assert_eq!(stats.frame_times_us.borrow().len(), FRAME_TIMING_WINDOW);
+        assert_eq!(*stats.frame_times_us.borrow().front().unwrap(), 100);
+    }
+
+    #[test]
+    fn frame_timing_percentiles_empty() {
+        let empty = VecDeque::new();
+        assert_eq!(FrameTimingStats::percentiles(&empty), (0, 0, 0));
+    }
+
+    #[test]
+    fn frame_timing_percentiles_single_value() {
+        let mut times = VecDeque::new();
+        times.push_back(5000);
+        assert_eq!(FrameTimingStats::percentiles(&times), (5000, 5000, 5000));
+    }
+
+    #[test]
+    fn frame_timing_percentiles_known_distribution() {
+        let mut times = VecDeque::new();
+        for i in 1..=100 {
+            times.push_back(i * 1000);
+        }
+        let (p50, p95, p99) = FrameTimingStats::percentiles(&times);
+        assert_eq!(p50, 51_000);
+        assert_eq!(p95, 96_000);
+        assert_eq!(p99, 100_000);
+    }
+
+    #[test]
+    fn frame_timing_summary_disabled() {
+        let stats = make_stats(false);
+        assert!(stats.summary().contains("disabled"));
+    }
+
+    #[test]
+    fn frame_timing_summary_enabled_contains_stats() {
+        let stats = make_stats(true);
+        stats.record_frame(5000);
+        stats.record_content_build(2000);
+        let summary = stats.summary();
+        assert!(summary.contains("Frame timing"));
+        assert!(summary.contains("view()"));
+        assert!(summary.contains("content"));
+        assert!(summary.contains("viewport"));
+        assert!(summary.contains("update()"));
+        assert!(summary.contains("Budget exceeded"));
+    }
+
+    #[test]
+    fn frame_timing_budget_exceeded_counts_correctly() {
+        let stats = make_stats(true);
+        stats.record_frame(10_000);
+        stats.record_frame(16_000);
+        stats.record_frame(FRAME_BUDGET_US);
+        assert_eq!(stats.budget_exceeded_count.get(), 0);
+        stats.record_frame(FRAME_BUDGET_US + 1);
+        stats.record_frame(20_000);
+        assert_eq!(stats.budget_exceeded_count.get(), 2);
     }
 }

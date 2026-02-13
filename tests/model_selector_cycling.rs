@@ -758,7 +758,7 @@ fn cycle_model_single_in_scope_shows_status() {
 }
 
 #[test]
-fn cycle_model_empty_scope_with_config_shows_status() {
+fn cycle_model_empty_scope_with_config_falls_back_to_available_models() {
     let harness = TestHarness::new("cycle_scope_empty");
     let current = make_model_entry("anthropic", "claude-sonnet-4");
     let available = vec![
@@ -776,8 +776,15 @@ fn cycle_model_empty_scope_with_config_shows_status() {
 
     app.cycle_model(1);
 
-    // With enabled_models config set but empty scope, should say "No models in scope"
-    assert_eq!(get_status(&app), Some("No models in scope"));
+    let status = get_status(&app).unwrap_or("");
+    assert!(
+        status.contains("No scoped models matched; cycling all available models."),
+        "Expected fallback warning, got: {status}"
+    );
+    assert!(
+        status.contains("Switched model: openai/gpt-4o"),
+        "Expected fallback cycle target openai/gpt-4o, got: {status}"
+    );
 }
 
 #[test]

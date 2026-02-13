@@ -3,7 +3,7 @@
 //! Auth file: ~/.pi/agent/auth.json
 
 use crate::error::{Error, Result};
-use crate::provider_metadata::provider_auth_env_keys;
+use crate::provider_metadata::{canonical_provider_id, provider_auth_env_keys};
 use base64::Engine as _;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
@@ -302,7 +302,13 @@ impl AuthStorage {
             return Some(key);
         }
 
-        self.api_key(provider)
+        if let Some(key) = self.api_key(provider) {
+            return Some(key);
+        }
+
+        canonical_provider_id(provider)
+            .filter(|canonical| *canonical != provider)
+            .and_then(|canonical| self.api_key(canonical))
     }
 
     /// Refresh any expired OAuth tokens that this binary knows how to refresh.
@@ -2733,6 +2739,28 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_api_key_openrouter_env_beats_stored() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "openrouter",
+            AuthCredential::ApiKey {
+                key: "stored-openrouter-key".to_string(),
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("openrouter", None, |var| match var {
+            "OPENROUTER_API_KEY" => Some("env-openrouter-key".to_string()),
+            _ => None,
+        });
+        assert_eq!(resolved.as_deref(), Some("env-openrouter-key"));
+    }
+
+    #[test]
     fn test_resolve_api_key_empty_env_falls_through_to_stored() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("auth.json");
@@ -2798,6 +2826,25 @@ mod tests {
         });
 
         assert_eq!(resolved.as_deref(), Some("gemini-fallback-key"));
+    }
+
+    #[test]
+    fn test_resolve_api_key_gemini_alias_reads_google_stored_key() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "google",
+            AuthCredential::ApiKey {
+                key: "stored-google-key".to_string(),
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("gemini", None, |_| None);
+        assert_eq!(resolved.as_deref(), Some("stored-google-key"));
     }
 
     #[test]
@@ -2885,6 +2932,33 @@ mod tests {
         );
 
         assert_eq!(auth.api_key("openai").as_deref(), Some("sk-openai-test"));
+    }
+
+    #[test]
+    fn test_google_api_key_overwrite_persists_latest_value() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path.clone(),
+            entries: HashMap::new(),
+        };
+
+        auth.set(
+            "google",
+            AuthCredential::ApiKey {
+                key: "google-key-old".to_string(),
+            },
+        );
+        auth.set(
+            "google",
+            AuthCredential::ApiKey {
+                key: "google-key-new".to_string(),
+            },
+        );
+        auth.save().expect("save");
+
+        let loaded = AuthStorage::load(auth_path).expect("load");
+        assert_eq!(loaded.api_key("google").as_deref(), Some("google-key-new"));
     }
 
     #[test]
