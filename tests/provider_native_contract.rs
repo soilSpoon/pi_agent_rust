@@ -1057,7 +1057,17 @@ mod cohere_contract {
 mod openai_compat_preset_contract {
     use super::*;
 
-    const PRESET_PROVIDERS: [&str; 5] = ["groq", "deepseek", "xai", "perplexity", "fireworks"];
+    const PRESET_PROVIDERS: [&str; 9] = [
+        "groq",
+        "deepseek",
+        "xai",
+        "perplexity",
+        "fireworks",
+        "cerebras",
+        "openrouter",
+        "moonshotai",
+        "alibaba",
+    ];
 
     #[test]
     fn preset_providers_use_bearer_auth_and_chat_completions() {
@@ -1220,6 +1230,719 @@ mod cross_provider_invariants {
                 request_header(&req.headers, "content-type").as_deref(),
                 Some("application/json"),
                 "{provider_id} must send Content-Type: application/json"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// GAP PROVIDER CONTRACT TESTS (bd-3uqg.11.11.2)
+//
+// Explicit per-provider contract tests for the 5 gap providers:
+//   groq, cerebras, openrouter, moonshotai (kimi), alibaba (qwen/dashscope)
+//
+// Each module validates: request shape, auth, tools, text decoding, tool-call
+// decoding, and HTTP error responses (401, 429).
+// ============================================================================
+
+fn openai_error_json(status: u16, error_type: &str, message: &str) -> MockHttpResponse {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": status.to_string()
+        }
+    });
+    MockHttpResponse {
+        status,
+        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+        body: serde_json::to_vec(&body).unwrap(),
+    }
+}
+
+/// Shared contract-test driver for an OpenAI-compatible gap provider.
+mod gap_provider_helpers {
+    use super::*;
+
+    pub fn assert_factory_routes_and_api(provider_id: &str) {
+        let harness = TestHarness::new(format!("{provider_id}_factory_route"));
+        let server = harness.start_mock_http_server();
+        let endpoint = "/v1/chat/completions";
+        server.add_route(
+            "POST",
+            endpoint,
+            text_event_stream_response(openai_simple_sse()),
+        );
+
+        let entry = make_model_entry_with_api(
+            provider_id,
+            "gap-model",
+            &format!("{}/v1", server.base_url()),
+            "openai-completions",
+        );
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+
+        assert_eq!(
+            provider.api(),
+            "openai-completions",
+            "{provider_id} must route to openai-completions"
+        );
+        assert_eq!(
+            provider.model_id(),
+            "gap-model",
+            "{provider_id} model_id must match"
+        );
+
+        collect_stream_events(provider, simple_context(), options_with_key("key"));
+
+        let req = &server.requests()[0];
+        assert_eq!(req.path, endpoint, "{provider_id} path mismatch");
+        assert_eq!(req.method, "POST", "{provider_id} method mismatch");
+    }
+
+    pub fn assert_bearer_auth(provider_id: &str) {
+        let harness = TestHarness::new(format!("{provider_id}_bearer_auth"));
+        let server = harness.start_mock_http_server();
+        let endpoint = "/v1/chat/completions";
+        server.add_route(
+            "POST",
+            endpoint,
+            text_event_stream_response(openai_simple_sse()),
+        );
+
+        let entry = make_model_entry_with_api(
+            provider_id,
+            "gap-model",
+            &format!("{}/v1", server.base_url()),
+            "openai-completions",
+        );
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+
+        let api_key = format!("{provider_id}-secret-key-42");
+        collect_stream_events(provider, simple_context(), options_with_key(&api_key));
+
+        let req = &server.requests()[0];
+        let expected = format!("Bearer {api_key}");
+        assert_eq!(
+            request_header(&req.headers, "authorization").as_deref(),
+            Some(expected.as_str()),
+            "{provider_id} must use Bearer auth"
+        );
+    }
+
+    pub fn assert_request_body_shape(provider_id: &str) {
+        let harness = TestHarness::new(format!("{provider_id}_request_body"));
+        let server = harness.start_mock_http_server();
+        let endpoint = "/v1/chat/completions";
+        server.add_route(
+            "POST",
+            endpoint,
+            text_event_stream_response(openai_simple_sse()),
+        );
+
+        let entry = make_model_entry_with_api(
+            provider_id,
+            "gap-model",
+            &format!("{}/v1", server.base_url()),
+            "openai-completions",
+        );
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+
+        collect_stream_events(provider, simple_context(), options_with_key("key"));
+
+        let req = &server.requests()[0];
+        let body = request_body_json(req);
+
+        assert_eq!(body["model"], "gap-model", "{provider_id} model field");
+        assert_eq!(body["stream"], true, "{provider_id} stream field");
+        assert!(
+            body["messages"].is_array(),
+            "{provider_id} messages must be array"
+        );
+
+        let messages = body["messages"].as_array().unwrap();
+        let has_user = messages.iter().any(|m| m["role"] == "user");
+        assert!(has_user, "{provider_id} must include user message");
+
+        assert_eq!(
+            request_header(&req.headers, "content-type").as_deref(),
+            Some("application/json"),
+            "{provider_id} content-type"
+        );
+    }
+
+    pub fn assert_tool_schema_translation(provider_id: &str) {
+        let harness = TestHarness::new(format!("{provider_id}_tool_schema"));
+        let server = harness.start_mock_http_server();
+        let endpoint = "/v1/chat/completions";
+        server.add_route(
+            "POST",
+            endpoint,
+            text_event_stream_response(openai_tool_call_sse()),
+        );
+
+        let entry = make_model_entry_with_api(
+            provider_id,
+            "gap-model",
+            &format!("{}/v1", server.base_url()),
+            "openai-completions",
+        );
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+
+        collect_stream_events(provider, context_with_tools(), options_with_key("key"));
+
+        let req = &server.requests()[0];
+        let body = request_body_json(req);
+
+        let tools = body["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{provider_id}: tools must be array"));
+        assert_eq!(tools.len(), 2, "{provider_id} tool count");
+
+        let echo_tool = &tools[0];
+        assert_eq!(
+            echo_tool["function"]["name"], "echo",
+            "{provider_id} echo tool name"
+        );
+        assert!(
+            echo_tool["function"]["parameters"].is_object(),
+            "{provider_id} echo tool parameters"
+        );
+    }
+
+    pub fn assert_text_response_decoding(provider_id: &str) {
+        let harness = TestHarness::new(format!("{provider_id}_text_decoding"));
+        let server = harness.start_mock_http_server();
+        let endpoint = "/v1/chat/completions";
+        server.add_route(
+            "POST",
+            endpoint,
+            text_event_stream_response(openai_simple_sse()),
+        );
+
+        let entry = make_model_entry_with_api(
+            provider_id,
+            "gap-model",
+            &format!("{}/v1", server.base_url()),
+            "openai-completions",
+        );
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+
+        let events = collect_stream_events(provider, simple_context(), options_with_key("key"));
+
+        let has_text = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { .. }));
+        let has_done = events.iter().any(|e| matches!(e, StreamEvent::Done { .. }));
+
+        assert!(has_text, "{provider_id} must produce TextDelta");
+        assert!(has_done, "{provider_id} must produce Done");
+    }
+
+    pub fn assert_tool_call_response_decoding(provider_id: &str) {
+        let harness = TestHarness::new(format!("{provider_id}_tool_call_decoding"));
+        let server = harness.start_mock_http_server();
+        let endpoint = "/v1/chat/completions";
+        server.add_route(
+            "POST",
+            endpoint,
+            text_event_stream_response(openai_tool_call_sse()),
+        );
+
+        let entry = make_model_entry_with_api(
+            provider_id,
+            "gap-model",
+            &format!("{}/v1", server.base_url()),
+            "openai-completions",
+        );
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+
+        let events = collect_stream_events(provider, context_with_tools(), options_with_key("key"));
+
+        let has_tool_call = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCallStart { .. }));
+        let has_done = events.iter().any(|e| matches!(e, StreamEvent::Done { .. }));
+
+        assert!(has_tool_call, "{provider_id} must produce ToolCallStart");
+        assert!(has_done, "{provider_id} must produce Done");
+    }
+
+    pub fn assert_http_401_error(provider_id: &str) {
+        let harness = TestHarness::new(format!("{provider_id}_error_401"));
+        let server = harness.start_mock_http_server();
+        let endpoint = "/v1/chat/completions";
+        server.add_route(
+            "POST",
+            endpoint,
+            openai_error_json(401, "authentication_error", "Invalid API key"),
+        );
+
+        let entry = make_model_entry_with_api(
+            provider_id,
+            "gap-model",
+            &format!("{}/v1", server.base_url()),
+            "openai-completions",
+        );
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+
+        let ctx = simple_context();
+        let opts = options_with_key("bad-key");
+        let provider_id_owned = provider_id.to_string();
+        common::run_async(async move {
+            match provider.stream(&ctx, &opts).await {
+                Err(e) => {
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains("401")
+                            || msg.to_lowercase().contains("auth")
+                            || msg.to_lowercase().contains("unauthorized")
+                            || msg.to_lowercase().contains("error")
+                            || msg.to_lowercase().contains("http"),
+                        "{provider_id_owned} 401 error message should reference the error: {msg}"
+                    );
+                }
+                Ok(mut stream) => {
+                    let mut events = Vec::new();
+                    while let Some(event) = stream.next().await {
+                        if let Ok(ev) = event {
+                            let is_done = matches!(ev, StreamEvent::Done { .. });
+                            events.push(ev);
+                            if is_done {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    let has_text = events
+                        .iter()
+                        .any(|e| matches!(e, StreamEvent::TextDelta { .. }));
+                    assert!(
+                        !has_text,
+                        "{provider_id_owned} 401 error must not produce TextDelta events"
+                    );
+                }
+            }
+        });
+
+        harness
+            .log()
+            .info_ctx("error", "401 handled correctly", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+            });
+    }
+
+    pub fn assert_http_429_error(provider_id: &str) {
+        let harness = TestHarness::new(format!("{provider_id}_error_429"));
+        let server = harness.start_mock_http_server();
+        let endpoint = "/v1/chat/completions";
+        server.add_route(
+            "POST",
+            endpoint,
+            openai_error_json(429, "rate_limit_error", "Rate limit exceeded"),
+        );
+
+        let entry = make_model_entry_with_api(
+            provider_id,
+            "gap-model",
+            &format!("{}/v1", server.base_url()),
+            "openai-completions",
+        );
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+
+        let ctx = simple_context();
+        let opts = options_with_key("key");
+        let provider_id_owned = provider_id.to_string();
+        common::run_async(async move {
+            match provider.stream(&ctx, &opts).await {
+                Err(e) => {
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains("429")
+                            || msg.to_lowercase().contains("rate")
+                            || msg.to_lowercase().contains("limit")
+                            || msg.to_lowercase().contains("error")
+                            || msg.to_lowercase().contains("http"),
+                        "{provider_id_owned} 429 error message should reference the error: {msg}"
+                    );
+                }
+                Ok(mut stream) => {
+                    let mut events = Vec::new();
+                    while let Some(event) = stream.next().await {
+                        if let Ok(ev) = event {
+                            let is_done = matches!(ev, StreamEvent::Done { .. });
+                            events.push(ev);
+                            if is_done {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    let has_text = events
+                        .iter()
+                        .any(|e| matches!(e, StreamEvent::TextDelta { .. }));
+                    assert!(
+                        !has_text,
+                        "{provider_id_owned} 429 error must not produce TextDelta events"
+                    );
+                }
+            }
+        });
+
+        harness
+            .log()
+            .info_ctx("error", "429 handled correctly", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+            });
+    }
+}
+
+// ── Groq ────────────────────────────────────────────────────────────────
+
+mod groq_contract {
+    use super::*;
+
+    #[test]
+    fn factory_route_and_api() {
+        gap_provider_helpers::assert_factory_routes_and_api("groq");
+    }
+
+    #[test]
+    fn bearer_auth() {
+        gap_provider_helpers::assert_bearer_auth("groq");
+    }
+
+    #[test]
+    fn request_body_shape() {
+        gap_provider_helpers::assert_request_body_shape("groq");
+    }
+
+    #[test]
+    fn tool_schema_translation() {
+        gap_provider_helpers::assert_tool_schema_translation("groq");
+    }
+
+    #[test]
+    fn text_response_decoding() {
+        gap_provider_helpers::assert_text_response_decoding("groq");
+    }
+
+    #[test]
+    fn tool_call_response_decoding() {
+        gap_provider_helpers::assert_tool_call_response_decoding("groq");
+    }
+
+    #[test]
+    fn error_401_auth_failure() {
+        gap_provider_helpers::assert_http_401_error("groq");
+    }
+
+    #[test]
+    fn error_429_rate_limit() {
+        gap_provider_helpers::assert_http_429_error("groq");
+    }
+}
+
+// ── Cerebras ────────────────────────────────────────────────────────────
+
+mod cerebras_contract {
+    use super::*;
+
+    #[test]
+    fn factory_route_and_api() {
+        gap_provider_helpers::assert_factory_routes_and_api("cerebras");
+    }
+
+    #[test]
+    fn bearer_auth() {
+        gap_provider_helpers::assert_bearer_auth("cerebras");
+    }
+
+    #[test]
+    fn request_body_shape() {
+        gap_provider_helpers::assert_request_body_shape("cerebras");
+    }
+
+    #[test]
+    fn tool_schema_translation() {
+        gap_provider_helpers::assert_tool_schema_translation("cerebras");
+    }
+
+    #[test]
+    fn text_response_decoding() {
+        gap_provider_helpers::assert_text_response_decoding("cerebras");
+    }
+
+    #[test]
+    fn tool_call_response_decoding() {
+        gap_provider_helpers::assert_tool_call_response_decoding("cerebras");
+    }
+
+    #[test]
+    fn error_401_auth_failure() {
+        gap_provider_helpers::assert_http_401_error("cerebras");
+    }
+
+    #[test]
+    fn error_429_rate_limit() {
+        gap_provider_helpers::assert_http_429_error("cerebras");
+    }
+}
+
+// ── OpenRouter ──────────────────────────────────────────────────────────
+
+mod openrouter_contract {
+    use super::*;
+
+    #[test]
+    fn factory_route_and_api() {
+        gap_provider_helpers::assert_factory_routes_and_api("openrouter");
+    }
+
+    #[test]
+    fn bearer_auth() {
+        gap_provider_helpers::assert_bearer_auth("openrouter");
+    }
+
+    #[test]
+    fn request_body_shape() {
+        gap_provider_helpers::assert_request_body_shape("openrouter");
+    }
+
+    #[test]
+    fn tool_schema_translation() {
+        gap_provider_helpers::assert_tool_schema_translation("openrouter");
+    }
+
+    #[test]
+    fn text_response_decoding() {
+        gap_provider_helpers::assert_text_response_decoding("openrouter");
+    }
+
+    #[test]
+    fn tool_call_response_decoding() {
+        gap_provider_helpers::assert_tool_call_response_decoding("openrouter");
+    }
+
+    #[test]
+    fn error_401_auth_failure() {
+        gap_provider_helpers::assert_http_401_error("openrouter");
+    }
+
+    #[test]
+    fn error_429_rate_limit() {
+        gap_provider_helpers::assert_http_429_error("openrouter");
+    }
+}
+
+// ── Moonshotai / Kimi ───────────────────────────────────────────────────
+
+mod moonshotai_contract {
+    use super::*;
+
+    #[test]
+    fn factory_route_and_api() {
+        gap_provider_helpers::assert_factory_routes_and_api("moonshotai");
+    }
+
+    #[test]
+    fn bearer_auth() {
+        gap_provider_helpers::assert_bearer_auth("moonshotai");
+    }
+
+    #[test]
+    fn request_body_shape() {
+        gap_provider_helpers::assert_request_body_shape("moonshotai");
+    }
+
+    #[test]
+    fn tool_schema_translation() {
+        gap_provider_helpers::assert_tool_schema_translation("moonshotai");
+    }
+
+    #[test]
+    fn text_response_decoding() {
+        gap_provider_helpers::assert_text_response_decoding("moonshotai");
+    }
+
+    #[test]
+    fn tool_call_response_decoding() {
+        gap_provider_helpers::assert_tool_call_response_decoding("moonshotai");
+    }
+
+    #[test]
+    fn error_401_auth_failure() {
+        gap_provider_helpers::assert_http_401_error("moonshotai");
+    }
+
+    #[test]
+    fn error_429_rate_limit() {
+        gap_provider_helpers::assert_http_429_error("moonshotai");
+    }
+}
+
+// ── Alibaba / Qwen / DashScope ─────────────────────────────────────────
+
+mod alibaba_contract {
+    use super::*;
+
+    #[test]
+    fn factory_route_and_api() {
+        gap_provider_helpers::assert_factory_routes_and_api("alibaba");
+    }
+
+    #[test]
+    fn bearer_auth() {
+        gap_provider_helpers::assert_bearer_auth("alibaba");
+    }
+
+    #[test]
+    fn request_body_shape() {
+        gap_provider_helpers::assert_request_body_shape("alibaba");
+    }
+
+    #[test]
+    fn tool_schema_translation() {
+        gap_provider_helpers::assert_tool_schema_translation("alibaba");
+    }
+
+    #[test]
+    fn text_response_decoding() {
+        gap_provider_helpers::assert_text_response_decoding("alibaba");
+    }
+
+    #[test]
+    fn tool_call_response_decoding() {
+        gap_provider_helpers::assert_tool_call_response_decoding("alibaba");
+    }
+
+    #[test]
+    fn error_401_auth_failure() {
+        gap_provider_helpers::assert_http_401_error("alibaba");
+    }
+
+    #[test]
+    fn error_429_rate_limit() {
+        gap_provider_helpers::assert_http_429_error("alibaba");
+    }
+}
+
+// ── Gap-provider metadata consistency ───────────────────────────────────
+
+mod gap_provider_metadata {
+    use pi::provider_metadata::{
+        PROVIDER_METADATA, canonical_provider_id, provider_auth_env_keys, provider_routing_defaults,
+    };
+
+    const GAP_PROVIDERS: [(&str, &str, &[&str]); 5] = [
+        ("groq", "openai-completions", &["GROQ_API_KEY"]),
+        ("cerebras", "openai-completions", &["CEREBRAS_API_KEY"]),
+        ("openrouter", "openai-completions", &["OPENROUTER_API_KEY"]),
+        (
+            "moonshotai",
+            "openai-completions",
+            &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+        ),
+        (
+            "alibaba",
+            "openai-completions",
+            &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+        ),
+    ];
+
+    #[test]
+    fn all_gap_providers_present_in_metadata() {
+        for (id, _, _) in &GAP_PROVIDERS {
+            let resolved = canonical_provider_id(id);
+            assert_eq!(
+                resolved,
+                Some(*id),
+                "{id} must be a canonical provider ID in metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn all_gap_providers_have_routing_defaults() {
+        for (id, expected_api, _) in &GAP_PROVIDERS {
+            let defaults = provider_routing_defaults(id);
+            assert!(
+                defaults.is_some(),
+                "{id} must have routing defaults in metadata"
+            );
+            let defaults = defaults.unwrap();
+            assert_eq!(
+                defaults.api, *expected_api,
+                "{id} routing default API mismatch"
+            );
+            assert!(
+                defaults.auth_header,
+                "{id} must use auth_header=true for Bearer auth"
+            );
+        }
+    }
+
+    #[test]
+    fn all_gap_providers_have_auth_env_keys() {
+        for (id, _, expected_keys) in &GAP_PROVIDERS {
+            let keys = provider_auth_env_keys(id);
+            assert!(
+                !keys.is_empty(),
+                "{id} must have at least one auth env key in metadata"
+            );
+            assert_eq!(
+                keys[0], expected_keys[0],
+                "{id} primary auth env key mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_alias_resolves_to_moonshotai() {
+        let meta = PROVIDER_METADATA
+            .iter()
+            .find(|m| m.canonical_id == "moonshotai");
+        assert!(meta.is_some(), "moonshotai must exist in PROVIDER_METADATA");
+        let meta = meta.unwrap();
+        assert!(
+            meta.aliases.contains(&"kimi") || meta.aliases.contains(&"moonshot"),
+            "moonshotai must have kimi or moonshot as alias"
+        );
+    }
+
+    #[test]
+    fn dashscope_alias_resolves_to_alibaba() {
+        let resolved = canonical_provider_id("dashscope");
+        assert_eq!(
+            resolved,
+            Some("alibaba"),
+            "dashscope must resolve to alibaba"
+        );
+    }
+
+    #[test]
+    fn all_gap_providers_require_tests() {
+        for (id, _, _) in &GAP_PROVIDERS {
+            let meta = PROVIDER_METADATA.iter().find(|m| m.canonical_id == *id);
+            assert!(meta.is_some(), "{id} must exist in PROVIDER_METADATA");
+            let meta = meta.unwrap();
+            assert!(
+                meta.test_obligations.unit,
+                "{id} must have unit test obligation"
+            );
+            assert!(
+                meta.test_obligations.contract,
+                "{id} must have contract test obligation"
             );
         }
     }
