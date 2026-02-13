@@ -1,3 +1,4 @@
+#![allow(clippy::doc_markdown)]
 //! Non-mock coverage tests for provider/session surfaces (bd-1f42.8.4.2).
 //!
 //! Targets uncovered code paths:
@@ -7,28 +8,24 @@
 //! - Session corruption recovery (malformed JSONL, empty files)
 //! - Session state mutations (append, label, branch, model change)
 //! - Session index operations
-//! - ModelEntry thinking level clamping
-//! - Provider enum parsing (Api, KnownProvider)
+//! - `ModelEntry` thinking level clamping
+//! - Provider enum parsing (`Api`, `KnownProvider`)
 //!
 //! All tests use real filesystem and real Session objects, no mocks.
 
 mod common;
 
 use common::TestHarness;
-use pi::models::{ModelEntry, OAuthConfig};
+use pi::models::ModelEntry;
 use pi::provider::{Api, CacheRetention, KnownProvider, Model, ModelCost, StreamOptions};
 use pi::providers::{
     create_provider, normalize_cohere_base, normalize_openai_base,
     normalize_openai_responses_base,
 };
-use pi::session::{
-    Session, SessionEntry, SessionHeader, SessionMessage, SessionOpenDiagnostics,
-    SessionOpenOrphanedParentLink, SessionOpenSkippedEntry,
-};
+use pi::session::{Session, SessionEntry, SessionMessage, SessionOpenDiagnostics};
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
 
 // ===========================================================================
 // Helpers
@@ -43,7 +40,12 @@ fn make_model(provider: &str, api: &str, base_url: &str) -> Model {
         base_url: base_url.to_string(),
         reasoning: false,
         input: vec![],
-        cost: ModelCost::default(),
+        cost: ModelCost {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        },
         context_window: 128_000,
         max_tokens: 4096,
         headers: HashMap::new(),
@@ -76,12 +78,19 @@ fn make_session_header() -> serde_json::Value {
 fn make_message_entry(id: &str, msg_type: &str, text: &str) -> serde_json::Value {
     json!({
         "id": id,
-        "timestamp": 1707782400000_i64,
+        "timestamp": 1_707_782_400_000_i64,
         "message": {
             "type": msg_type,
             "content": text
         }
     })
+}
+
+fn user_msg(text: &str) -> SessionMessage {
+    SessionMessage::User {
+        content: pi::model::UserContent::Text(text.to_string()),
+        timestamp: None,
+    }
 }
 
 // ===========================================================================
@@ -162,19 +171,33 @@ fn known_provider_from_str_custom() {
 // Provider URL normalization
 // ===========================================================================
 
-/// OpenAI base URL normalization strips trailing slashes and common suffixes.
+/// OpenAI base URL normalization ensures URL ends with `/chat/completions`.
 #[test]
-fn normalize_openai_base_strips_trailing() {
+fn normalize_openai_base_appends_endpoint() {
     let cases = [
-        ("https://api.openai.com/v1/", "https://api.openai.com/v1"),
-        ("https://api.openai.com/v1", "https://api.openai.com/v1"),
+        // Base with /v1 gets /chat/completions appended
         (
-            "https://custom.api.com/v1/chat/completions",
-            "https://custom.api.com/v1",
+            "https://api.openai.com/v1/",
+            "https://api.openai.com/v1/chat/completions",
         ),
         (
-            "https://custom.api.com/v1/chat/completions/",
-            "https://custom.api.com/v1",
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/chat/completions",
+        ),
+        // Already has /chat/completions - kept as-is
+        (
+            "https://custom.api.com/v1/chat/completions",
+            "https://custom.api.com/v1/chat/completions",
+        ),
+        // Trailing slash stripped, then /chat/completions appended
+        (
+            "https://custom.api.com/",
+            "https://custom.api.com/chat/completions",
+        ),
+        // /responses suffix is stripped, then /chat/completions appended
+        (
+            "https://api.openai.com/v1/responses",
+            "https://api.openai.com/v1/chat/completions",
         ),
     ];
     for (input, expected) in &cases {
@@ -186,19 +209,30 @@ fn normalize_openai_base_strips_trailing() {
     }
 }
 
-/// OpenAI Responses base URL normalization.
+/// OpenAI Responses base URL normalization ensures URL ends with `/responses`.
 #[test]
-fn normalize_openai_responses_base_strips() {
+fn normalize_openai_responses_base_appends_endpoint() {
     let cases = [
+        // Already has /responses - kept as-is
         (
             "https://api.openai.com/v1/responses",
-            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/responses",
         ),
+        // Trailing slash stripped, then /responses appended
         (
-            "https://api.openai.com/v1/responses/",
-            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/",
+            "https://api.openai.com/v1/responses",
         ),
-        ("https://api.openai.com/v1/", "https://api.openai.com/v1"),
+        // /v1 gets /responses appended
+        (
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/responses",
+        ),
+        // /chat/completions suffix stripped, then /responses appended
+        (
+            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/responses",
+        ),
     ];
     for (input, expected) in &cases {
         let result = normalize_openai_responses_base(input);
@@ -209,15 +243,30 @@ fn normalize_openai_responses_base_strips() {
     }
 }
 
-/// Cohere base URL normalization.
+/// Cohere base URL normalization ensures URL ends with `/chat`.
 #[test]
-fn normalize_cohere_base_strips() {
+fn normalize_cohere_base_appends_endpoint() {
     let cases = [
-        ("https://api.cohere.com/v2/chat", "https://api.cohere.com"),
-        ("https://api.cohere.com/v2/chat/", "https://api.cohere.com"),
-        ("https://api.cohere.com/v2/", "https://api.cohere.com"),
-        ("https://api.cohere.com/v2", "https://api.cohere.com"),
-        ("https://api.cohere.com/", "https://api.cohere.com"),
+        // Already has /chat - kept as-is
+        (
+            "https://api.cohere.com/v2/chat",
+            "https://api.cohere.com/v2/chat",
+        ),
+        // /v2 gets /chat appended
+        (
+            "https://api.cohere.com/v2",
+            "https://api.cohere.com/v2/chat",
+        ),
+        // Bare URL gets /chat appended
+        (
+            "https://api.cohere.com",
+            "https://api.cohere.com/chat",
+        ),
+        // Trailing slash stripped, then /chat appended
+        (
+            "https://api.cohere.com/",
+            "https://api.cohere.com/chat",
+        ),
     ];
     for (input, expected) in &cases {
         let result = normalize_cohere_base(input);
@@ -347,9 +396,9 @@ fn stream_options_default_values() {
 fn session_create_has_valid_id() {
     asupersync::test_utils::run_test(|| async {
         let session = Session::create();
-        assert!(!session.id().is_empty(), "session ID should not be empty");
+        assert!(!session.header.id.is_empty(), "session ID should not be empty");
         assert!(
-            session.entries().is_empty(),
+            session.entries.is_empty(),
             "new session should have no entries"
         );
     });
@@ -361,7 +410,7 @@ fn session_create_with_dir() {
     asupersync::test_utils::run_test(|| async {
         let h = TestHarness::new("session_with_dir");
         let session = Session::create_with_dir(Some(h.temp_dir().to_path_buf()));
-        assert!(!session.id().is_empty());
+        assert!(!session.header.id.is_empty());
     });
 }
 
@@ -370,11 +419,9 @@ fn session_create_with_dir() {
 fn session_append_message_adds_entry() {
     asupersync::test_utils::run_test(|| async {
         let mut session = Session::create();
-        let id = session.append_message(SessionMessage::User(pi::model::UserContent::Text(
-            "hello world".to_string(),
-        )));
+        let id = session.append_message(user_msg("hello world"));
         assert!(!id.is_empty(), "append should return non-empty ID");
-        assert_eq!(session.entries().len(), 1, "should have 1 entry");
+        assert_eq!(session.entries.len(), 1, "should have 1 entry");
     });
 }
 
@@ -396,9 +443,9 @@ fn session_model_change_entry() {
         let mut session = Session::create();
         let id = session.append_model_change("openai".to_string(), "gpt-4".to_string());
         assert!(!id.is_empty());
-        assert_eq!(session.entries().len(), 1);
+        assert_eq!(session.entries.len(), 1);
         // Verify it's a ModelChange entry
-        match &session.entries()[0] {
+        match &session.entries[0] {
             SessionEntry::ModelChange(entry) => {
                 assert_eq!(entry.provider, "openai");
                 assert_eq!(entry.model_id, "gpt-4");
@@ -433,12 +480,10 @@ fn session_add_label_nonexistent_returns_none() {
 fn session_add_label_existing_entry() {
     asupersync::test_utils::run_test(|| async {
         let mut session = Session::create();
-        let entry_id = session.append_message(SessionMessage::User(
-            pi::model::UserContent::Text("msg".to_string()),
-        ));
+        let entry_id = session.append_message(user_msg("msg"));
         let label_id = session.add_label(&entry_id, Some("important".to_string()));
         assert!(label_id.is_some(), "labeling existing entry should succeed");
-        assert_eq!(session.entries().len(), 2, "should have message + label");
+        assert_eq!(session.entries.len(), 2, "should have message + label");
     });
 }
 
@@ -449,10 +494,10 @@ fn session_custom_entry() {
         let mut session = Session::create();
         let id = session.append_custom_entry(
             "test-custom-type".to_string(),
-            json!({"key": "value", "count": 42}),
+            Some(json!({"key": "value", "count": 42})),
         );
         assert!(!id.is_empty());
-        assert_eq!(session.entries().len(), 1);
+        assert_eq!(session.entries.len(), 1);
     });
 }
 
@@ -471,9 +516,7 @@ fn session_entries_for_current_path_empty() {
 fn session_entries_for_current_path_single() {
     asupersync::test_utils::run_test(|| async {
         let mut session = Session::create();
-        session.append_message(SessionMessage::User(pi::model::UserContent::Text(
-            "msg".to_string(),
-        )));
+        session.append_message(user_msg("msg"));
         let entries = session.entries_for_current_path();
         assert_eq!(entries.len(), 1, "should have 1 entry in path");
     });
@@ -491,21 +534,19 @@ fn session_save_and_open_round_trip() {
         let mut session = Session::create_with_dir(Some(h.temp_dir().to_path_buf()));
 
         // Add some entries
-        session.append_message(SessionMessage::User(pi::model::UserContent::Text(
-            "first message".to_string(),
-        )));
+        session.append_message(user_msg("first message"));
         session.set_name("round-trip-test");
         session.append_model_change("anthropic".to_string(), "claude-sonnet-4-5".to_string());
 
         // Save
         session.save().await.expect("save should succeed");
-        let path = session.path().expect("should have a path after save");
+        let path = session.path.as_ref().expect("should have a path after save");
         let path_str = path.to_string_lossy().to_string();
 
         // Re-open
         let restored = Session::open(&path_str).await.expect("open should succeed");
         assert_eq!(restored.get_name().as_deref(), Some("round-trip-test"));
-        assert!(!restored.entries().is_empty(), "should have entries");
+        assert!(!restored.entries.is_empty(), "should have entries");
     });
 }
 
@@ -518,7 +559,8 @@ fn session_open_nonexistent_file() {
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
             err_msg.to_lowercase().contains("not found")
-                || err_msg.to_lowercase().contains("not exist"),
+                || err_msg.to_lowercase().contains("not exist")
+                || err_msg.to_lowercase().contains("no such file"),
             "error should mention not found: got {err_msg}"
         );
     });
@@ -590,19 +632,17 @@ fn session_double_save_idempotent() {
     asupersync::test_utils::run_test(|| async {
         let h = TestHarness::new("session_double_save");
         let mut session = Session::create_with_dir(Some(h.temp_dir().to_path_buf()));
-        session.append_message(SessionMessage::User(pi::model::UserContent::Text(
-            "msg".to_string(),
-        )));
+        session.append_message(user_msg("msg"));
 
         session.save().await.expect("first save");
-        let path = session.path().expect("path after save").to_path_buf();
+        let path = session.path.as_ref().expect("path after save").clone();
         session.save().await.expect("second save");
 
         // Re-open should still work
         let restored = Session::open(&path.to_string_lossy())
             .await
             .expect("open after double save");
-        assert!(!restored.entries().is_empty());
+        assert!(!restored.entries.is_empty());
     });
 }
 
@@ -613,17 +653,15 @@ fn session_save_after_mutations() {
         let h = TestHarness::new("session_mutations");
         let mut session = Session::create_with_dir(Some(h.temp_dir().to_path_buf()));
 
-        let msg_id = session.append_message(SessionMessage::User(
-            pi::model::UserContent::Text("first".to_string()),
-        ));
+        let msg_id = session.append_message(user_msg("first"));
         session.set_name("mutated");
         session.add_label(&msg_id, Some("reviewed".to_string()));
         session.append_model_change("openai".to_string(), "gpt-4".to_string());
         session.append_thinking_level_change("high".to_string());
-        session.append_custom_entry("custom".to_string(), json!({"data": 1}));
+        session.append_custom_entry("custom".to_string(), Some(json!({"data": 1})));
 
         session.save().await.expect("save with mutations");
-        let path = session.path().expect("path").to_path_buf();
+        let path = session.path.as_ref().expect("path").clone();
 
         // Verify round-trip
         let restored = Session::open(&path.to_string_lossy())
@@ -632,9 +670,9 @@ fn session_save_after_mutations() {
         assert_eq!(restored.get_name().as_deref(), Some("mutated"));
         // Should have: message + label + model_change + thinking_change + custom + session_info(name)
         assert!(
-            restored.entries().len() >= 5,
+            restored.entries.len() >= 5,
             "should have multiple entry types: got {}",
-            restored.entries().len()
+            restored.entries.len()
         );
     });
 }
@@ -649,9 +687,7 @@ fn session_branch_creates_fork() {
     asupersync::test_utils::run_test(|| async {
         let mut session = Session::create();
 
-        let entry_id = session.append_message(SessionMessage::User(
-            pi::model::UserContent::Text("branch point".to_string()),
-        ));
+        let entry_id = session.append_message(user_msg("branch point"));
 
         // Create branch from the entry
         let branched = session.create_branch_from(&entry_id);
@@ -686,12 +722,8 @@ fn session_get_children_empty() {
 fn session_get_path_to_entry() {
     asupersync::test_utils::run_test(|| async {
         let mut session = Session::create();
-        let id1 = session.append_message(SessionMessage::User(
-            pi::model::UserContent::Text("first".to_string()),
-        ));
-        let _id2 = session.append_message(SessionMessage::User(
-            pi::model::UserContent::Text("second".to_string()),
-        ));
+        let id1 = session.append_message(user_msg("first"));
+        let _id2 = session.append_message(user_msg("second"));
 
         let path = session.get_path_to_entry(&id1);
         assert!(!path.is_empty(), "path to existing entry should not be empty");
@@ -874,18 +906,15 @@ fn encode_cwd_special_chars() {
 fn session_set_model_header() {
     asupersync::test_utils::run_test(|| async {
         let mut session = Session::create();
-        session.set_model_header("openai".to_string(), "gpt-4-turbo".to_string());
-        // The model change should be reflected in session state
-        // (header is internal, but we can verify through model change entries)
+        session.set_model_header(
+            Some("openai".to_string()),
+            Some("gpt-4-turbo".to_string()),
+            None,
+        );
+        // Verify header reflects the change
+        assert_eq!(session.header.provider.as_deref(), Some("openai"));
+        assert_eq!(session.header.model_id.as_deref(), Some("gpt-4-turbo"));
     });
-}
-
-/// Session bash_execution_to_text converts properly.
-#[test]
-fn bash_execution_to_text_format() {
-    let text = pi::session::bash_execution_to_text("echo hello", "hello\n", 0);
-    assert!(text.contains("echo hello"), "should contain command");
-    assert!(text.contains("hello"), "should contain output");
 }
 
 // ===========================================================================

@@ -13,15 +13,19 @@
 
 [suite.unit]
 files = [
+    "agent_tools_coverage",
     "bench_schema",
+    "branch_edge_failure_coverage",
     "capability_denial_matrix",
     "capability_policy_model",
     "capability_policy_scoped",
     "compaction",
     "compaction_bug",
+    "config_edge_cases",
     "config_precedence",
     "error_types",
     "extension_scoring",
+    "extensions_auth_error_coverage",
     "mock_spec_schema",
     "mock_spec_validation",
     "model_selector_cycling",
@@ -31,12 +35,16 @@ files = [
     "perf_budgets",
     "perf_comparison",
     "perf_regression",
-    "provider_backward_lock",
-    "provider_unit_checklist",
     "performance_comparison",
+    "provider_backward_lock",
+    "provider_registry_guardrails",
+    "provider_session_coverage",
+    "provider_unit_checklist",
+    "resource_edge_cases",
     "scheduler_repro",
     "security_budgets",
     "session_conformance",
+    "vcr_parity_validation",
 ]
 
 [suite.vcr]
@@ -49,6 +57,7 @@ files = [
     "ci_cross_platform_matrix",
     "ci_evidence_bundle",
     "ci_full_suite_gate",
+    "e2e_replay_bundles",
     "conformance_comparator",
     "conformance_regression_gate",
     "conformance_fixtures",
@@ -123,7 +132,9 @@ files = [
     "provider_metadata_comprehensive",
     "provider_native_contract",
     "provider_native_verify",
+    "provider_smoke_matrix",
     "provider_streaming",
+    "qa_certification_dossier",
     "repro_config_error",
     "repro_edit_encoding",
     "reproduction_truncate",
@@ -134,6 +145,7 @@ files = [
     "release_readiness",
     "repro_sse_newline",
     "resource_loader",
+    "rpc_edge_cases",
     "rpc_mode",
     "rpc_protocol",
     "rpc_session_connector",
@@ -154,23 +166,29 @@ files = [
 
 [suite.e2e]
 files = [
-    "e2e_auto_repair",
     "e2e_agent_loop",
+    "e2e_auto_repair",
     "e2e_cli",
     "e2e_cross_provider_parity",
-    "e2e_golden_path",
     "e2e_extension_registration",
+    "e2e_failure_injection_recovery",
+    "e2e_golden_path",
+    "e2e_high_risk_workflows",
+    "e2e_interruption_resume_replay",
     "e2e_library_integration",
     "e2e_live",
     "e2e_live_harness",
     "e2e_message_session_control",
+    "e2e_provider_failure_injection",
     "e2e_provider_scenarios",
     "e2e_provider_streaming",
     "e2e_rpc",
     "e2e_session_persistence",
+    "e2e_soak_stability",
     "e2e_tools",
     "e2e_ts_extension_loading",
     "e2e_tui",
+    "e2e_tui_features",
     "e2e_workflow_preflight",
     "provider_live_verify",
 ]
@@ -200,3 +218,36 @@ files = [
 # repro = "cargo test example_flaky_test -- --nocapture"
 # reason = "Intermittent timeout on CI due to thread scheduling variance"
 # remove_when = "Two consecutive green CI runs for this test on Linux/macOS/Windows"
+
+# ─── Waivers: temporary CI gate bypasses with enforced lifecycle ─────────
+#
+# Waivers allow a specific CI gate to be temporarily bypassed. Every waiver
+# MUST have a linked bead, owner, expiry, and measurable removal plan.
+# Expired waivers fail CI — they must be renewed or the underlying issue fixed.
+#
+# Each entry: [waiver.<gate_id>]
+#   gate_id      = Must match a SubGate.id in ci_full_suite_gate.rs
+#   owner        = "<AgentName or person responsible for removal>"
+#   created      = "YYYY-MM-DD"
+#   expires      = "YYYY-MM-DD"   (max 30 days from created)
+#   bead         = "bd-XXXX"      (linked issue tracking the fix)
+#   reason       = "<why this gate is waived>"
+#   scope        = "full" | "preflight" | "both"  (which lane is affected)
+#   remove_when  = "<objective measurable condition for removing waiver>"
+#
+# Rules:
+#   - Max waiver duration: 30 days (must renew or fix)
+#   - Expired waivers cause CI failure (waiver_lifecycle gate)
+#   - Each waiver must have ALL required fields
+#   - Waivers expiring within 3 days trigger warnings
+#   - Only gates listed in ci_full_suite_gate.rs can be waived
+#
+# Example:
+# [waiver.ext_must_pass]
+# owner = "TopazForest"
+# created = "2026-02-10"
+# expires = "2026-02-24"
+# bead = "bd-1f42.4.4"
+# reason = "Extension conformance suite blocked by upstream QuickJS bug"
+# scope = "both"
+# remove_when = "QuickJS bug fix merged and all 208 extensions pass"

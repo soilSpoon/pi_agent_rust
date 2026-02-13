@@ -2773,12 +2773,15 @@ mod docs_runtime_consistency {
     #[test]
     fn config_examples_doc_covers_all_gap_providers() {
         let doc = load_doc("docs/provider-config-examples.json");
-        let providers = doc
-            .get("providers")
+        let families = doc
+            .get("provider_families")
             .and_then(|v| v.as_array())
-            .expect("config-examples must have providers array");
-        let ids: Vec<&str> = providers
+            .expect("config-examples must have provider_families array");
+        // Collect all provider_ids across all families
+        let ids: Vec<&str> = families
             .iter()
+            .filter_map(|f| f.get("providers").and_then(|v| v.as_array()))
+            .flatten()
             .filter_map(|p| p.get("provider_id").and_then(|v| v.as_str()))
             .collect();
         for (provider, _) in &DOC_PROVIDERS {
@@ -2789,7 +2792,7 @@ mod docs_runtime_consistency {
                         .find(|m| m.canonical_id == *provider)
                         .is_some_and(|m| *id == m.canonical_id || m.aliases.contains(id))
                 }),
-                "{provider}: must be covered in config-examples.json providers array"
+                "{provider}: must be covered in config-examples.json provider_families"
             );
         }
     }
@@ -2797,24 +2800,35 @@ mod docs_runtime_consistency {
     #[test]
     fn config_examples_env_vars_match_runtime() {
         let doc = load_doc("docs/provider-config-examples.json");
-        let env_refs = doc
-            .pointer("/env_quick_reference/vars")
-            .and_then(|v| v.as_array())
-            .expect("config-examples must have env_quick_reference.vars");
-        for entry in env_refs {
-            let var_name = entry.get("var").and_then(|v| v.as_str()).unwrap_or("");
-            let provider_str = entry.get("provider").and_then(|v| v.as_str()).unwrap_or("");
-            // Extract first provider from comma-separated list
-            let first_provider = provider_str.split(',').next().unwrap_or("").trim();
-            if first_provider.is_empty() {
-                continue;
-            }
-            let runtime_keys = provider_auth_env_keys(first_provider);
-            if !runtime_keys.is_empty() {
-                assert!(
-                    runtime_keys.contains(&var_name),
-                    "env_quick_reference var '{var_name}' for '{first_provider}' not in runtime keys {runtime_keys:?}"
-                );
+        let env_ref = doc
+            .get("env_quick_reference")
+            .expect("config-examples must have env_quick_reference");
+        // Collect env var entries from all category arrays
+        let categories = ["built_in_native", "native_adapter", "openai_compatible"];
+        for category in &categories {
+            let entries = env_ref
+                .get(*category)
+                .and_then(|v| v.as_array());
+            let Some(entries) = entries else { continue };
+            for entry in entries {
+                let var_name = entry.get("var").and_then(|v| v.as_str()).unwrap_or("");
+                let provider_str = entry.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+                // Extract first provider from slash/comma-separated list
+                let first_provider = provider_str
+                    .split(&[',', '/'][..])
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if first_provider.is_empty() {
+                    continue;
+                }
+                let runtime_keys = provider_auth_env_keys(first_provider);
+                if !runtime_keys.is_empty() {
+                    assert!(
+                        runtime_keys.contains(&var_name),
+                        "env_quick_reference[{category}] var '{var_name}' for '{first_provider}' not in runtime keys {runtime_keys:?}"
+                    );
+                }
             }
         }
     }
