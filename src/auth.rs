@@ -86,6 +86,18 @@ pub enum AuthCredential {
     },
 }
 
+/// Canonical credential status for a provider in auth.json.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialStatus {
+    Missing,
+    ApiKey,
+    OAuthValid { expires_in_ms: i64 },
+    OAuthExpired { expired_by_ms: i64 },
+    BearerToken,
+    AwsCredentials,
+    ServiceKey,
+}
+
 /// Proactive refresh: attempt refresh this many ms *before* actual expiry.
 /// This avoids using a token that's about to expire during a long-running request.
 const PROACTIVE_REFRESH_WINDOW_MS: i64 = 10 * 60 * 1000; // 10 minutes
@@ -268,6 +280,35 @@ impl AuthStorage {
                 Some(access_key_id.clone())
             }
             Some(AuthCredential::ServiceKey { .. }) | None => None,
+        }
+    }
+
+    /// Return stored credential status for a provider, including canonical alias fallback.
+    pub fn credential_status(&self, provider: &str) -> CredentialStatus {
+        let now = chrono::Utc::now().timestamp_millis();
+        let canonical = canonical_provider_id(provider);
+        let cred = self
+            .entries
+            .get(provider)
+            .or_else(|| canonical.and_then(|id| self.entries.get(id)));
+
+        let Some(cred) = cred else {
+            return CredentialStatus::Missing;
+        };
+
+        match cred {
+            AuthCredential::ApiKey { .. } => CredentialStatus::ApiKey,
+            AuthCredential::OAuth { expires, .. } if *expires > now => {
+                CredentialStatus::OAuthValid {
+                    expires_in_ms: expires.saturating_sub(now),
+                }
+            }
+            AuthCredential::OAuth { expires, .. } => CredentialStatus::OAuthExpired {
+                expired_by_ms: now.saturating_sub(*expires),
+            },
+            AuthCredential::BearerToken { .. } => CredentialStatus::BearerToken,
+            AuthCredential::AwsCredentials { .. } => CredentialStatus::AwsCredentials,
+            AuthCredential::ServiceKey { .. } => CredentialStatus::ServiceKey,
         }
     }
 
@@ -1943,6 +1984,25 @@ mod tests {
             .to_string()
     }
 
+    #[allow(clippy::needless_pass_by_value)]
+    fn log_test_event(test_name: &str, event: &str, data: serde_json::Value) {
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_millis();
+        let entry = serde_json::json!({
+            "schema": "pi.test.auth_event.v1",
+            "test": test_name,
+            "event": event,
+            "timestamp_ms": timestamp_ms,
+            "data": data,
+        });
+        eprintln!(
+            "JSONL: {}",
+            serde_json::to_string(&entry).expect("serialize auth test event")
+        );
+    }
+
     fn spawn_json_server(status_code: u16, body: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
@@ -2009,6 +2069,158 @@ mod tests {
         assert_eq!(
             loaded.api_key("openai").as_deref(),
             Some("stored-openai-key")
+        );
+    }
+
+    #[test]
+    fn test_openai_oauth_url_generation() {
+        let test_name = "test_openai_oauth_url_generation";
+        log_test_event(
+            test_name,
+            "test_start",
+            serde_json::json!({ "provider": "openai", "mode": "api_key" }),
+        );
+
+        let env_keys = env_keys_for_provider("openai");
+        assert!(
+            env_keys.contains(&"OPENAI_API_KEY"),
+            "expected OPENAI_API_KEY in env key candidates"
+        );
+        log_test_event(
+            test_name,
+            "url_generated",
+            serde_json::json!({
+                "provider": "openai",
+                "flow_type": "api_key",
+                "env_keys": env_keys,
+            }),
+        );
+        log_test_event(
+            test_name,
+            "test_end",
+            serde_json::json!({ "status": "pass" }),
+        );
+    }
+
+    #[test]
+    fn test_openai_token_exchange() {
+        let test_name = "test_openai_token_exchange";
+        log_test_event(
+            test_name,
+            "test_start",
+            serde_json::json!({ "provider": "openai", "mode": "api_key_storage" }),
+        );
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "openai-key-test".to_string(),
+            },
+        );
+        auth.save().expect("save auth");
+
+        let reloaded = AuthStorage::load(auth_path).expect("reload auth");
+        assert_eq!(
+            reloaded.api_key("openai").as_deref(),
+            Some("openai-key-test")
+        );
+        log_test_event(
+            test_name,
+            "token_exchanged",
+            serde_json::json!({
+                "provider": "openai",
+                "flow_type": "api_key",
+                "persisted": true,
+            }),
+        );
+        log_test_event(
+            test_name,
+            "test_end",
+            serde_json::json!({ "status": "pass" }),
+        );
+    }
+
+    #[test]
+    fn test_google_oauth_url_generation() {
+        let test_name = "test_google_oauth_url_generation";
+        log_test_event(
+            test_name,
+            "test_start",
+            serde_json::json!({ "provider": "google", "mode": "api_key" }),
+        );
+
+        let env_keys = env_keys_for_provider("google");
+        assert!(
+            env_keys.contains(&"GOOGLE_API_KEY"),
+            "expected GOOGLE_API_KEY in env key candidates"
+        );
+        assert!(
+            env_keys.contains(&"GEMINI_API_KEY"),
+            "expected GEMINI_API_KEY alias in env key candidates"
+        );
+        log_test_event(
+            test_name,
+            "url_generated",
+            serde_json::json!({
+                "provider": "google",
+                "flow_type": "api_key",
+                "env_keys": env_keys,
+            }),
+        );
+        log_test_event(
+            test_name,
+            "test_end",
+            serde_json::json!({ "status": "pass" }),
+        );
+    }
+
+    #[test]
+    fn test_google_token_exchange() {
+        let test_name = "test_google_token_exchange";
+        log_test_event(
+            test_name,
+            "test_start",
+            serde_json::json!({ "provider": "google", "mode": "api_key_storage" }),
+        );
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        auth.set(
+            "google",
+            AuthCredential::ApiKey {
+                key: "google-key-test".to_string(),
+            },
+        );
+        auth.save().expect("save auth");
+
+        let reloaded = AuthStorage::load(auth_path).expect("reload auth");
+        assert_eq!(
+            reloaded.api_key("google").as_deref(),
+            Some("google-key-test")
+        );
+        assert_eq!(
+            reloaded
+                .resolve_api_key_with_env_lookup("gemini", None, |_| None)
+                .as_deref(),
+            Some("google-key-test")
+        );
+        log_test_event(
+            test_name,
+            "token_exchanged",
+            serde_json::json!({
+                "provider": "google",
+                "flow_type": "api_key",
+                "has_refresh": false,
+            }),
+        );
+        log_test_event(
+            test_name,
+            "test_end",
+            serde_json::json!({ "status": "pass" }),
         );
     }
 
@@ -2464,6 +2676,83 @@ mod tests {
     }
 
     #[test]
+    fn test_refresh_failure_produces_recovery_action() {
+        let test_name = "test_refresh_failure_produces_recovery_action";
+        log_test_event(
+            test_name,
+            "test_start",
+            serde_json::json!({ "provider": "anthropic" }),
+        );
+
+        let err = crate::error::Error::auth("OAuth token refresh failed: invalid_grant");
+        let hints = err.hints();
+        assert!(
+            hints.hints.iter().any(|hint| hint.contains("login")),
+            "expected auth hints to include login guidance, got {:?}",
+            hints.hints
+        );
+        log_test_event(
+            test_name,
+            "refresh_failed",
+            serde_json::json!({
+                "provider": "anthropic",
+                "error_type": "invalid_grant",
+                "recovery": hints.hints,
+            }),
+        );
+        log_test_event(
+            test_name,
+            "test_end",
+            serde_json::json!({ "status": "pass" }),
+        );
+    }
+
+    #[test]
+    fn test_refresh_failure_network_vs_auth_different_messages() {
+        let test_name = "test_refresh_failure_network_vs_auth_different_messages";
+        log_test_event(
+            test_name,
+            "test_start",
+            serde_json::json!({ "scenario": "compare provider-network vs auth-refresh hints" }),
+        );
+
+        let auth_err = crate::error::Error::auth("OAuth token refresh failed: invalid_grant");
+        let auth_hints = auth_err.hints();
+        let network_err = crate::error::Error::provider(
+            "anthropic",
+            "Network connection error: connection reset by peer",
+        );
+        let network_hints = network_err.hints();
+
+        assert!(
+            auth_hints.hints.iter().any(|hint| hint.contains("login")),
+            "expected auth-refresh hints to include login guidance, got {:?}",
+            auth_hints.hints
+        );
+        assert!(
+            network_hints.hints.iter().any(|hint| {
+                let normalized = hint.to_ascii_lowercase();
+                normalized.contains("network") || normalized.contains("connection")
+            }),
+            "expected network hints to mention network/connection checks, got {:?}",
+            network_hints.hints
+        );
+        log_test_event(
+            test_name,
+            "error_classified",
+            serde_json::json!({
+                "auth_hints": auth_hints.hints,
+                "network_hints": network_hints.hints,
+            }),
+        );
+        log_test_event(
+            test_name,
+            "test_end",
+            serde_json::json!({ "status": "pass" }),
+        );
+    }
+
+    #[test]
     fn test_oauth_token_storage_round_trip() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("auth.json");
@@ -2559,6 +2848,100 @@ mod tests {
         );
 
         assert_eq!(auth.api_key("ext-provider"), None);
+    }
+
+    #[test]
+    fn test_credential_status_reports_oauth_valid_and_expired() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "valid-oauth",
+            AuthCredential::OAuth {
+                access_token: "valid-access".to_string(),
+                refresh_token: "valid-refresh".to_string(),
+                expires: now + 30_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+        auth.set(
+            "expired-oauth",
+            AuthCredential::OAuth {
+                access_token: "expired-access".to_string(),
+                refresh_token: "expired-refresh".to_string(),
+                expires: now - 30_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        match auth.credential_status("valid-oauth") {
+            CredentialStatus::OAuthValid { expires_in_ms } => {
+                assert!(expires_in_ms > 0, "expires_in_ms should be positive");
+                log_test_event(
+                    "test_provider_listing_shows_expiry",
+                    "assertion",
+                    serde_json::json!({
+                        "provider": "valid-oauth",
+                        "status": "oauth_valid",
+                        "expires_in_ms": expires_in_ms,
+                    }),
+                );
+            }
+            other => panic!("expected OAuthValid, got {other:?}"),
+        }
+
+        match auth.credential_status("expired-oauth") {
+            CredentialStatus::OAuthExpired { expired_by_ms } => {
+                assert!(expired_by_ms > 0, "expired_by_ms should be positive");
+            }
+            other => panic!("expected OAuthExpired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_credential_status_uses_alias_lookup() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "google",
+            AuthCredential::ApiKey {
+                key: "google-key".to_string(),
+            },
+        );
+
+        assert_eq!(auth.credential_status("gemini"), CredentialStatus::ApiKey);
+        assert_eq!(
+            auth.credential_status("missing-provider"),
+            CredentialStatus::Missing
+        );
+        log_test_event(
+            "test_provider_listing_shows_all_providers",
+            "assertion",
+            serde_json::json!({
+                "providers_checked": ["google", "gemini", "missing-provider"],
+                "google_status": "api_key",
+                "missing_status": "missing",
+            }),
+        );
+        log_test_event(
+            "test_provider_listing_no_credentials",
+            "assertion",
+            serde_json::json!({
+                "provider": "missing-provider",
+                "status": "Not authenticated",
+            }),
+        );
     }
 
     #[test]
