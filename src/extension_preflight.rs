@@ -904,6 +904,41 @@ pub enum SecurityRuleId {
     /// `console` usage that may leak information.
     #[serde(rename = "SEC-CONSOLE-001")]
     ConsoleInfoLeak,
+
+    // ---- Added in rulebook v2.0.0 ----
+
+    // Critical tier:
+    /// Command execution via `child_process.exec/spawn/execFile/fork`.
+    #[serde(rename = "SEC-SPAWN-001")]
+    ChildProcessSpawn,
+    /// Sandbox escape via `constructor.constructor('return this')()`.
+    #[serde(rename = "SEC-CONSTRUCTOR-001")]
+    ConstructorEscape,
+    /// Native addon require via `.node`/`.so`/`.dylib` file extension.
+    #[serde(rename = "SEC-NATIVEMOD-001")]
+    NativeModuleRequire,
+
+    // High tier:
+    /// `globalThis`/`global` property mutation (sandbox escape vector).
+    #[serde(rename = "SEC-GLOBAL-001")]
+    GlobalMutation,
+    /// Symlink/hard-link creation for path traversal.
+    #[serde(rename = "SEC-SYMLINK-001")]
+    SymlinkCreation,
+    /// `fs.chmod`/`fs.chown` permission elevation.
+    #[serde(rename = "SEC-CHMOD-001")]
+    PermissionChange,
+    /// `net.createServer`/`dgram.createSocket` unauthorized listeners.
+    #[serde(rename = "SEC-SOCKET-001")]
+    SocketListener,
+    /// `WebAssembly.instantiate`/`compile` sandbox bypass.
+    #[serde(rename = "SEC-WASM-001")]
+    WebAssemblyUsage,
+
+    // Medium tier:
+    /// `arguments.callee.caller` stack introspection.
+    #[serde(rename = "SEC-ARGUMENTS-001")]
+    ArgumentsCallerAccess,
 }
 
 impl SecurityRuleId {
@@ -928,6 +963,15 @@ impl SecurityRuleId {
             Self::WithStatement => "with-statement",
             Self::DebuggerStatement => "debugger-statement",
             Self::ConsoleInfoLeak => "console-info-leak",
+            Self::ChildProcessSpawn => "child-process-spawn",
+            Self::ConstructorEscape => "constructor-escape",
+            Self::NativeModuleRequire => "native-module-require",
+            Self::GlobalMutation => "global-mutation",
+            Self::SymlinkCreation => "symlink-creation",
+            Self::PermissionChange => "permission-change",
+            Self::SocketListener => "socket-listener",
+            Self::WebAssemblyUsage => "webassembly-usage",
+            Self::ArgumentsCallerAccess => "arguments-caller-access",
         }
     }
 
@@ -1780,6 +1824,266 @@ fn strip_block_comment_tracking(line: &str, in_block: &mut bool) -> String {
 }
 
 // ============================================================================
+// Install-time composite risk classifier (bd-21vng, SEC-2.3)
+// ============================================================================
+
+/// Schema version for the install-time risk classification report.
+pub const INSTALL_TIME_RISK_SCHEMA: &str = "pi.ext.install_risk.v1";
+
+/// Install-time recommendation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallRecommendation {
+    /// Safe to install and load without further review.
+    Allow,
+    /// Install but flag for operator review before first run.
+    Review,
+    /// Block installation; active exploit vectors detected.
+    Block,
+}
+
+impl fmt::Display for InstallRecommendation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Allow => f.write_str("ALLOW"),
+            Self::Review => f.write_str("REVIEW"),
+            Self::Block => f.write_str("BLOCK"),
+        }
+    }
+}
+
+/// Composite install-time risk classification report that synthesizes signals
+/// from both the compatibility preflight and the security scanner into a
+/// single deterministic verdict.
+///
+/// The classification algorithm is purely functional: given the same
+/// `PreflightReport` and `SecurityScanReport`, it always produces the
+/// identical `InstallTimeRiskReport`. No randomness, no side effects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallTimeRiskReport {
+    /// Schema version.
+    pub schema: String,
+    /// Extension identifier.
+    pub extension_id: String,
+    /// Composite risk tier (worst-of across both reports).
+    pub composite_risk_tier: RiskTier,
+    /// Composite risk score (0 = maximum risk, 100 = clean).
+    pub composite_risk_score: u8,
+    /// Install recommendation derived from composite analysis.
+    pub recommendation: InstallRecommendation,
+    /// Human-readable one-line verdict.
+    pub verdict: String,
+    /// Compatibility preflight summary.
+    pub preflight_summary: PreflightSummaryBrief,
+    /// Security scan summary.
+    pub security_summary: SecuritySummaryBrief,
+    /// Rulebook version that produced the security findings.
+    pub rulebook_version: String,
+}
+
+/// Abbreviated preflight summary for embedding in the composite report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreflightSummaryBrief {
+    pub verdict: PreflightVerdict,
+    pub confidence: u8,
+    pub errors: usize,
+    pub warnings: usize,
+}
+
+/// Abbreviated security summary for embedding in the composite report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecuritySummaryBrief {
+    pub overall_tier: RiskTier,
+    pub critical: usize,
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+    pub total_findings: usize,
+}
+
+impl InstallTimeRiskReport {
+    /// Build from a preflight report and a security scan report.
+    ///
+    /// The composite risk tier is the worst (lowest ordinal) tier from either
+    /// report. The composite score is a weighted combination of the preflight
+    /// confidence and the security finding severity.
+    ///
+    /// This function is pure and deterministic.
+    #[must_use]
+    pub fn classify(
+        extension_id: &str,
+        preflight: &PreflightReport,
+        security: &SecurityScanReport,
+    ) -> Self {
+        let preflight_summary = PreflightSummaryBrief {
+            verdict: preflight.verdict,
+            confidence: preflight.confidence.value(),
+            errors: preflight.summary.errors,
+            warnings: preflight.summary.warnings,
+        };
+
+        let security_summary = SecuritySummaryBrief {
+            overall_tier: security.overall_tier,
+            critical: security.tier_counts.critical,
+            high: security.tier_counts.high,
+            medium: security.tier_counts.medium,
+            low: security.tier_counts.low,
+            total_findings: security.findings.len(),
+        };
+
+        // Composite risk tier: worst-of across both reports.
+        // Map preflight verdict to a risk tier for comparison.
+        let preflight_risk = match preflight.verdict {
+            PreflightVerdict::Fail => RiskTier::High,
+            PreflightVerdict::Warn => RiskTier::Medium,
+            PreflightVerdict::Pass => RiskTier::Low,
+        };
+        let composite_risk_tier = preflight_risk.min(security.overall_tier);
+
+        // Composite risk score: 0 = maximum risk, 100 = clean.
+        // Start from 100 and apply deductions.
+        let security_deduction = security.tier_counts.critical.saturating_mul(30)
+            + security.tier_counts.high.saturating_mul(20)
+            + security.tier_counts.medium.saturating_mul(10)
+            + security.tier_counts.low.saturating_mul(3);
+        let preflight_deduction =
+            preflight.summary.errors.saturating_mul(15)
+            + preflight.summary.warnings.saturating_mul(5);
+        let total_deduction = security_deduction + preflight_deduction;
+        let composite_risk_score =
+            u8::try_from(100_usize.saturating_sub(total_deduction).min(100)).unwrap_or(0);
+
+        // Recommendation: deterministic decision tree.
+        let recommendation = match composite_risk_tier {
+            RiskTier::Critical => InstallRecommendation::Block,
+            RiskTier::High => InstallRecommendation::Review,
+            RiskTier::Medium => {
+                if composite_risk_score < 50 {
+                    InstallRecommendation::Review
+                } else {
+                    InstallRecommendation::Allow
+                }
+            }
+            RiskTier::Low => InstallRecommendation::Allow,
+        };
+
+        let verdict = Self::format_verdict(
+            recommendation,
+            &preflight_summary,
+            &security_summary,
+            composite_risk_score,
+        );
+
+        Self {
+            schema: INSTALL_TIME_RISK_SCHEMA.to_string(),
+            extension_id: extension_id.to_string(),
+            composite_risk_tier,
+            composite_risk_score,
+            recommendation,
+            verdict,
+            preflight_summary,
+            security_summary,
+            rulebook_version: SECURITY_RULEBOOK_VERSION.to_string(),
+        }
+    }
+
+    fn format_verdict(
+        recommendation: InstallRecommendation,
+        preflight: &PreflightSummaryBrief,
+        security: &SecuritySummaryBrief,
+        score: u8,
+    ) -> String {
+        let sec_part = if security.total_findings == 0 {
+            "no security findings".to_string()
+        } else {
+            let mut parts = Vec::new();
+            if security.critical > 0 {
+                parts.push(format!("{} critical", security.critical));
+            }
+            if security.high > 0 {
+                parts.push(format!("{} high", security.high));
+            }
+            if security.medium > 0 {
+                parts.push(format!("{} medium", security.medium));
+            }
+            if security.low > 0 {
+                parts.push(format!("{} low", security.low));
+            }
+            parts.join(", ")
+        };
+
+        let compat_part = match preflight.verdict {
+            PreflightVerdict::Pass => "compatible".to_string(),
+            PreflightVerdict::Warn => format!(
+                "{} compat warning(s)",
+                preflight.warnings
+            ),
+            PreflightVerdict::Fail => format!(
+                "{} compat error(s)",
+                preflight.errors
+            ),
+        };
+
+        format!(
+            "{recommendation}: score {score}/100 — {sec_part}; {compat_part}"
+        )
+    }
+
+    /// Serialize to pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Whether installation should be blocked.
+    #[must_use]
+    pub const fn should_block(&self) -> bool {
+        matches!(self.recommendation, InstallRecommendation::Block)
+    }
+
+    /// Whether manual review is recommended before first run.
+    #[must_use]
+    pub const fn needs_review(&self) -> bool {
+        matches!(
+            self.recommendation,
+            InstallRecommendation::Block | InstallRecommendation::Review
+        )
+    }
+}
+
+/// Convenience function: run both the preflight analyzer and security scanner
+/// on raw source text and produce a composite install-time risk report.
+///
+/// This is the primary entry point for install-time risk classification.
+#[must_use]
+pub fn classify_extension_source(
+    extension_id: &str,
+    source: &str,
+    policy: &ExtensionPolicy,
+) -> InstallTimeRiskReport {
+    let analyzer = PreflightAnalyzer::new(policy, Some(extension_id));
+    let preflight = analyzer.analyze_source(extension_id, source);
+    let security = SecurityScanner::scan_source(extension_id, source);
+    InstallTimeRiskReport::classify(extension_id, &preflight, &security)
+}
+
+/// Run both the preflight analyzer and security scanner on extension files
+/// at a given path and produce a composite install-time risk report.
+pub fn classify_extension_path(
+    extension_id: &str,
+    path: &Path,
+    policy: &ExtensionPolicy,
+) -> InstallTimeRiskReport {
+    let analyzer = PreflightAnalyzer::new(policy, Some(extension_id));
+    let preflight = analyzer.analyze(path);
+    let security = SecurityScanner::scan_path(extension_id, path, path);
+    InstallTimeRiskReport::classify(extension_id, &preflight, &security)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2016,7 +2320,7 @@ mod tests {
     }
 
     #[test]
-    fn report_json_roundtrip() {
+    fn security_scan_report_json_roundtrip() {
         let findings = vec![PreflightFinding {
             severity: FindingSeverity::Warning,
             category: FindingCategory::ModuleCompat,
