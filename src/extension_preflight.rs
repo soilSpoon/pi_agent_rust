@@ -2375,6 +2375,391 @@ pub fn classify_extension_path(
 }
 
 // ============================================================================
+// Quarantine-to-trust promotion lifecycle (bd-21nj4, SEC-2.4)
+// ============================================================================
+
+/// Schema version for trust lifecycle transition events.
+pub const TRUST_LIFECYCLE_SCHEMA: &str = "pi.ext.trust_lifecycle.v1";
+
+/// Extension trust lifecycle states.
+///
+/// The trust lifecycle is a strict state machine:
+/// - `Quarantined` → `Restricted` (via promotion with operator acknowledgment)
+/// - `Restricted` → `Trusted` (via promotion with operator acknowledgment)
+/// - `Trusted` → `Quarantined` (via demotion, immediate)
+/// - `Restricted` → `Quarantined` (via demotion, immediate)
+///
+/// Transitions always require an explicit reason and produce an audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionTrustState {
+    /// Extension is fully quarantined: no dangerous hostcalls permitted.
+    /// Default state for extensions with `Block` or `Review` install
+    /// recommendations.
+    Quarantined,
+    /// Extension may execute read-only hostcalls but not write, exec, or
+    /// network operations. Intermediate state requiring a second promotion
+    /// to reach full trust.
+    Restricted,
+    /// Extension is fully trusted and may exercise all policy-allowed
+    /// capabilities.
+    Trusted,
+}
+
+impl fmt::Display for ExtensionTrustState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Quarantined => f.write_str("quarantined"),
+            Self::Restricted => f.write_str("restricted"),
+            Self::Trusted => f.write_str("trusted"),
+        }
+    }
+}
+
+impl ExtensionTrustState {
+    /// Whether the extension may execute dangerous hostcalls (write, exec,
+    /// network, env).
+    #[must_use]
+    pub const fn allows_dangerous_hostcalls(self) -> bool {
+        matches!(self, Self::Trusted)
+    }
+
+    /// Whether the extension may execute read-only hostcalls (read, list,
+    /// stat, tool registration).
+    #[must_use]
+    pub const fn allows_read_hostcalls(self) -> bool {
+        matches!(self, Self::Restricted | Self::Trusted)
+    }
+
+    /// Whether the extension is in quarantine and cannot execute any
+    /// hostcalls beyond registration.
+    #[must_use]
+    pub const fn is_quarantined(self) -> bool {
+        matches!(self, Self::Quarantined)
+    }
+}
+
+/// Direction of a trust state transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustTransitionKind {
+    /// Promote to a higher trust level.
+    Promote,
+    /// Demote to a lower trust level (quarantine).
+    Demote,
+}
+
+impl fmt::Display for TrustTransitionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Promote => f.write_str("promote"),
+            Self::Demote => f.write_str("demote"),
+        }
+    }
+}
+
+/// A recorded trust state transition event for the audit trail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustTransitionEvent {
+    /// Schema version.
+    pub schema: String,
+    /// Extension identifier.
+    pub extension_id: String,
+    /// Previous trust state.
+    pub from_state: ExtensionTrustState,
+    /// New trust state.
+    pub to_state: ExtensionTrustState,
+    /// Direction of transition.
+    pub kind: TrustTransitionKind,
+    /// Human-readable reason for the transition.
+    pub reason: String,
+    /// Whether operator explicitly acknowledged this transition.
+    pub operator_acknowledged: bool,
+    /// Install-time risk score at time of transition (0-100).
+    pub risk_score: Option<u8>,
+    /// Install-time recommendation at time of transition.
+    pub recommendation: Option<InstallRecommendation>,
+    /// Timestamp (RFC 3339) of the transition.
+    pub timestamp: String,
+}
+
+impl TrustTransitionEvent {
+    /// Serialize to JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// Errors that can occur during trust state transitions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustTransitionError {
+    /// Attempted promotion without operator acknowledgment.
+    OperatorAckRequired {
+        from: ExtensionTrustState,
+        to: ExtensionTrustState,
+    },
+    /// Attempted an invalid state transition (e.g., Quarantined → Trusted
+    /// without passing through Restricted).
+    InvalidTransition {
+        from: ExtensionTrustState,
+        to: ExtensionTrustState,
+    },
+    /// Extension's install-time risk score is too high for the target state.
+    RiskTooHigh {
+        target: ExtensionTrustState,
+        risk_score: u8,
+        max_allowed: u8,
+    },
+}
+
+impl fmt::Display for TrustTransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OperatorAckRequired { from, to } => {
+                write!(
+                    f,
+                    "operator acknowledgment required to promote {from} → {to}"
+                )
+            }
+            Self::InvalidTransition { from, to } => {
+                write!(f, "invalid trust transition: {from} → {to}")
+            }
+            Self::RiskTooHigh {
+                target,
+                risk_score,
+                max_allowed,
+            } => {
+                write!(
+                    f,
+                    "risk score {risk_score} exceeds maximum {max_allowed} for {target} state"
+                )
+            }
+        }
+    }
+}
+
+/// Mutable trust lifecycle tracker for a single extension.
+///
+/// This struct manages the trust state machine and produces audit events
+/// for every transition.
+#[derive(Debug, Clone)]
+pub struct ExtensionTrustTracker {
+    extension_id: String,
+    state: ExtensionTrustState,
+    history: Vec<TrustTransitionEvent>,
+}
+
+impl ExtensionTrustTracker {
+    /// Create a new tracker with the given initial state.
+    #[must_use]
+    pub fn new(extension_id: &str, initial_state: ExtensionTrustState) -> Self {
+        Self {
+            extension_id: extension_id.to_string(),
+            state: initial_state,
+            history: Vec::new(),
+        }
+    }
+
+    /// Create a tracker with initial state derived from an install-time risk
+    /// report.
+    #[must_use]
+    pub fn from_risk_report(report: &InstallTimeRiskReport) -> Self {
+        let state = match report.recommendation {
+            InstallRecommendation::Block => ExtensionTrustState::Quarantined,
+            InstallRecommendation::Review => ExtensionTrustState::Quarantined,
+            InstallRecommendation::Allow => ExtensionTrustState::Trusted,
+        };
+        Self::new(&report.extension_id, state)
+    }
+
+    /// Current trust state.
+    #[must_use]
+    pub const fn state(&self) -> ExtensionTrustState {
+        self.state
+    }
+
+    /// Extension identifier.
+    #[must_use]
+    pub fn extension_id(&self) -> &str {
+        &self.extension_id
+    }
+
+    /// Full transition history.
+    #[must_use]
+    pub fn history(&self) -> &[TrustTransitionEvent] {
+        &self.history
+    }
+
+    /// Attempt to promote the extension to the next trust level.
+    ///
+    /// Promotions must follow the strict path:
+    /// `Quarantined` → `Restricted` → `Trusted`.
+    ///
+    /// Skipping levels (e.g., `Quarantined` → `Trusted`) is not allowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TrustTransitionError` if:
+    /// - `operator_ack` is false (promotions require explicit acknowledgment)
+    /// - The extension is already `Trusted`
+    /// - The risk score exceeds the threshold for the target state
+    pub fn promote(
+        &mut self,
+        reason: &str,
+        operator_ack: bool,
+        risk_score: Option<u8>,
+        recommendation: Option<InstallRecommendation>,
+    ) -> Result<&TrustTransitionEvent, TrustTransitionError> {
+        let target = match self.state {
+            ExtensionTrustState::Quarantined => ExtensionTrustState::Restricted,
+            ExtensionTrustState::Restricted => ExtensionTrustState::Trusted,
+            ExtensionTrustState::Trusted => {
+                return Err(TrustTransitionError::InvalidTransition {
+                    from: self.state,
+                    to: ExtensionTrustState::Trusted,
+                });
+            }
+        };
+
+        if !operator_ack {
+            return Err(TrustTransitionError::OperatorAckRequired {
+                from: self.state,
+                to: target,
+            });
+        }
+
+        // Risk threshold gate: Restricted requires score >= 30, Trusted
+        // requires >= 50.
+        if let Some(score) = risk_score {
+            let max = match target {
+                ExtensionTrustState::Restricted => 30,
+                ExtensionTrustState::Trusted => 50,
+                ExtensionTrustState::Quarantined => 0,
+            };
+            if score < max {
+                return Err(TrustTransitionError::RiskTooHigh {
+                    target,
+                    risk_score: score,
+                    max_allowed: max,
+                });
+            }
+        }
+
+        let event = TrustTransitionEvent {
+            schema: TRUST_LIFECYCLE_SCHEMA.to_string(),
+            extension_id: self.extension_id.clone(),
+            from_state: self.state,
+            to_state: target,
+            kind: TrustTransitionKind::Promote,
+            reason: reason.to_string(),
+            operator_acknowledged: true,
+            risk_score,
+            recommendation,
+            timestamp: now_rfc3339(),
+        };
+
+        self.state = target;
+        self.history.push(event);
+        Ok(self.history.last().unwrap())
+    }
+
+    /// Demote the extension back to quarantine.
+    ///
+    /// Demotions are always allowed and do not require operator
+    /// acknowledgment. They are immediate and unconditional.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TrustTransitionError::InvalidTransition` if the extension is
+    /// already quarantined.
+    pub fn demote(&mut self, reason: &str) -> Result<&TrustTransitionEvent, TrustTransitionError> {
+        if self.state == ExtensionTrustState::Quarantined {
+            return Err(TrustTransitionError::InvalidTransition {
+                from: self.state,
+                to: ExtensionTrustState::Quarantined,
+            });
+        }
+
+        let event = TrustTransitionEvent {
+            schema: TRUST_LIFECYCLE_SCHEMA.to_string(),
+            extension_id: self.extension_id.clone(),
+            from_state: self.state,
+            to_state: ExtensionTrustState::Quarantined,
+            kind: TrustTransitionKind::Demote,
+            reason: reason.to_string(),
+            operator_acknowledged: false,
+            risk_score: None,
+            recommendation: None,
+            timestamp: now_rfc3339(),
+        };
+
+        self.state = ExtensionTrustState::Quarantined;
+        self.history.push(event);
+        Ok(self.history.last().unwrap())
+    }
+
+    /// Export the full transition history as JSONL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn history_jsonl(&self) -> Result<String, serde_json::Error> {
+        let mut out = String::new();
+        for (i, event) in self.history.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&serde_json::to_string(event)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Determine the initial trust state for a newly installed extension
+/// based on its install-time risk report.
+#[must_use]
+pub fn initial_trust_state(report: &InstallTimeRiskReport) -> ExtensionTrustState {
+    match report.recommendation {
+        InstallRecommendation::Block | InstallRecommendation::Review => {
+            ExtensionTrustState::Quarantined
+        }
+        InstallRecommendation::Allow => ExtensionTrustState::Trusted,
+    }
+}
+
+/// Check whether a hostcall category is allowed for the given trust state.
+///
+/// Dangerous categories (write, exec, env, http) require `Trusted` state.
+/// Read-only categories (read, list, stat, tool) require at least `Restricted`.
+/// Registration-only operations (register tool/slash_command) are always
+/// allowed.
+#[must_use]
+pub fn is_hostcall_allowed_for_trust(
+    trust_state: ExtensionTrustState,
+    hostcall_category: &str,
+) -> bool {
+    match hostcall_category {
+        // Always allowed (registration).
+        "register" | "tool" | "slash_command" | "shortcut" | "flag" | "event_hook" | "log" => true,
+        // Read-only: requires at least Restricted.
+        "read" | "list" | "stat" | "session_read" | "ui" => trust_state.allows_read_hostcalls(),
+        // Dangerous: requires Trusted.
+        "write" | "exec" | "env" | "http" | "session_write" | "fs_write" | "fs_delete"
+        | "fs_mkdir" => trust_state.allows_dangerous_hostcalls(),
+        // Unknown categories default to requiring Trusted.
+        _ => trust_state.allows_dangerous_hostcalls(),
+    }
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -3459,26 +3844,26 @@ debugger;
 
     #[test]
     fn detect_native_node_require() {
-        let report = scan(r#"const addon = require('./native.node');"#);
+        let report = scan(r"const addon = require('./native.node');");
         assert!(has_rule(&report, SecurityRuleId::NativeModuleRequire));
         assert_eq!(report.overall_tier, RiskTier::Critical);
     }
 
     #[test]
     fn detect_native_so_require() {
-        let report = scan(r#"const lib = require('/usr/lib/evil.so');"#);
+        let report = scan(r"const lib = require('/usr/lib/evil.so');");
         assert!(has_rule(&report, SecurityRuleId::NativeModuleRequire));
     }
 
     #[test]
     fn detect_native_dylib_require() {
-        let report = scan(r#"const lib = require('./lib.dylib');"#);
+        let report = scan(r"const lib = require('./lib.dylib');");
         assert!(has_rule(&report, SecurityRuleId::NativeModuleRequire));
     }
 
     #[test]
     fn normal_require_not_flagged_as_native() {
-        let report = scan(r#"const fs = require('fs');"#);
+        let report = scan(r"const fs = require('fs');");
         assert!(!has_rule(&report, SecurityRuleId::NativeModuleRequire));
     }
 
@@ -3631,7 +4016,7 @@ debugger;
 
     #[test]
     fn scan_with_new_rules_is_deterministic() {
-        let source = r#"
+        let source = r"
 eval('x');
 const cp = require('child_process'); cp.exec('ls');
 globalThis.foo = 'bar';
@@ -3642,7 +4027,7 @@ const m = WebAssembly.compile(b);
 const c = arguments.callee;
 constructor.constructor('return this')();
 const addon = require('./evil.node');
-"#;
+";
         let r1 = scan(source);
         let r2 = scan(source);
         let j1 = r1.to_json().unwrap();
@@ -3688,11 +4073,11 @@ const addon = require('./evil.node');
 
     #[test]
     fn evidence_ledger_includes_new_rules() {
-        let source = r#"
+        let source = r"
 constructor.constructor('return this')();
 const m = WebAssembly.compile(b);
 const c = arguments.callee;
-"#;
+";
         let report = scan(source);
         let jsonl = security_evidence_ledger_jsonl(&report).unwrap();
         let entries: Vec<SecurityEvidenceLedgerEntry> = jsonl
