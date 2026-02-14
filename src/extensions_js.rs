@@ -129,6 +129,39 @@ pub fn is_env_var_allowed(key: &str) -> bool {
     true
 }
 
+fn parse_truthy_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn is_compat_scan_mode(env: &HashMap<String, String>) -> bool {
+    env.get("PI_EXT_COMPAT_SCAN")
+        .is_some_and(|value| parse_truthy_flag(value))
+        || std::env::var("PI_EXT_COMPAT_SCAN").is_ok_and(|value| parse_truthy_flag(&value))
+}
+
+/// Compatibility-mode fallback values for environment-gated extension registration.
+///
+/// This keeps conformance scans deterministic while preserving the default secret
+/// filtering behavior in normal runtime mode.
+fn compat_env_fallback_value(key: &str, env: &HashMap<String, String>) -> Option<String> {
+    if !is_compat_scan_mode(env) {
+        return None;
+    }
+
+    let upper = key.to_ascii_uppercase();
+    if upper.ends_with("_API_KEY") {
+        return Some(format!("pi-compat-{}", upper.to_ascii_lowercase()));
+    }
+    if upper == "PI_SEMANTIC_LEGACY" {
+        return Some("1".to_string());
+    }
+
+    None
+}
+
 // ============================================================================
 // Promise Bridge Types (bd-2ke)
 // ============================================================================
@@ -5401,6 +5434,28 @@ pub fn generate_monorepo_stub(names: &[String]) -> String {
 
 static REQUIRE_CALL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 
+fn source_declares_binding(source: &str, name: &str) -> bool {
+    let patterns = [
+        format!("const {name}"),
+        format!("let {name}"),
+        format!("var {name}"),
+        format!("function {name}"),
+        format!("class {name}"),
+        format!("export const {name}"),
+        format!("export let {name}"),
+        format!("export var {name}"),
+        format!("export function {name}"),
+        format!("export class {name}"),
+    ];
+    source.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('*') {
+            return false;
+        }
+        patterns.iter().any(|pattern| trimmed.starts_with(pattern))
+    })
+}
+
 /// Detect if a JavaScript source uses CommonJS patterns (`require(...)` or
 /// `module.exports`) and transform it into an ESM-compatible wrapper.
 ///
@@ -5415,10 +5470,10 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     let has_module_exports = source.contains("module.exports")
         || source.contains("module[\"exports\"]")
         || source.contains("module['exports']");
-    let has_exports_binding = source.contains("exports.") || source.contains("exports[");
+    let has_exports_usage = source.contains("exports.") || source.contains("exports[");
     let has_dirname_refs = source.contains("__dirname") || source.contains("__filename");
 
-    if !has_require && !has_module_exports && !has_exports_binding && !has_dirname_refs {
+    if !has_require && !has_module_exports && !has_exports_usage && !has_dirname_refs {
         return source.to_string();
     }
 
@@ -5442,13 +5497,13 @@ fn maybe_cjs_to_esm(source: &str) -> String {
         }
     }
 
-    if specifiers.is_empty() && !has_module_exports && !has_exports_binding && !has_dirname_refs {
+    if specifiers.is_empty() && !has_module_exports && !has_exports_usage && !has_dirname_refs {
         return source.to_string();
     }
     if specifiers.is_empty()
         && has_esm
         && !has_module_exports
-        && !has_exports_binding
+        && !has_exports_usage
         && !has_dirname_refs
     {
         return source.to_string();
@@ -5462,7 +5517,8 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     }
 
     // Build require map + function
-    if !specifiers.is_empty() {
+    let has_require_binding = source_declares_binding(source, "require");
+    if !specifiers.is_empty() && !has_require_binding {
         output.push_str("const __cjs_req_map = {");
         for (i, spec) in specifiers.iter().enumerate() {
             if i > 0 {
@@ -5481,24 +5537,41 @@ fn maybe_cjs_to_esm(source: &str) -> String {
         );
     }
 
-    let inject_cjs_bindings =
-        !has_esm || has_module_exports || has_exports_binding || has_dirname_refs;
-    if inject_cjs_bindings {
-        // Provide CJS compatibility globals.
-        output.push_str(
-            "const __filename = (() => {\n\
-             \x20 try { return new URL(import.meta.url).pathname || ''; } catch { return ''; }\n\
-             })();\n\
-             const __dirname = __filename ? __filename.replace(/[/\\\\][^/\\\\]*$/, '') : '.';\n\
-             const module = { exports: {} };\n\
-             const exports = module.exports;\n",
-        );
+    let has_filename_binding = source_declares_binding(source, "__filename");
+    let has_dirname_binding = source_declares_binding(source, "__dirname");
+    let has_module_binding = source_declares_binding(source, "module");
+    let has_exports_binding = source_declares_binding(source, "exports");
+    let needs_filename = has_dirname_refs && !has_filename_binding;
+    let needs_dirname = has_dirname_refs && !has_dirname_binding;
+    let needs_module = (has_module_exports || has_exports_usage) && !has_module_binding;
+    let needs_exports = (has_module_exports || has_exports_usage) && !has_exports_binding;
+
+    if needs_filename || needs_dirname || needs_module || needs_exports {
+        // Provide CJS compatibility globals only for bindings not declared by source.
+        if needs_filename {
+            output.push_str(
+                "const __filename = (() => {\n\
+                 \x20 try { return new URL(import.meta.url).pathname || ''; } catch { return ''; }\n\
+                 })();\n",
+            );
+        }
+        if needs_dirname {
+            output.push_str(
+                "const __dirname = __filename ? __filename.replace(/[/\\\\][^/\\\\]*$/, '') : '.';\n",
+            );
+        }
+        if needs_module {
+            output.push_str("const module = { exports: {} };\n");
+        }
+        if needs_exports {
+            output.push_str("const exports = module.exports;\n");
+        }
     }
 
     output.push_str(source);
     output.push('\n');
 
-    if !has_export_default && (!has_esm || has_module_exports || has_exports_binding) {
+    if !has_export_default && (!has_esm || has_module_exports || has_exports_usage) {
         // Export CommonJS entrypoint for loaders that require a default init fn.
         output.push_str("export default module.exports;\n");
     }
@@ -12114,6 +12187,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let env = env.clone();
                         move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
+                            if let Some(value) = compat_env_fallback_value(&key, &env) {
+                                tracing::debug!(
+                                    event = "pijs.env.get.compat",
+                                    key = %key,
+                                    "env compat fallback"
+                                );
+                                return Ok(Some(value));
+                            }
                             let allowed = is_env_var_allowed(&key);
                             tracing::debug!(
                                 event = "pijs.env.get",
@@ -12273,13 +12354,132 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 // Open first to get a handle, then verify the handle's path.
                                 // This prevents TOCTOU attacks where the path is swapped
                                 // between check and read.
-                                let mut file =
-                                    std::fs::File::open(&requested_abs).map_err(|err| {
-                                        rquickjs::Error::new_loading_message(
+                                let mut file = match std::fs::File::open(&requested_abs) {
+                                    Ok(file) => file,
+                                    Err(err)
+                                        if err.kind() == std::io::ErrorKind::NotFound
+                                            && repair_mode.should_apply() =>
+                                    {
+                                        // Pattern 2 (bd-k5q5.8.3): missing asset fallback.
+                                        // Linux uses fd-based TOCTOU-safe reads; when the file
+                                        // is missing we still allow extension-local empty asset
+                                        // fallbacks for known text formats.
+                                        let checked_path = std::fs::canonicalize(&requested_abs)
+                                            .map(crate::extensions::strip_unc_prefix)
+                                            .or_else(|canonicalize_err| {
+                                                if canonicalize_err.kind()
+                                                    == std::io::ErrorKind::NotFound
+                                                {
+                                                    // Walk up the ancestor chain to find the nearest
+                                                    // existing directory. This handles cases where
+                                                    // intermediate directories are missing.
+                                                    let mut ancestor = requested_abs.as_path();
+                                                    loop {
+                                                        ancestor = match ancestor.parent() {
+                                                            Some(p) if !p.as_os_str().is_empty() => p,
+                                                            _ => break,
+                                                        };
+                                                        if let Ok(canonical_ancestor) =
+                                                            std::fs::canonicalize(ancestor).map(
+                                                                crate::extensions::strip_unc_prefix,
+                                                            )
+                                                        {
+                                                            if canonical_ancestor
+                                                                .starts_with(&workspace_root)
+                                                            {
+                                                                return Ok(requested_abs.clone());
+                                                            }
+                                                            if let Ok(roots) =
+                                                                allowed_read_roots.lock()
+                                                            {
+                                                                for root in roots.iter() {
+                                                                    if canonical_ancestor
+                                                                        .starts_with(root)
+                                                                    {
+                                                                        return Ok(
+                                                                            requested_abs.clone()
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Err(canonicalize_err)
+                                            })
+                                            .map_err(|canonicalize_err| {
+                                                rquickjs::Error::new_loading_message(
+                                                    &path,
+                                                    format!("host read open: {canonicalize_err}"),
+                                                )
+                                            })?;
+
+                                        let in_ext_root =
+                                            allowed_read_roots.lock().is_ok_and(|roots| {
+                                                roots.iter().any(|root| checked_path.starts_with(root))
+                                            });
+
+                                        if in_ext_root {
+                                            let ext = checked_path
+                                                .extension()
+                                                .and_then(|e| e.to_str())
+                                                .unwrap_or("");
+                                            let fallback = match ext {
+                                                "html" | "htm" => {
+                                                    "<!DOCTYPE html><html><body></body></html>"
+                                                }
+                                                "css" => "/* auto-repair: empty stylesheet */",
+                                                "js" | "mjs" => "// auto-repair: empty script",
+                                                "md" | "txt" | "toml" | "yaml" | "yml" => "",
+                                                // Do NOT fallback for .json (empty string is
+                                                // not valid JSON) or .env (security-relevant).
+                                                _ => {
+                                                    return Err(rquickjs::Error::new_loading_message(
+                                                        &path,
+                                                        format!("host read open: {err}"),
+                                                    ));
+                                                }
+                                            };
+
+                                            tracing::info!(
+                                                event = "pijs.repair.missing_asset",
+                                                path = %path,
+                                                ext = %ext,
+                                                "returning empty fallback for missing asset"
+                                            );
+
+                                            if let Ok(mut events) = repair_events.lock() {
+                                                events.push(ExtensionRepairEvent {
+                                                    extension_id: String::new(),
+                                                    pattern: RepairPattern::MissingAsset,
+                                                    original_error: format!(
+                                                        "ENOENT: {}",
+                                                        checked_path.display()
+                                                    ),
+                                                    repair_action: format!(
+                                                        "returned empty {ext} fallback"
+                                                    ),
+                                                    success: true,
+                                                    timestamp_ms: 0,
+                                                });
+                                            }
+
+                                            return Ok(fallback.to_string());
+                                        }
+
+                                        return Err(rquickjs::Error::new_loading_message(
                                             &path,
                                             format!("host read open: {err}"),
-                                        )
-                                    })?;
+                                        ));
+                                    }
+                                    Err(err) => {
+                                        return Err(rquickjs::Error::new_loading_message(
+                                            &path,
+                                            format!("host read open: {err}"),
+                                        ));
+                                    }
+                                };
 
                                 let secure_path_buf = std::fs::read_link(format!(
                                     "/proc/self/fd/{}",
