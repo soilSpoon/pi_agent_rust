@@ -1586,13 +1586,43 @@ pub struct ExtensionQuotaConfig {
 
 impl Default for ExtensionQuotaConfig {
     fn default() -> Self {
-        Self {
-            max_hostcalls_per_second: Some(100),
-            max_hostcalls_per_minute: Some(2000),
-            max_hostcalls_total: None,
-            max_subprocesses: Some(8),
-            max_write_bytes: None,
-            max_http_requests: None,
+        Self::for_mode(ExtensionPolicyMode::Prompt)
+    }
+}
+
+impl ExtensionQuotaConfig {
+    /// Create quota defaults appropriate for a given policy mode.
+    ///
+    /// - **Strict**: restrictive burst/rate limits and low subprocess fan-out.
+    /// - **Prompt**: moderate defaults (original baseline).
+    /// - **Permissive**: relaxed limits for trusted extensions.
+    #[must_use]
+    pub const fn for_mode(mode: ExtensionPolicyMode) -> Self {
+        match mode {
+            ExtensionPolicyMode::Strict => Self {
+                max_hostcalls_per_second: Some(20),
+                max_hostcalls_per_minute: Some(500),
+                max_hostcalls_total: Some(5_000),
+                max_subprocesses: Some(4),
+                max_write_bytes: Some(50 * 1024 * 1024), // 50 MB
+                max_http_requests: Some(200),
+            },
+            ExtensionPolicyMode::Prompt => Self {
+                max_hostcalls_per_second: Some(100),
+                max_hostcalls_per_minute: Some(2_000),
+                max_hostcalls_total: None,
+                max_subprocesses: Some(8),
+                max_write_bytes: None,
+                max_http_requests: None,
+            },
+            ExtensionPolicyMode::Permissive => Self {
+                max_hostcalls_per_second: Some(500),
+                max_hostcalls_per_minute: Some(10_000),
+                max_hostcalls_total: None,
+                max_subprocesses: Some(32),
+                max_write_bytes: None,
+                max_http_requests: None,
+            },
         }
     }
 }
@@ -1608,6 +1638,21 @@ struct ExtensionQuotaState {
     active_subprocesses: u32,
     write_bytes_total: u64,
     http_requests_total: u64,
+}
+
+/// Telemetry event emitted when a quota limit is breached.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaBreachEvent {
+    /// Unix epoch milliseconds when the breach was detected.
+    pub ts_ms: i64,
+    /// Extension that triggered the breach.
+    pub extension_id: String,
+    /// Capability being requested (e.g. "exec", "http", "write").
+    pub capability: String,
+    /// Human-readable reason for the breach.
+    pub reason: String,
+    /// Source of the quota config: "per_extension" or "global".
+    pub quota_config_source: String,
 }
 
 /// Result of a quota check before dispatching a hostcall.
@@ -1653,9 +1698,7 @@ fn check_extension_quota(
             .count();
         if count_1s > max_per_sec as usize {
             return QuotaCheckResult::Exceeded {
-                reason: format!(
-                    "hostcall rate {count_1s}/s exceeds limit {max_per_sec}/s"
-                ),
+                reason: format!("hostcall rate {count_1s}/s exceeds limit {max_per_sec}/s"),
             };
         }
     }
@@ -1665,9 +1708,7 @@ fn check_extension_quota(
         let count_60s = state.hostcall_timestamps_ms.len();
         if count_60s > max_per_min as usize {
             return QuotaCheckResult::Exceeded {
-                reason: format!(
-                    "hostcall rate {count_60s}/60s exceeds limit {max_per_min}/60s"
-                ),
+                reason: format!("hostcall rate {count_60s}/60s exceeds limit {max_per_min}/60s"),
             };
         }
     }
@@ -8824,7 +8865,8 @@ pub async fn dispatch_host_call_shared(
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-            let quota_result = manager.check_quota(ctx.extension_id, capability, now_ms);
+            let quota_result =
+                manager.check_quota(ctx.extension_id, capability, now_ms, ctx.policy);
             if let QuotaCheckResult::Exceeded { reason: ref qr } = quota_result {
                 tracing::warn!(
                     event = "ext.quota.exceeded",
@@ -8854,6 +8896,9 @@ pub async fn dispatch_host_call_shared(
         }
     }
 
+    // SEC-4.1: track whether we need subprocess lifecycle recording.
+    let is_exec = capability == "exec";
+
     let mut runtime_risk_decision = None;
     let outcome = if decision == PolicyDecision::Allow {
         if let Some(manager) = ctx.manager.as_ref() {
@@ -8873,7 +8918,23 @@ pub async fn dispatch_host_call_shared(
             );
         }
 
-        match runtime_risk_decision
+        let will_dispatch = match runtime_risk_decision
+            .as_ref()
+            .map_or(RuntimeRiskAction::Allow, |d| d.action)
+        {
+            RuntimeRiskAction::Allow => true,
+            RuntimeRiskAction::Harden => !runtime_risk_is_dangerous(capability),
+            RuntimeRiskAction::Deny | RuntimeRiskAction::Terminate => false,
+        };
+
+        // SEC-4.1: record subprocess spawn before exec dispatch.
+        if is_exec && will_dispatch {
+            if let (Some(manager), Some(ext_id)) = (ctx.manager.as_ref(), ctx.extension_id) {
+                manager.record_subprocess_spawn(ext_id);
+            }
+        }
+
+        let dispatched = match runtime_risk_decision
             .as_ref()
             .map_or(RuntimeRiskAction::Allow, |d| d.action)
         {
@@ -8898,7 +8959,16 @@ pub async fn dispatch_host_call_shared(
                 code: "denied".to_string(),
                 message: "Extension quarantined by runtime risk controller".to_string(),
             },
+        };
+
+        // SEC-4.1: record subprocess exit after exec dispatch completes.
+        if is_exec && will_dispatch {
+            if let (Some(manager), Some(ext_id)) = (ctx.manager.as_ref(), ctx.extension_id) {
+                manager.record_subprocess_exit(ext_id);
+            }
         }
+
+        dispatched
     } else {
         HostcallOutcome::Error {
             code: "denied".to_string(),
@@ -10545,6 +10615,8 @@ struct ExtensionManagerInner {
     /// Per-extension resource quota config and mutable counters (SEC-4.1).
     quota_config: ExtensionQuotaConfig,
     quota_states: HashMap<String, ExtensionQuotaState>,
+    /// Quota breach telemetry events (SEC-4.1).
+    quota_breach_events: VecDeque<QuotaBreachEvent>,
     /// Budget for extension operations (structured concurrency).
     extension_budget: Budget,
 }
@@ -10846,11 +10918,14 @@ impl ExtensionManager {
 
     /// Check per-extension resource quotas before dispatching a hostcall.
     /// Returns [`QuotaCheckResult::Exceeded`] if any configured limit is breached.
+    ///
+    /// Quota config resolution: per-extension override (from policy) > global default.
     fn check_quota(
         &self,
         extension_id: Option<&str>,
         capability: &str,
         now_ms: i64,
+        policy: &ExtensionPolicy,
     ) -> QuotaCheckResult {
         let Some(ext_id) = extension_id else {
             return QuotaCheckResult::Allowed;
@@ -10860,19 +10935,39 @@ impl ExtensionManager {
         };
 
         // Resolve quota config: per-extension override > global default.
-        let quota_config = guard
-            .policy_prompt_cache
+        let quota_config = policy
+            .per_extension
             .get(ext_id)
-            .and(None::<&ExtensionQuotaConfig>)
+            .and_then(|ovr| ovr.quota.as_ref())
             .cloned()
             .unwrap_or_else(|| guard.quota_config.clone());
 
-        let state = guard
-            .quota_states
-            .entry(ext_id.to_string())
-            .or_default();
+        let state = guard.quota_states.entry(ext_id.to_string()).or_default();
 
-        check_extension_quota(&quota_config, state, now_ms, capability)
+        let result = check_extension_quota(&quota_config, state, now_ms, capability);
+
+        // Record breach telemetry if quota was exceeded.
+        if let QuotaCheckResult::Exceeded { ref reason } = result {
+            guard.quota_breach_events.push_back(QuotaBreachEvent {
+                ts_ms: now_ms,
+                extension_id: ext_id.to_string(),
+                capability: capability.to_string(),
+                reason: reason.clone(),
+                quota_config_source: if policy
+                    .per_extension
+                    .get(ext_id)
+                    .and_then(|ovr| ovr.quota.as_ref())
+                    .is_some()
+                {
+                    "per_extension"
+                } else {
+                    "global"
+                }
+                .to_string(),
+            });
+        }
+
+        result
     }
 
     /// Record subprocess spawn (increments active subprocess counter).
@@ -10925,6 +11020,29 @@ impl ExtensionManager {
     pub fn set_quota_config(&self, config: ExtensionQuotaConfig) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.quota_config = config;
+        }
+    }
+
+    /// Drain and return all quota breach telemetry events.
+    pub fn drain_quota_breach_events(&self) -> Vec<QuotaBreachEvent> {
+        self.inner.lock().ok().map_or_else(Vec::new, |mut guard| {
+            guard.quota_breach_events.drain(..).collect()
+        })
+    }
+
+    /// Get the count of recorded quota breach events (for inspection).
+    pub fn quota_breach_count(&self) -> usize {
+        self.inner
+            .lock()
+            .ok()
+            .map_or(0, |guard| guard.quota_breach_events.len())
+    }
+
+    /// Reset quota counters for a specific extension (e.g. on extension reload).
+    /// The sliding window timestamps and monotonic counters are cleared.
+    pub fn reset_quota_state(&self, extension_id: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.quota_states.remove(extension_id);
         }
     }
 
@@ -19526,7 +19644,10 @@ mod tests {
         let result = runtime_risk_quantile(vec![0.5, f64::NAN, 0.3], 1.0);
         // After sort with NaN as Equal: order depends on sort stability.
         // Key invariant: function does not panic.
-        assert!(result.is_nan() || result.is_finite(), "should not panic on NaN values");
+        assert!(
+            result.is_nan() || result.is_finite(),
+            "should not panic on NaN values"
+        );
     }
 
     #[test]
@@ -19540,7 +19661,7 @@ mod tests {
 
     #[test]
     fn quantile_large_input_deterministic() {
-        let values: Vec<f64> = (0..1000).map(|i| (i as f64) / 1000.0).collect();
+        let values: Vec<f64> = (0..1000).map(|i| f64::from(i) / 1000.0).collect();
         let result_a = runtime_risk_quantile(values.clone(), 0.95);
         let result_b = runtime_risk_quantile(values, 0.95);
         assert!(
@@ -19594,7 +19715,7 @@ mod tests {
         // Mimics the actual conformal prediction use: q = 1 - alpha = 0.99
         // 10 residuals: [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10]
         // q=0.99 → idx = round(9*0.99) = round(8.91) = 9 → 0.10
-        let residuals: Vec<f64> = (1..=10).map(|i| i as f64 / 100.0).collect();
+        let residuals: Vec<f64> = (1..=10).map(|i| f64::from(i) / 100.0).collect();
         let result = runtime_risk_quantile(residuals, 0.99);
         assert!(
             (result - 0.10).abs() < f64::EPSILON,
@@ -22117,5 +22238,343 @@ mod tests {
         assert!((runtime_risk_clamp01(0.5) - 0.5).abs() < f64::EPSILON);
         assert!((runtime_risk_clamp01(0.0) - 0.0).abs() < f64::EPSILON);
         assert!((runtime_risk_clamp01(1.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ── SEC-4.1: Per-Extension Resource Quota Tests ──────────────────────
+
+    #[test]
+    fn quota_default_matches_prompt_mode() {
+        let default = ExtensionQuotaConfig::default();
+        let prompt = ExtensionQuotaConfig::for_mode(ExtensionPolicyMode::Prompt);
+        assert_eq!(
+            default.max_hostcalls_per_second,
+            prompt.max_hostcalls_per_second
+        );
+        assert_eq!(
+            default.max_hostcalls_per_minute,
+            prompt.max_hostcalls_per_minute
+        );
+        assert_eq!(default.max_subprocesses, prompt.max_subprocesses);
+    }
+
+    #[test]
+    fn quota_strict_more_restrictive_than_prompt() {
+        let strict = ExtensionQuotaConfig::for_mode(ExtensionPolicyMode::Strict);
+        let prompt = ExtensionQuotaConfig::for_mode(ExtensionPolicyMode::Prompt);
+        assert!(
+            strict.max_hostcalls_per_second.unwrap()
+                < prompt.max_hostcalls_per_second.unwrap()
+        );
+        assert!(
+            strict.max_hostcalls_per_minute.unwrap()
+                < prompt.max_hostcalls_per_minute.unwrap()
+        );
+        assert!(strict.max_subprocesses.unwrap() < prompt.max_subprocesses.unwrap());
+        assert!(strict.max_hostcalls_total.is_some());
+        assert!(prompt.max_hostcalls_total.is_none());
+    }
+
+    #[test]
+    fn quota_permissive_more_relaxed_than_prompt() {
+        let permissive = ExtensionQuotaConfig::for_mode(ExtensionPolicyMode::Permissive);
+        let prompt = ExtensionQuotaConfig::for_mode(ExtensionPolicyMode::Prompt);
+        assert!(
+            permissive.max_hostcalls_per_second.unwrap()
+                > prompt.max_hostcalls_per_second.unwrap()
+        );
+        assert!(
+            permissive.max_hostcalls_per_minute.unwrap()
+                > prompt.max_hostcalls_per_minute.unwrap()
+        );
+        assert!(permissive.max_subprocesses.unwrap() > prompt.max_subprocesses.unwrap());
+    }
+
+    #[test]
+    fn quota_check_allows_within_limits() {
+        let config = ExtensionQuotaConfig::default();
+        let mut state = ExtensionQuotaState::default();
+        let result = check_extension_quota(&config, &mut state, 1000, "tool");
+        assert_eq!(result, QuotaCheckResult::Allowed);
+        assert_eq!(state.hostcalls_total, 1);
+    }
+
+    #[test]
+    fn quota_per_second_burst_exceeded() {
+        let config = ExtensionQuotaConfig {
+            max_hostcalls_per_second: Some(3),
+            ..Default::default()
+        };
+        let mut state = ExtensionQuotaState::default();
+        for i in 0..3 {
+            let r =
+                check_extension_quota(&config, &mut state, 1000 + i64::from(i), "tool");
+            assert_eq!(r, QuotaCheckResult::Allowed);
+        }
+        let r = check_extension_quota(&config, &mut state, 1002, "tool");
+        assert!(matches!(r, QuotaCheckResult::Exceeded { .. }));
+    }
+
+    #[test]
+    fn quota_per_minute_rate_exceeded() {
+        let config = ExtensionQuotaConfig {
+            max_hostcalls_per_minute: Some(5),
+            max_hostcalls_per_second: None,
+            ..Default::default()
+        };
+        let mut state = ExtensionQuotaState::default();
+        for i in 0..5 {
+            let r =
+                check_extension_quota(&config, &mut state, 1000 + i * 10_000, "tool");
+            assert_eq!(r, QuotaCheckResult::Allowed);
+        }
+        let r = check_extension_quota(&config, &mut state, 41_000, "tool");
+        assert!(matches!(r, QuotaCheckResult::Exceeded { .. }));
+    }
+
+    #[test]
+    fn quota_sliding_window_expiry() {
+        let config = ExtensionQuotaConfig {
+            max_hostcalls_per_minute: Some(3),
+            max_hostcalls_per_second: None,
+            ..Default::default()
+        };
+        let mut state = ExtensionQuotaState::default();
+        for _ in 0..3 {
+            let _ = check_extension_quota(&config, &mut state, 1000, "tool");
+        }
+        let r = check_extension_quota(&config, &mut state, 1000, "tool");
+        assert!(matches!(r, QuotaCheckResult::Exceeded { .. }));
+        let r = check_extension_quota(&config, &mut state, 62_000, "tool");
+        assert_eq!(r, QuotaCheckResult::Allowed);
+    }
+
+    #[test]
+    fn quota_total_budget_exceeded() {
+        let config = ExtensionQuotaConfig {
+            max_hostcalls_total: Some(2),
+            max_hostcalls_per_second: None,
+            max_hostcalls_per_minute: None,
+            ..Default::default()
+        };
+        let mut state = ExtensionQuotaState::default();
+        let _ = check_extension_quota(&config, &mut state, 1000, "tool");
+        let _ = check_extension_quota(&config, &mut state, 2000, "tool");
+        let r = check_extension_quota(&config, &mut state, 3000, "tool");
+        assert!(matches!(r, QuotaCheckResult::Exceeded { .. }));
+    }
+
+    #[test]
+    fn quota_subprocess_limit_enforced() {
+        let config = ExtensionQuotaConfig {
+            max_subprocesses: Some(2),
+            max_hostcalls_per_second: None,
+            max_hostcalls_per_minute: None,
+            ..Default::default()
+        };
+        let mut state = ExtensionQuotaState::default();
+        state.active_subprocesses = 2;
+        let r = check_extension_quota(&config, &mut state, 1000, "exec");
+        assert!(matches!(r, QuotaCheckResult::Exceeded { .. }));
+        let r2 = check_extension_quota(&config, &mut state, 2000, "tool");
+        assert_eq!(r2, QuotaCheckResult::Allowed);
+    }
+
+    #[test]
+    fn quota_http_request_limit_enforced() {
+        let config = ExtensionQuotaConfig {
+            max_http_requests: Some(2),
+            max_hostcalls_per_second: None,
+            max_hostcalls_per_minute: None,
+            ..Default::default()
+        };
+        let mut state = ExtensionQuotaState::default();
+        let r1 = check_extension_quota(&config, &mut state, 1000, "http");
+        assert_eq!(r1, QuotaCheckResult::Allowed);
+        let r2 = check_extension_quota(&config, &mut state, 2000, "http");
+        assert_eq!(r2, QuotaCheckResult::Allowed);
+        let r3 = check_extension_quota(&config, &mut state, 3000, "http");
+        assert!(matches!(r3, QuotaCheckResult::Exceeded { .. }));
+    }
+
+    #[test]
+    fn quota_write_bytes_limit_enforced() {
+        let config = ExtensionQuotaConfig {
+            max_write_bytes: Some(1024),
+            max_hostcalls_per_second: None,
+            max_hostcalls_per_minute: None,
+            ..Default::default()
+        };
+        let mut state = ExtensionQuotaState::default();
+        state.write_bytes_total = 1024;
+        let r = check_extension_quota(&config, &mut state, 1000, "write");
+        assert!(matches!(r, QuotaCheckResult::Exceeded { .. }));
+        let mut state2 = ExtensionQuotaState::default();
+        state2.write_bytes_total = 500;
+        let r2 = check_extension_quota(&config, &mut state2, 1000, "write");
+        assert_eq!(r2, QuotaCheckResult::Allowed);
+    }
+
+    #[test]
+    fn quota_manager_per_extension_override() {
+        let manager = ExtensionManager::new();
+        let mut policy = ExtensionPolicy::default();
+        policy.per_extension.insert(
+            "test-ext".to_string(),
+            ExtensionOverride {
+                quota: Some(ExtensionQuotaConfig {
+                    max_hostcalls_per_second: Some(1),
+                    max_hostcalls_per_minute: Some(5),
+                    max_hostcalls_total: None,
+                    max_subprocesses: Some(1),
+                    max_write_bytes: None,
+                    max_http_requests: None,
+                }),
+                ..Default::default()
+            },
+        );
+        let r1 = manager.check_quota(Some("test-ext"), "tool", 1000, &policy);
+        assert_eq!(r1, QuotaCheckResult::Allowed);
+        let r2 = manager.check_quota(Some("test-ext"), "tool", 1000, &policy);
+        assert!(matches!(r2, QuotaCheckResult::Exceeded { .. }));
+    }
+
+    #[test]
+    fn quota_manager_global_default_no_override() {
+        let manager = ExtensionManager::new();
+        let policy = ExtensionPolicy::default();
+        for i in 0..50 {
+            let r = manager.check_quota(Some("other-ext"), "tool", 1000 + i, &policy);
+            assert_eq!(r, QuotaCheckResult::Allowed);
+        }
+    }
+
+    #[test]
+    fn quota_manager_no_ext_id_always_allowed() {
+        let manager = ExtensionManager::new();
+        let policy = ExtensionPolicy::default();
+        let r = manager.check_quota(None, "tool", 1000, &policy);
+        assert_eq!(r, QuotaCheckResult::Allowed);
+    }
+
+    #[test]
+    fn quota_subprocess_spawn_exit_tracking() {
+        let manager = ExtensionManager::new();
+        assert_eq!(manager.quota_state("ext-1"), None);
+        manager.record_subprocess_spawn("ext-1");
+        let (_, active, _, _) = manager.quota_state("ext-1").unwrap();
+        assert_eq!(active, 1);
+        manager.record_subprocess_spawn("ext-1");
+        let (_, active, _, _) = manager.quota_state("ext-1").unwrap();
+        assert_eq!(active, 2);
+        manager.record_subprocess_exit("ext-1");
+        let (_, active, _, _) = manager.quota_state("ext-1").unwrap();
+        assert_eq!(active, 1);
+        manager.record_subprocess_exit("ext-1");
+        manager.record_subprocess_exit("ext-1");
+        let (_, active, _, _) = manager.quota_state("ext-1").unwrap();
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn quota_write_bytes_tracking() {
+        let manager = ExtensionManager::new();
+        manager.record_write_bytes("ext-1", 512);
+        let (_, _, wb, _) = manager.quota_state("ext-1").unwrap();
+        assert_eq!(wb, 512);
+        manager.record_write_bytes("ext-1", 1024);
+        let (_, _, wb, _) = manager.quota_state("ext-1").unwrap();
+        assert_eq!(wb, 1536);
+    }
+
+    #[test]
+    fn quota_breach_telemetry_recorded() {
+        let manager = ExtensionManager::new();
+        let mut policy = ExtensionPolicy::default();
+        policy.per_extension.insert(
+            "bad-ext".to_string(),
+            ExtensionOverride {
+                quota: Some(ExtensionQuotaConfig {
+                    max_hostcalls_per_second: Some(1),
+                    max_hostcalls_per_minute: Some(1),
+                    max_hostcalls_total: None,
+                    max_subprocesses: None,
+                    max_write_bytes: None,
+                    max_http_requests: None,
+                }),
+                ..Default::default()
+            },
+        );
+        let _ = manager.check_quota(Some("bad-ext"), "tool", 1000, &policy);
+        assert_eq!(manager.quota_breach_count(), 0);
+        let r = manager.check_quota(Some("bad-ext"), "tool", 1000, &policy);
+        assert!(matches!(r, QuotaCheckResult::Exceeded { .. }));
+        assert_eq!(manager.quota_breach_count(), 1);
+        let events = manager.drain_quota_breach_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].extension_id, "bad-ext");
+        assert_eq!(events[0].capability, "tool");
+        assert_eq!(events[0].quota_config_source, "per_extension");
+        assert_eq!(manager.quota_breach_count(), 0);
+    }
+
+    #[test]
+    fn quota_reset_clears_state() {
+        let manager = ExtensionManager::new();
+        let policy = ExtensionPolicy::default();
+        let _ = manager.check_quota(Some("ext-1"), "tool", 1000, &policy);
+        manager.record_subprocess_spawn("ext-1");
+        manager.record_write_bytes("ext-1", 1000);
+        assert!(manager.quota_state("ext-1").is_some());
+        manager.reset_quota_state("ext-1");
+        assert!(manager.quota_state("ext-1").is_none());
+    }
+
+    #[test]
+    fn quota_config_serialization_roundtrip() {
+        let config = ExtensionQuotaConfig::for_mode(ExtensionPolicyMode::Strict);
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: ExtensionQuotaConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            config.max_hostcalls_per_second,
+            restored.max_hostcalls_per_second
+        );
+        assert_eq!(config.max_subprocesses, restored.max_subprocesses);
+        assert_eq!(config.max_write_bytes, restored.max_write_bytes);
+    }
+
+    #[test]
+    fn quota_per_extension_override_policy_serialization() {
+        let mut policy = ExtensionPolicy::default();
+        policy.per_extension.insert(
+            "my-ext".to_string(),
+            ExtensionOverride {
+                quota: Some(ExtensionQuotaConfig {
+                    max_hostcalls_per_second: Some(10),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let json = serde_json::to_string(&policy).unwrap();
+        let restored: ExtensionPolicy = serde_json::from_str(&json).unwrap();
+        let ovr = restored.per_extension.get("my-ext").unwrap();
+        assert_eq!(
+            ovr.quota.as_ref().unwrap().max_hostcalls_per_second,
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn quota_monotonic_total_never_decreases() {
+        let config = ExtensionQuotaConfig {
+            max_hostcalls_per_second: None,
+            max_hostcalls_per_minute: None,
+            ..Default::default()
+        };
+        let mut state = ExtensionQuotaState::default();
+        for i in 0..100 {
+            let _ = check_extension_quota(&config, &mut state, i * 1000, "tool");
+        }
+        assert_eq!(state.hostcalls_total, 100);
     }
 }
