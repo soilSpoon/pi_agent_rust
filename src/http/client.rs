@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 const DEFAULT_USER_AGENT: &str = concat!("pi_agent_rust/", env!("CARGO_PKG_VERSION"));
+const ANTIGRAVITY_VERSION_ENV: &str = "PI_AI_ANTIGRAVITY_VERSION";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_BUFFERED_BYTES: usize = 256 * 1024;
@@ -41,9 +42,14 @@ impl Client {
             .and_then(|builder| builder.alpn_protocols(vec![b"http/1.1".to_vec()]).build())
             .map_err(|e| e.to_string());
 
+        let user_agent = std::env::var(ANTIGRAVITY_VERSION_ENV).map_or_else(
+            |_| DEFAULT_USER_AGENT.to_string(),
+            |v| format!("{DEFAULT_USER_AGENT} Antigravity/{v}"),
+        );
+
         Self {
             tls,
-            user_agent: DEFAULT_USER_AGENT.to_string(),
+            user_agent,
             vcr: None,
         }
     }
@@ -1465,5 +1471,29 @@ mod tests {
             assert!(result.is_ok());
             assert_eq!(result.unwrap().len(), MAX_TEXT_BODY_BYTES);
         });
+    }
+
+    // ── PI_AI_ANTIGRAVITY_VERSION env var ─────────────────────────────
+
+    #[test]
+    fn antigravity_user_agent_format() {
+        // Verify the format string used when PI_AI_ANTIGRAVITY_VERSION is set.
+        let version = "1.2.3";
+        let ua = format!("{DEFAULT_USER_AGENT} Antigravity/{version}");
+        assert!(ua.starts_with("pi_agent_rust/"));
+        assert!(ua.contains("Antigravity/1.2.3"));
+
+        // Verify default user agent contains crate version.
+        assert!(DEFAULT_USER_AGENT.starts_with("pi_agent_rust/"));
+    }
+
+    #[test]
+    fn antigravity_user_agent_in_request_headers() {
+        // Simulate the antigravity user agent being used in request building.
+        let ua = format!("{DEFAULT_USER_AGENT} Antigravity/42.0");
+        let parsed = ParsedUrl::parse("http://example.com/api").unwrap();
+        let bytes = build_request_bytes(Method::Get, &parsed, &ua, &[], &[]);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(&format!("User-Agent: {ua}\r\n")));
     }
 }
