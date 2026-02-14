@@ -1606,14 +1606,14 @@ async fn run_prompt_with_retry(
                         let ext_event_name = event_name.to_string();
                         runtime_handle.spawn(async move {
                             if let Err(err) = manager.dispatch_event(event_name, data).await {
-                                let _ = error_tx.send(
-                                    json!({
-                                        "type": "extension_error",
-                                        "event": ext_event_name,
-                                        "error": err.to_string(),
-                                    })
-                                    .to_string(),
-                                );
+                                let ext_err = AgentEvent::ExtensionError {
+                                    extension_id: None,
+                                    event: ext_event_name,
+                                    error: err.to_string(),
+                                };
+                                if let Ok(serialized) = serde_json::to_string(&ext_err) {
+                                    let _ = error_tx.send(serialized);
+                                }
                             }
                         });
                     }

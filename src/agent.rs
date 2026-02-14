@@ -289,6 +289,13 @@ pub enum AgentEvent {
         #[serde(rename = "finalError", skip_serializing_if = "Option::is_none")]
         final_error: Option<String>,
     },
+    /// Extension error during event dispatch or execution.
+    ExtensionError {
+        #[serde(rename = "extensionId", skip_serializing_if = "Option::is_none")]
+        extension_id: Option<String>,
+        event: String,
+        error: String,
+    },
 }
 
 // ============================================================================
@@ -3233,6 +3240,7 @@ mod abort_tests {
             AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
             AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
             AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
+            AgentEvent::ExtensionError { .. } => "extension_error",
         }
     }
 

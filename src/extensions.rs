@@ -9281,9 +9281,7 @@ mod wasm_host {
                 &mut linker,
                 |data| data,
             )
-            .map_err(|err| {
-                Error::extension(format!("Failed to link WASM host imports: {err}"))
-            })?;
+            .map_err(|err| Error::extension(format!("Failed to link WASM host imports: {err}")))?;
 
             let mut store = wasmtime::Store::new(engine, state);
             let bindings = PiExtension::instantiate_async(&mut store, &component, &linker)
@@ -18212,7 +18210,8 @@ pub fn extension_event_from_agent(
         AgentEvent::AutoCompactionStart { .. }
         | AgentEvent::AutoCompactionEnd { .. }
         | AgentEvent::AutoRetryStart { .. }
-        | AgentEvent::AutoRetryEnd { .. } => return None,
+        | AgentEvent::AutoRetryEnd { .. }
+        | AgentEvent::ExtensionError { .. } => return None,
     };
 
     let payload = serde_json::to_value(event).ok();

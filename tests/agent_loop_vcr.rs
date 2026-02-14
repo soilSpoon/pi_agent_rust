@@ -110,6 +110,16 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             "attempt": attempt,
             "finalError": final_error,
         }),
+        AgentEvent::ExtensionError {
+            extension_id,
+            event,
+            error,
+        } => json!({
+            "event": "extension_error",
+            "extensionId": extension_id,
+            "hookEvent": event,
+            "error": error,
+        }),
     }
 }
 
