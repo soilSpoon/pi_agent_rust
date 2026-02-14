@@ -1627,7 +1627,7 @@ mod tests {
             let parsed: Message = serde_json::from_value(serialized.clone())
                 .expect("serialized message should deserialize");
             let reserialized = serde_json::to_value(parsed).expect("re-serialize should succeed");
-            prop_assert_eq!(reserialized, serialized);
+            prop_assert_eq!(reserialized, serialized.clone());
 
             let mut with_extra = serialized.clone();
             if let serde_json::Value::Object(ref mut obj) = with_extra {
