@@ -5987,6 +5987,13 @@ export class Text {
   }
 }
 
+export class TruncatedText extends Text {
+  constructor(text, width = 80, x = 0, y = 0) {
+    super(text, x, y);
+    this.width = Number(width ?? 80);
+  }
+}
+
 export class Container {
   constructor(..._args) {}
 }
@@ -6176,7 +6183,7 @@ export class Image {
   }
 }
 
-export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, Image, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter, CancellableLoader };
+export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, TruncatedText, Container, Markdown, Spacer, Editor, Box, SelectList, Input, Image, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter, CancellableLoader };
 "#
         .trim()
         .to_string(),
@@ -6564,8 +6571,25 @@ export class UserMessageComponent {
 
 export class SessionManager {
   constructor() {}
+  static inMemory() { return new SessionManager(); }
   getSessionFile() { return ""; }
   getSessionDir() { return ""; }
+  getSessionId() { return ""; }
+}
+
+export class SettingsManager {
+  constructor(cwd = "", agentDir = "") {
+    this.cwd = String(cwd ?? "");
+    this.agentDir = String(agentDir ?? "");
+  }
+  static create(cwd, agentDir) { return new SettingsManager(cwd, agentDir); }
+}
+
+export class DefaultResourceLoader {
+  constructor(opts = {}) {
+    this.opts = opts;
+  }
+  async reload() { return; }
 }
 
 export function highlightCode(code, _lang, _theme) {
@@ -6656,6 +6680,8 @@ export default {
   ToolExecutionComponent,
   UserMessageComponent,
   SessionManager,
+  SettingsManager,
+  DefaultResourceLoader,
   highlightCode,
   getLanguageFromPath,
   isBashToolResult,
@@ -10697,6 +10723,102 @@ export const z = {
 };
 export default z;
 "
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "yaml".to_string(),
+        r##"
+export function parse(input) {
+    const text = String(input ?? "").trim();
+    if (!text) return {};
+    const out = {};
+    for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#")) continue;
+        const idx = line.indexOf(":");
+        if (idx === -1) continue;
+        const key = line.slice(0, idx).trim();
+        const value = line.slice(idx + 1).trim();
+        if (key) out[key] = value;
+    }
+    return out;
+}
+export function stringify(value) {
+    if (!value || typeof value !== "object") return "";
+    const lines = Object.entries(value).map(([k, v]) => `${k}: ${v ?? ""}`);
+    return lines.length ? `${lines.join("\n")}\n` : "";
+}
+export default { parse, stringify };
+"##
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "better-sqlite3".to_string(),
+        r#"
+class Statement {
+    all() { return []; }
+    get() { return undefined; }
+    run() { return { changes: 0, lastInsertRowid: 0 }; }
+}
+
+function BetterSqlite3(filename, options = {}) {
+    if (!(this instanceof BetterSqlite3)) return new BetterSqlite3(filename, options);
+    this.filename = String(filename ?? "");
+    this.options = options;
+}
+
+BetterSqlite3.prototype.prepare = function(_sql) { return new Statement(); };
+BetterSqlite3.prototype.exec = function(_sql) { return this; };
+BetterSqlite3.prototype.pragma = function(_sql) { return []; };
+BetterSqlite3.prototype.transaction = function(fn) {
+    const wrapped = (...args) => (typeof fn === "function" ? fn(...args) : undefined);
+    wrapped.immediate = wrapped;
+    wrapped.deferred = wrapped;
+    wrapped.exclusive = wrapped;
+    return wrapped;
+};
+BetterSqlite3.prototype.close = function() {};
+
+BetterSqlite3.Statement = Statement;
+BetterSqlite3.Database = BetterSqlite3;
+
+export { Statement };
+export default BetterSqlite3;
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@mariozechner/pi-agent-core".to_string(),
+        r#"
+export const ThinkingLevel = {
+    low: "low",
+    medium: "medium",
+    high: "high",
+};
+export class AgentTool {}
+export default { ThinkingLevel, AgentTool };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@mariozechner/pi-agent-core/index.js".to_string(),
+        r#"
+export const ThinkingLevel = {
+    low: "low",
+    medium: "medium",
+    high: "high",
+};
+export class AgentTool {}
+export default { ThinkingLevel, AgentTool };
+"#
         .trim()
         .to_string(),
     );
