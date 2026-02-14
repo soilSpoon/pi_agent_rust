@@ -278,7 +278,7 @@ pub enum PackageSource {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingsScope {
     Global,
     Project,

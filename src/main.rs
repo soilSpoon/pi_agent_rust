@@ -1409,35 +1409,757 @@ fn print_package_entry_blocking(manager: &PackageManager, entry: &PackageEntry) 
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn handle_config(cwd: &Path) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConfigResourceKind {
+    Extensions,
+    Skills,
+    Prompts,
+    Themes,
+}
+
+impl ConfigResourceKind {
+    const ALL: [Self; 4] = [Self::Extensions, Self::Skills, Self::Prompts, Self::Themes];
+
+    const fn field_name(self) -> &'static str {
+        match self {
+            Self::Extensions => "extensions",
+            Self::Skills => "skills",
+            Self::Prompts => "prompts",
+            Self::Themes => "themes",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Extensions => "extension",
+            Self::Skills => "skill",
+            Self::Prompts => "prompt",
+            Self::Themes => "theme",
+        }
+    }
+
+    const fn order(self) -> usize {
+        match self {
+            Self::Extensions => 0,
+            Self::Skills => 1,
+            Self::Prompts => 2,
+            Self::Themes => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConfigResourceState {
+    kind: ConfigResourceKind,
+    path: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigPackageState {
+    scope: SettingsScope,
+    source: String,
+    resources: Vec<ConfigResourceState>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigPathsReport {
+    global: String,
+    project: String,
+    auth: String,
+    sessions: String,
+    packages: String,
+    extension_index: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigResourceReport {
+    kind: String,
+    path: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigPackageReport {
+    scope: String,
+    source: String,
+    resources: Vec<ConfigResourceReport>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigReport {
+    paths: ConfigPathsReport,
+    precedence: Vec<String>,
+    config_valid: bool,
+    config_error: Option<String>,
+    packages: Vec<ConfigPackageReport>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PackageFilterState {
+    extensions: Option<Vec<String>>,
+    skills: Option<Vec<String>>,
+    prompts: Option<Vec<String>>,
+    themes: Option<Vec<String>>,
+}
+
+impl PackageFilterState {
+    fn set_kind(&mut self, kind: ConfigResourceKind, values: Vec<String>) {
+        match kind {
+            ConfigResourceKind::Extensions => self.extensions = Some(values),
+            ConfigResourceKind::Skills => self.skills = Some(values),
+            ConfigResourceKind::Prompts => self.prompts = Some(values),
+            ConfigResourceKind::Themes => self.themes = Some(values),
+        }
+    }
+
+    fn values_for_kind(&self, kind: ConfigResourceKind) -> Option<&Vec<String>> {
+        match kind {
+            ConfigResourceKind::Extensions => self.extensions.as_ref(),
+            ConfigResourceKind::Skills => self.skills.as_ref(),
+            ConfigResourceKind::Prompts => self.prompts.as_ref(),
+            ConfigResourceKind::Themes => self.themes.as_ref(),
+        }
+    }
+
+    fn has_any_field(&self) -> bool {
+        self.extensions.is_some()
+            || self.skills.is_some()
+            || self.prompts.is_some()
+            || self.themes.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConfigUiResult {
+    save_requested: bool,
+    packages: Vec<ConfigPackageState>,
+}
+
+#[derive(bubbletea::Model)]
+struct ConfigUiApp {
+    packages: Vec<ConfigPackageState>,
+    selected: usize,
+    settings_summary: String,
+    status: String,
+    result_slot: Arc<StdMutex<Option<ConfigUiResult>>>,
+}
+
+impl ConfigUiApp {
+    fn new(
+        packages: Vec<ConfigPackageState>,
+        settings_summary: String,
+        result_slot: Arc<StdMutex<Option<ConfigUiResult>>>,
+    ) -> Self {
+        let status = if packages.iter().any(|pkg| !pkg.resources.is_empty()) {
+            String::new()
+        } else {
+            "No package resources discovered. Press Enter to exit.".to_string()
+        };
+
+        Self {
+            packages,
+            selected: 0,
+            settings_summary,
+            status,
+            result_slot,
+        }
+    }
+
+    fn selectable_count(&self) -> usize {
+        self.packages.iter().map(|pkg| pkg.resources.len()).sum()
+    }
+
+    fn selected_coords(&self) -> Option<(usize, usize)> {
+        let mut cursor = 0usize;
+        for (pkg_idx, pkg) in self.packages.iter().enumerate() {
+            for (res_idx, _) in pkg.resources.iter().enumerate() {
+                if cursor == self.selected {
+                    return Some((pkg_idx, res_idx));
+                }
+                cursor = cursor.saturating_add(1);
+            }
+        }
+        None
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let total = self.selectable_count();
+        if total == 0 {
+            self.selected = 0;
+            return;
+        }
+
+        let current = self.selected as isize;
+        let next = (current + delta).clamp(0, (total.saturating_sub(1)) as isize) as usize;
+        self.selected = next;
+    }
+
+    fn toggle_selected(&mut self) {
+        if let Some((pkg_idx, res_idx)) = self.selected_coords() {
+            if let Some(resource) = self
+                .packages
+                .get_mut(pkg_idx)
+                .and_then(|pkg| pkg.resources.get_mut(res_idx))
+            {
+                resource.enabled = !resource.enabled;
+            }
+        }
+    }
+
+    fn finish(&mut self, save_requested: bool) -> Option<Cmd> {
+        if let Ok(mut slot) = self.result_slot.lock() {
+            *slot = Some(ConfigUiResult {
+                save_requested,
+                packages: self.packages.clone(),
+            });
+        }
+        Some(quit())
+    }
+
+    fn init(&self) -> Option<Cmd> {
+        None
+    }
+
+    fn update(&mut self, msg: BubbleMessage) -> Option<Cmd> {
+        if let Some(key) = msg.downcast_ref::<KeyMsg>() {
+            match key.key_type {
+                KeyType::Up => self.move_selection(-1),
+                KeyType::Down => self.move_selection(1),
+                KeyType::Runes if key.runes == ['k'] => self.move_selection(-1),
+                KeyType::Runes if key.runes == ['j'] => self.move_selection(1),
+                KeyType::Space => self.toggle_selected(),
+                KeyType::Enter => return self.finish(true),
+                KeyType::Esc | KeyType::CtrlC => return self.finish(false),
+                KeyType::Runes if key.runes == ['q'] => return self.finish(false),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn view(&self) -> String {
+        let mut out = String::new();
+        out.push_str("Pi Config UI\n");
+        out.push_str(&format!("{}\n", self.settings_summary));
+        out.push_str("Keys: ↑/↓ (or j/k) move, Space toggle, Enter save, q cancel\n\n");
+
+        let mut cursor = 0usize;
+        for package in &self.packages {
+            out.push_str(&format!(
+                "{} package: {}\n",
+                scope_label(package.scope),
+                package.source
+            ));
+
+            if package.resources.is_empty() {
+                out.push_str("    (no discovered resources)\n");
+                continue;
+            }
+
+            for resource in &package.resources {
+                let selected = cursor == self.selected;
+                let marker = if resource.enabled { "x" } else { " " };
+                let prefix = if selected { ">" } else { " " };
+                out.push_str(&format!(
+                    "{} [{}] {:<10} {}\n",
+                    prefix,
+                    marker,
+                    resource.kind.label(),
+                    resource.path
+                ));
+                cursor = cursor.saturating_add(1);
+            }
+
+            out.push('\n');
+        }
+
+        if !self.status.is_empty() {
+            out.push_str(&format!("{}\n", self.status));
+        }
+
+        out
+    }
+}
+
+fn scope_label(scope: SettingsScope) -> &'static str {
+    match scope {
+        SettingsScope::Global => "Global",
+        SettingsScope::Project => "Project",
+    }
+}
+
+fn scope_key(scope: SettingsScope) -> &'static str {
+    match scope {
+        SettingsScope::Global => "global",
+        SettingsScope::Project => "project",
+    }
+}
+
+const fn settings_scope_from_package_scope(scope: PackageScope) -> Option<SettingsScope> {
+    match scope {
+        PackageScope::User => Some(SettingsScope::Global),
+        PackageScope::Project => Some(SettingsScope::Project),
+        PackageScope::Temporary => None,
+    }
+}
+
+fn package_lookup_key(scope: SettingsScope, source: &str) -> String {
+    format!("{}::{source}", scope_key(scope))
+}
+
+fn normalize_path_for_display(path: &Path, base_dir: Option<&Path>) -> String {
+    let rel = base_dir
+        .and_then(|base| path.strip_prefix(base).ok())
+        .unwrap_or(path);
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+fn normalize_filter_entry(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn merge_resolved_resources(
+    kind: ConfigResourceKind,
+    resources: &[ResolvedResource],
+    packages: &mut Vec<ConfigPackageState>,
+    lookup: &mut std::collections::HashMap<String, usize>,
+) {
+    for resource in resources {
+        if resource.metadata.origin != ResourceOrigin::Package {
+            continue;
+        }
+
+        let Some(scope) = settings_scope_from_package_scope(resource.metadata.scope) else {
+            continue;
+        };
+
+        let key = package_lookup_key(scope, &resource.metadata.source);
+        let idx = if let Some(idx) = lookup.get(&key).copied() {
+            idx
+        } else {
+            let idx = packages.len();
+            packages.push(ConfigPackageState {
+                scope,
+                source: resource.metadata.source.clone(),
+                resources: Vec::new(),
+            });
+            lookup.insert(key, idx);
+            idx
+        };
+
+        let path =
+            normalize_path_for_display(&resource.path, resource.metadata.base_dir.as_deref());
+        packages[idx].resources.push(ConfigResourceState {
+            kind,
+            path,
+            enabled: resource.enabled,
+        });
+    }
+}
+
+fn sort_and_dedupe_package_resources(packages: &mut [ConfigPackageState]) {
+    for package in packages {
+        package.resources.sort_by(|a, b| {
+            (a.kind.order(), a.path.as_str()).cmp(&(b.kind.order(), b.path.as_str()))
+        });
+
+        let mut deduped: Vec<ConfigResourceState> = Vec::new();
+        for resource in std::mem::take(&mut package.resources) {
+            if let Some(existing) = deduped
+                .iter_mut()
+                .find(|r| r.kind == resource.kind && r.path == resource.path)
+            {
+                existing.enabled = existing.enabled || resource.enabled;
+            } else {
+                deduped.push(resource);
+            }
+        }
+        package.resources = deduped;
+    }
+}
+
+async fn collect_config_packages(manager: &PackageManager) -> Vec<ConfigPackageState> {
+    let mut packages = Vec::new();
+    let mut lookup = std::collections::HashMap::<String, usize>::new();
+
+    let entries = manager.list_packages().await.unwrap_or_default();
+    for entry in entries {
+        let Some(scope) = settings_scope_from_package_scope(entry.scope) else {
+            continue;
+        };
+        let key = package_lookup_key(scope, &entry.source);
+        if lookup.contains_key(&key) {
+            continue;
+        }
+        lookup.insert(key, packages.len());
+        packages.push(ConfigPackageState {
+            scope,
+            source: entry.source,
+            resources: Vec::new(),
+        });
+    }
+
+    match manager.resolve().await {
+        Ok(ResolvedPaths {
+            extensions,
+            skills,
+            prompts,
+            themes,
+        }) => {
+            merge_resolved_resources(
+                ConfigResourceKind::Extensions,
+                &extensions,
+                &mut packages,
+                &mut lookup,
+            );
+            merge_resolved_resources(
+                ConfigResourceKind::Skills,
+                &skills,
+                &mut packages,
+                &mut lookup,
+            );
+            merge_resolved_resources(
+                ConfigResourceKind::Prompts,
+                &prompts,
+                &mut packages,
+                &mut lookup,
+            );
+            merge_resolved_resources(
+                ConfigResourceKind::Themes,
+                &themes,
+                &mut packages,
+                &mut lookup,
+            );
+        }
+        Err(err) => {
+            eprintln!("Warning: failed to resolve package resources for config UI: {err}");
+        }
+    }
+
+    sort_and_dedupe_package_resources(&mut packages);
+    packages
+}
+
+fn build_config_report(cwd: &Path, packages: &[ConfigPackageState]) -> ConfigReport {
     let config_path = std::env::var("PI_CONFIG_PATH")
         .ok()
         .map_or_else(|| Config::global_dir().join("settings.json"), PathBuf::from);
     let project_path = cwd.join(Config::project_dir()).join("settings.json");
 
+    let (config_valid, config_error) = match Config::load() {
+        Ok(_) => (true, None),
+        Err(err) => (false, Some(err.to_string())),
+    };
+
+    let packages = packages
+        .iter()
+        .map(|package| ConfigPackageReport {
+            scope: scope_key(package.scope).to_string(),
+            source: package.source.clone(),
+            resources: package
+                .resources
+                .iter()
+                .map(|resource| ConfigResourceReport {
+                    kind: resource.kind.field_name().to_string(),
+                    path: resource.path.clone(),
+                    enabled: resource.enabled,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+
+    ConfigReport {
+        paths: ConfigPathsReport {
+            global: config_path.display().to_string(),
+            project: project_path.display().to_string(),
+            auth: Config::auth_path().display().to_string(),
+            sessions: Config::sessions_dir().display().to_string(),
+            packages: Config::package_dir().display().to_string(),
+            extension_index: Config::extension_index_path().display().to_string(),
+        },
+        precedence: vec![
+            "CLI flags".to_string(),
+            "Environment variables".to_string(),
+            format!("Project settings ({})", project_path.display()),
+            format!("Global settings ({})", config_path.display()),
+            "Built-in defaults".to_string(),
+        ],
+        config_valid,
+        config_error,
+        packages,
+    }
+}
+
+fn print_config_report(report: &ConfigReport, include_packages: bool) {
     println!("Settings paths:");
-    println!("  Global:  {}", config_path.display());
-    println!("  Project: {}", project_path.display());
+    println!("  Global:  {}", report.paths.global);
+    println!("  Project: {}", report.paths.project);
     println!();
     println!("Other paths:");
-    println!("  Auth:     {}", Config::auth_path().display());
-    println!("  Sessions: {}", Config::sessions_dir().display());
-    println!("  Packages: {}", Config::package_dir().display());
-    println!("  ExtIndex: {}", Config::extension_index_path().display());
+    println!("  Auth:     {}", report.paths.auth);
+    println!("  Sessions: {}", report.paths.sessions);
+    println!("  Packages: {}", report.paths.packages);
+    println!("  ExtIndex: {}", report.paths.extension_index);
     println!();
     println!("Settings precedence:");
-    println!("  1) CLI flags");
-    println!("  2) Environment variables");
-    println!("  3) Project settings ({})", project_path.display());
-    println!("  4) Global settings ({})", config_path.display());
-    println!("  5) Built-in defaults");
+    for (idx, entry) in report.precedence.iter().enumerate() {
+        println!("  {}) {}", idx + 1, entry);
+    }
     println!();
 
-    match Config::load() {
-        Ok(_) => println!("Current configuration is valid."),
-        Err(e) => println!("Configuration Error: {e}"),
+    if report.config_valid {
+        println!("Current configuration is valid.");
+    } else if let Some(error) = &report.config_error {
+        println!("Configuration Error: {error}");
     }
+
+    if !include_packages {
+        return;
+    }
+
+    println!();
+    println!("Package resources:");
+    if report.packages.is_empty() {
+        println!("  (no configured packages)");
+        return;
+    }
+
+    for package in &report.packages {
+        println!("  [{}] {}", package.scope, package.source);
+        if package.resources.is_empty() {
+            println!("    (no discovered resources)");
+            continue;
+        }
+        for resource in &package.resources {
+            let marker = if resource.enabled { "x" } else { " " };
+            println!("    [{}] {:<10} {}", marker, resource.kind, resource.path);
+        }
+    }
+}
+
+fn format_settings_summary(config: &Config) -> String {
+    let provider = config.default_provider.as_deref().unwrap_or("(default)");
+    let model = config.default_model.as_deref().unwrap_or("(default)");
+    let thinking = config
+        .default_thinking_level
+        .as_deref()
+        .unwrap_or("(default)");
+    format!("provider={provider}  model={model}  thinking={thinking}")
+}
+
+fn run_config_tui(
+    packages: Vec<ConfigPackageState>,
+    settings_summary: String,
+) -> Result<Option<Vec<ConfigPackageState>>> {
+    let result_slot = Arc::new(StdMutex::new(None));
+    let app = ConfigUiApp::new(packages, settings_summary, Arc::clone(&result_slot));
+    Program::new(app).with_alt_screen().run()?;
+
+    let result = result_slot.lock().ok().and_then(|guard| guard.clone());
+    match result {
+        Some(result) if result.save_requested => Ok(Some(result.packages)),
+        _ => Ok(None),
+    }
+}
+
+fn load_settings_json_object(path: &Path) -> Result<Value> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(json!({}));
+    }
+
+    let value: Value = serde_json::from_str(&content)?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Ok(json!({}))
+    }
+}
+
+fn extract_package_source(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_string).or_else(|| {
+        value
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn persist_package_toggles(cwd: &Path, packages: &[ConfigPackageState]) -> Result<()> {
+    let global_dir = Config::global_dir();
+    persist_package_toggles_with_roots(cwd, &global_dir, packages)
+}
+
+fn persist_package_toggles_with_roots(
+    cwd: &Path,
+    global_dir: &Path,
+    packages: &[ConfigPackageState],
+) -> Result<()> {
+    let mut updates_by_scope: std::collections::HashMap<
+        SettingsScope,
+        std::collections::HashMap<String, PackageFilterState>,
+    > = std::collections::HashMap::new();
+
+    for package in packages {
+        if package.resources.is_empty() {
+            continue;
+        }
+
+        let mut state = PackageFilterState::default();
+        for kind in ConfigResourceKind::ALL {
+            let kind_resources = package
+                .resources
+                .iter()
+                .filter(|resource| resource.kind == kind)
+                .collect::<Vec<_>>();
+            if kind_resources.is_empty() {
+                continue;
+            }
+
+            let mut enabled = kind_resources
+                .iter()
+                .filter(|resource| resource.enabled)
+                .map(|resource| normalize_filter_entry(&resource.path))
+                .collect::<Vec<_>>();
+            enabled.sort();
+            enabled.dedup();
+            state.set_kind(kind, enabled);
+        }
+
+        if !state.has_any_field() {
+            continue;
+        }
+
+        updates_by_scope
+            .entry(package.scope)
+            .or_default()
+            .insert(package.source.clone(), state);
+    }
+
+    for scope in [SettingsScope::Global, SettingsScope::Project] {
+        let Some(scope_updates) = updates_by_scope.get(&scope) else {
+            continue;
+        };
+
+        let settings_path = Config::settings_path_with_roots(scope, global_dir, cwd);
+        let mut settings = load_settings_json_object(&settings_path)?;
+        if !settings.is_object() {
+            settings = json!({});
+        }
+
+        let packages_array = settings
+            .as_object_mut()
+            .expect("checked is object")
+            .entry("packages".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if !packages_array.is_array() {
+            *packages_array = Value::Array(Vec::new());
+        }
+
+        let package_entries = packages_array
+            .as_array_mut()
+            .expect("forced packages to be an array");
+
+        let mut updated_sources = std::collections::HashSet::new();
+        for entry in package_entries.iter_mut() {
+            let Some(source) = extract_package_source(entry) else {
+                continue;
+            };
+            let Some(filter_state) = scope_updates.get(&source) else {
+                continue;
+            };
+
+            let mut obj = entry
+                .as_object()
+                .cloned()
+                .unwrap_or_else(serde_json::Map::new);
+            obj.insert("source".to_string(), Value::String(source.clone()));
+            for kind in ConfigResourceKind::ALL {
+                if let Some(values) = filter_state.values_for_kind(kind) {
+                    let arr = values
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect::<Vec<_>>();
+                    obj.insert(kind.field_name().to_string(), Value::Array(arr));
+                }
+            }
+            *entry = Value::Object(obj);
+            updated_sources.insert(source);
+        }
+
+        for (source, filter_state) in scope_updates {
+            if updated_sources.contains(source) {
+                continue;
+            }
+
+            let mut obj = serde_json::Map::new();
+            obj.insert("source".to_string(), Value::String(source.clone()));
+            for kind in ConfigResourceKind::ALL {
+                if let Some(values) = filter_state.values_for_kind(kind) {
+                    let arr = values
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect::<Vec<_>>();
+                    obj.insert(kind.field_name().to_string(), Value::Array(arr));
+                }
+            }
+            package_entries.push(Value::Object(obj));
+        }
+
+        let patch = json!({ "packages": package_entries.clone() });
+        Config::patch_settings_with_roots(scope, global_dir, cwd, patch)?;
+    }
+
+    Ok(())
+}
+
+async fn handle_config(
+    manager: &PackageManager,
+    cwd: &Path,
+    show: bool,
+    paths: bool,
+    json_output: bool,
+) -> Result<()> {
+    if json_output && (show || paths) {
+        bail!("`pi config --json` cannot be combined with --show/--paths");
+    }
+
+    let packages = collect_config_packages(manager).await;
+    let report = build_config_report(cwd, &packages);
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    let interactive_requested = !show && !paths;
+    let has_tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+
+    if interactive_requested && has_tty {
+        let config = Config::load().unwrap_or_default();
+        let settings_summary = format_settings_summary(&config);
+        if let Some(updated) = run_config_tui(packages, settings_summary)? {
+            persist_package_toggles(cwd, &updated)?;
+            println!("Saved package resource toggles.");
+        } else {
+            println!("No changes saved.");
+        }
+        return Ok(());
+    }
+
+    print_config_report(&report, show);
+    Ok(())
 }
 
 fn handle_doctor(
@@ -2202,6 +2924,8 @@ fn default_export_path(input: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
 
     #[test]
     fn provider_from_token_numbered_choices() {
@@ -2274,5 +2998,131 @@ mod tests {
     fn provider_from_token_unknown_returns_none() {
         assert!(provider_from_token("nonexistent-provider-xyz").is_none());
         assert!(provider_from_token("").is_none());
+    }
+
+    #[test]
+    fn persist_package_toggles_writes_filters_per_scope() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path().join("repo");
+        let global_dir = temp.path().join("global");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&global_dir).expect("create global dir");
+        std::fs::create_dir_all(cwd.join(".pi")).expect("create project .pi");
+
+        std::fs::write(
+            global_dir.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "packages": ["npm:foo"]
+            }))
+            .expect("serialize global settings"),
+        )
+        .expect("write global settings");
+
+        std::fs::write(
+            cwd.join(".pi").join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "packages": [
+                    {
+                        "source": "npm:bar",
+                        "local": true,
+                        "kind": "npm"
+                    }
+                ]
+            }))
+            .expect("serialize project settings"),
+        )
+        .expect("write project settings");
+
+        let packages = vec![
+            ConfigPackageState {
+                scope: SettingsScope::Global,
+                source: "npm:foo".to_string(),
+                resources: vec![
+                    ConfigResourceState {
+                        kind: ConfigResourceKind::Extensions,
+                        path: "extensions/a.js".to_string(),
+                        enabled: true,
+                    },
+                    ConfigResourceState {
+                        kind: ConfigResourceKind::Extensions,
+                        path: "extensions/b.js".to_string(),
+                        enabled: false,
+                    },
+                ],
+            },
+            ConfigPackageState {
+                scope: SettingsScope::Project,
+                source: "npm:bar".to_string(),
+                resources: vec![ConfigResourceState {
+                    kind: ConfigResourceKind::Skills,
+                    path: "skills/demo/SKILL.md".to_string(),
+                    enabled: true,
+                }],
+            },
+        ];
+
+        persist_package_toggles_with_roots(&cwd, &global_dir, &packages)
+            .expect("persist package toggles");
+
+        let global_value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(global_dir.join("settings.json")).expect("read global"),
+        )
+        .expect("parse global json");
+        let global_pkg = global_value["packages"]
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(serde_json::Value::as_object)
+            .expect("global package object");
+        assert_eq!(
+            global_pkg
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .expect("source"),
+            "npm:foo"
+        );
+        assert_eq!(
+            global_pkg
+                .get("extensions")
+                .and_then(serde_json::Value::as_array)
+                .expect("extensions")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["extensions/a.js"]
+        );
+
+        let project_value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cwd.join(".pi").join("settings.json")).expect("read project"),
+        )
+        .expect("parse project json");
+        let project_pkg = project_value["packages"]
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(serde_json::Value::as_object)
+            .expect("project package object");
+        assert_eq!(
+            project_pkg
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .expect("source"),
+            "npm:bar"
+        );
+        assert_eq!(
+            project_pkg
+                .get("skills")
+                .and_then(serde_json::Value::as_array)
+                .expect("skills")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["skills/demo/SKILL.md"]
+        );
+        assert_eq!(
+            project_pkg
+                .get("local")
+                .and_then(serde_json::Value::as_bool)
+                .expect("local"),
+            true
+        );
     }
 }
