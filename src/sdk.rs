@@ -104,6 +104,17 @@ pub struct AgentSessionHandle {
     session: AgentSession,
 }
 
+/// Snapshot of the current agent session state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionState {
+    pub session_id: Option<String>,
+    pub provider: String,
+    pub model_id: String,
+    pub thinking_level: Option<crate::model::ThinkingLevel>,
+    pub save_enabled: bool,
+    pub message_count: usize,
+}
+
 impl AgentSessionHandle {
     /// Send one user prompt through the agent loop.
     pub async fn prompt(
@@ -114,13 +125,99 @@ impl AgentSessionHandle {
         self.session.run_text(input.into(), on_event).await
     }
 
+    /// Send one user prompt through the agent loop with an explicit abort signal.
+    pub async fn prompt_with_abort(
+        &mut self,
+        input: impl Into<String>,
+        abort_signal: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.session
+            .run_text_with_abort(input.into(), Some(abort_signal), on_event)
+            .await
+    }
+
+    /// Create a new abort handle/signal pair for prompt cancellation.
+    pub fn new_abort_handle() -> (AbortHandle, AbortSignal) {
+        AbortHandle::new()
+    }
+
+    /// Return the active provider/model pair.
+    pub fn model(&self) -> (String, String) {
+        let provider = self.session.agent.provider();
+        (provider.name().to_string(), provider.model_id().to_string())
+    }
+
+    /// Return the currently configured thinking level.
+    pub const fn thinking_level(&self) -> Option<crate::model::ThinkingLevel> {
+        self.session.agent.stream_options().thinking_level
+    }
+
+    /// Update thinking level and persist it to session metadata.
+    pub async fn set_thinking_level(
+        &mut self,
+        level: crate::model::ThinkingLevel,
+    ) -> Result<()> {
+        let level_string = level.to_string();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.set_model_header(None, None, Some(level_string.clone()));
+            guard.append_thinking_level_change(level_string);
+        }
+        self.session.agent.stream_options_mut().thinking_level = Some(level);
+        self.session.persist_session().await
+    }
+
+    /// Return all model messages for the current session path.
+    pub async fn messages(&self) -> Result<Vec<Message>> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let guard = self
+            .session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(guard.to_messages_for_current_path())
+    }
+
+    /// Return a lightweight state snapshot.
+    pub async fn state(&self) -> Result<AgentSessionState> {
+        let (provider, model_id) = self.model();
+        let thinking_level = self.thinking_level();
+        let save_enabled = self.session.save_enabled();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let guard = self
+            .session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let session_id = Some(guard.header.id.clone());
+        let message_count = guard.to_messages_for_current_path().len();
+
+        Ok(AgentSessionState {
+            session_id,
+            provider,
+            model_id,
+            thinking_level,
+            save_enabled,
+            message_count,
+        })
+    }
+
     /// Access the underlying `AgentSession`.
     pub const fn session(&self) -> &AgentSession {
         &self.session
     }
 
     /// Mutable access to the underlying `AgentSession`.
-    pub fn session_mut(&mut self) -> &mut AgentSession {
+    pub const fn session_mut(&mut self) -> &mut AgentSession {
         &mut self.session
     }
 
