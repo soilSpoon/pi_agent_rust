@@ -73,9 +73,8 @@ fn check_headers_redacted(headers: &serde_json::Value, path: &str) -> Vec<String
 fn scan_cassette(cassette: &serde_json::Value, filename: &str) -> Vec<String> {
     let mut violations = Vec::new();
 
-    let interactions = match cassette.get("interactions").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return violations,
+    let Some(interactions) = cassette.get("interactions").and_then(|v| v.as_array()) else {
+        return violations;
     };
 
     for (idx, interaction) in interactions.iter().enumerate() {
