@@ -41,11 +41,12 @@ fn emergency_kill_switch(
     manager: &ExtensionManager,
     reason: &str,
 ) {
-    let event = tracker.demote(reason).expect("demotion must succeed");
+    let ext_id = tracker.extension_id().to_string();
+    tracker.demote(reason).expect("demotion must succeed");
     // Record a quarantine alert mirroring what the runtime would produce.
     manager.record_security_alert(SecurityAlert::from_quarantine(
-        tracker.extension_id(),
-        &event.reason,
+        &ext_id,
+        reason,
         0.95, // high risk score triggering kill-switch
     ));
 }
@@ -215,7 +216,7 @@ fn audit_trail_preserves_full_provenance() {
         assert_eq!(v["extension_id"], "ext.audit");
     }
 
-    // Verify timestamps are monotonically increasing.
+    // Verify timestamps are monotonically non-decreasing (RFC 3339 strings sort correctly).
     for window in history.windows(2) {
         assert!(
             window[0].timestamp <= window[1].timestamp,
@@ -342,7 +343,7 @@ fn multi_extension_independent_trust_states() {
 
     let mut alpha = risky_tracker("ext.alpha");
     let mut beta = trusted_tracker("ext.beta");
-    let mut gamma = risky_tracker("ext.gamma");
+    let gamma = risky_tracker("ext.gamma");
 
     // Promote alpha to Restricted.
     alpha.promote("reviewed", true, None, None).unwrap();
@@ -650,7 +651,7 @@ fn trust_event_json_includes_all_required_fields() {
     assert!(v["kind"].is_string(), "kind must be present");
     assert!(v["reason"].is_string(), "reason must be present");
     assert!(v["operator_acknowledged"].is_boolean(), "operator_acknowledged must be present");
-    assert!(v["timestamp"].is_number(), "timestamp must be present");
+    assert!(v["timestamp"].is_string(), "timestamp must be present");
 
     // Optional but expected for onboarding.
     assert!(v["risk_score"].is_number(), "risk_score must be present when provided");
