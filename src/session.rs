@@ -1272,6 +1272,14 @@ impl Session {
     }
 
     fn next_entry_id(&self) -> String {
+        for _ in 0..100 {
+            let candidate = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            if !entry_id_exists(&self.entries, &candidate) {
+                return candidate;
+            }
+        }
+
+        // Extremely unlikely fallback: recover by rebuilding the set and retrying.
         let existing = entry_id_set(&self.entries);
         generate_entry_id(&existing)
     }
@@ -2493,6 +2501,12 @@ fn entry_id_set(entries: &[SessionEntry]) -> HashSet<String> {
         .iter()
         .filter_map(|e| e.base_id().cloned())
         .collect()
+}
+
+fn entry_id_exists(entries: &[SessionEntry], candidate: &str) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.base_id().is_some_and(|id| id == candidate))
 }
 
 fn ensure_entry_ids(entries: &mut [SessionEntry]) {
@@ -4475,5 +4489,636 @@ mod tests {
             false
         });
         assert!(has_details, "tool result details should survive round-trip");
+    }
+
+    // ======================================================================
+    // FUZZ-P1.4: Proptest coverage for Session JSONL parsing
+    // ======================================================================
+
+    mod proptest_session {
+        use super::*;
+        use proptest::prelude::*;
+        use serde_json::json;
+
+        /// Generate a random valid timestamp string.
+        fn timestamp_strategy() -> impl Strategy<Value = String> {
+            (2020u32..2030, 1u32..13, 1u32..29, 0u32..24, 0u32..60, 0u32..60).prop_map(
+                |(y, mo, d, h, mi, s)| {
+                    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.000Z")
+                },
+            )
+        }
+
+        /// Generate a random entry ID (8 hex chars).
+        fn entry_id_strategy() -> impl Strategy<Value = String> {
+            "[0-9a-f]{8}".prop_map(|s| s.to_string())
+        }
+
+        /// Generate an arbitrary JSON value of bounded depth/size.
+        fn bounded_json_value(max_depth: u32) -> BoxedStrategy<serde_json::Value> {
+            if max_depth == 0 {
+                prop_oneof![
+                    Just(json!(null)),
+                    any::<bool>().prop_map(|b| json!(b)),
+                    any::<i64>().prop_map(|n| json!(n)),
+                    "[a-zA-Z0-9 ]{0,32}".prop_map(|s| json!(s)),
+                ]
+                .boxed()
+            } else {
+                prop_oneof![
+                    Just(json!(null)),
+                    any::<bool>().prop_map(|b| json!(b)),
+                    any::<i64>().prop_map(|n| json!(n)),
+                    "[a-zA-Z0-9 ]{0,32}".prop_map(|s| json!(s)),
+                    prop::collection::vec(bounded_json_value(max_depth - 1), 0..4)
+                        .prop_map(|v| serde_json::Value::Array(v)),
+                ]
+                .boxed()
+            }
+        }
+
+        /// Generate a valid `SessionEntry` JSON object for one of the known types.
+        #[allow(clippy::too_many_lines)]
+        fn valid_session_entry_json() -> impl Strategy<Value = serde_json::Value> {
+            let ts = timestamp_strategy();
+            let eid = entry_id_strategy();
+            let parent = prop::option::of(entry_id_strategy());
+
+            (ts, eid, parent, 0u8..8).prop_flat_map(|(ts, eid, parent, variant)| {
+                let base = json!({
+                    "id": eid,
+                    "parentId": parent,
+                    "timestamp": ts,
+                });
+
+                match variant {
+                    0 => {
+                        // Message - User
+                        "[a-zA-Z0-9 ]{1,64}".prop_map(move |text| {
+                            let mut v = base.clone();
+                            v["type"] = json!("message");
+                            v["message"] = json!({
+                                "role": "user",
+                                "content": text,
+                            });
+                            v
+                        }).boxed()
+                    }
+                    1 => {
+                        // Message - Assistant
+                        "[a-zA-Z0-9 ]{1,64}".prop_map(move |text| {
+                            let mut v = base.clone();
+                            v["type"] = json!("message");
+                            v["message"] = json!({
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": text}],
+                                "api": "anthropic",
+                                "provider": "anthropic",
+                                "model": "test-model",
+                                "usage": {
+                                    "input": 10,
+                                    "output": 5,
+                                    "cacheRead": 0,
+                                    "cacheWrite": 0,
+                                    "totalTokens": 15,
+                                    "cost": {"input": 0.0, "output": 0.0, "total": 0.0}
+                                },
+                                "stopReason": "end_turn",
+                                "timestamp": 12345,
+                            });
+                            v
+                        }).boxed()
+                    }
+                    2 => {
+                        // ModelChange
+                        ("[a-z]{3,8}", "[a-z0-9-]{5,20}").prop_map(move |(provider, model)| {
+                            let mut v = base.clone();
+                            v["type"] = json!("model_change");
+                            v["provider"] = json!(provider);
+                            v["modelId"] = json!(model);
+                            v
+                        }).boxed()
+                    }
+                    3 => {
+                        // ThinkingLevelChange
+                        prop_oneof![
+                            Just("off".to_string()),
+                            Just("low".to_string()),
+                            Just("medium".to_string()),
+                            Just("high".to_string()),
+                        ].prop_map(move |level| {
+                            let mut v = base.clone();
+                            v["type"] = json!("thinking_level_change");
+                            v["thinkingLevel"] = json!(level);
+                            v
+                        }).boxed()
+                    }
+                    4 => {
+                        // Compaction
+                        ("[a-zA-Z0-9 ]{1,32}", entry_id_strategy(), 100u64..100_000)
+                            .prop_map(move |(summary, kept_id, tokens)| {
+                                let mut v = base.clone();
+                                v["type"] = json!("compaction");
+                                v["summary"] = json!(summary);
+                                v["firstKeptEntryId"] = json!(kept_id);
+                                v["tokensBefore"] = json!(tokens);
+                                v
+                            }).boxed()
+                    }
+                    5 => {
+                        // Label
+                        (entry_id_strategy(), prop::option::of("[a-zA-Z0-9 ]{1,16}"))
+                            .prop_map(move |(target, label)| {
+                                let mut v = base.clone();
+                                v["type"] = json!("label");
+                                v["targetId"] = json!(target);
+                                if let Some(l) = label {
+                                    v["label"] = json!(l);
+                                }
+                                v
+                            }).boxed()
+                    }
+                    6 => {
+                        // SessionInfo
+                        prop::option::of("[a-zA-Z0-9 ]{1,32}").prop_map(move |name| {
+                            let mut v = base.clone();
+                            v["type"] = json!("session_info");
+                            if let Some(n) = name {
+                                v["name"] = json!(n);
+                            }
+                            v
+                        }).boxed()
+                    }
+                    _ => {
+                        // Custom
+                        ("[a-z_]{3,12}", bounded_json_value(2)).prop_map(move |(custom_type, data)| {
+                            let mut v = base.clone();
+                            v["type"] = json!("custom");
+                            v["customType"] = json!(custom_type);
+                            v["data"] = data;
+                            v
+                        }).boxed()
+                    }
+                }
+            })
+        }
+
+        /// Generate a corrupted JSON line (valid JSON but wrong shape for `SessionEntry`).
+        fn corrupted_entry_json() -> impl Strategy<Value = String> {
+            prop_oneof![
+                // Missing "type" field
+                Just(r#"{"id":"aaaaaaaa","timestamp":"2024-01-01T00:00:00.000Z"}"#.to_string()),
+                // Unknown type
+                Just(r#"{"type":"unknown_type","id":"bbbbbbbb","timestamp":"2024-01-01T00:00:00.000Z"}"#.to_string()),
+                // Empty object
+                Just(r#"{}"#.to_string()),
+                // Array instead of object
+                Just(r#"[1,2,3]"#.to_string()),
+                // Scalar values
+                Just(r#"42"#.to_string()),
+                Just(r#""just a string""#.to_string()),
+                Just(r#"null"#.to_string()),
+                Just(r#"true"#.to_string()),
+                // Truncated JSON (simulating crash)
+                Just(r#"{"type":"message","id":"cccccccc","timestamp":"2024-01-01T"#.to_string()),
+                // Valid JSON with wrong field types
+                Just(r#"{"type":"message","id":12345,"timestamp":"2024-01-01T00:00:00.000Z"}"#.to_string()),
+            ]
+        }
+
+        /// Build a complete JSONL file string from header + entries.
+        fn build_jsonl(header: &str, entry_lines: &[String]) -> String {
+            let mut lines = vec![header.to_string()];
+            lines.extend(entry_lines.iter().cloned());
+            lines.join("\n")
+        }
+
+        // ------------------------------------------------------------------
+        // Proptest 1: SessionEntry deserialization never panics
+        // ------------------------------------------------------------------
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                max_shrink_iters: 200,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn session_entry_deser_never_panics(
+                entry_json in valid_session_entry_json()
+            ) {
+                let json_str = entry_json.to_string();
+                // Must not panic — Ok or Err is fine
+                let _ = serde_json::from_str::<SessionEntry>(&json_str);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Proptest 2: Corrupted/malformed input never panics
+        // ------------------------------------------------------------------
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                max_shrink_iters: 200,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn corrupted_entry_deser_never_panics(
+                line in corrupted_entry_json()
+            ) {
+                let _ = serde_json::from_str::<SessionEntry>(&line);
+            }
+
+            #[test]
+            fn arbitrary_bytes_deser_never_panics(
+                raw in prop::collection::vec(any::<u8>(), 0..512)
+            ) {
+                // Even random bytes must not panic serde
+                if let Ok(s) = String::from_utf8(raw) {
+                    let _ = serde_json::from_str::<SessionEntry>(&s);
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Proptest 3: Valid entries round-trip through serialization
+        // ------------------------------------------------------------------
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                max_shrink_iters: 200,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn valid_entry_round_trip(
+                entry_json in valid_session_entry_json()
+            ) {
+                let json_str = entry_json.to_string();
+                if let Ok(entry) = serde_json::from_str::<SessionEntry>(&json_str) {
+                    // Serialize back
+                    let reserialized = serde_json::to_string(&entry).unwrap();
+                    // Deserialize again
+                    let re_entry = serde_json::from_str::<SessionEntry>(&reserialized).unwrap();
+                    // Both should have the same entry ID
+                    assert_eq!(entry.base_id(), re_entry.base_id());
+                    // Both should have the same type tag
+                    assert_eq!(
+                        std::mem::discriminant(&entry),
+                        std::mem::discriminant(&re_entry)
+                    );
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Proptest 4: Full JSONL load with mixed valid/invalid lines
+        //             recovers valid entries and reports diagnostics
+        // ------------------------------------------------------------------
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 128,
+                max_shrink_iters: 100,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn jsonl_corrupted_recovery(
+                valid_entries in prop::collection::vec(valid_session_entry_json(), 1..8),
+                corrupted_lines in prop::collection::vec(corrupted_entry_json(), 0..5),
+                interleave_seed in any::<u64>(),
+            ) {
+                let header_json = json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": "testid01",
+                    "timestamp": "2024-01-01T00:00:00.000Z",
+                    "cwd": "/tmp/test"
+                }).to_string();
+
+                // Interleave valid and corrupted lines deterministically
+                let valid_strs: Vec<String> = valid_entries
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect();
+                let total = valid_strs.len() + corrupted_lines.len();
+                let mut all_lines: Vec<(bool, String)> = Vec::with_capacity(total);
+                for s in &valid_strs {
+                    all_lines.push((true, s.clone()));
+                }
+                for s in &corrupted_lines {
+                    all_lines.push((false, s.clone()));
+                }
+
+                // Deterministic shuffle based on seed
+                let mut seed = interleave_seed;
+                for i in (1..all_lines.len()).rev() {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let j = (seed >> 33) as usize % (i + 1);
+                    all_lines.swap(i, j);
+                }
+
+                let entry_lines: Vec<String> = all_lines.iter().map(|(_, s)| s.clone()).collect();
+                let content = build_jsonl(&header_json, &entry_lines);
+
+                // Write to temp file and load
+                let temp_dir = tempfile::tempdir().unwrap();
+                let file_path = temp_dir.path().join("test_session.jsonl");
+                std::fs::write(&file_path, &content).unwrap();
+
+                let (session, diagnostics) = run_async(async {
+                    Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+                }).unwrap();
+
+                // Invariant: parsed + skipped == total lines (all non-empty)
+                let total_parsed = session.entries.len();
+                assert_eq!(
+                    total_parsed + diagnostics.skipped_entries.len(),
+                    total,
+                    "parsed ({total_parsed}) + skipped ({}) should equal total lines ({total})",
+                    diagnostics.skipped_entries.len()
+                );
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Proptest 5: Orphaned parent links are detected
+        // ------------------------------------------------------------------
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 128,
+                max_shrink_iters: 100,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn orphaned_parent_links_detected(
+                n_entries in 2usize..10,
+                orphan_idx in 0usize..8,
+            ) {
+                let orphan_idx = orphan_idx % n_entries;
+                let header_json = json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": "testid01",
+                    "timestamp": "2024-01-01T00:00:00.000Z",
+                    "cwd": "/tmp/test"
+                }).to_string();
+
+                let mut entry_lines = Vec::new();
+                let mut prev_id: Option<String> = None;
+
+                for i in 0..n_entries {
+                    let eid = format!("{i:08x}");
+                    let parent = if i == orphan_idx {
+                        // Point to a nonexistent parent
+                        Some("deadbeef".to_string())
+                    } else {
+                        prev_id.clone()
+                    };
+
+                    let entry = json!({
+                        "type": "message",
+                        "id": eid,
+                        "parentId": parent,
+                        "timestamp": "2024-01-01T00:00:00.000Z",
+                        "message": {
+                            "role": "user",
+                            "content": format!("msg {i}"),
+                        }
+                    });
+                    entry_lines.push(entry.to_string());
+                    prev_id = Some(eid);
+                }
+
+                let content = build_jsonl(&header_json, &entry_lines);
+                let temp_dir = tempfile::tempdir().unwrap();
+                let file_path = temp_dir.path().join("orphan_test.jsonl");
+                std::fs::write(&file_path, &content).unwrap();
+
+                let (_session, diagnostics) = run_async(async {
+                    Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+                }).unwrap();
+
+                // The orphaned entry should be detected
+                let has_orphan = diagnostics.orphaned_parent_links.iter().any(|o| {
+                    o.missing_parent_id == "deadbeef"
+                });
+                assert!(
+                    has_orphan,
+                    "orphaned parent link to 'deadbeef' should be detected"
+                );
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Proptest 6: ensure_entry_ids assigns IDs to entries without them
+        // ------------------------------------------------------------------
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 128,
+                max_shrink_iters: 100,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn ensure_entry_ids_fills_gaps(
+                n_total in 1usize..20,
+                missing_mask in prop::collection::vec(any::<bool>(), 1..20),
+            ) {
+                let n = n_total.min(missing_mask.len());
+                let mut entries: Vec<SessionEntry> = (0..n).map(|i| {
+                    let id = if missing_mask[i] {
+                        None
+                    } else {
+                        Some(format!("{i:08x}"))
+                    };
+                    SessionEntry::Message(MessageEntry {
+                        base: EntryBase {
+                            id,
+                            parent_id: None,
+                            timestamp: "2024-01-01T00:00:00.000Z".to_string(),
+                        },
+                        message: SessionMessage::User {
+                            content: UserContent::Text(format!("msg {i}")),
+                            timestamp: Some(0),
+                        },
+                    })
+                }).collect();
+
+                ensure_entry_ids(&mut entries);
+
+                // All entries must have IDs after the call
+                for entry in &entries {
+                    assert!(
+                        entry.base_id().is_some(),
+                        "all entries must have IDs after ensure_entry_ids"
+                    );
+                }
+
+                // All IDs must be unique
+                let ids: Vec<&String> = entries.iter().filter_map(|e| e.base_id()).collect();
+                let unique: std::collections::HashSet<&String> = ids.iter().copied().collect();
+                assert_eq!(
+                    ids.len(),
+                    unique.len(),
+                    "all entry IDs must be unique"
+                );
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Proptest 7: SessionHeader deserialization with boundary values
+        // ------------------------------------------------------------------
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                max_shrink_iters: 200,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn session_header_deser_never_panics(
+                version in prop::option::of(0u8..255),
+                id in "[a-zA-Z0-9-]{0,64}",
+                ts in timestamp_strategy(),
+                cwd in "(/[a-zA-Z0-9_]{1,8}){0,5}",
+                provider in prop::option::of("[a-z]{2,10}"),
+                model_id in prop::option::of("[a-z0-9-]{2,20}"),
+                thinking_level in prop::option::of("[a-z]{2,8}"),
+            ) {
+                let mut obj = json!({
+                    "type": "session",
+                    "id": id,
+                    "timestamp": ts,
+                    "cwd": cwd,
+                });
+                if let Some(v) = version {
+                    obj["version"] = json!(v);
+                }
+                if let Some(p) = &provider {
+                    obj["provider"] = json!(p);
+                }
+                if let Some(m) = &model_id {
+                    obj["modelId"] = json!(m);
+                }
+                if let Some(t) = &thinking_level {
+                    obj["thinkingLevel"] = json!(t);
+                }
+                let json_str = obj.to_string();
+                let _ = serde_json::from_str::<SessionHeader>(&json_str);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Proptest 8: Edge-case JSONL files
+        // ------------------------------------------------------------------
+
+        #[test]
+        fn empty_file_returns_error() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let file_path = temp_dir.path().join("empty.jsonl");
+            std::fs::write(&file_path, "").unwrap();
+
+            let result = run_async(async {
+                Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+            });
+            assert!(result.is_err(), "empty file should return error");
+        }
+
+        #[test]
+        fn header_only_file_produces_empty_session() {
+            let header = json!({
+                "type": "session",
+                "version": 3,
+                "id": "testid01",
+                "timestamp": "2024-01-01T00:00:00.000Z",
+                "cwd": "/tmp/test"
+            }).to_string();
+
+            let temp_dir = tempfile::tempdir().unwrap();
+            let file_path = temp_dir.path().join("header_only.jsonl");
+            std::fs::write(&file_path, &header).unwrap();
+
+            let (session, diagnostics) = run_async(async {
+                Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+            }).unwrap();
+
+            assert!(session.entries.is_empty(), "header-only file should have no entries");
+            assert!(diagnostics.skipped_entries.is_empty(), "no lines to skip");
+        }
+
+        #[test]
+        fn file_with_only_invalid_lines_has_diagnostics() {
+            let header = json!({
+                "type": "session",
+                "version": 3,
+                "id": "testid01",
+                "timestamp": "2024-01-01T00:00:00.000Z",
+                "cwd": "/tmp/test"
+            }).to_string();
+
+            let content = format!(
+                "{}\n{}\n{}\n{}",
+                header,
+                r#"{"bad":"json","no":"type"}"#,
+                r#"not json at all"#,
+                r#"{"type":"nonexistent_type","id":"aaa","timestamp":"2024-01-01T00:00:00.000Z"}"#,
+            );
+
+            let temp_dir = tempfile::tempdir().unwrap();
+            let file_path = temp_dir.path().join("all_invalid.jsonl");
+            std::fs::write(&file_path, &content).unwrap();
+
+            let (session, diagnostics) = run_async(async {
+                Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+            }).unwrap();
+
+            assert!(session.entries.is_empty(), "all-invalid file should have no entries");
+            assert_eq!(
+                diagnostics.skipped_entries.len(),
+                3,
+                "should have 3 skipped entries"
+            );
+        }
+
+        #[test]
+        fn duplicate_entry_ids_are_loaded_without_panic() {
+            let header = json!({
+                "type": "session",
+                "version": 3,
+                "id": "testid01",
+                "timestamp": "2024-01-01T00:00:00.000Z",
+                "cwd": "/tmp/test"
+            }).to_string();
+
+            let entry1 = json!({
+                "type": "message",
+                "id": "deadbeef",
+                "timestamp": "2024-01-01T00:00:00.000Z",
+                "message": {"role": "user", "content": "first"}
+            }).to_string();
+
+            let entry2 = json!({
+                "type": "message",
+                "id": "deadbeef",
+                "timestamp": "2024-01-01T00:00:01.000Z",
+                "message": {"role": "user", "content": "second (duplicate id)"}
+            }).to_string();
+
+            let content = format!("{header}\n{entry1}\n{entry2}");
+
+            let temp_dir = tempfile::tempdir().unwrap();
+            let file_path = temp_dir.path().join("dup_ids.jsonl");
+            std::fs::write(&file_path, &content).unwrap();
+
+            // Must not panic
+            let (session, _diagnostics) = run_async(async {
+                Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+            }).unwrap();
+
+            assert_eq!(session.entries.len(), 2, "both entries should be loaded");
+        }
     }
 }
