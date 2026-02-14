@@ -11293,6 +11293,29 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         Ok(())
     }
 
+    /// Invoke a zero-argument global JS function and drain immediate microtasks.
+    ///
+    /// This is useful for hot loops that need to trigger pre-installed JS helpers
+    /// without paying per-call parser/compile overhead from `eval()`.
+    pub async fn call_global_void(&self, name: &str) -> Result<()> {
+        self.interrupt_budget.reset();
+        match self
+            .context
+            .with(|ctx| {
+                let global = ctx.globals();
+                let function: Function<'_> = global.get(name)?;
+                function.call::<(), ()>(())?;
+                Ok::<(), rquickjs::Error>(())
+            })
+            .await
+        {
+            Ok(()) => {}
+            Err(err) => return Err(self.map_quickjs_error(&err)),
+        }
+        self.drain_jobs().await?;
+        Ok(())
+    }
+
     // ---- Auto-repair event infrastructure (bd-k5q5.8.1) --------------------
 
     /// The configured repair mode for this runtime.

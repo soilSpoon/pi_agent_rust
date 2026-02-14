@@ -9,6 +9,9 @@ use pi::scheduler::HostcallOutcome;
 use serde_json::json;
 use std::time::Instant;
 
+const BENCH_BEGIN_FN: &str = "__bench_begin_roundtrip";
+const BENCH_ASSERT_FN: &str = "__bench_assert_roundtrip";
+
 const BENCH_TOOL_SETUP: &str = r#"
 __pi_begin_extension("ext.bench", { name: "Bench" });
 pi.registerTool({
@@ -19,18 +22,17 @@ pi.registerTool({
     return { ok: true, value: input.value };
   },
 });
-__pi_end_extension();
-"#;
-
-const BENCH_TOOL_CALL: &str = r#"
 globalThis.__bench_done = false;
-pi.tool("bench_tool", { value: 1 }).then(() => { globalThis.__bench_done = true; });
-"#;
-
-const BENCH_TOOL_ASSERT: &str = r#"
-if (!globalThis.__bench_done) {
-  throw new Error("bench tool call did not resolve");
-}
+globalThis.__bench_begin_roundtrip = () => {
+  globalThis.__bench_done = false;
+  return pi.tool("bench_tool", { value: 1 }).then(() => { globalThis.__bench_done = true; });
+};
+globalThis.__bench_assert_roundtrip = () => {
+  if (!globalThis.__bench_done) {
+    throw new Error("bench tool call did not resolve");
+  }
+};
+__pi_end_extension();
 "#;
 
 #[derive(Parser, Debug)]
@@ -94,7 +96,7 @@ fn run() -> Result<()> {
 
 fn run_tool_roundtrip(runtime: &PiJsRuntime) -> Result<()> {
     block_on(async {
-        runtime.eval(BENCH_TOOL_CALL).await?;
+        runtime.call_global_void(BENCH_BEGIN_FN).await?;
         let mut requests = runtime.drain_hostcall_requests();
         let request = requests
             .pop_front()
@@ -110,7 +112,7 @@ fn run_tool_roundtrip(runtime: &PiJsRuntime) -> Result<()> {
             HostcallOutcome::Success(json!({"ok": true})),
         );
         runtime.tick().await?;
-        runtime.eval(BENCH_TOOL_ASSERT).await?;
+        runtime.call_global_void(BENCH_ASSERT_FN).await?;
         Ok(())
     })
 }
