@@ -56,8 +56,18 @@ const REDACTION_KEYS: [&str; 10] = [
 /// Deprecated: new tests MUST use v2. This constant exists only for backward-compat
 /// validation of existing test data. See DISC-021 / bd-38m8w.
 const TEST_LOG_SCHEMA_V1: &str = "pi.test.log.v1";
-const TEST_LOG_SCHEMA: &str = "pi.test.log.v2";
-const TEST_ARTIFACT_SCHEMA: &str = "pi.test.artifact.v1";
+/// Canonical log schema for all new test JSONL records.
+pub const TEST_LOG_SCHEMA_V2: &str = "pi.test.log.v2";
+/// Canonical artifact index schema for JSONL artifact records.
+pub const TEST_ARTIFACT_SCHEMA_V1: &str = "pi.test.artifact.v1";
+/// Canonical evidence contract schema for aggregate e2e run evidence.
+pub const EVIDENCE_CONTRACT_SCHEMA_V1: &str = "pi.qa.evidence_contract.v1";
+/// Canonical failure digest schema used for failing suites.
+pub const FAILURE_DIGEST_SCHEMA_V1: &str = "pi.e2e.failure_digest.v1";
+/// Versioned parity test/logging contract identifier.
+pub const PARITY_TEST_LOGGING_CONTRACT_SCHEMA_V1: &str = "pi.parity.test_logging_contract.v1";
+const TEST_LOG_SCHEMA: &str = TEST_LOG_SCHEMA_V2;
+const TEST_ARTIFACT_SCHEMA: &str = TEST_ARTIFACT_SCHEMA_V1;
 const PLACEHOLDER_TIMESTAMP: &str = "<TIMESTAMP>";
 const PLACEHOLDER_PROJECT_ROOT: &str = "<PROJECT_ROOT>";
 const PLACEHOLDER_TEST_ROOT: &str = "<TEST_ROOT>";

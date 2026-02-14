@@ -850,7 +850,9 @@ fn test_assistant_message_event_tool_call_end() {
     let event = AssistantMessageEvent::ToolCallEnd {
         content_index: 0,
         tool_call: tool_call.clone(),
-        partial: Arc::new(make_assistant_message(vec![ContentBlock::ToolCall(tool_call)])),
+        partial: Arc::new(make_assistant_message(vec![ContentBlock::ToolCall(
+            tool_call,
+        )])),
     };
 
     let json = serde_json::to_string(&event).unwrap();

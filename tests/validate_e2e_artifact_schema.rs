@@ -21,10 +21,13 @@
 
 mod common;
 
-use common::TestHarness;
 use common::logging::{
     find_unredacted_keys, redact_json_value, validate_jsonl, validate_jsonl_line,
     validate_jsonl_line_v2_only, validate_jsonl_v2_only,
+};
+use common::{
+    EVIDENCE_CONTRACT_SCHEMA_V1, FAILURE_DIGEST_SCHEMA_V1, PARITY_TEST_LOGGING_CONTRACT_SCHEMA_V1,
+    TEST_ARTIFACT_SCHEMA_V1, TEST_LOG_SCHEMA_V2, TestHarness,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -83,7 +86,11 @@ fn artifact_contract_defines_jsonl_schemas() {
         .as_object()
         .expect("jsonl_schemas must be object");
 
-    let expected = ["pi.test.log.v1", "pi.test.log.v2", "pi.test.artifact.v1"];
+    let expected = [
+        "pi.test.log.v1",
+        TEST_LOG_SCHEMA_V2,
+        TEST_ARTIFACT_SCHEMA_V1,
+    ];
     for schema in &expected {
         assert!(
             schemas.contains_key(*schema),
@@ -344,8 +351,9 @@ fn harness_logs_use_v2_schema() {
         let parsed: Value = serde_json::from_str(line).expect("valid JSON");
         let schema = parsed["schema"].as_str().unwrap_or("");
         assert_eq!(
-            schema, "pi.test.log.v2",
-            "All new harness logs must use pi.test.log.v2, got {schema}"
+            schema, TEST_LOG_SCHEMA_V2,
+            "All new harness logs must use {}, got {schema}",
+            TEST_LOG_SCHEMA_V2
         );
     }
 }
@@ -1035,8 +1043,9 @@ fn evidence_contract_schema_has_correct_id() {
     let schema = load_json(&path).expect("parse schema");
     assert_eq!(
         schema["$id"].as_str().unwrap_or(""),
-        "pi.qa.evidence_contract.v1",
-        "Schema $id must be pi.qa.evidence_contract.v1"
+        EVIDENCE_CONTRACT_SCHEMA_V1,
+        "Schema $id must be {}",
+        EVIDENCE_CONTRACT_SCHEMA_V1
     );
 }
 
@@ -1151,7 +1160,7 @@ fn evidence_contract_schema_defines_parity_contract_overlay() {
         overlay["properties"]["schema"]["const"]
             .as_str()
             .unwrap_or(""),
-        "pi.parity.test_logging_contract.v1",
+        PARITY_TEST_LOGGING_CONTRACT_SCHEMA_V1,
         "parity_contract schema const must match the documented contract version"
     );
 
@@ -1159,22 +1168,25 @@ fn evidence_contract_schema_defines_parity_contract_overlay() {
         overlay["properties"]["log_record_schema"]["const"]
             .as_str()
             .unwrap_or(""),
-        "pi.test.log.v2",
-        "parity_contract log_record_schema must pin pi.test.log.v2"
+        TEST_LOG_SCHEMA_V2,
+        "parity_contract log_record_schema must pin {}",
+        TEST_LOG_SCHEMA_V2
     );
     assert_eq!(
         overlay["properties"]["artifact_record_schema"]["const"]
             .as_str()
             .unwrap_or(""),
-        "pi.test.artifact.v1",
-        "parity_contract artifact_record_schema must pin pi.test.artifact.v1"
+        TEST_ARTIFACT_SCHEMA_V1,
+        "parity_contract artifact_record_schema must pin {}",
+        TEST_ARTIFACT_SCHEMA_V1
     );
     assert_eq!(
         overlay["properties"]["failure_digest_schema"]["const"]
             .as_str()
             .unwrap_or(""),
-        "pi.e2e.failure_digest.v1",
-        "parity_contract failure_digest_schema must pin pi.e2e.failure_digest.v1"
+        FAILURE_DIGEST_SCHEMA_V1,
+        "parity_contract failure_digest_schema must pin {}",
+        FAILURE_DIGEST_SCHEMA_V1
     );
 }
 
@@ -1266,7 +1278,7 @@ fn synthetic_evidence_contract_validates_against_schema() {
         .collect();
 
     let synthetic = serde_json::json!({
-        "schema": "pi.qa.evidence_contract.v1",
+        "schema": EVIDENCE_CONTRACT_SCHEMA_V1,
         "generated_at": "2026-02-13T00:00:00Z",
         "correlation_id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
         "run_summary": {
@@ -1307,7 +1319,7 @@ fn synthetic_evidence_contract_validates_against_schema() {
                 },
                 "elapsed_ms": 12000,
                 "failure_digest": {
-                    "schema": "pi.e2e.failure_digest.v1",
+                    "schema": FAILURE_DIGEST_SCHEMA_V1,
                     "suite": "openai",
                     "root_cause_class": "assertion_failure",
                     "impacted_scenario_ids": ["SC-OAI-001"],
@@ -1319,11 +1331,11 @@ fn synthetic_evidence_contract_validates_against_schema() {
             }
         ],
         "parity_contract": {
-            "schema": "pi.parity.test_logging_contract.v1",
+            "schema": PARITY_TEST_LOGGING_CONTRACT_SCHEMA_V1,
             "suite_taxonomy_ref": "tests/suite_classification.toml",
-            "log_record_schema": "pi.test.log.v2",
-            "artifact_record_schema": "pi.test.artifact.v1",
-            "failure_digest_schema": "pi.e2e.failure_digest.v1",
+            "log_record_schema": TEST_LOG_SCHEMA_V2,
+            "artifact_record_schema": TEST_ARTIFACT_SCHEMA_V1,
+            "failure_digest_schema": FAILURE_DIGEST_SCHEMA_V1,
             "trace_model": {
                 "correlation_id_field": "correlation_id",
                 "trace_id_field": "trace_id",
@@ -1354,7 +1366,7 @@ fn synthetic_evidence_contract_validates_against_schema() {
     // Verify schema value matches const
     assert_eq!(
         synthetic["schema"].as_str().unwrap(),
-        "pi.qa.evidence_contract.v1"
+        EVIDENCE_CONTRACT_SCHEMA_V1
     );
 
     // Verify run_summary fields
@@ -1402,10 +1414,7 @@ fn synthetic_evidence_contract_validates_against_schema() {
     assert_eq!(failing["status"].as_str().unwrap(), "fail");
     let digest = &failing["failure_digest"];
     assert!(digest.is_object(), "failing suite must have failure_digest");
-    assert_eq!(
-        digest["schema"].as_str().unwrap(),
-        "pi.e2e.failure_digest.v1"
-    );
+    assert_eq!(digest["schema"].as_str().unwrap(), FAILURE_DIGEST_SCHEMA_V1);
     assert_eq!(
         digest["root_cause_class"].as_str().unwrap(),
         "assertion_failure"
@@ -1415,7 +1424,7 @@ fn synthetic_evidence_contract_validates_against_schema() {
     let contract = &synthetic["parity_contract"];
     assert_eq!(
         contract["schema"].as_str().unwrap(),
-        "pi.parity.test_logging_contract.v1"
+        PARITY_TEST_LOGGING_CONTRACT_SCHEMA_V1
     );
     assert_eq!(
         contract["trace_model"]["correlation_id_field"]

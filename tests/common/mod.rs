@@ -43,9 +43,10 @@ pub use harness::{
 pub use harness::{MockHttpResponse, MockHttpServer, TestEnv};
 #[allow(unused_imports)]
 pub use logging::{
-    CostBudgetOutcome, CostThreshold, JsonlValidationError, check_cost_budget,
-    default_cost_thresholds, find_unredacted_keys, redact_json_value, validate_jsonl,
-    validate_jsonl_line,
+    CostBudgetOutcome, CostThreshold, EVIDENCE_CONTRACT_SCHEMA_V1, FAILURE_DIGEST_SCHEMA_V1,
+    JsonlValidationError, PARITY_TEST_LOGGING_CONTRACT_SCHEMA_V1, TEST_ARTIFACT_SCHEMA_V1,
+    TEST_LOG_SCHEMA_V2, check_cost_budget, default_cost_thresholds, find_unredacted_keys,
+    redact_json_value, validate_jsonl, validate_jsonl_line,
 };
 
 /// Runs an async future to completion on an asupersync runtime.

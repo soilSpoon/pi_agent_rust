@@ -1132,7 +1132,7 @@ fn stream_truncation_preserves_partial_and_reports_error() {
         let assistant_msgs: Vec<&AssistantMessage> = messages
             .iter()
             .filter_map(|m| match m {
-                Message::Assistant(a) => Some(a),
+                Message::Assistant(a) => Some(a.as_ref()),
                 _ => None,
             })
             .collect();

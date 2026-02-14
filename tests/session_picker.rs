@@ -96,6 +96,14 @@ fn create_session(harness: &TestHarness, base_dir: &Path, cwd: &Path, label: &st
     path
 }
 
+fn corrupt_session_header(path: &Path) {
+    let raw = std::fs::read_to_string(path).expect("read session file");
+    let mut lines = raw.lines().map(str::to_string).collect::<Vec<_>>();
+    assert!(!lines.is_empty(), "session file should have a header line");
+    lines[0] = "{ not valid json header".to_string();
+    std::fs::write(path, format!("{}\n", lines.join("\n"))).expect("write corrupted session");
+}
+
 #[test]
 fn format_time_parses_rfc3339() {
     let harness = TestHarness::new("format_time_parses_rfc3339");
@@ -499,4 +507,65 @@ fn session_new_resume_uses_config_session_picker_input() {
 
     assert_eq!(session.path.as_ref(), Some(&first_path));
     assert_eq!(session.session_dir.as_ref(), Some(&base_dir));
+}
+
+#[test]
+fn continue_recent_skips_unreadable_newest_indexed_session() {
+    let _lock = session_picker_lock();
+    let harness = TestHarness::new("continue_recent_skips_unreadable_newest_indexed_session");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_path("project");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    let _guard = CurrentDirGuard::new(&cwd);
+
+    let older_path = create_session(&harness, &base_dir, &cwd, "older");
+    sleep(Duration::from_millis(20));
+    let newest_path = create_session(&harness, &base_dir, &cwd, "newest");
+    corrupt_session_header(&newest_path);
+    harness.record_artifact("corrupted-newest.jsonl", &newest_path);
+
+    let resumed = run_async(async {
+        Session::continue_recent_in_dir(Some(&base_dir), &Config::default())
+            .await
+            .expect("continue recent")
+    });
+
+    assert_eq!(resumed.path.as_ref(), Some(&older_path));
+    assert_eq!(resumed.session_dir.as_ref(), Some(&base_dir));
+}
+
+#[test]
+fn resume_with_picker_selected_unreadable_session_falls_back_to_new() {
+    let _lock = session_picker_lock();
+    let harness =
+        TestHarness::new("resume_with_picker_selected_unreadable_session_falls_back_to_new");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_path("project");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    let _guard = CurrentDirGuard::new(&cwd);
+
+    let broken_path = create_session(&harness, &base_dir, &cwd, "broken");
+    let old_id = run_async(async {
+        Session::open(broken_path.to_string_lossy().as_ref())
+            .await
+            .expect("open created session")
+            .header
+            .id
+    });
+    corrupt_session_header(&broken_path);
+    harness.record_artifact("corrupted-selected.jsonl", &broken_path);
+
+    let resumed = run_async(async {
+        Box::pin(Session::resume_with_picker(
+            Some(&base_dir),
+            &Config::default(),
+            Some("1".to_string()),
+        ))
+        .await
+        .expect("resume with picker")
+    });
+
+    assert!(resumed.path.is_none(), "expected fresh unsaved session");
+    assert_eq!(resumed.session_dir.as_ref(), Some(&base_dir));
+    assert_ne!(resumed.header.id, old_id);
 }
