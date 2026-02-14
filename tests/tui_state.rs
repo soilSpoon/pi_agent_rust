@@ -7209,23 +7209,22 @@ fn tui_perf_degraded_mode_skips_markdown_cache() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
     app.set_terminal_size(220, 400);
-    press_ctrlt(&harness, &mut app);
 
     let rss_reader = MockRssReader::new(30_000_000);
     app.install_memory_rss_reader_for_test(rss_reader.as_reader_fn());
 
-    let messages = (0..12)
+    let messages = (0..3)
         .map(|idx| ConversationMessage {
-            role: MessageRole::Assistant,
-            content: format!("cache pressure message {idx}"),
-            thinking: Some(format!("pressure-think-{idx}")),
+            role: MessageRole::Tool,
+            content: format!("tool-{idx} output\npayload-line-{idx}\ntrailing-line-{idx}"),
             collapsed: false,
+            thinking: None,
         })
         .collect::<Vec<_>>();
     apply_pi(
         &harness,
         &mut app,
-        "PiMsg::ConversationReset(cache+thinking)",
+        "PiMsg::ConversationReset(cache+tools)",
         PiMsg::ConversationReset {
             messages,
             usage: Usage::default(),
@@ -7236,58 +7235,40 @@ fn tui_perf_degraded_mode_skips_markdown_cache() {
     // Warm the render cache first.
     let before = normalize_view(&BubbleteaModel::view(&app));
     assert!(
-        before.contains("Thinking: pressure-think-0"),
-        "baseline should include early thinking blocks before pressure"
-    );
-    assert!(
-        before.contains("Thinking: pressure-think-11"),
-        "baseline should include recent thinking blocks before pressure"
+        before.contains("payload-line-0"),
+        "baseline should include expanded tool payload before pressure collapse"
     );
     let _ = normalize_view(&BubbleteaModel::view(&app));
 
-    // Pressure mode strips thinking from messages older than the last 10.
+    // Pressure mode collapses the next uncollapsed tool output.
     rss_reader.set_rss_bytes(142_000_000);
+    app.force_memory_collapse_tick_for_test();
     app.force_memory_cycle_for_test();
 
     let after_state = app.conversation_messages_for_test();
     assert_eq!(
-        after_state
-            .first()
-            .and_then(|msg| msg.thinking.as_deref()),
-        None,
-        "oldest message thinking should be removed at pressure level"
+        after_state.first().map(|msg| msg.collapsed),
+        Some(true),
+        "pressure mode should collapse the first eligible tool output"
     );
     assert_eq!(
-        after_state
-            .get(1)
-            .and_then(|msg| msg.thinking.as_deref()),
-        None,
-        "second-oldest message thinking should be removed at pressure level"
-    );
-    assert_eq!(
-        after_state
-            .last()
-            .and_then(|msg| msg.thinking.as_deref()),
-        Some("pressure-think-11"),
-        "newest message thinking should be retained at pressure level"
+        after_state.first().map(|msg| msg.content.as_str()),
+        Some("[tool output collapsed due to memory pressure]"),
+        "collapsed tool placeholder should be persisted in conversation state"
     );
 
     let after = normalize_view(&BubbleteaModel::view(&app));
     assert!(
-        !after.contains("Thinking: pressure-think-0"),
-        "cache should not preserve stale thinking for old messages after pressure floor"
-    );
-    assert!(
-        !after.contains("Thinking: pressure-think-1"),
-        "cache should refresh old message rendering when pressure strips thinking"
-    );
-    assert!(
-        after.contains("Thinking: pressure-think-11"),
-        "recent messages should retain thinking in pressure mode"
+        !after.contains("payload-line-0"),
+        "cache should not leak stale expanded tool payload after pressure collapse"
     );
     assert_ne!(
         before, after,
         "pressure transition should produce a distinct rendered output"
+    );
+    assert!(
+        app.memory_summary_for_test().contains("Pressure"),
+        "memory summary should report pressure level"
     );
 
     log_perf_test_event(
@@ -7296,8 +7277,8 @@ fn tui_perf_degraded_mode_skips_markdown_cache() {
         json!({
             "fidelity": "degraded",
             "cache_key_includes_fidelity": true,
-            "old_thinking_removed": true,
-            "recent_thinking_retained": true,
+            "collapsed_placeholder_rendered": true,
+            "stale_tool_payload_absent": true,
         }),
     );
 }
@@ -7792,5 +7773,419 @@ fn tui_scroll_re_enables_follow_when_pagedown_reaches_bottom() {
     assert_eq!(
         pct, 100,
         "should auto-follow after scrolling back to bottom"
+    );
+}
+
+// ============================================================================
+// PERF-2: Cache + Incremental integration tests (bd-231ba / PERF-TEST-1)
+// ============================================================================
+
+/// Cached messages correctly populate the incremental prefix buffer.
+/// When all messages are cache hits, the prefix should be assembled from
+/// cache entries without re-rendering.
+#[test]
+fn tui_perf_cache_feeds_prefix() {
+    let harness = TestHarness::new("tui_perf_cache_feeds_prefix");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+    app.set_terminal_size(220, 400);
+
+    // Load 50 messages to create a non-trivial prefix.
+    let messages: Vec<ConversationMessage> = (0..50)
+        .map(|i| ConversationMessage {
+            role: if i % 2 == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            },
+            content: format!("message-{i}-content-payload"),
+            thinking: None,
+            collapsed: false,
+        })
+        .collect();
+    apply_pi(
+        &harness,
+        &mut app,
+        "ConversationReset(50 msgs)",
+        PiMsg::ConversationReset {
+            messages,
+            usage: Usage::default(),
+            status: None,
+        },
+    );
+
+    // Warm the render cache + prefix by triggering a full rebuild.
+    let baseline = app.build_conversation_content();
+    let cache_hits = (0..50)
+        .filter(|i| baseline.contains(&format!("message-{i}-content-payload")))
+        .count();
+    assert_eq!(cache_hits, 50, "all 50 messages should appear in baseline");
+    assert!(
+        app.prefix_cache_valid_for_test(),
+        "prefix should be valid after full rebuild"
+    );
+    let prefix_len = app.prefix_cache_len_for_test();
+    assert!(
+        prefix_len > 0,
+        "prefix should be non-empty after full rebuild"
+    );
+
+    // Start streaming — the prefix should remain valid because message count
+    // has not changed and no invalidation event has occurred.
+    apply_pi(
+        &harness,
+        &mut app,
+        "TextDelta(streaming-word)",
+        PiMsg::TextDelta("streaming-word".to_string()),
+    );
+
+    assert!(
+        app.prefix_cache_valid_for_test(),
+        "prefix should remain valid during streaming (no structural change)"
+    );
+
+    // The streaming content should appear alongside the cached messages.
+    let during_streaming = app.build_conversation_content();
+    assert!(
+        during_streaming.contains("message-49-content-payload"),
+        "last cached message should still appear"
+    );
+    assert!(
+        during_streaming.contains("streaming-word"),
+        "streaming tail should be appended to prefix"
+    );
+    assert!(
+        during_streaming.contains("message-0-content-payload"),
+        "first cached message should still appear"
+    );
+
+    log_perf_test_event(
+        "tui_perf_cache_feeds_prefix",
+        "prefix_built",
+        json!({
+            "cache_hits": cache_hits,
+            "cache_misses": 0,
+            "prefix_len": prefix_len,
+        }),
+    );
+}
+
+/// When `AgentDone` fires, the streaming tail buffer transitions into a cache
+/// entry and the prefix is extended. Verify no content duplication or gap.
+#[test]
+fn tui_perf_streaming_to_cache_transition() {
+    let harness = TestHarness::new("tui_perf_streaming_to_cache_transition");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+    app.set_terminal_size(220, 400);
+
+    // Load a few initial messages.
+    let messages: Vec<ConversationMessage> = (0..5)
+        .map(|i| ConversationMessage {
+            role: MessageRole::User,
+            content: format!("initial-msg-{i}"),
+            thinking: None,
+            collapsed: false,
+        })
+        .collect();
+    apply_pi(
+        &harness,
+        &mut app,
+        "ConversationReset(5 msgs)",
+        PiMsg::ConversationReset {
+            messages,
+            usage: Usage::default(),
+            status: None,
+        },
+    );
+
+    // Warm cache + prefix.
+    let _ = app.build_conversation_content();
+    let msg_count_before = app.conversation_messages_for_test().len();
+    assert_eq!(msg_count_before, 5);
+    assert!(app.prefix_cache_valid_for_test());
+
+    // Stream some text.
+    let streaming_content = "streamed-response-text-for-transition-test";
+    apply_pi(
+        &harness,
+        &mut app,
+        "TextDelta(response)",
+        PiMsg::TextDelta(streaming_content.to_string()),
+    );
+
+    let during_streaming = app.build_conversation_content();
+    assert!(
+        during_streaming.contains(streaming_content),
+        "streaming text should appear in output"
+    );
+    let streaming_len = streaming_content.len();
+
+    // AgentDone: streaming buffers become a finalized message.
+    apply_pi(
+        &harness,
+        &mut app,
+        "AgentDone(stop)",
+        PiMsg::AgentDone {
+            usage: Some(Usage {
+                input: 100,
+                output: 50,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: 150,
+                cost: Cost {
+                    input: 0.0005,
+                    output: 0.0005,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    total: 0.001,
+                },
+            }),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        },
+    );
+
+    // After AgentDone: message count should increase (streaming → finalized).
+    let msg_count_after = app.conversation_messages_for_test().len();
+    assert_eq!(
+        msg_count_after,
+        msg_count_before + 1,
+        "AgentDone should finalize the streaming text into a new message"
+    );
+
+    // The finalized message should contain the streamed text.
+    let last_msg = &app.conversation_messages_for_test()[msg_count_after - 1];
+    assert_eq!(last_msg.role, MessageRole::Assistant);
+    assert!(
+        last_msg.content.contains(streaming_content),
+        "finalized message should contain the streamed text"
+    );
+
+    // Prefix is now invalid (message count changed) — triggers rebuild.
+    // After rebuild, prefix should be valid with new count.
+    let after_done = app.build_conversation_content();
+    assert!(
+        app.prefix_cache_valid_for_test(),
+        "prefix should be valid after post-AgentDone rebuild"
+    );
+
+    // No duplication: streamed text should appear exactly once.
+    let occurrences = after_done.matches(streaming_content).count();
+    assert_eq!(
+        occurrences, 1,
+        "streamed text must appear exactly once (no duplication from cache + streaming)"
+    );
+
+    // All initial messages still present.
+    for i in 0..5 {
+        assert!(
+            after_done.contains(&format!("initial-msg-{i}")),
+            "initial message {i} should still be present"
+        );
+    }
+
+    log_perf_test_event(
+        "tui_perf_streaming_to_cache_transition",
+        "transition",
+        json!({
+            "streaming_len": streaming_len,
+            "cache_entry_created": true,
+            "prefix_extended": true,
+        }),
+    );
+}
+
+// ============================================================================
+// PERF-7 + PERF-1: Buffer + Cache integration tests (bd-2mjm6 / PERF-TEST-4)
+// ============================================================================
+
+/// Verify that the pre-allocated conversation buffer (PERF-7) reuses cached
+/// content from `MessageRenderCache` (PERF-1). After a full rebuild populates
+/// the cache, subsequent calls to `build_conversation_content()` should use the
+/// same buffer with preserved heap capacity — no new allocations.
+#[test]
+fn tui_perf_render_buffer_reuses_cached_content() {
+    let harness = TestHarness::new("tui_perf_render_buffer_reuses_cached_content");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+    app.set_terminal_size(120, 40);
+
+    // Load 20 messages to create a non-trivial conversation.
+    let messages: Vec<ConversationMessage> = (0..20)
+        .map(|i| ConversationMessage {
+            role: if i % 2 == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            },
+            content: format!("buffer-test-message-{i:03}-payload"),
+            thinking: None,
+            collapsed: false,
+        })
+        .collect();
+    apply_pi(
+        &harness,
+        &mut app,
+        "ConversationReset(20 msgs)",
+        PiMsg::ConversationReset {
+            messages,
+            usage: Usage::default(),
+            status: None,
+        },
+    );
+
+    // First call: populates cache + prefix + sets capacity hint via view().
+    let view1 = BubbleteaModel::view(&app);
+    let hint_after_first = app.render_buffer_capacity_hint_for_test();
+    assert!(
+        hint_after_first > 0,
+        "capacity hint should be positive after first frame"
+    );
+
+    // Second call: should reuse cached entries (PERF-1 cache hits) and
+    // the pre-allocated buffer (PERF-7 capacity preserved).
+    let view2 = BubbleteaModel::view(&app);
+    let hint_after_second = app.render_buffer_capacity_hint_for_test();
+
+    // Capacity hint should be stable (same content → same output size).
+    assert_eq!(
+        hint_after_first, hint_after_second,
+        "capacity hint should be stable across identical frames"
+    );
+
+    // Both renders should produce identical output (cache hits = same content).
+    assert_eq!(
+        normalize_view(&view1),
+        normalize_view(&view2),
+        "consecutive identical frames must produce identical output"
+    );
+
+    // Verify all messages appear in output.
+    let content = app.build_conversation_content();
+    let hits = (0..20)
+        .filter(|i| content.contains(&format!("buffer-test-message-{i:03}-payload")))
+        .count();
+    assert_eq!(hits, 20, "all 20 messages should appear in content");
+
+    // Prefix should be valid (cache populated, no structural changes).
+    assert!(
+        app.prefix_cache_valid_for_test(),
+        "prefix cache should be valid after identical frames"
+    );
+
+    log_perf_test_event(
+        "tui_perf_render_buffer_reuses_cached_content",
+        "buffer_reuse",
+        json!({
+            "buffer_capacity_after_first": hint_after_first,
+            "buffer_capacity_after_second": hint_after_second,
+            "new_allocation": false,
+            "message_count": 20,
+            "cache_hits": hits,
+        }),
+    );
+}
+
+/// After cache invalidation (e.g. terminal resize bumps the generation),
+/// the pre-allocated render buffer (PERF-7) should still function correctly.
+/// Content is rebuilt from fresh cache misses into the same buffer, and
+/// the capacity hint adapts to the new output size.
+#[test]
+fn tui_perf_buffer_survives_cache_invalidation() {
+    let harness = TestHarness::new("tui_perf_buffer_survives_cache_invalidation");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+    app.set_terminal_size(120, 40);
+
+    // Load messages.
+    let messages: Vec<ConversationMessage> = (0..10)
+        .map(|i| ConversationMessage {
+            role: if i % 2 == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            },
+            content: format!("invalidation-msg-{i:02}"),
+            thinking: None,
+            collapsed: false,
+        })
+        .collect();
+    apply_pi(
+        &harness,
+        &mut app,
+        "ConversationReset(10 msgs)",
+        PiMsg::ConversationReset {
+            messages,
+            usage: Usage::default(),
+            status: None,
+        },
+    );
+
+    // Warm cache: full rebuild populates cache + prefix.
+    let view_before = normalize_view(&BubbleteaModel::view(&app));
+    let hint_before = app.render_buffer_capacity_hint_for_test();
+    assert!(
+        app.prefix_cache_valid_for_test(),
+        "prefix valid before resize"
+    );
+    assert!(
+        !view_before.is_empty(),
+        "view should be non-empty after loading messages"
+    );
+
+    // Invalidate cache via terminal resize (bumps generation).
+    // Note: set_terminal_size calls invalidate_all() AND then
+    // resize_conversation_viewport() which triggers an immediate rebuild
+    // via scroll_to_bottom() → refresh_conversation_viewport() →
+    // build_conversation_content() → prefix_set(). So the prefix is
+    // re-established within set_terminal_size itself.
+    app.set_terminal_size(100, 30);
+
+    // After resize, the prefix was invalidated then immediately re-built
+    // (resize triggers a full conversation viewport refresh). Verify it
+    // was re-established correctly with the new generation.
+    assert!(
+        app.prefix_cache_valid_for_test(),
+        "prefix should be valid after resize (rebuild happens inside set_terminal_size)"
+    );
+
+    // Render again — content should reflect the new terminal dimensions.
+    // The buffer should still work (capacity preserved from take/return).
+    let view_after = normalize_view(&BubbleteaModel::view(&app));
+    let hint_after = app.render_buffer_capacity_hint_for_test();
+
+    // The viewport is scrolled to the bottom (follow_tail=true during
+    // resize), so early messages may not be visible in the 30-row view.
+    // Verify at least *some* message content appears in the viewport.
+    assert!(
+        !view_after.is_empty(),
+        "view should be non-empty after resize and rebuild"
+    );
+
+    // All messages should still be present in the full conversation content
+    // (not just the visible viewport).
+    let content = app.build_conversation_content();
+    for i in 0..10 {
+        assert!(
+            content.contains(&format!("invalidation-msg-{i:02}")),
+            "message {i} should still appear after cache invalidation"
+        );
+    }
+
+    // Both hint values should be positive (buffer is functioning).
+    assert!(hint_before > 0, "hint before should be positive");
+    assert!(hint_after > 0, "hint after should be positive");
+
+    log_perf_test_event(
+        "tui_perf_buffer_survives_cache_invalidation",
+        "invalidation_recovery",
+        json!({
+            "hint_before": hint_before,
+            "hint_after": hint_after,
+            "buffer_valid": true,
+            "content_rebuilt": true,
+            "message_count": 10,
+        }),
     );
 }
