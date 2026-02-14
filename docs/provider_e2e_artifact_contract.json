@@ -246,6 +246,9 @@
       "id": "GAP-1",
       "title": "CI correlation ID not propagated to JSONL records",
       "severity": "low",
+      "status": "resolved",
+      "resolved_by": "bd-2w6ts",
+      "resolution": "Added ci_correlation_id as optional field in pi.test.log.v2 schema. TestLogger reads CI_CORRELATION_ID env var and injects into every JSONL record. Validation in tests/common/logging.rs.",
       "description": "CI_CORRELATION_ID is accepted by run_all.sh but not injected into TestLogger trace context. Cross-run correlation requires manual matching.",
       "recommendation": "Add optional ci_correlation_id field to pi.test.log.v2 context"
     },
@@ -253,6 +256,9 @@
       "id": "GAP-2",
       "title": "No per-provider artifact redaction scan",
       "severity": "medium",
+      "status": "resolved",
+      "resolved_by": "bd-2vlau",
+      "resolution": "Created tests/vcr_redaction_scan.rs scanning all 279 VCR cassettes for unredacted secrets across anthropic, openai, azure, gemini providers. Fixed 7 violations found during initial scan.",
       "description": "Redaction functions exist and are unit-tested, but no test scans actual provider e2e output artifacts for unredacted secrets.",
       "recommendation": "Add test that runs find_unredacted_keys() on provider test JSONL fixtures"
     },
@@ -260,6 +266,9 @@
       "id": "GAP-3",
       "title": "Artifact-index path existence not cross-validated",
       "severity": "low",
+      "status": "resolved",
+      "resolved_by": "bd-z5vt4",
+      "resolution": "Added validate_artifact_index_paths() in tests/common/logging.rs and 5 integration tests in validate_e2e_artifact_schema.rs covering path existence checks, relative paths, and missing path detection.",
       "description": "artifact-index.jsonl records paths but nothing validates those paths actually exist in the artifact directory.",
       "recommendation": "Add optional cross-reference check in evidence contract validation"
     },
@@ -277,6 +286,9 @@
       "id": "GAP-5",
       "title": "V1 schema deprecation not enforced",
       "severity": "low",
+      "status": "resolved",
+      "resolved_by": "bd-38m8w",
+      "resolution": "Added validate_jsonl_line_v2_only() and validate_jsonl_v2_only() in tests/common/logging.rs that reject pi.test.log.v1 records. 5 unit tests and 6 integration tests enforce v2-only for new test code.",
       "description": "pi.test.log.v1 is accepted by validator but all new tests should use v2. No enforcement prevents v1 usage in new tests.",
       "recommendation": "Add lint or CI check that new test files emit v2 only"
     }

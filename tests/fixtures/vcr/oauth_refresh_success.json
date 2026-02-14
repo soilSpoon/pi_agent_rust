@@ -23,7 +23,7 @@
           ["content-type", "application/json"]
         ],
         "body_chunks": [
-          "{\"access_token\":\"[REDACTED]\",\"refresh_token\":\"[REDACTED]\",\"expires_in\":3600}"
+          "{\"access_token\":\"new-access-success\",\"refresh_token\":\"new-refresh-success\",\"expires_in\":3600}"
         ]
       }
     }
