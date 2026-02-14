@@ -1619,6 +1619,7 @@ impl PiApp {
         None
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_model(&mut self, args: &str) -> Option<Cmd> {
         if args.trim().is_empty() {
             self.status_message = Some(format!("Current model: {}", self.model));

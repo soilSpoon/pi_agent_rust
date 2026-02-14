@@ -2167,3 +2167,84 @@ fn default_export_path(input: &Path) -> PathBuf {
         .unwrap_or("session");
     PathBuf::from(format!("pi-session-{basename}.html"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_from_token_numbered_choices() {
+        // Original 3 providers by number
+        assert_eq!(provider_from_token("1").unwrap().id, "anthropic");
+        assert_eq!(provider_from_token("2").unwrap().id, "openai");
+        assert_eq!(provider_from_token("3").unwrap().id, "google");
+        // New providers by number
+        assert_eq!(provider_from_token("4").unwrap().id, "azure-openai");
+        assert_eq!(provider_from_token("5").unwrap().id, "amazon-bedrock");
+        assert_eq!(provider_from_token("6").unwrap().id, "groq");
+        assert_eq!(provider_from_token("7").unwrap().id, "openrouter");
+        assert_eq!(provider_from_token("8").unwrap().id, "mistral");
+        assert_eq!(provider_from_token("9").unwrap().id, "togetherai");
+        assert_eq!(provider_from_token("10").unwrap().id, "google-vertex");
+        // Out of range
+        assert!(provider_from_token("0").is_none());
+        assert!(provider_from_token("11").is_none());
+    }
+
+    #[test]
+    fn provider_from_token_common_nicknames() {
+        assert_eq!(provider_from_token("claude").unwrap().id, "anthropic");
+        assert_eq!(provider_from_token("gpt").unwrap().id, "openai");
+        assert_eq!(provider_from_token("chatgpt").unwrap().id, "openai");
+        assert_eq!(provider_from_token("gemini").unwrap().id, "google");
+        assert_eq!(provider_from_token("azure").unwrap().id, "azure-openai");
+        assert_eq!(provider_from_token("bedrock").unwrap().id, "amazon-bedrock");
+        assert_eq!(provider_from_token("aws").unwrap().id, "amazon-bedrock");
+        assert_eq!(provider_from_token("together").unwrap().id, "togetherai");
+        assert_eq!(provider_from_token("vertex").unwrap().id, "google-vertex");
+        assert_eq!(provider_from_token("vertexai").unwrap().id, "google-vertex");
+    }
+
+    #[test]
+    fn provider_from_token_canonical_ids() {
+        assert_eq!(provider_from_token("anthropic").unwrap().id, "anthropic");
+        assert_eq!(provider_from_token("openai").unwrap().id, "openai");
+        assert_eq!(provider_from_token("groq").unwrap().id, "groq");
+        assert_eq!(provider_from_token("openrouter").unwrap().id, "openrouter");
+        assert_eq!(provider_from_token("mistral").unwrap().id, "mistral");
+    }
+
+    #[test]
+    fn provider_from_token_case_insensitive() {
+        assert_eq!(provider_from_token("ANTHROPIC").unwrap().id, "anthropic");
+        assert_eq!(provider_from_token("Groq").unwrap().id, "groq");
+        assert_eq!(provider_from_token("OpenRouter").unwrap().id, "openrouter");
+    }
+
+    #[test]
+    fn provider_from_token_metadata_fallback() {
+        // Providers not in the top-10 list but in provider_metadata registry
+        assert_eq!(provider_from_token("deepseek").unwrap().id, "deepseek");
+        assert_eq!(provider_from_token("cerebras").unwrap().id, "cerebras");
+        assert_eq!(provider_from_token("cohere").unwrap().id, "cohere");
+        assert_eq!(provider_from_token("perplexity").unwrap().id, "perplexity");
+        // Aliases resolve through metadata
+        assert_eq!(
+            provider_from_token("open-router").unwrap().id,
+            "openrouter"
+        );
+        assert_eq!(provider_from_token("dashscope").unwrap().id, "alibaba");
+    }
+
+    #[test]
+    fn provider_from_token_whitespace_handling() {
+        assert_eq!(provider_from_token("  groq  ").unwrap().id, "groq");
+        assert_eq!(provider_from_token(" 1 ").unwrap().id, "anthropic");
+    }
+
+    #[test]
+    fn provider_from_token_unknown_returns_none() {
+        assert!(provider_from_token("nonexistent-provider-xyz").is_none());
+        assert!(provider_from_token("").is_none());
+    }
+}
