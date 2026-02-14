@@ -139,6 +139,7 @@ pub const RUNTIME_RISK_EXPLANATION_TERM_BUDGET: usize = 12;
 pub const RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS: u64 = 2;
 pub const RUNTIME_RISK_BASELINE_SCHEMA_VERSION: &str = "pi.ext.runtime_risk_baseline.v1";
 pub const SECURITY_ALERT_SCHEMA_VERSION: &str = "pi.ext.security_alert.v1";
+pub const INCIDENT_EVIDENCE_BUNDLE_SCHEMA_VERSION: &str = "pi.ext.incident_evidence_bundle.v1";
 const RUNTIME_HOSTCALL_SEQUENCE_WINDOW: usize = 64;
 const CAPABILITY_MANIFEST_SCHEMA_V1: &str = "pi.ext.cap.v1";
 const CAPABILITY_MANIFEST_SCHEMA_V2: &str = "pi.ext.cap.v2";
@@ -22152,6 +22153,7 @@ mod tests {
         let manager = ExtensionManager::new();
         manager.set_runtime_risk_config(RuntimeRiskConfig {
             enabled: true,
+            enforce: true,
             alpha: 0.01,
             window_size: 64,
             ledger_limit: 256,
