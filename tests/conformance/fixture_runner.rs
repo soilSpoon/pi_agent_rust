@@ -272,7 +272,7 @@ fn command_value(command: Option<&Commands>) -> Value {
         Some(Commands::List) => json!({
             "name": "list",
         }),
-        Some(Commands::Config) => json!({
+        Some(Commands::Config { .. }) => json!({
             "name": "config",
         }),
         Some(Commands::Search {

@@ -710,7 +710,53 @@ mod tests {
     #[test]
     fn parse_config_subcommand() {
         let cli = Cli::parse_from(["pi", "config"]);
-        assert!(matches!(cli.command, Some(Commands::Config)));
+        match cli.command {
+            Some(Commands::Config { show, paths, json }) => {
+                assert!(!show);
+                assert!(!paths);
+                assert!(!json);
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_config_show_flag() {
+        let cli = Cli::parse_from(["pi", "config", "--show"]);
+        match cli.command {
+            Some(Commands::Config { show, paths, json }) => {
+                assert!(show);
+                assert!(!paths);
+                assert!(!json);
+            }
+            other => panic!("expected Config --show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_config_paths_flag() {
+        let cli = Cli::parse_from(["pi", "config", "--paths"]);
+        match cli.command {
+            Some(Commands::Config { show, paths, json }) => {
+                assert!(!show);
+                assert!(paths);
+                assert!(!json);
+            }
+            other => panic!("expected Config --paths, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_config_json_flag() {
+        let cli = Cli::parse_from(["pi", "config", "--json"]);
+        match cli.command {
+            Some(Commands::Config { show, paths, json }) => {
+                assert!(!show);
+                assert!(!paths);
+                assert!(json);
+            }
+            other => panic!("expected Config --json, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1109,7 +1155,17 @@ pub enum Commands {
     List,
 
     /// Open configuration UI
-    Config,
+    Config {
+        /// Print configuration summary as text (non-interactive)
+        #[arg(long)]
+        show: bool,
+        /// Print path and precedence details only
+        #[arg(long)]
+        paths: bool,
+        /// Print configuration details as JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Diagnose environment health and extension compatibility
     Doctor {

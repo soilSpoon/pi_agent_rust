@@ -12,12 +12,14 @@
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::Mutex;
+use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::Parser;
 use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::app::StartupError;
@@ -25,11 +27,14 @@ use pi::auth::{AuthCredential, AuthStorage};
 use pi::cli;
 use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
+use pi::config::SettingsScope;
 use pi::extension_index::ExtensionIndexStore;
 use pi::extensions::{ALL_CAPABILITIES, Capability, PolicyDecision, extension_event_from_agent};
 use pi::model::{AssistantMessage, ContentBlock, StopReason};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
-use pi::package_manager::{PackageEntry, PackageManager, PackageScope};
+use pi::package_manager::{
+    PackageEntry, PackageManager, PackageScope, ResolvedPaths, ResolvedResource, ResourceOrigin,
+};
 use pi::provider::InputType;
 use pi::provider_metadata::{self, PROVIDER_METADATA};
 use pi::providers;
@@ -38,6 +43,8 @@ use pi::session::Session;
 use pi::session_index::SessionIndex;
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
+use serde::Serialize;
+use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -65,10 +72,6 @@ fn main_impl() -> Result<()> {
     // Ultra-fast paths that don't need tracing or the async runtime.
     if let Some(command) = &cli.command {
         match command {
-            cli::Commands::Config => {
-                handle_config(&cwd);
-                return Ok(());
-            }
             cli::Commands::List => {
                 let manager = PackageManager::new(cwd);
                 handle_package_list_blocking(&manager)?;
@@ -851,8 +854,8 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::List => {
             handle_package_list(&manager).await?;
         }
-        cli::Commands::Config => {
-            handle_config(cwd);
+        cli::Commands::Config { show, paths, json } => {
+            handle_config(&manager, cwd, show, paths, json).await?;
         }
         cli::Commands::Doctor {
             path,
