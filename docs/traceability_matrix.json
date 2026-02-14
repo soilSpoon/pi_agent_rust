@@ -863,6 +863,39 @@
           "justification": "Golden-path journey logs and artifact capture."
         }
       ]
+    },
+    {
+      "id": "bd-3bwpg",
+      "title": "SEC-TRACK: Deterministic Extension Security Program",
+      "acceptance_criteria": "Every SEC implementation bead has at least one mapped unit test target, deterministic behavior claims are backed by fixed-fixture tests, and matrix updates are required when behavior changes.",
+      "unit_tests": [
+        { "path": "tests/e2e_runtime_risk_telemetry.rs", "justification": "SEC-3.1 (bd-2a9ll): Runtime hostcall telemetry schema and feature extraction validation." },
+        { "path": "tests/baseline_modeling_evidence.rs", "justification": "SEC-3.2 (bd-153pv): Baseline modeling with Dirichlet posterior and Markov profiles." },
+        { "path": "tests/risk_scorer_golden_fixtures.rs", "justification": "SEC-3.3 (bd-3f1ab): Deterministic golden-fixture tests for scoring formula replay." },
+        { "path": "tests/enforcement_state_machine_sec34.rs", "justification": "SEC-3.4 (bd-3tb30): Enforcement state machine (allow/harden/deny/terminate) with hysteresis." },
+        { "path": "tests/ledger_calibration_sec35.rs", "justification": "SEC-3.5 (bd-3i9da): Hash-chained decision ledger and offline threshold calibration." },
+        { "path": "tests/runtime_risk_quantile_validation.rs", "justification": "SEC-3.x: Quantile validation across scoring pipeline." },
+        { "path": "tests/runtime_risk_quantile_evidence.rs", "justification": "SEC-3.x: Quantile evidence with budget enforcement." },
+        { "path": "tests/bayesian_explanation_evidence.rs", "justification": "SEC-3.x: Bayesian explanation determinism and contributor term coverage." },
+        { "path": "tests/explanation_calibration_replay.rs", "justification": "SEC-3.x: Explanation calibration replay across risk levels." },
+        { "path": "tests/accuracy_performance_sec63.rs", "justification": "SEC-6.3 (bd-cu17q): FP/FN accuracy metrics and performance evaluation." },
+        { "path": "tests/capability_policy_model.rs", "justification": "SEC-4.4 (bd-2vbax): Policy profile hardening and dangerous-capability opt-in." },
+        { "path": "tests/capability_policy_scoped.rs", "justification": "SEC-4.2 (bd-wzzp4): Capability-scoped allowlists with least-privilege defaults." },
+        { "path": "tests/capability_denial_matrix.rs", "justification": "SEC-4.x: Capability denial matrix and policy interaction validation." },
+        { "path": "tests/trust_onboarding_killswitch_sec52.rs", "justification": "SEC-5.2 (bd-ww5br): Trust onboarding wizard and emergency kill-switch workflow." },
+        { "path": "tests/incident_evidence_bundle.rs", "justification": "SEC-5.3 (bd-11mqo): Incident evidence bundle determinism, filtering, redaction." },
+        { "path": "tests/incident_evidence_bundle_sec53.rs", "justification": "SEC-5.3 (bd-11mqo): Incident evidence bundle integration with real manager state." },
+        { "path": "tests/e2e_workflow_preflight.rs", "justification": "SEC-2.x: Extension preflight validation, safe-mode, policy enforcement." }
+      ],
+      "e2e_scripts": [
+        { "path": "tests/e2e_runtime_risk_telemetry.rs", "justification": "E2E: Benign/adversarial/recovery hostcall flows with structured JSONL telemetry." },
+        { "path": "tests/e2e_high_risk_workflows.rs", "justification": "E2E: Provider errors, infinite loops, tool failures, session corruption, CLI errors." }
+      ],
+      "evidence_logs": [
+        { "path": "docs/security/threat-model.md", "justification": "Threat model defining attack surface and mitigations." },
+        { "path": "docs/security/security-slos.md", "justification": "Security SLOs and acceptable risk thresholds." },
+        { "path": "docs/security/invariants.machine.json", "justification": "Machine-readable security invariants for CI validation." }
+      ]
     }
   ]
 }
