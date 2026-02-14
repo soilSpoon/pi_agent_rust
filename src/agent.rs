@@ -4033,6 +4033,12 @@ impl AgentSession {
         let js_runtime = JsExtensionRuntimeHandle::start_with_policy(
             PiJsRuntimeConfig {
                 cwd: cwd.display().to_string(),
+                limits: crate::extensions_js::PiJsRuntimeLimits {
+                    memory_limit_bytes: Some(
+                        (resolved_policy.max_memory_mb as usize).saturating_mul(1024 * 1024),
+                    ),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             Arc::clone(&tools),
