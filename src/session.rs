@@ -330,6 +330,8 @@ pub struct Session {
     /// Base directory for session storage (optional override)
     pub session_dir: Option<PathBuf>,
     store_kind: SessionStoreKind,
+    /// Cached entry IDs for O(1) uniqueness checks when appending.
+    entry_ids: HashSet<String>,
 }
 
 /// Result of planning a `/fork` operation from a specific user message.
@@ -567,6 +569,7 @@ impl Session {
             leaf_id: None,
             session_dir: None,
             store_kind: SessionStoreKind::Jsonl,
+            entry_ids: HashSet::new(),
         }
     }
 
@@ -592,6 +595,7 @@ impl Session {
             leaf_id: None,
             session_dir,
             store_kind,
+            entry_ids: HashSet::new(),
         }
     }
 
@@ -711,6 +715,7 @@ impl Session {
                         leaf_id,
                         session_dir: None,
                         store_kind: SessionStoreKind::Jsonl,
+                        entry_ids: existing_ids,
                     },
                     diagnostics,
                 ))
@@ -730,6 +735,7 @@ impl Session {
     async fn open_sqlite(path: &Path) -> Result<Self> {
         let (header, mut entries) = crate::session_sqlite::load_session(path).await?;
         ensure_entry_ids(&mut entries);
+        let entry_ids = entry_id_set(&entries);
         let leaf_id = entries.iter().rev().find_map(|e| e.base_id().cloned());
 
         Ok(Self {
@@ -739,6 +745,7 @@ impl Session {
             leaf_id,
             session_dir: None,
             store_kind: SessionStoreKind::Sqlite,
+            entry_ids,
         })
     }
 
@@ -810,6 +817,7 @@ impl Session {
     #[allow(clippy::too_many_lines)]
     pub async fn save(&mut self) -> Result<()> {
         ensure_entry_ids(&mut self.entries);
+        self.entry_ids = entry_id_set(&self.entries);
 
         let store_kind = match self
             .path
@@ -948,6 +956,7 @@ impl Session {
         let entry = SessionEntry::Message(MessageEntry { base, message });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_ids.insert(id.clone());
         id
     }
 
@@ -966,6 +975,7 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_ids.insert(id.clone());
         id
     }
 
@@ -978,6 +988,7 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_ids.insert(id.clone());
         id
     }
 
@@ -987,6 +998,7 @@ impl Session {
         let entry = SessionEntry::SessionInfo(SessionInfoEntry { base, name });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_ids.insert(id.clone());
         id
     }
 
@@ -1005,6 +1017,7 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_ids.insert(id.clone());
         id
     }
 
@@ -1034,6 +1047,7 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_ids.insert(id.clone());
         id
     }
 
@@ -1073,6 +1087,7 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_ids.insert(id.clone());
         id
     }
 
@@ -1094,11 +1109,13 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_ids.insert(id.clone());
         id
     }
 
     pub fn ensure_entry_ids(&mut self) {
         ensure_entry_ids(&mut self.entries);
+        self.entry_ids = entry_id_set(&self.entries);
     }
 
     /// Convert session entries to model messages (for provider context).
@@ -1274,14 +1291,13 @@ impl Session {
     fn next_entry_id(&self) -> String {
         for _ in 0..100 {
             let candidate = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-            if !entry_id_exists(&self.entries, &candidate) {
+            if !self.entry_ids.contains(&candidate) {
                 return candidate;
             }
         }
 
         // Extremely unlikely fallback: recover by rebuilding the set and retrying.
-        let existing = entry_id_set(&self.entries);
-        generate_entry_id(&existing)
+        generate_entry_id(&self.entry_ids)
     }
 
     // ========================================================================
@@ -1687,6 +1703,7 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_ids.insert(id.clone());
         Some(id)
     }
 }
@@ -2503,12 +2520,6 @@ fn entry_id_set(entries: &[SessionEntry]) -> HashSet<String> {
         .collect()
 }
 
-fn entry_id_exists(entries: &[SessionEntry], candidate: &str) -> bool {
-    entries
-        .iter()
-        .any(|entry| entry.base_id().is_some_and(|id| id == candidate))
-}
-
 fn ensure_entry_ids(entries: &mut [SessionEntry]) {
     let mut existing = entry_id_set(entries);
     for entry in entries.iter_mut() {
@@ -3139,6 +3150,7 @@ mod tests {
         });
         session.leaf_id = Some(id);
         session.entries.push(entry);
+        session.entry_ids = entry_id_set(&session.entries);
 
         // The excluded bash execution should not appear in model messages
         let messages = session.to_messages();
