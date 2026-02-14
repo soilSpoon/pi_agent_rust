@@ -274,6 +274,36 @@ impl PiApp {
         Ok(new_text)
     }
 
+    /// Navigate to previous history entry.
+    fn navigate_history_back(&mut self) {
+        if !self.history.has_entries() {
+            return;
+        }
+
+        self.history.cursor_up();
+        self.apply_history_selection();
+    }
+
+    /// Navigate to next history entry.
+    fn navigate_history_forward(&mut self) {
+        // Avoid clearing the editor when the user hasn't entered history navigation.
+        if self.history.cursor_is_empty() {
+            return;
+        }
+
+        self.history.cursor_down();
+        self.apply_history_selection();
+    }
+
+    fn apply_history_selection(&mut self) {
+        let selected = self.history.selected_value();
+        if selected.is_empty() {
+            self.input.reset();
+        } else {
+            self.input.set_value(selected);
+        }
+    }
+
     fn handle_double_escape_action(&mut self) -> (bool, Option<Cmd>) {
         let now = std::time::Instant::now();
         if let Some(last_time) = self.last_escape_time {

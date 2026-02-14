@@ -65,6 +65,195 @@ impl PiApp {
             .map_or_else(|| fallback.to_string(), std::string::ToString::to_string)
     }
 
+    /// Render the view.
+    #[allow(clippy::too_many_lines)]
+    fn view(&self) -> String {
+        let view_start = if self.frame_timing.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        let mut output = String::new();
+
+        // Header
+        output.push_str(&self.render_header());
+        output.push('\n');
+
+        // Modal overlays (e.g. /tree) take over the main view.
+        if let Some(tree_ui) = &self.tree_ui {
+            output.push_str(&view_tree_ui(tree_ui, &self.styles));
+            output.push_str(&self.render_footer());
+            return output;
+        }
+
+        // Build conversation content for viewport.
+        // Trim trailing whitespace so the viewport line count matches
+        // what refresh_conversation_viewport() stored — this keeps the
+        // y_offset from goto_bottom() aligned with the visible lines.
+        let conversation_content = {
+            let content_start = if self.frame_timing.enabled {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let raw = self.build_conversation_content();
+            if let Some(start) = content_start {
+                self.frame_timing
+                    .record_content_build(micros_as_u64(start.elapsed().as_micros()));
+            }
+            raw.trim_end().to_string()
+        };
+
+        // Update viewport content (we can't mutate self in view, so we render with current offset)
+        // The viewport will be updated in update() when new messages arrive
+        let viewport_content = if conversation_content.is_empty() {
+            if self.config.quiet_startup.unwrap_or(false) {
+                String::new()
+            } else {
+                self.styles
+                    .muted_italic
+                    .render("  Welcome to Pi! Type a message to begin, or /help for commands.")
+            }
+        } else {
+            conversation_content
+        };
+
+        // Render conversation area (scrollable).
+        // Use the per-frame effective height so that conditional chrome
+        // (scroll indicator, tool status, status message, …) is accounted
+        // for and the total output never exceeds term_height rows.
+        let effective_vp = self.view_effective_conversation_height();
+        let conversation_lines: Vec<&str> = viewport_content.lines().collect();
+        let start = self
+            .conversation_viewport
+            .y_offset()
+            .min(conversation_lines.len().saturating_sub(1));
+        let end = (start + effective_vp).min(conversation_lines.len());
+        let visible_lines = conversation_lines.get(start..end).unwrap_or(&[]);
+        output.push_str(&visible_lines.join("\n"));
+        output.push('\n');
+
+        // Scroll indicator
+        if conversation_lines.len() > effective_vp {
+            let total = conversation_lines.len().saturating_sub(effective_vp);
+            let percent = (start * 100).checked_div(total).map_or(100, |p| p.min(100));
+            let indicator = format!("  [{percent}%] ↑/↓ PgUp/PgDn to scroll");
+            output.push_str(&self.styles.muted.render(&indicator));
+            output.push('\n');
+        }
+
+        // Tool status
+        if let Some(tool) = &self.current_tool {
+            let progress_str = self.tool_progress.as_ref().map_or_else(String::new, |p| {
+                let secs = p.elapsed_ms / 1000;
+                if secs < 1 {
+                    return String::new();
+                }
+                let mut parts = vec![format!("{secs}s")];
+                if p.line_count > 0 {
+                    parts.push(format!("{} lines", format_count(p.line_count)));
+                } else if p.byte_count > 0 {
+                    parts.push(format!("{} bytes", format_count(p.byte_count)));
+                }
+                if let Some(timeout_ms) = p.timeout_ms {
+                    let timeout_s = timeout_ms / 1000;
+                    if timeout_s > 0 {
+                        parts.push(format!("timeout {timeout_s}s"));
+                    }
+                }
+                format!(" ({})", parts.join(" \u{2022} "))
+            });
+            let _ = write!(
+                output,
+                "\n  {} {}{} ...\n",
+                self.spinner.view(),
+                self.styles.warning_bold.render(&format!("Running {tool}")),
+                self.styles.muted.render(&progress_str),
+            );
+        }
+
+        // Status message (slash command feedback)
+        if let Some(status) = &self.status_message {
+            let status_style = self.styles.accent.clone().italic();
+            let _ = write!(output, "\n  {}\n", status_style.render(status));
+        }
+
+        // Session picker overlay (if open)
+        if let Some(ref picker) = self.session_picker {
+            output.push_str(&self.render_session_picker(picker));
+        }
+
+        // Settings overlay (if open)
+        if let Some(ref settings_ui) = self.settings_ui {
+            output.push_str(&self.render_settings_ui(settings_ui));
+        }
+
+        // Theme picker overlay (if open)
+        if let Some(ref picker) = self.theme_picker {
+            output.push_str(&self.render_theme_picker(picker));
+        }
+
+        // Capability prompt overlay (if open)
+        if let Some(ref prompt) = self.capability_prompt {
+            output.push_str(&self.render_capability_prompt(prompt));
+        }
+
+        // Branch picker overlay (if open)
+        if let Some(ref picker) = self.branch_picker {
+            output.push_str(&self.render_branch_picker(picker));
+        }
+
+        // Model selector overlay (if open)
+        if let Some(ref selector) = self.model_selector {
+            output.push_str(&self.render_model_selector(selector));
+        }
+
+        // Input area (only when idle and no overlay open)
+        if self.agent_state == AgentState::Idle
+            && self.session_picker.is_none()
+            && self.settings_ui.is_none()
+            && self.theme_picker.is_none()
+            && self.capability_prompt.is_none()
+            && self.branch_picker.is_none()
+            && self.model_selector.is_none()
+        {
+            output.push_str(&self.render_input());
+
+            // Autocomplete dropdown (if open)
+            if self.autocomplete.open && !self.autocomplete.items.is_empty() {
+                output.push_str(&self.render_autocomplete_dropdown());
+            }
+        } else if self.agent_state != AgentState::Idle {
+            // Show spinner when processing
+            let _ = write!(
+                output,
+                "\n  {} {}\n",
+                self.spinner.view(),
+                self.styles.accent.render("Processing...")
+            );
+
+            if let Some(pending_queue) = self.render_pending_message_queue() {
+                output.push_str(&pending_queue);
+            }
+        }
+
+        // Footer with usage stats
+        output.push_str(&self.render_footer());
+
+        // Clamp the output to `term_height` rows so the terminal never
+        // scrolls in the alternate-screen buffer.
+        let output = clamp_to_terminal_height(output, self.term_height);
+        let output = normalize_raw_terminal_newlines(output);
+
+        if let Some(start) = view_start {
+            self.frame_timing
+                .record_frame(micros_as_u64(start.elapsed().as_micros()));
+        }
+
+        output
+    }
+
     pub(super) fn render_header(&self) -> String {
         let model_label = format!("({})", self.model);
 
@@ -261,7 +450,7 @@ impl PiApp {
 
     /// Build the conversation content string for the viewport.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn build_conversation_content(&self) -> String {
+    pub fn build_conversation_content(&self) -> String {
         let mut output = String::new();
 
         for msg in &self.messages {

@@ -1,4 +1,4 @@
-use std::fmt::Write as _;
+use super::*;
 
 use crate::models::ModelEntry;
 
@@ -346,6 +346,191 @@ pub(super) fn format_login_provider_listing(
 
     output.push_str("\nUsage: /login <provider>");
     output
+}
+
+impl PiApp {
+    pub(super) fn submit_oauth_code(
+        &mut self,
+        code_input: &str,
+        pending: PendingOAuth,
+    ) -> Option<Cmd> {
+        // Do not store OAuth codes in history or session.
+        self.input.reset();
+        self.input_mode = InputMode::SingleLine;
+        self.set_input_height(3);
+
+        self.agent_state = AgentState::Processing;
+        self.scroll_to_bottom();
+
+        let event_tx = self.event_tx.clone();
+        let PendingOAuth {
+            provider,
+            kind,
+            verifier,
+            oauth_config,
+        } = pending;
+        let code_input = code_input.to_string();
+
+        let runtime_handle = self.runtime_handle.clone();
+        runtime_handle.spawn(async move {
+            let auth_path = crate::config::Config::auth_path();
+            let mut auth = match crate::auth::AuthStorage::load_async(auth_path).await {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
+                    return;
+                }
+            };
+
+            let credential = match kind {
+                PendingLoginKind::ApiKey => normalize_api_key_input(&code_input)
+                    .map(|key| crate::auth::AuthCredential::ApiKey { key })
+                    .map_err(crate::error::Error::auth),
+                PendingLoginKind::OAuth => {
+                    if provider == "anthropic" {
+                        Box::pin(crate::auth::complete_anthropic_oauth(
+                            &code_input,
+                            &verifier,
+                        ))
+                        .await
+                    } else if let Some(config) = &oauth_config {
+                        Box::pin(crate::auth::complete_extension_oauth(
+                            config,
+                            &code_input,
+                            &verifier,
+                        ))
+                        .await
+                    } else {
+                        Err(crate::error::Error::auth(format!(
+                            "OAuth provider not supported: {provider}"
+                        )))
+                    }
+                }
+            };
+
+            let credential = match credential {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
+                    return;
+                }
+            };
+
+            save_provider_credential(&mut auth, &provider, credential);
+            if let Err(e) = auth.save_async().await {
+                let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
+                return;
+            }
+
+            let status = match kind {
+                PendingLoginKind::ApiKey => {
+                    format!("API key saved for {provider}. Credentials saved to auth.json.")
+                }
+                PendingLoginKind::OAuth => {
+                    format!(
+                        "OAuth login successful for {provider}. Credentials saved to auth.json."
+                    )
+                }
+            };
+            let _ = event_tx.try_send(PiMsg::System(status));
+        });
+
+        None
+    }
+
+    pub(super) fn submit_bash_command(
+        &mut self,
+        raw_message: &str,
+        command: String,
+        exclude_from_context: bool,
+    ) -> Option<Cmd> {
+        if self.bash_running {
+            self.status_message = Some("A bash command is already running.".to_string());
+            return None;
+        }
+
+        self.bash_running = true;
+        self.agent_state = AgentState::ToolRunning;
+        self.current_tool = Some("bash".to_string());
+        self.history.push(raw_message.to_string());
+
+        self.input.reset();
+        self.input_mode = InputMode::SingleLine;
+        self.set_input_height(3);
+
+        let event_tx = self.event_tx.clone();
+        let session = Arc::clone(&self.session);
+        let save_enabled = self.save_enabled;
+        let cwd = self.cwd.clone();
+        let shell_path = self.config.shell_path.clone();
+        let command_prefix = self.config.shell_command_prefix.clone();
+        let runtime_handle = self.runtime_handle.clone();
+
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let result = crate::tools::run_bash_command(
+                &cwd,
+                shell_path.as_deref(),
+                command_prefix.as_deref(),
+                &command,
+                None,
+                None,
+            )
+            .await;
+
+            match result {
+                Ok(result) => {
+                    let display =
+                        bash_execution_to_text(&command, &result.output, 0, false, false, None);
+
+                    if exclude_from_context {
+                        let mut extra = HashMap::new();
+                        extra.insert("excludeFromContext".to_string(), Value::Bool(true));
+
+                        let bash_message = SessionMessage::BashExecution {
+                            command: command.clone(),
+                            output: result.output.clone(),
+                            exit_code: result.exit_code,
+                            cancelled: Some(result.cancelled),
+                            truncated: Some(result.truncated),
+                            full_output_path: result.full_output_path.clone(),
+                            timestamp: Some(Utc::now().timestamp_millis()),
+                            extra,
+                        };
+
+                        if let Ok(mut session_guard) = session.lock(&cx).await {
+                            session_guard.append_message(bash_message);
+                            if save_enabled {
+                                let _ = session_guard.save().await;
+                            }
+                        }
+
+                        let mut display = display;
+                        display.push_str("\n\n[Output excluded from model context]");
+                        let _ = event_tx.try_send(PiMsg::BashResult {
+                            display,
+                            content_for_agent: None,
+                        });
+                    } else {
+                        let content_for_agent =
+                            vec![ContentBlock::Text(TextContent::new(display.clone()))];
+                        let _ = event_tx.try_send(PiMsg::BashResult {
+                            display,
+                            content_for_agent: Some(content_for_agent),
+                        });
+                    }
+                }
+                Err(err) => {
+                    let _ = event_tx.try_send(PiMsg::BashResult {
+                        display: format!("Bash command failed: {err}"),
+                        content_for_agent: None,
+                    });
+                }
+            }
+        });
+
+        None
+    }
 }
 
 #[cfg(test)]
