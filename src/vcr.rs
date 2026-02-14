@@ -1982,4 +1982,261 @@ mod tests {
                 .contains("my__test_name.json")
         );
     }
+
+    // ========================================================================
+    // Proptest — VCR cassette parser fuzz coverage (FUZZ-P1.7)
+    // ========================================================================
+
+    mod proptest_vcr {
+        use super::*;
+        use proptest::prelude::*;
+
+        // ── Strategies ──────────────────────────────────────────────────
+
+        fn small_string() -> impl Strategy<Value = String> {
+            prop_oneof![Just(String::new()), "[a-zA-Z0-9_]{1,16}", "[ -~]{0,32}",]
+        }
+
+        fn url_string() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("https://api.example.com/v1/messages".to_string()),
+                Just(String::new()),
+                Just("not-a-url".to_string()),
+                Just("http://localhost:8080/test?q=1&b=2".to_string()),
+                "https?://[a-z.]{1,20}/[a-z/]{0,20}",
+                "[ -~]{0,64}",
+            ]
+        }
+
+        fn http_method() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("GET".to_string()),
+                Just("POST".to_string()),
+                Just("PUT".to_string()),
+                Just("DELETE".to_string()),
+                Just("get".to_string()),
+                Just("post".to_string()),
+                "[A-Z]{1,8}",
+                small_string(),
+            ]
+        }
+
+        fn header_pair() -> impl Strategy<Value = (String, String)> {
+            let key = prop_oneof![
+                Just("Content-Type".to_string()),
+                Just("Authorization".to_string()),
+                Just("x-api-key".to_string()),
+                Just("X-Custom-Header".to_string()),
+                "[a-zA-Z][a-zA-Z0-9-]{0,20}",
+            ];
+            let value = prop_oneof![
+                Just("application/json".to_string()),
+                Just("Bearer sk-test-123".to_string()),
+                small_string(),
+                // CRLF injection attempt
+                Just("value\r\nInjected: header".to_string()),
+            ];
+            (key, value)
+        }
+
+        fn json_value() -> impl Strategy<Value = Value> {
+            let leaf = prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::Bool),
+                any::<i64>().prop_map(|n| Value::Number(n.into())),
+                small_string().prop_map(Value::String),
+            ];
+            leaf.prop_recursive(3, 32, 4, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                    prop::collection::hash_map("[a-z_]{1,10}", inner, 0..4)
+                        .prop_map(|m| Value::Object(m.into_iter().collect())),
+                ]
+            })
+        }
+
+        fn recorded_request() -> impl Strategy<Value = RecordedRequest> {
+            (
+                http_method(),
+                url_string(),
+                prop::collection::vec(header_pair(), 0..4),
+                prop::option::of(json_value()),
+                prop::option::of(small_string()),
+            )
+                .prop_map(|(method, url, headers, body, body_text)| RecordedRequest {
+                    method,
+                    url,
+                    headers,
+                    body,
+                    body_text,
+                })
+        }
+
+        fn base64_chunk() -> impl Strategy<Value = String> {
+            prop_oneof![
+                // Valid base64
+                prop::collection::vec(any::<u8>(), 0..64)
+                    .prop_map(|bytes| base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                // Invalid base64
+                Just("not-valid-base64!!!".to_string()),
+                Just("====".to_string()),
+                Just(String::new()),
+                "[ -~]{0,32}",
+            ]
+        }
+
+        fn recorded_response() -> impl Strategy<Value = RecordedResponse> {
+            (
+                any::<u16>(),
+                prop::collection::vec(header_pair(), 0..4),
+                prop::collection::vec(small_string(), 0..4),
+                prop::option::of(prop::collection::vec(base64_chunk(), 0..4)),
+            )
+                .prop_map(|(status, headers, body_chunks, body_chunks_base64)| {
+                    RecordedResponse {
+                        status,
+                        headers,
+                        body_chunks,
+                        body_chunks_base64,
+                    }
+                })
+        }
+
+        // ── Property tests ──────────────────────────────────────────────
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                max_shrink_iters: 100,
+                .. ProptestConfig::default()
+            })]
+
+            /// redact_json is idempotent: redacting twice yields the same result.
+            #[test]
+            fn redact_json_is_idempotent(mut value in json_value()) {
+                let mut first = value.clone();
+                redact_json(&mut first);
+                let mut second = first.clone();
+                redact_json(&mut second);
+                assert_eq!(first, second);
+            }
+
+            /// redact_json never panics on arbitrary JSON values.
+            #[test]
+            fn redact_json_never_panics(mut value in json_value()) {
+                let _ = redact_json(&mut value);
+            }
+
+            /// request_matches is reflexive: a request matches itself.
+            #[test]
+            fn request_matches_is_reflexive(req in recorded_request()) {
+                // Redact the request body to simulate cassette state
+                // (cassettes always store redacted bodies).
+                let mut cassette_req = req.clone();
+                if let Some(body) = &mut cassette_req.body {
+                    redact_json(body);
+                }
+                assert!(request_matches(&cassette_req, &req));
+            }
+
+            /// request_matches never panics on arbitrary request pairs.
+            #[test]
+            fn request_matches_never_panics(
+                a in recorded_request(),
+                b in recorded_request()
+            ) {
+                let _ = request_matches(&a, &b);
+            }
+
+            /// match_json_template never panics on arbitrary JSON value pairs.
+            #[test]
+            fn match_json_template_never_panics(
+                a in json_value(),
+                b in json_value()
+            ) {
+                let _ = match_json_template(&a, &b);
+            }
+
+            /// match_json_template is reflexive: a value matches itself.
+            #[test]
+            fn match_json_template_is_reflexive(v in json_value()) {
+                assert!(match_json_template(&v, &v));
+            }
+
+            /// into_byte_stream never panics on arbitrary responses.
+            #[test]
+            fn into_byte_stream_never_panics(resp in recorded_response()) {
+                let stream = resp.into_byte_stream();
+                run_async(async move {
+                    use futures::StreamExt;
+                    let _results: Vec<_> = stream.collect().await;
+                });
+            }
+
+            /// Cassette serde round-trip: serialize then deserialize preserves
+            /// the structure.
+            #[test]
+            fn cassette_serde_round_trip(
+                version in small_string(),
+                test_name in small_string(),
+                recorded_at in small_string(),
+                req in recorded_request(),
+                resp in recorded_response()
+            ) {
+                let cassette = Cassette {
+                    version,
+                    test_name,
+                    recorded_at,
+                    interactions: vec![Interaction {
+                        request: req,
+                        response: resp,
+                    }],
+                };
+                let json = serde_json::to_string(&cassette).expect("serialize");
+                let reparsed: Cassette = serde_json::from_str(&json).expect("deserialize");
+                assert_eq!(cassette.version, reparsed.version);
+                assert_eq!(cassette.test_name, reparsed.test_name);
+                assert_eq!(cassette.recorded_at, reparsed.recorded_at);
+                assert_eq!(cassette.interactions.len(), reparsed.interactions.len());
+            }
+
+            /// is_sensitive_key never panics on arbitrary strings.
+            #[test]
+            fn is_sensitive_key_never_panics(key in "[ -~]{0,64}") {
+                let _ = is_sensitive_key(&key);
+            }
+
+            /// base64 body_chunks_base64 takes precedence over body_chunks when
+            /// both are present.
+            #[test]
+            fn base64_takes_precedence_over_text(
+                text_chunks in prop::collection::vec(small_string(), 1..4),
+                base64_chunks in prop::collection::vec(
+                    prop::collection::vec(any::<u8>(), 0..32)
+                        .prop_map(|b| base64::engine::general_purpose::STANDARD.encode(&b)),
+                    1..4
+                )
+            ) {
+                let expected_bytes: Vec<Vec<u8>> = base64_chunks.iter().map(|c| {
+                    base64::engine::general_purpose::STANDARD.decode(c).unwrap()
+                }).collect();
+
+                let resp = RecordedResponse {
+                    status: 200,
+                    headers: vec![],
+                    body_chunks: text_chunks,
+                    body_chunks_base64: Some(base64_chunks),
+                };
+                let results: Vec<std::result::Result<Vec<u8>, std::io::Error>> =
+                    run_async(async move {
+                        use futures::StreamExt;
+                        resp.into_byte_stream().collect().await
+                    });
+                assert_eq!(results.len(), expected_bytes.len());
+                for (result, expected) in results.iter().zip(&expected_bytes) {
+                    assert_eq!(result.as_ref().unwrap(), expected);
+                }
+            }
+        }
+    }
 }
