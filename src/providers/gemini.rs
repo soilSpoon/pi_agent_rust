@@ -313,9 +313,11 @@ where
 
     #[allow(clippy::unnecessary_wraps)]
     fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
+        let has_finish_reason = candidate.finish_reason.is_some();
+
         // Handle finish reason
-        if let Some(reason) = candidate.finish_reason {
-            self.partial.stop_reason = match reason.as_str() {
+        if let Some(reason) = candidate.finish_reason.as_deref() {
+            self.partial.stop_reason = match reason {
                 "MAX_TOKENS" => StopReason::Length,
                 "SAFETY" | "RECITATION" | "OTHER" => StopReason::Error,
                 // STOP and any other reason treated as normal stop
@@ -409,7 +411,7 @@ where
         }
 
         // Emit TextEnd if we have a finish reason and the last block was text
-        if candidate.finish_reason.is_some() {
+        if has_finish_reason {
             if let Some(ContentBlock::Text(t)) = self.partial.content.last() {
                 let content_index = self.partial.content.len() - 1;
                 self.pending_events.push_back(StreamEvent::TextEnd {
