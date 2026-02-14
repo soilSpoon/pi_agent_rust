@@ -53,6 +53,8 @@ const REDACTION_KEYS: [&str; 10] = [
     "token",
 ];
 
+/// Deprecated: new tests MUST use v2. This constant exists only for backward-compat
+/// validation of existing test data. See DISC-021 / bd-38m8w.
 const TEST_LOG_SCHEMA_V1: &str = "pi.test.log.v1";
 const TEST_LOG_SCHEMA: &str = "pi.test.log.v2";
 const TEST_ARTIFACT_SCHEMA: &str = "pi.test.artifact.v1";
@@ -232,6 +234,8 @@ struct TestLogJsonRecord {
     parent_span_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     test: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_correlation_id: Option<String>,
     seq: usize,
     ts: String,
     t_ms: u64,
@@ -384,6 +388,8 @@ pub struct TestLogger {
     normalize_root: Mutex<Option<String>>,
     /// Unique trace ID for this logger instance (correlates all records).
     trace_id: String,
+    /// Optional CI correlation ID from `CI_CORRELATION_ID` env var.
+    ci_correlation_id: Option<String>,
     /// Stack of active spans (most recent last).
     active_spans: Mutex<Vec<SpanInfo>>,
     /// Monotonic counter for generating span IDs.
@@ -403,6 +409,9 @@ impl TestLogger {
     /// A unique `trace_id` is generated automatically.
     #[must_use]
     pub fn new() -> Self {
+        let ci_correlation_id = std::env::var("CI_CORRELATION_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
         Self {
             entries: Mutex::new(Vec::with_capacity(256)),
             artifacts: Mutex::new(Vec::with_capacity(16)),
@@ -412,6 +421,7 @@ impl TestLogger {
             test_name: Mutex::new(None),
             normalize_root: Mutex::new(None),
             trace_id: generate_trace_id(),
+            ci_correlation_id,
             active_spans: Mutex::new(Vec::new()),
             next_span_seq: AtomicU64::new(1),
         }
@@ -420,6 +430,9 @@ impl TestLogger {
     /// Create a logger that only captures entries at or above the given level.
     #[must_use]
     pub fn with_min_level(min_level: LogLevel) -> Self {
+        let ci_correlation_id = std::env::var("CI_CORRELATION_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
         Self {
             entries: Mutex::new(Vec::with_capacity(256)),
             artifacts: Mutex::new(Vec::with_capacity(16)),
@@ -429,6 +442,7 @@ impl TestLogger {
             test_name: Mutex::new(None),
             normalize_root: Mutex::new(None),
             trace_id: generate_trace_id(),
+            ci_correlation_id,
             active_spans: Mutex::new(Vec::new()),
             next_span_seq: AtomicU64::new(1),
         }
@@ -438,6 +452,12 @@ impl TestLogger {
     #[must_use]
     pub fn trace_id(&self) -> &str {
         &self.trace_id
+    }
+
+    /// Returns the CI correlation ID, if set via `CI_CORRELATION_ID` env var.
+    #[must_use]
+    pub fn ci_correlation_id(&self) -> Option<&str> {
+        self.ci_correlation_id.as_deref()
     }
 
     /// Configure a root path for normalization in JSONL dumps.
@@ -782,6 +802,7 @@ impl TestLogger {
                     seq,
                     test_name,
                     &self.trace_id,
+                    self.ci_correlation_id.as_deref(),
                     ctx.as_ref(),
                     self.start_wall,
                     normalized,
@@ -917,6 +938,7 @@ fn build_log_record(
     seq: usize,
     test_name: Option<&str>,
     trace_id: &str,
+    ci_correlation_id: Option<&str>,
     ctx: Option<&NormalizationContext>,
     start_wall: SystemTime,
     normalized: bool,
@@ -974,6 +996,7 @@ fn build_log_record(
         span_id,
         parent_span_id,
         test: test_name.map(ToString::to_string),
+        ci_correlation_id: ci_correlation_id.map(ToString::to_string),
         seq,
         ts,
         t_ms,
@@ -1210,6 +1233,15 @@ pub fn validate_jsonl_line(line: &str, line_number: usize) -> Result<(), JsonlVa
                 });
             }
         }
+        if let Some(ci_correlation_id) = obj.get("ci_correlation_id") {
+            if !ci_correlation_id.is_string() {
+                return Err(JsonlValidationError {
+                    line: line_number,
+                    field: "ci_correlation_id".to_string(),
+                    message: format!("expected string, got {ci_correlation_id}"),
+                });
+            }
+        }
     }
 
     Ok(())
@@ -1230,6 +1262,86 @@ pub fn validate_jsonl(content: &str) -> Vec<JsonlValidationError> {
         }
     }
     errors
+}
+
+// ============================================================================
+// Artifact-Index Path Cross-Validation (DISC-019 / GAP-3)
+// ============================================================================
+
+/// Warning emitted when an artifact-index record references a path that does
+/// not exist on disk.
+#[derive(Debug, Clone)]
+pub struct ArtifactPathWarning {
+    /// 1-based line number in the artifact-index JSONL.
+    pub line: usize,
+    /// The logical artifact name from the record.
+    pub name: String,
+    /// The path value that did not resolve.
+    pub path: String,
+}
+
+impl std::fmt::Display for ArtifactPathWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "line {}: artifact '{}' path not found: {}",
+            self.line, self.name, self.path
+        )
+    }
+}
+
+/// Cross-validate artifact-index JSONL paths against the filesystem.
+///
+/// Parses each `pi.test.artifact.v1` record and checks that the `path` field
+/// resolves to an existing file, either as an absolute path or relative to
+/// `artifact_dir`. Returns a list of warnings for paths that don't resolve.
+///
+/// Non-artifact records and unparseable lines are silently skipped (those are
+/// validated separately by [`validate_jsonl`]).
+pub fn validate_artifact_index_paths(
+    artifact_index_jsonl: &str,
+    artifact_dir: &Path,
+) -> Vec<ArtifactPathWarning> {
+    let mut warnings = Vec::new();
+    for (i, line) in artifact_index_jsonl.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let schema = obj.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+        if schema != TEST_ARTIFACT_SCHEMA {
+            continue;
+        }
+        let Some(path_str) = obj.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+
+        let path = Path::new(path_str);
+        let exists = if path.is_absolute() {
+            path.exists()
+        } else {
+            artifact_dir.join(path).exists()
+        };
+
+        if !exists {
+            warnings.push(ArtifactPathWarning {
+                line: i + 1,
+                name: name.to_string(),
+                path: path_str.to_string(),
+            });
+        }
+    }
+    warnings
 }
 
 // ============================================================================
@@ -2206,5 +2318,39 @@ mod tests {
         let ctx_entry = entries.iter().find(|e| e.message == "ctx msg").unwrap();
         assert_eq!(ctx_entry.span_id.as_deref(), Some("span-1"));
         assert!(!ctx_entry.context.is_empty());
+    }
+
+    #[test]
+    fn ci_correlation_id_absent_when_env_unset() {
+        // CI_CORRELATION_ID is not set in normal test runs.
+        let logger = TestLogger::new();
+        assert!(logger.ci_correlation_id().is_none());
+        logger.info("test", "no ci id");
+        let jsonl = logger.dump_jsonl();
+        let record: serde_json::Value =
+            serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        // Field should be absent from JSON (skip_serializing_if = None).
+        assert!(record.get("ci_correlation_id").is_none());
+    }
+
+    #[test]
+    fn ci_correlation_id_in_jsonl_passes_validation() {
+        // A v2 record with ci_correlation_id as a string should validate.
+        let record = r#"{"schema":"pi.test.log.v2","type":"log","trace_id":"abc","ci_correlation_id":"run-42","seq":1,"ts":"x","t_ms":0,"level":"info","category":"c","message":"m"}"#;
+        assert!(validate_jsonl_line(record, 1).is_ok());
+    }
+
+    #[test]
+    fn ci_correlation_id_without_value_passes_validation() {
+        // A v2 record without ci_correlation_id should also validate.
+        let record = r#"{"schema":"pi.test.log.v2","type":"log","trace_id":"abc","seq":1,"ts":"x","t_ms":0,"level":"info","category":"c","message":"m"}"#;
+        assert!(validate_jsonl_line(record, 1).is_ok());
+    }
+
+    #[test]
+    fn v2_schema_rejects_non_string_ci_correlation_id() {
+        let record = r#"{"schema":"pi.test.log.v2","type":"log","trace_id":"abc","ci_correlation_id":123,"seq":1,"ts":"x","t_ms":0,"level":"info","category":"c","message":"m"}"#;
+        let err = validate_jsonl_line(record, 1).unwrap_err();
+        assert_eq!(err.field, "ci_correlation_id");
     }
 }
