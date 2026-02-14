@@ -1138,6 +1138,47 @@ fn evidence_contract_schema_defines_failure_digest() {
 }
 
 #[test]
+fn evidence_contract_schema_defines_parity_contract_overlay() {
+    let path = repo_root().join("docs/evidence-contract-schema.json");
+    let schema = load_json(&path).expect("parse schema");
+    let overlay = &schema["definitions"]["parity_contract"];
+    assert!(
+        overlay.is_object(),
+        "Schema must define a parity_contract overlay in definitions"
+    );
+
+    assert_eq!(
+        overlay["properties"]["schema"]["const"]
+            .as_str()
+            .unwrap_or(""),
+        "pi.parity.test_logging_contract.v1",
+        "parity_contract schema const must match the documented contract version"
+    );
+
+    assert_eq!(
+        overlay["properties"]["log_record_schema"]["const"]
+            .as_str()
+            .unwrap_or(""),
+        "pi.test.log.v2",
+        "parity_contract log_record_schema must pin pi.test.log.v2"
+    );
+    assert_eq!(
+        overlay["properties"]["artifact_record_schema"]["const"]
+            .as_str()
+            .unwrap_or(""),
+        "pi.test.artifact.v1",
+        "parity_contract artifact_record_schema must pin pi.test.artifact.v1"
+    );
+    assert_eq!(
+        overlay["properties"]["failure_digest_schema"]["const"]
+            .as_str()
+            .unwrap_or(""),
+        "pi.e2e.failure_digest.v1",
+        "parity_contract failure_digest_schema must pin pi.e2e.failure_digest.v1"
+    );
+}
+
+#[test]
 fn evidence_contract_schema_suite_artifacts_match_contract() {
     // Verify that the evidence contract schema's suite_artifacts fields
     // match the per_suite_artifacts defined in the artifact contract
@@ -1277,6 +1318,24 @@ fn synthetic_evidence_contract_validates_against_schema() {
                 }
             }
         ],
+        "parity_contract": {
+            "schema": "pi.parity.test_logging_contract.v1",
+            "suite_taxonomy_ref": "tests/suite_classification.toml",
+            "log_record_schema": "pi.test.log.v2",
+            "artifact_record_schema": "pi.test.artifact.v1",
+            "failure_digest_schema": "pi.e2e.failure_digest.v1",
+            "trace_model": {
+                "correlation_id_field": "correlation_id",
+                "trace_id_field": "trace_id",
+                "span_id_field": "span_id",
+                "parent_span_id_field": "parent_span_id"
+            },
+            "triage_required_fields": [
+                "root_cause_class",
+                "first_failing_assertion",
+                "remediation_pointer.replay_command"
+            ]
+        },
         "aggregate_artifacts": {
             "summary": "artifacts/summary.json",
             "environment": "artifacts/environment.json",
@@ -1350,6 +1409,23 @@ fn synthetic_evidence_contract_validates_against_schema() {
     assert_eq!(
         digest["root_cause_class"].as_str().unwrap(),
         "assertion_failure"
+    );
+
+    // Verify optional parity contract overlay shape.
+    let contract = &synthetic["parity_contract"];
+    assert_eq!(
+        contract["schema"].as_str().unwrap(),
+        "pi.parity.test_logging_contract.v1"
+    );
+    assert_eq!(
+        contract["trace_model"]["correlation_id_field"]
+            .as_str()
+            .unwrap(),
+        "correlation_id"
+    );
+    assert_eq!(
+        contract["trace_model"]["trace_id_field"].as_str().unwrap(),
+        "trace_id"
     );
 }
 
