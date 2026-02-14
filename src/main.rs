@@ -1363,7 +1363,6 @@ fn print_package_entry_blocking(manager: &PackageManager, entry: &PackageEntry) 
 }
 
 fn handle_config(cwd: &Path) -> Result<()> {
-    let _ = Config::load()?;
     let config_path = std::env::var("PI_CONFIG_PATH")
         .ok()
         .map_or_else(|| Config::global_dir().join("settings.json"), PathBuf::from);
@@ -1385,6 +1384,12 @@ fn handle_config(cwd: &Path) -> Result<()> {
     println!("  3) Project settings ({})", project_path.display());
     println!("  4) Global settings ({})", config_path.display());
     println!("  5) Built-in defaults");
+    println!();
+
+    match Config::load() {
+        Ok(_) => println!("Current configuration is valid."),
+        Err(e) => println!("Configuration Error: {e}"),
+    }
 
     Ok(())
 }

@@ -747,6 +747,7 @@ async fn generate_turn_prefix_summary(
 // Public API
 // =============================================================================
 
+#[allow(clippy::too_many_lines)]
 pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,

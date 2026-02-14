@@ -103,7 +103,7 @@ pub struct AutocompleteProvider {
 
 impl AutocompleteProvider {
     #[must_use]
-    pub fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
+    pub const fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
         Self {
             cwd,
             home_dir_override: None,
@@ -426,7 +426,7 @@ struct FileCache {
 impl FileCache {
     const TTL: Duration = Duration::from_secs(2);
 
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             files: Vec::new(),
             last_update_request: None,
