@@ -640,11 +640,20 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
 
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
     let session_arc = Arc::new(Mutex::new(session));
+    let context_window_tokens = if selection.model_entry.model.context_window == 0 {
+        tracing::warn!(
+            "Model {} reported context_window=0; falling back to default compaction window",
+            selection.model_entry.model.id
+        );
+        ResolvedCompactionSettings::default().context_window_tokens
+    } else {
+        selection.model_entry.model.context_window
+    };
     let compaction_settings = ResolvedCompactionSettings {
         enabled: config.compaction_enabled(),
         reserve_tokens: config.compaction_reserve_tokens(),
         keep_recent_tokens: config.compaction_keep_recent_tokens(),
-        ..Default::default()
+        context_window_tokens,
     };
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),

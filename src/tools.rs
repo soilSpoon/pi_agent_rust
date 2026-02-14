@@ -20,7 +20,7 @@ use std::fmt::Write as _;
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -1690,100 +1690,6 @@ fn restore_line_endings(text: &str, ending: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone)]
-struct FuzzyMatchResult {
-    found: bool,
-    index: usize,
-    match_length: usize,
-    content_for_replacement: String,
-}
-
-/// Map a range in normalized content back to byte offsets in the original text.
-///
-/// Returns `(original_start_byte_idx, original_match_byte_len)`.
-fn map_normalized_range_to_original(
-    content: &str,
-    norm_match_start: usize,
-    norm_match_len: usize,
-) -> (usize, usize) {
-    let mut norm_idx = 0;
-    let mut orig_idx = 0;
-    let mut match_start = None;
-    let mut match_end = None;
-    let norm_match_end = norm_match_start + norm_match_len;
-
-    let mut lines = content.split_inclusive('\n').peekable();
-    while let Some(line) = lines.next() {
-        let line_content = line.strip_suffix('\n').unwrap_or(line);
-        let has_newline = line.ends_with('\n');
-        let trimmed_len = line_content.trim_end().len();
-
-        for (char_offset, c) in line_content.char_indices() {
-            if norm_idx == norm_match_start && match_start.is_none() {
-                match_start = Some(orig_idx + char_offset);
-            }
-            if norm_idx == norm_match_end && match_end.is_none() {
-                match_end = Some(orig_idx + char_offset);
-            }
-            if match_start.is_some() && match_end.is_some() {
-                break;
-            }
-
-            if char_offset >= trimmed_len {
-                continue;
-            }
-
-            let normalized_char = if is_special_unicode_space(c) {
-                ' '
-            } else if matches!(c, '\u{2018}' | '\u{2019}') {
-                '\''
-            } else if matches!(c, '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}') {
-                '"'
-            } else if matches!(
-                c,
-                '\u{2010}'
-                    | '\u{2011}'
-                    | '\u{2012}'
-                    | '\u{2013}'
-                    | '\u{2014}'
-                    | '\u{2015}'
-                    | '\u{2212}'
-            ) {
-                '-'
-            } else {
-                c
-            };
-
-            norm_idx += normalized_char.len_utf8();
-        }
-
-        orig_idx += line_content.len();
-
-        if has_newline {
-            if norm_idx == norm_match_start && match_start.is_none() {
-                match_start = Some(orig_idx);
-            }
-            if norm_idx == norm_match_end && match_end.is_none() {
-                match_end = Some(orig_idx);
-            }
-
-            norm_idx += 1;
-            orig_idx += 1;
-        }
-
-        if match_start.is_some() && match_end.is_some() {
-            break;
-        }
-    }
-
-    if norm_idx == norm_match_end && match_end.is_none() {
-        match_end = Some(orig_idx);
-    }
-
-    let start = match_start.unwrap_or(0);
-    let end = match_end.unwrap_or(content.len());
-    (start, end.saturating_sub(start))
-}
 
 fn build_normalized_content(content: &str) -> String {
     let mut normalized = String::with_capacity(content.len());
@@ -1826,75 +1732,6 @@ fn build_normalized_content(content: &str) -> String {
 
 fn normalize_for_fuzzy_match_text(text: &str) -> String {
     build_normalized_content(text)
-}
-
-struct FuzzyMatchResult {
-    found: bool,
-    index: usize,
-    match_length: usize,
-    content_for_replacement: String,
-}
-
-/// Map a byte range in normalized content back to the corresponding range
-/// in the original content. Both `normalized_index` and `normalized_len`
-/// are byte offsets into the string produced by `build_normalized_content`.
-fn map_normalized_range_to_original(
-    original: &str,
-    normalized_index: usize,
-    normalized_len: usize,
-) -> (usize, usize) {
-    // Re-normalize to build a char-by-char mapping.
-    // The normalization collapses runs of whitespace and trims trailing
-    // whitespace per line, so we walk both strings in lockstep.
-    let normalized = build_normalized_content(original);
-
-    // Find the original byte position corresponding to normalized_index.
-    // Walk the original and normalized in parallel, consuming chars.
-    let mut orig_iter = original.char_indices().peekable();
-    let mut norm_iter = normalized.char_indices().peekable();
-
-    // Advance both iterators to the normalized_index position.
-    let mut orig_start = 0;
-    while let Some(&(ni, nc)) = norm_iter.peek() {
-        if ni >= normalized_index {
-            break;
-        }
-        norm_iter.next();
-        // Advance original past any chars that were collapsed
-        while let Some(&(oi, oc)) = orig_iter.peek() {
-            orig_iter.next();
-            if oc == nc {
-                orig_start = oi + oc.len_utf8();
-                break;
-            }
-            // Skip over whitespace/chars that were collapsed in normalization.
-        }
-    }
-    // orig_start now points to the first char after the prefix. We want the
-    // start of the match, which is the current original position.
-    let match_orig_start = orig_iter
-        .peek()
-        .map_or(original.len(), |&(oi, _)| oi);
-
-    // Now advance through the matched portion.
-    let norm_end = normalized_index + normalized_len;
-    while let Some(&(ni, nc)) = norm_iter.peek() {
-        if ni >= norm_end {
-            break;
-        }
-        norm_iter.next();
-        while let Some(&(_oi, oc)) = orig_iter.peek() {
-            orig_iter.next();
-            if oc == nc {
-                break;
-            }
-        }
-    }
-    let match_orig_end = orig_iter
-        .peek()
-        .map_or(original.len(), |&(oi, _)| oi);
-
-    (match_orig_start, match_orig_end - match_orig_start)
 }
 
 fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
@@ -3423,12 +3260,15 @@ impl Tool for LsTool {
 // ============================================================================
 
 fn rg_available() -> bool {
-    std::process::Command::new("rg")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("rg")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    })
 }
 
 fn pump_stream<R: Read + Send + 'static>(mut reader: R, tx: &mpsc::SyncSender<Vec<u8>>) {
@@ -3713,25 +3553,28 @@ async fn get_file_lines_async<'a>(
 }
 
 fn find_fd_binary() -> Option<&'static str> {
-    if std::process::Command::new("fd")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
-    {
-        return Some("fd");
-    }
-    if std::process::Command::new("fdfind")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
-    {
-        return Some("fdfind");
-    }
-    None
+    static BINARY: OnceLock<Option<&'static str>> = OnceLock::new();
+    *BINARY.get_or_init(|| {
+        if std::process::Command::new("fd")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return Some("fd");
+        }
+        if std::process::Command::new("fdfind")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return Some("fdfind");
+        }
+        None
+    })
 }
 
 // ============================================================================
