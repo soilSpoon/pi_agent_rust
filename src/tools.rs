@@ -2346,6 +2346,15 @@ impl Tool for WriteTool {
         // Restore original file permissions (tempfile defaults to 0o600) before persisting.
         if let Some(perms) = original_perms {
             let _ = temp_file.as_file().set_permissions(perms);
+        } else {
+            // New file: default to 0644 (rw-r--r--) instead of tempfile's 0600.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = temp_file
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o644));
+            }
         }
 
         // Persist (atomic rename)
