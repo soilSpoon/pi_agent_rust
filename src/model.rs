@@ -1647,9 +1647,9 @@ mod tests {
             let reparsed: Message = serde_json::from_value(reserialized.clone())
                 .expect("re-serialized message should deserialize");
             let stabilized = serde_json::to_value(reparsed).expect("stabilized serialize");
-            prop_assert_eq!(stabilized, reserialized.clone());
+            prop_assert_eq!(stabilized, reserialized);
 
-            let mut with_extra = serialized.clone();
+            let mut with_extra = serialized;
             if let serde_json::Value::Object(ref mut obj) = with_extra {
                 obj.insert("extraFieldProptest".to_string(), extra_value);
             }

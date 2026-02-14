@@ -164,7 +164,7 @@ pub enum InputType {
 }
 
 /// Model pricing per million tokens.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCost {
     pub input: f64,

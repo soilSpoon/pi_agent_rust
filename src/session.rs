@@ -4663,7 +4663,7 @@ mod tests {
 
         /// Generate a random entry ID (8 hex chars).
         fn entry_id_strategy() -> impl Strategy<Value = String> {
-            "[0-9a-f]{8}".prop_map(|s| s.to_string())
+            "[0-9a-f]{8}"
         }
 
         /// Generate an arbitrary JSON value of bounded depth/size.
@@ -4683,7 +4683,7 @@ mod tests {
                     any::<i64>().prop_map(|n| json!(n)),
                     "[a-zA-Z0-9 ]{0,32}".prop_map(|s| json!(s)),
                     prop::collection::vec(bounded_json_value(max_depth - 1), 0..4)
-                        .prop_map(|v| serde_json::Value::Array(v)),
+                        .prop_map(serde_json::Value::Array),
                 ]
                 .boxed()
             }
@@ -4964,10 +4964,7 @@ mod tests {
                 }).to_string();
 
                 // Interleave valid and corrupted lines deterministically
-                let valid_strs: Vec<String> = valid_entries
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect();
+                let valid_strs: Vec<String> = valid_entries.iter().map(ToString::to_string).collect();
                 let total = valid_strs.len() + corrupted_lines.len();
                 let mut all_lines: Vec<(bool, String)> = Vec::with_capacity(total);
                 for s in &valid_strs {

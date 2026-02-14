@@ -1559,7 +1559,7 @@ mod tests {
             prop_assert_eq!(listed.len(), 1);
 
             let meta = &listed[0];
-            let expected_count = i64::try_from(message_count).unwrap_or(i64::MAX) as u64;
+            let expected_count = message_count;
             prop_assert_eq!(&meta.id, &id);
             prop_assert_eq!(&meta.cwd, &cwd);
             prop_assert_eq!(&meta.timestamp, &timestamp);

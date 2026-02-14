@@ -160,8 +160,8 @@ fn bench_sse_stream(c: &mut Criterion) {
 // Streaming Clone Benchmark — Arc<AssistantMessage> vs deep clone
 // ============================================================================
 
-/// Simulates the streaming hot path: accumulate text via push_str, then share
-/// with event consumers via Arc::clone (O(1)) instead of deep clone (O(n)).
+/// Simulates the streaming hot path: accumulate text via `push_str`, then share
+/// with event consumers via `Arc::clone` (O(1)) instead of deep clone (O(n)).
 fn bench_streaming_arc(c: &mut Criterion) {
     use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage};
     use std::sync::Arc;

@@ -77,6 +77,9 @@ pub struct Config {
     // Images
     pub images: Option<ImageSettings>,
 
+    // Markdown rendering
+    pub markdown: Option<MarkdownSettings>,
+
     // Terminal Display
     pub terminal: Option<TerminalSettings>,
 
@@ -244,6 +247,14 @@ pub struct ImageSettings {
     pub auto_resize: Option<bool>,
     #[serde(alias = "blockImages")]
     pub block_images: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MarkdownSettings {
+    /// Indentation (in spaces) applied to code blocks in rendered output.
+    #[serde(alias = "codeBlockIndent")]
+    pub code_block_indent: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -457,6 +468,9 @@ impl Config {
 
             // Images
             images: merge_images(base.images, other.images),
+
+            // Markdown rendering
+            markdown: other.markdown.or(base.markdown),
 
             // Terminal Display
             terminal: merge_terminal(base.terminal, other.terminal),
@@ -2339,10 +2353,8 @@ mod tests {
                 .and_then(|parsed| parsed.is_finite().then_some(parsed.clamp(1.0e-6, 0.5)));
 
             // Only PI_EXTENSION_RISK_ALPHA should override config alpha.
-            prop_assert_eq!(
-                resolved.settings.alpha,
-                env_alpha.unwrap_or_else(|| alpha.clamp(1.0e-6, 0.5))
-            );
+            let expected_alpha = env_alpha.unwrap_or_else(|| alpha.clamp(1.0e-6, 0.5));
+            prop_assert!((resolved.settings.alpha - expected_alpha).abs() <= f64::EPSILON);
             if env_alpha.is_some() {
                 prop_assert_eq!(resolved.source, "env");
             }
@@ -2379,7 +2391,7 @@ mod tests {
             let resolved = config.resolve_extension_risk_with_metadata();
             // Non-finite config alpha must be ignored, so result should match
             // baseline resolution under the same environment.
-            prop_assert_eq!(resolved.settings.alpha, baseline.settings.alpha);
+            prop_assert!((resolved.settings.alpha - baseline.settings.alpha).abs() <= f64::EPSILON);
             prop_assert_eq!(resolved.source, baseline.source);
         }
 

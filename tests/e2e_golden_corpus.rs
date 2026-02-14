@@ -59,6 +59,7 @@ struct GoldenFixture {
 
 /// Expected outcomes for a golden test.
 #[derive(Debug, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct GoldenExpected {
     #[serde(default)]
     exit_code: Option<i32>,
@@ -464,14 +465,12 @@ fn count_jsonl_files(dir: &Path) -> usize {
     if !dir.exists() {
         return 0;
     }
-    fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-                .count()
-        })
-        .unwrap_or(0)
+    fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+            .count()
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -561,13 +560,11 @@ fn run_surface_fixtures(surface: &str) {
             }
             Err(err) => {
                 fail_count += 1;
-                let msg = if let Some(s) = err.downcast_ref::<String>() {
-                    s.clone()
-                } else if let Some(s) = err.downcast_ref::<&str>() {
-                    (*s).to_string()
-                } else {
-                    "unknown panic".to_string()
-                };
+                let msg = err
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_else(|| "unknown panic".to_string());
                 harness
                     .harness
                     .log()
@@ -613,7 +610,7 @@ fn golden_corpus_error_cases() {
 /// @file expansion requires runtime cassette construction (dynamic body).
 /// Run with `--ignored` to include.
 #[test]
-#[ignore]
+#[ignore = "requires runtime cassette construction (dynamic body)"]
 fn golden_corpus_at_file_expansion() {
     run_surface_fixtures("at_file_expansion");
 }

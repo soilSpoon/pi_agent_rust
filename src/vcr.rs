@@ -2113,8 +2113,8 @@ mod tests {
 
             /// redact_json is idempotent: redacting twice yields the same result.
             #[test]
-            fn redact_json_is_idempotent(mut value in json_value()) {
-                let mut first = value.clone();
+            fn redact_json_is_idempotent(value in json_value()) {
+                let mut first = value;
                 redact_json(&mut first);
                 let mut second = first.clone();
                 redact_json(&mut second);

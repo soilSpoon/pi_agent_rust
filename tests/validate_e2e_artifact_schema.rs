@@ -352,8 +352,7 @@ fn harness_logs_use_v2_schema() {
         let schema = parsed["schema"].as_str().unwrap_or("");
         assert_eq!(
             schema, TEST_LOG_SCHEMA_V2,
-            "All new harness logs must use {}, got {schema}",
-            TEST_LOG_SCHEMA_V2
+            "All new harness logs must use {TEST_LOG_SCHEMA_V2}, got {schema}",
         );
     }
 }
@@ -1044,8 +1043,7 @@ fn evidence_contract_schema_has_correct_id() {
     assert_eq!(
         schema["$id"].as_str().unwrap_or(""),
         EVIDENCE_CONTRACT_SCHEMA_V1,
-        "Schema $id must be {}",
-        EVIDENCE_CONTRACT_SCHEMA_V1
+        "Schema $id must be {EVIDENCE_CONTRACT_SCHEMA_V1}",
     );
 }
 
@@ -1169,24 +1167,21 @@ fn evidence_contract_schema_defines_parity_contract_overlay() {
             .as_str()
             .unwrap_or(""),
         TEST_LOG_SCHEMA_V2,
-        "parity_contract log_record_schema must pin {}",
-        TEST_LOG_SCHEMA_V2
+        "parity_contract log_record_schema must pin {TEST_LOG_SCHEMA_V2}",
     );
     assert_eq!(
         overlay["properties"]["artifact_record_schema"]["const"]
             .as_str()
             .unwrap_or(""),
         TEST_ARTIFACT_SCHEMA_V1,
-        "parity_contract artifact_record_schema must pin {}",
-        TEST_ARTIFACT_SCHEMA_V1
+        "parity_contract artifact_record_schema must pin {TEST_ARTIFACT_SCHEMA_V1}",
     );
     assert_eq!(
         overlay["properties"]["failure_digest_schema"]["const"]
             .as_str()
             .unwrap_or(""),
         FAILURE_DIGEST_SCHEMA_V1,
-        "parity_contract failure_digest_schema must pin {}",
-        FAILURE_DIGEST_SCHEMA_V1
+        "parity_contract failure_digest_schema must pin {FAILURE_DIGEST_SCHEMA_V1}",
     );
 }
 
