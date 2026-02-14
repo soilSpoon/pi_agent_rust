@@ -368,6 +368,7 @@ impl RegistrationSnapshot {
             + self.flags.len()
             + self.event_hooks.len()
             + self.providers.len()
+            + self.models.len()
             + self.message_renderers.len()
     }
 
@@ -381,7 +382,7 @@ impl RegistrationSnapshot {
         if !self.slash_commands.is_empty() {
             types.push("command");
         }
-        if !self.providers.is_empty() {
+        if !self.providers.is_empty() || !self.models.is_empty() {
             types.push("provider");
         }
         if !self.event_hooks.is_empty() {
@@ -459,11 +460,11 @@ pub fn verify_registrations(
             }
         }
         ExtensionShape::Provider => {
-            if snapshot.providers.is_empty() {
+            if snapshot.providers.is_empty() && snapshot.models.is_empty() {
                 failures.push(
                     ShapeFailure::new(
                         FailureClass::MissingRegistration,
-                        "Provider extension must register at least one provider",
+                        "Provider extension must register at least one provider or model",
                     )
                     .with_path("registrations.providers")
                     .with_hint("Call pi.registerProvider(name, {api, baseUrl, models})"),
@@ -511,7 +512,7 @@ pub fn verify_registrations(
             let distinct_types = [
                 !snapshot.tools.is_empty(),
                 !snapshot.slash_commands.is_empty(),
-                !snapshot.providers.is_empty(),
+                !snapshot.providers.is_empty() || !snapshot.models.is_empty(),
                 !snapshot.event_hooks.is_empty(),
                 !snapshot.message_renderers.is_empty(),
                 !snapshot.flags.is_empty() || !snapshot.shortcuts.is_empty(),

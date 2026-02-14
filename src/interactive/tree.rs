@@ -218,7 +218,7 @@ pub(super) fn resolve_tree_selector_initial_id(session: &Session, args: &str) ->
     let matches = session
         .entries
         .iter()
-        .filter_map(SessionEntry::base_id)
+        .filter_map(|entry| entry.base_id().cloned())
         .filter(|id| id.starts_with(arg))
         .take(2)
         .collect::<Vec<_>>();

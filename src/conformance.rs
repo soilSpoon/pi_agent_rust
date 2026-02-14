@@ -1766,8 +1766,8 @@ pub mod normalization {
 
         // 2) Path canonicalization (order matters: most-specific first)
         let mut out = without_ansi.to_string();
-        out = replace_path_variants(&out, &ctx.pi_mono_root, PLACEHOLDER_PI_MONO_ROOT);
         out = replace_path_variants(&out, &ctx.cwd, PLACEHOLDER_PI_MONO_ROOT);
+        out = replace_path_variants(&out, &ctx.pi_mono_root, PLACEHOLDER_PI_MONO_ROOT);
         out = replace_path_variants(&out, &ctx.project_root, PLACEHOLDER_PROJECT_ROOT);
 
         // 3) Run-ID rewriting
@@ -2400,6 +2400,11 @@ pub mod normalization {
             assert!(
                 !out.contains("/repo/legacy/pi-mono/test-dir"),
                 "original cwd should be gone: {out}"
+            );
+            // The cwd-specific directory should not leak through.
+            assert!(
+                !out.contains("test-dir"),
+                "cwd subdirectory remnant should be normalized away: {out}"
             );
         }
 

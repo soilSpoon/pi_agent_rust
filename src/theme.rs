@@ -475,10 +475,10 @@ fn resolve_theme_path(spec: &str, cwd: &Path) -> PathBuf {
             .unwrap_or_else(|| cwd.to_path_buf())
             .join(rest);
     }
-    if trimmed.starts_with('~') {
+    if let Some(rest) = trimmed.strip_prefix('~') {
         return dirs::home_dir()
             .unwrap_or_else(|| cwd.to_path_buf())
-            .join(trimmed.trim_start_matches('~'));
+            .join(rest);
     }
 
     let path = PathBuf::from(trimmed);

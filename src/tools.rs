@@ -1468,7 +1468,8 @@ pub(crate) async fn run_bash_command(
 
     drop(bash_output.temp_file.take());
 
-    let full_output = String::from_utf8_lossy(&concat_chunks(&bash_output.chunks)).to_string();
+    let raw_output = concat_chunks(&bash_output.chunks);
+    let full_output = String::from_utf8_lossy(&raw_output);
 
     let mut truncation = truncate_tail(&full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
     if bash_output.total_bytes > bash_output.chunks_bytes {
@@ -1717,7 +1718,6 @@ struct FuzzyMatchResult {
     found: bool,
     index: usize,
     match_length: usize,
-    content_for_replacement: String,
 }
 
 /// Map a range in normalized content back to byte offsets in the original text.
@@ -1863,7 +1863,6 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
             found: true,
             index,
             match_length: old_text.len(),
-            content_for_replacement: content.to_string(),
         };
     }
 
@@ -1880,7 +1879,6 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
             found: true,
             index: original_start,
             match_length: original_match_len,
-            content_for_replacement: content.to_string(),
         };
     }
 
@@ -1888,7 +1886,6 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
         found: false,
         index: 0,
         match_length: 0,
-        content_for_replacement: content.to_string(),
     }
 }
 
@@ -2183,16 +2180,16 @@ impl Tool for EditTool {
         }
 
         // Perform replacement in the matched coordinate space (exact or fuzzy-normalized).
-        let base_content = match_result.content_for_replacement;
         let idx = match_result.index;
         let match_len = match_result.match_length;
 
-        let mut new_content = String::new();
-        new_content.push_str(&base_content[..idx]);
+        let new_len = normalized_content.len() - match_len + normalized_new_text.len();
+        let mut new_content = String::with_capacity(new_len);
+        new_content.push_str(&normalized_content[..idx]);
         new_content.push_str(&normalized_new_text);
-        new_content.push_str(&base_content[idx + match_len..]);
+        new_content.push_str(&normalized_content[idx + match_len..]);
 
-        if base_content == new_content {
+        if normalized_content == new_content {
             return Err(Error::tool(
                 "edit",
                 format!(
@@ -2229,7 +2226,7 @@ impl Tool for EditTool {
             .persist(&absolute_path)
             .map_err(|e| Error::tool("edit", format!("Failed to persist file: {e}")))?;
 
-        let (diff, first_changed_line) = generate_diff_string(&base_content, &new_content);
+        let (diff, first_changed_line) = generate_diff_string(&normalized_content, &new_content);
         let mut details = serde_json::Map::new();
         details.insert("diff".to_string(), serde_json::Value::String(diff));
         if let Some(line) = first_changed_line {
@@ -2811,12 +2808,12 @@ impl Tool for GrepTool {
         let mut lines_truncated = false;
 
         for (file_path, line_number) in &matches {
-            let relative_path = format_grep_path(file_path, &search_path, is_directory);
+            let relative_path = format_grep_path(file_path, &self.cwd);
             let lines = get_file_lines_async(file_path, &mut file_cache).await;
 
             if lines.is_empty() {
                 output_lines.push(format!(
-                    "{relative_path}:{line_number}: (unable to read file)"
+                    "{relative_path}:{line_number}: (unable to read file or too large)"
                 ));
                 continue;
             }
@@ -3501,7 +3498,8 @@ fn emit_bash_update(
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
 ) -> Result<()> {
     if let Some(callback) = on_update {
-        let full_text = String::from_utf8_lossy(&concat_chunks(&state.chunks)).to_string();
+        let raw = concat_chunks(&state.chunks);
+        let full_text = String::from_utf8_lossy(&raw);
         let truncation = truncate_tail(&full_text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
 
         let mut details_map = serde_json::Map::new();
@@ -3657,20 +3655,14 @@ fn collect_process_tree(
     }
 }
 
-fn format_grep_path(file_path: &Path, search_path: &Path, is_directory: bool) -> String {
-    if is_directory {
-        if let Ok(rel) = file_path.strip_prefix(search_path) {
-            let rel_str = rel.display().to_string().replace('\\', "/");
-            if !rel_str.is_empty() && !rel_str.starts_with("..") {
-                return rel_str;
-            }
+fn format_grep_path(file_path: &Path, cwd: &Path) -> String {
+    if let Ok(rel) = file_path.strip_prefix(cwd) {
+        let rel_str = rel.display().to_string().replace('\\', "/");
+        if !rel_str.is_empty() {
+            return rel_str;
         }
     }
-    file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string()
+    file_path.display().to_string().replace('\\', "/")
 }
 
 async fn get_file_lines_async<'a>(
@@ -5403,6 +5395,96 @@ mod tests {
             .prop_map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    fn match_char_strategy() -> impl Strategy<Value = char> {
+        prop_oneof![
+            8 => any::<char>(),
+            1 => Just('\u{00A0}'),
+            1 => Just('\u{202F}'),
+            1 => Just('\u{205F}'),
+            1 => Just('\u{3000}'),
+            1 => Just('\u{2018}'),
+            1 => Just('\u{2019}'),
+            1 => Just('\u{201C}'),
+            1 => Just('\u{201D}'),
+            1 => Just('\u{201E}'),
+            1 => Just('\u{201F}'),
+            1 => Just('\u{2010}'),
+            1 => Just('\u{2011}'),
+            1 => Just('\u{2012}'),
+            1 => Just('\u{2013}'),
+            1 => Just('\u{2014}'),
+            1 => Just('\u{2015}'),
+            1 => Just('\u{2212}'),
+            1 => Just('\u{200D}'),
+            1 => Just('\u{0301}'),
+        ]
+    }
+
+    fn arbitrary_match_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            9 => prop::collection::vec(match_char_strategy(), 0..2048),
+            1 => prop::collection::vec(match_char_strategy(), 8192..16384),
+        ]
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn line_char_strategy() -> impl Strategy<Value = char> {
+        prop_oneof![
+            8 => any::<char>().prop_filter("single-line chars only", |c| *c != '\n'),
+            1 => Just('é'),
+            1 => Just('你'),
+            1 => Just('😀'),
+        ]
+    }
+
+    fn boundary_line_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(0usize),
+            Just(GREP_MAX_LINE_LENGTH.saturating_sub(1)),
+            Just(GREP_MAX_LINE_LENGTH),
+            Just(GREP_MAX_LINE_LENGTH + 1),
+            0usize..(GREP_MAX_LINE_LENGTH + 128),
+        ]
+        .prop_flat_map(|len| {
+            prop::collection::vec(line_char_strategy(), len)
+                .prop_map(|chars| chars.into_iter().collect())
+        })
+    }
+
+    fn safe_relative_segment() -> impl Strategy<Value = String> {
+        prop_oneof![
+            proptest::string::string_regex("[A-Za-z0-9._-]{1,12}")
+                .expect("segment regex should compile"),
+            Just("emoji😀".to_string()),
+            Just("accent-é".to_string()),
+            Just("rtl-עברית".to_string()),
+            Just("line\nbreak".to_string()),
+            Just("nul\0byte".to_string()),
+        ]
+        .prop_filter("segment cannot be . or ..", |segment| {
+            segment != "." && segment != ".."
+        })
+    }
+
+    fn safe_relative_path() -> impl Strategy<Value = String> {
+        prop::collection::vec(safe_relative_segment(), 1..6)
+            .prop_map(|segments| segments.join("/"))
+    }
+
+    fn pathish_input() -> impl Strategy<Value = String> {
+        prop_oneof![
+            5 => safe_relative_path(),
+            2 => safe_relative_path().prop_map(|p| format!("../{p}")),
+            2 => safe_relative_path().prop_map(|p| format!("../../{p}")),
+            1 => safe_relative_path().prop_map(|p| format!("/tmp/{p}")),
+            1 => safe_relative_path().prop_map(|p| format!("~/{p}")),
+            1 => Just("~".to_string()),
+            1 => Just(".".to_string()),
+            1 => Just("..".to_string()),
+            1 => Just("././nested/../file.txt".to_string()),
+        ]
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
 
@@ -5468,6 +5550,90 @@ mod tests {
                     .split('\n')
                     .rev()
                     .any(|line| line.ends_with(content_trimmed)));
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 128, .. ProptestConfig::default() })]
+
+        #[test]
+        fn proptest_normalize_for_match_invariants(input in arbitrary_match_text()) {
+            let normalized = normalize_for_match(&input);
+            let renormalized = normalize_for_match(&normalized);
+
+            prop_assert_eq!(renormalized, normalized);
+            prop_assert!(normalized.len() <= input.len());
+            prop_assert!(normalized.chars().all(|c| {
+                !is_special_unicode_space(c)
+                    && !matches!(
+                        c,
+                        '\u{2018}'
+                            | '\u{2019}'
+                            | '\u{201C}'
+                            | '\u{201D}'
+                            | '\u{201E}'
+                            | '\u{201F}'
+                            | '\u{2010}'
+                            | '\u{2011}'
+                            | '\u{2012}'
+                            | '\u{2013}'
+                            | '\u{2014}'
+                            | '\u{2015}'
+                            | '\u{2212}'
+                    )
+            }));
+        }
+
+        #[test]
+        fn proptest_truncate_line_boundary_invariants(line in boundary_line_text()) {
+            const TRUNCATION_SUFFIX: &str = "... [truncated]";
+
+            let result = truncate_line(&line, GREP_MAX_LINE_LENGTH);
+            let line_char_count = line.chars().count();
+            let suffix_chars = TRUNCATION_SUFFIX.chars().count();
+
+            if line_char_count <= GREP_MAX_LINE_LENGTH {
+                prop_assert!(!result.was_truncated);
+                prop_assert_eq!(result.text, line);
+            } else {
+                prop_assert!(result.was_truncated);
+                prop_assert!(result.text.ends_with(TRUNCATION_SUFFIX));
+                let expected_prefix: String = line.chars().take(GREP_MAX_LINE_LENGTH).collect();
+                prop_assert_eq!(result.text, format!("{expected_prefix}{TRUNCATION_SUFFIX}"));
+                prop_assert!(result.text.chars().count() <= GREP_MAX_LINE_LENGTH + suffix_chars);
+            }
+        }
+
+        #[test]
+        fn proptest_resolve_path_safe_relative_invariants(relative_path in safe_relative_path()) {
+            let cwd = PathBuf::from("/tmp/pi-agent-rust-tools-proptest");
+            let resolved = resolve_path(&relative_path, &cwd);
+            let normalized = normalize_dot_segments(&resolved);
+
+            prop_assert_eq!(resolved, cwd.join(&relative_path));
+            prop_assert!(resolved.starts_with(&cwd));
+            prop_assert!(normalized.starts_with(&cwd));
+            prop_assert_eq!(normalize_dot_segments(&normalized), normalized);
+        }
+
+        #[test]
+        fn proptest_normalize_dot_segments_pathish_invariants(path_input in pathish_input()) {
+            let cwd = PathBuf::from("/tmp/pi-agent-rust-tools-proptest");
+            let resolved = resolve_path(&path_input, &cwd);
+            let normalized_once = normalize_dot_segments(&resolved);
+            let normalized_twice = normalize_dot_segments(&normalized_once);
+
+            prop_assert_eq!(normalized_once, normalized_twice);
+            prop_assert!(
+                normalized_once
+                    .components()
+                    .all(|component| !matches!(component, std::path::Component::CurDir))
+            );
+
+            if std::path::Path::new(&path_input).is_absolute() {
+                prop_assert!(resolved.is_absolute());
+                prop_assert!(normalized_once.is_absolute());
             }
         }
     }

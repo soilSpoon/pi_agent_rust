@@ -1395,7 +1395,7 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
         let slice = maybe_len.map_or_else(
             || args.get(start_idx..).unwrap_or(&[]).to_vec(),
             |len| {
-                let end = (start_idx + len).min(args.len());
+                let end = start_idx.saturating_add(len).min(args.len());
                 args.get(start_idx..end).unwrap_or(&[]).to_vec()
             },
         );
