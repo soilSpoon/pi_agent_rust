@@ -1135,13 +1135,13 @@ impl Tool for ReadTool {
             });
         }
 
+        // Count lines cheaply without allocating a vector
         // Split on '\n'. If the file ends with a newline, split() creates an empty string
-        // at the end. We drop it to avoid showing a phantom empty line number.
-        let mut all_lines: Vec<&str> = text_content.split('\n').collect();
-        if all_lines.last().is_some_and(|l| l.is_empty()) && text_content.ends_with('\n') {
-            all_lines.pop();
+        // at the end which we ignore to match legacy behavior.
+        let mut total_file_lines = memchr::memchr_iter(b'\n', text_content.as_bytes()).count() + 1;
+        if text_content.ends_with('\n') {
+            total_file_lines -= 1;
         }
-        let total_file_lines = all_lines.len();
 
         let start_line: usize = match input.offset {
             Some(n) if n > 0 => n.saturating_sub(1).try_into().unwrap_or(usize::MAX),
@@ -1149,7 +1149,7 @@ impl Tool for ReadTool {
         };
         let start_line_display = start_line.saturating_add(1);
 
-        if start_line >= all_lines.len() {
+        if start_line >= total_file_lines {
             let offset_display = input.offset.unwrap_or(0);
             return Err(Error::tool(
                 "read",
@@ -1161,14 +1161,14 @@ impl Tool for ReadTool {
 
         // Determine end line based on user limit
         let (end_line, user_limited_lines): (usize, Option<usize>) = input.limit.map_or_else(
-            || (all_lines.len(), None),
+            || (total_file_lines, None),
             |limit| {
                 let limit_usize = if limit > 0 {
                     usize::try_from(limit).unwrap_or(usize::MAX)
                 } else {
                     0
                 };
-                let end = start_line.saturating_add(limit_usize).min(all_lines.len());
+                let end = start_line.saturating_add(limit_usize).min(total_file_lines);
                 (end, Some(end.saturating_sub(start_line)))
             },
         );
@@ -1182,8 +1182,20 @@ impl Tool for ReadTool {
         // Format: "     N→content" where N is right-aligned
         let max_line_num = end_line;
         let line_num_width = max_line_num.to_string().len().max(5);
-        let selected_content: String = all_lines[start_line..clamped_end_line]
-            .iter()
+
+        // Iterate lines lazily
+        let line_iter = text_content.split('\n');
+        // If file ends with newline, the iterator yields an empty string at the end which we must skip
+        // if it would otherwise be included (though our index clamping usually handles this).
+        let effective_iter = if text_content.ends_with('\n') {
+            line_iter.take(total_file_lines)
+        } else {
+            line_iter.take(usize::MAX)
+        };
+
+        let selected_content: String = effective_iter
+            .skip(start_line)
+            .take(clamped_end_line - start_line)
             .enumerate()
             .map(|(i, line)| {
                 let line_num = start_line + i + 1;
@@ -1202,7 +1214,7 @@ impl Tool for ReadTool {
         let mut details: Option<serde_json::Value> = None;
 
         if truncation.first_line_exceeds_limit {
-            let first_line = all_lines.get(start_line).copied().unwrap_or("");
+            let first_line = text_content.split('\n').nth(start_line).unwrap_or("");
             let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
             let first_line_size = format_size(first_line.len());
             output_text = format!(
@@ -1232,10 +1244,9 @@ impl Tool for ReadTool {
 
             details = Some(serde_json::json!({ "truncation": truncation }));
         } else if let Some(user_limited) = user_limited_lines {
-            if start_line.saturating_add(user_limited) < all_lines.len() {
-                let remaining = all_lines
-                    .len()
-                    .saturating_sub(start_line.saturating_add(user_limited));
+            if start_line.saturating_add(user_limited) < total_file_lines {
+                let remaining =
+                    total_file_lines.saturating_sub(start_line.saturating_add(user_limited));
                 let next_offset = start_line.saturating_add(user_limited).saturating_add(1);
                 let _ = write!(
                     output_text,
@@ -1729,7 +1740,7 @@ fn map_normalized_range_to_original(
         // Wait, `build_normalized_with_mapping` splits by `\n` which consumes delimiters.
         // And adds `\n` back "if not the last line".
         // So effectively it preserves newlines between lines.
-        
+
         let line_content = line.strip_suffix('\n').unwrap_or(line);
         let has_newline = line.ends_with('\n');
 
@@ -1868,11 +1879,8 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
 
     // Try to find the normalized old_text in normalized content
     if let Some(normalized_index) = normalized_content.find(&normalized_old_text) {
-        let (original_start, original_match_len) = map_normalized_range_to_original(
-            content,
-            normalized_index,
-            normalized_old_text.len(),
-        );
+        let (original_start, original_match_len) =
+            map_normalized_range_to_original(content, normalized_index, normalized_old_text.len());
 
         return FuzzyMatchResult {
             found: true,
