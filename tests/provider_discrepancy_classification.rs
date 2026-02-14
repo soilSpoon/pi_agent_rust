@@ -189,7 +189,7 @@ fn summary_total_matches_discrepancy_count() {
     let total = doc["summary"]["total_discrepancies"].as_u64().unwrap();
     let entries = doc["discrepancies"].as_array().unwrap();
     assert_eq!(
-        total as usize,
+        usize::try_from(total).unwrap(),
         entries.len(),
         "Summary total ({total}) does not match actual discrepancy count ({})",
         entries.len()
@@ -282,7 +282,7 @@ fn cross_reference_by_root_cause_counts_match() {
         let claimed_count = data["count"].as_u64().unwrap();
         let ids = data["ids"].as_array().unwrap();
         assert_eq!(
-            claimed_count as usize,
+            usize::try_from(claimed_count).unwrap(),
             ids.len(),
             "Cross-ref by_root_cause[{cause}] count ({claimed_count}) != ids length ({})",
             ids.len()
@@ -346,7 +346,7 @@ fn cross_reference_by_user_impact_counts_match() {
         let claimed_count = data["count"].as_u64().unwrap();
         let ids = data["ids"].as_array().unwrap();
         assert_eq!(
-            claimed_count as usize,
+            usize::try_from(claimed_count).unwrap(),
             ids.len(),
             "Cross-ref by_user_impact[{impact}] count ({claimed_count}) != ids length ({})",
             ids.len()
@@ -401,7 +401,7 @@ fn remediation_ranks_are_sequential() {
     for (i, entry) in priorities.iter().enumerate() {
         let rank = entry["rank"].as_u64().unwrap();
         assert_eq!(
-            rank as usize,
+            usize::try_from(rank).unwrap(),
             i + 1,
             "Remediation priority rank at index {i} is {rank}, expected {}",
             i + 1

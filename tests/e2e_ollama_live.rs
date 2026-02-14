@@ -1,7 +1,7 @@
 //! Live E2E smoke tests against a real ollama server.
 //!
 //! These tests are **skipped** unless ollama is reachable at `http://127.0.0.1:11434`.
-//! They exercise the full provider stack: create_provider → stream → collect events.
+//! They exercise the full provider stack: `create_provider` → stream → collect events.
 //!
 //! To run:
 //!   1. `ollama serve` (if not already running)
