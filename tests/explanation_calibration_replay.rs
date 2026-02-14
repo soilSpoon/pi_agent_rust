@@ -839,12 +839,14 @@ fn action_progression_through_phases() {
         .filter(|e| e.call_id.starts_with("adversarial-"))
         .collect();
     assert!(!adversarial.is_empty());
-    #[allow(clippy::cast_precision_loss)] // test vectors are small
+    let adversarial_len = f64::from(
+        u32::try_from(adversarial.len()).expect("adversarial vector length must fit u32"),
+    );
+    let benign_len =
+        f64::from(u32::try_from(benign.len().max(1)).expect("benign vector length must fit u32"));
     let avg_adversarial_risk: f64 =
-        adversarial.iter().map(|e| e.risk_score).sum::<f64>() / adversarial.len() as f64;
-    #[allow(clippy::cast_precision_loss)] // test vectors are small
-    let avg_benign_risk: f64 =
-        benign.iter().map(|e| e.risk_score).sum::<f64>() / benign.len().max(1) as f64;
+        adversarial.iter().map(|e| e.risk_score).sum::<f64>() / adversarial_len;
+    let avg_benign_risk: f64 = benign.iter().map(|e| e.risk_score).sum::<f64>() / benign_len;
     assert!(
         avg_adversarial_risk > avg_benign_risk,
         "adversarial avg risk ({avg_adversarial_risk:.4}) must exceed benign ({avg_benign_risk:.4})"

