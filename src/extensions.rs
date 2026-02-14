@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest as _;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -11900,6 +11900,574 @@ impl JsExtensionRuntimeHandle {
     }
 }
 
+const JS_EXTENSION_ENTRY_EXTS: &[&str] = &["ts", "tsx", "js", "mjs", "cjs", "mts", "cts"];
+const MAX_BUNDLE_CLUSTER_DIRS: usize = 40;
+const MAX_AUXILIARY_EXAMPLE_ENTRIES: usize = 24;
+const AUXILIARY_EXTENSION_DIR_NAMES: &[&str] = &["examples", "example", "demos", "demo"];
+
+fn is_supported_js_extension_entry(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            JS_EXTENSION_ENTRY_EXTS
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+        })
+}
+
+fn resolve_extension_entry_file(path: &Path) -> Option<PathBuf> {
+    if path.is_file() && is_supported_js_extension_entry(path) {
+        return Some(safe_canonicalize(path));
+    }
+    if path.extension().is_some() {
+        return None;
+    }
+
+    JS_EXTENSION_ENTRY_EXTS.iter().find_map(|ext| {
+        let candidate = path.with_extension(ext);
+        if candidate.is_file() {
+            Some(safe_canonicalize(&candidate))
+        } else {
+            None
+        }
+    })
+}
+
+fn collect_extension_entries_from_dir(dir: &Path) -> Vec<PathBuf> {
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for ext in JS_EXTENSION_ENTRY_EXTS {
+        let candidate = dir.join(format!("index.{ext}"));
+        if let Some(path) = resolve_extension_entry_file(&candidate) {
+            if seen.insert(path.clone()) {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut extras = Vec::new();
+    let mut nested = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(index_path) = resolve_extension_entry_file(&path.join("index")) {
+                    nested.push(index_path);
+                }
+                if let Some(dir_name) = path.file_name().and_then(|name| name.to_str()) {
+                    if let Some(named_path) = resolve_extension_entry_file(&path.join(dir_name)) {
+                        nested.push(named_path);
+                    }
+                }
+                continue;
+            }
+            if !path.is_file() || !is_supported_js_extension_entry(&path) {
+                continue;
+            }
+            if path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("index"))
+            {
+                continue;
+            }
+            extras.push(path);
+        }
+    }
+    extras.sort();
+    nested.sort();
+    for path in extras {
+        let canonical = safe_canonicalize(&path);
+        if seen.insert(canonical.clone()) {
+            out.push(canonical);
+        }
+    }
+    for path in nested {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+
+    out
+}
+
+fn is_likely_auxiliary_extension_entry(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if file_name.contains("extension")
+        || file_name.contains("plugin")
+        || file_name.contains("command")
+    {
+        return true;
+    }
+
+    let Ok(raw) = fs::read(path) else {
+        return false;
+    };
+    let preview_len = raw.len().min(32_768);
+    let preview = String::from_utf8_lossy(&raw[..preview_len]);
+    [
+        "registerCommand(",
+        "registerTool(",
+        "registerProvider(",
+        "registerShortcut(",
+        "registerFlag(",
+        "pi.registerCommand(",
+        "pi.registerTool(",
+        "pi.registerProvider(",
+        "export default function",
+    ]
+    .iter()
+    .any(|needle| preview.contains(needle))
+}
+
+fn discover_auxiliary_example_entries(
+    package_dir: &Path,
+    canonical_primary: &Path,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for dir_name in AUXILIARY_EXTENSION_DIR_NAMES {
+        let candidate_dir = package_dir.join(dir_name);
+        for candidate in collect_extension_entries_from_dir(&candidate_dir) {
+            if &candidate == canonical_primary {
+                continue;
+            }
+            if !is_likely_auxiliary_extension_entry(&candidate) {
+                continue;
+            }
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+                if out.len() >= MAX_AUXILIARY_EXAMPLE_ENTRIES {
+                    return out;
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn parse_pi_extensions_from_package(package_json_path: &Path) -> Vec<String> {
+    let Ok(raw) = fs::read_to_string(package_json_path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(entries_value) = json.get("pi").and_then(|pi| pi.get("extensions")) else {
+        return Vec::new();
+    };
+
+    if let Some(entry) = entries_value.as_str() {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Vec::new();
+        }
+        return vec![entry.to_owned()];
+    }
+
+    let Some(entries) = entries_value.as_array() else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn parse_package_name_from_package(package_json_path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(package_json_path).ok()?;
+    let json = serde_json::from_str::<Value>(&raw).ok()?;
+    json.get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn find_package_json_ancestors(mut dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    while let Some(current) = dir {
+        let candidate = current.join("package.json");
+        if candidate.is_file() {
+            let canonical = safe_canonicalize(&candidate);
+            if seen.insert(canonical.clone()) {
+                out.push(canonical);
+            }
+        }
+        dir = current.parent();
+    }
+    out
+}
+
+fn extract_node_modules_package_name(entry: &str) -> Option<String> {
+    let normalized = entry.replace('\\', "/");
+    let marker = "node_modules/";
+    let start = normalized.find(marker)?;
+    let mut parts = normalized[start + marker.len()..].split('/');
+    let first = parts.next()?;
+    if first.starts_with('@') {
+        let second = parts.next()?;
+        Some(format!("{first}/{second}"))
+    } else {
+        Some(first.to_string())
+    }
+}
+
+fn find_workspace_package_dir_by_name(
+    workspace_root: &Path,
+    package_name: &str,
+) -> Option<PathBuf> {
+    let entries = fs::read_dir(workspace_root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let package_json = path.join("package.json");
+        if !package_json.is_file() {
+            continue;
+        }
+        if parse_package_name_from_package(&package_json).is_some_and(|name| name == package_name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn resolve_package_declared_entries(
+    package_dir: &Path,
+    package_entries: &[String],
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let workspace_root = package_dir.parent();
+
+    for raw_entry in package_entries {
+        let mut resolved = Vec::new();
+        let declared_path = package_dir.join(raw_entry);
+        if declared_path.is_dir() {
+            resolved.extend(collect_extension_entries_from_dir(&declared_path));
+        } else if let Some(path) = resolve_extension_entry_file(&declared_path) {
+            resolved.push(path);
+        }
+
+        if resolved.is_empty()
+            && raw_entry.contains("node_modules/")
+            && let Some(workspace_root) = workspace_root
+            && let Some(package_name) = extract_node_modules_package_name(raw_entry)
+            && let Some(workspace_package_dir) =
+                find_workspace_package_dir_by_name(workspace_root, &package_name)
+        {
+            let nested_package_json = workspace_package_dir.join("package.json");
+            let nested_entries = parse_pi_extensions_from_package(&nested_package_json);
+            if nested_entries.is_empty() {
+                if let Some(index_path) =
+                    resolve_extension_entry_file(&workspace_package_dir.join("index"))
+                {
+                    resolved.push(index_path);
+                }
+            } else {
+                resolved.extend(resolve_package_declared_entries(
+                    &workspace_package_dir,
+                    &nested_entries,
+                ));
+            }
+        }
+
+        for path in resolved {
+            if seen.insert(path.clone()) {
+                out.push(path);
+            }
+        }
+    }
+
+    out
+}
+
+fn discover_workspace_bundle_entries(package_dir: &Path) -> Vec<PathBuf> {
+    let Some(workspace_root) = package_dir.parent() else {
+        return Vec::new();
+    };
+
+    let mut cluster_dirs = Vec::new();
+    if let Ok(entries) = fs::read_dir(workspace_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                cluster_dirs.push(path);
+            }
+        }
+    }
+    if cluster_dirs.is_empty() || cluster_dirs.len() > MAX_BUNDLE_CLUSTER_DIRS {
+        return Vec::new();
+    }
+    cluster_dirs.sort();
+
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for dir in &cluster_dirs {
+        let package_json = dir.join("package.json");
+        let package_entries = parse_pi_extensions_from_package(&package_json);
+        if package_entries.is_empty() {
+            continue;
+        }
+        for path in resolve_package_declared_entries(dir, &package_entries) {
+            if seen.insert(path.clone()) {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut root_files = Vec::new();
+    if let Ok(entries) = fs::read_dir(workspace_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && is_supported_js_extension_entry(&path) {
+                root_files.push(path);
+            }
+        }
+    }
+    root_files.sort();
+    for path in root_files {
+        let canonical = safe_canonicalize(&path);
+        if seen.insert(canonical.clone()) {
+            out.push(canonical);
+        }
+    }
+
+    for dir in cluster_dirs {
+        if dir.join("package.json").is_file() {
+            continue;
+        }
+        for path in collect_extension_entries_from_dir(&dir) {
+            if seen.insert(path.clone()) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn discover_sibling_index_entries(primary: &Path) -> Vec<PathBuf> {
+    let canonical_primary = safe_canonicalize(primary);
+    if primary
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_none_or(|stem| !stem.eq_ignore_ascii_case("index"))
+    {
+        return Vec::new();
+    }
+    let Some(parent_dir) = primary.parent() else {
+        return Vec::new();
+    };
+    let Some(cluster_root) = parent_dir.parent() else {
+        return Vec::new();
+    };
+
+    let mut candidate_dirs = Vec::new();
+    if let Ok(entries) = fs::read_dir(cluster_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                candidate_dirs.push(path);
+            }
+        }
+    }
+    if candidate_dirs.len() < 2 || candidate_dirs.len() > MAX_BUNDLE_CLUSTER_DIRS {
+        return Vec::new();
+    }
+    candidate_dirs.sort();
+
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for dir in candidate_dirs {
+        for ext in JS_EXTENSION_ENTRY_EXTS {
+            let candidate = dir.join(format!("index.{ext}"));
+            if let Some(path) = resolve_extension_entry_file(&candidate) {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+                break;
+            }
+        }
+    }
+
+    if out.len() < 2 || !out.iter().any(|path| path == &canonical_primary) {
+        return Vec::new();
+    }
+    out
+}
+
+fn discover_extensions_dir_entries(primary: &Path) -> Vec<PathBuf> {
+    let canonical_primary = safe_canonicalize(primary);
+    let Some(parent_dir) = primary.parent() else {
+        return Vec::new();
+    };
+    if !parent_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("extensions"))
+    {
+        return Vec::new();
+    }
+
+    let entries = collect_extension_entries_from_dir(parent_dir);
+    if entries.len() < 2 || !entries.iter().any(|path| path == &canonical_primary) {
+        return Vec::new();
+    }
+    entries
+}
+
+fn discover_sibling_extension_entries(primary: &Path) -> Vec<PathBuf> {
+    let canonical_primary = safe_canonicalize(primary);
+    let Some(parent_dir) = primary.parent() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut sibling_files = Vec::new();
+    let mut sibling_dirs = Vec::new();
+    if let Ok(entries) = fs::read_dir(parent_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && is_supported_js_extension_entry(&path) {
+                sibling_files.push(path);
+                continue;
+            }
+            if !path.is_dir() {
+                continue;
+            }
+            if let Some(index_path) = resolve_extension_entry_file(&path.join("index")) {
+                sibling_dirs.push(index_path);
+            }
+            if let Some(dir_name) = path.file_name().and_then(|name| name.to_str()) {
+                if let Some(named_path) = resolve_extension_entry_file(&path.join(dir_name)) {
+                    sibling_dirs.push(named_path);
+                }
+            }
+        }
+    }
+    sibling_files.sort();
+    sibling_dirs.sort();
+
+    for path in sibling_files {
+        let canonical = safe_canonicalize(&path);
+        if seen.insert(canonical.clone()) {
+            out.push(canonical);
+        }
+    }
+    for path in sibling_dirs {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+
+    if out.len() < 2 || !out.iter().any(|path| path == &canonical_primary) {
+        return Vec::new();
+    }
+
+    out
+}
+
+fn discover_related_extension_entries(primary: &Path) -> Vec<PathBuf> {
+    let canonical_primary = safe_canonicalize(primary);
+    let mut out = vec![canonical_primary.clone()];
+    let mut seen = BTreeSet::new();
+    let _ = seen.insert(canonical_primary.clone());
+
+    let mut selected_package_dir: Option<PathBuf> = None;
+    let mut selected_package_entries_len = 0usize;
+    let mut selected_resolved: Vec<PathBuf> = Vec::new();
+    for package_json in find_package_json_ancestors(primary.parent()) {
+        let Some(package_dir) = package_json.parent() else {
+            continue;
+        };
+        let package_entries = parse_pi_extensions_from_package(&package_json);
+        if package_entries.is_empty() {
+            continue;
+        }
+        let resolved = resolve_package_declared_entries(package_dir, &package_entries);
+        if !resolved.contains(&canonical_primary) {
+            continue;
+        }
+        if resolved.len() > selected_resolved.len() {
+            selected_package_dir = Some(package_dir.to_path_buf());
+            selected_package_entries_len = package_entries.len();
+            selected_resolved = resolved;
+        }
+    }
+
+    if !selected_resolved.is_empty() {
+        for path in selected_resolved {
+            if seen.insert(path.clone()) {
+                out.push(path);
+            }
+        }
+
+        let is_primary_index = canonical_primary
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("index"));
+        if selected_package_entries_len == 1 && is_primary_index {
+            if let Some(package_dir) = selected_package_dir.as_deref() {
+                let bundle_entries = discover_workspace_bundle_entries(package_dir);
+                if bundle_entries.len() >= 2
+                    && bundle_entries.iter().any(|path| path == &canonical_primary)
+                {
+                    for path in bundle_entries {
+                        if seen.insert(path.clone()) {
+                            out.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for path in discover_sibling_extension_entries(&canonical_primary) {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    if let Some(package_dir) = selected_package_dir.as_deref() {
+        for path in discover_auxiliary_example_entries(package_dir, &canonical_primary) {
+            if seen.insert(path.clone()) {
+                out.push(path);
+            }
+        }
+    }
+    for path in discover_sibling_index_entries(&canonical_primary) {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    for path in discover_extensions_dir_entries(&canonical_primary) {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+
+    out
+}
+
 #[allow(clippy::future_not_send)]
 async fn load_all_extensions(
     runtime: &PiJsRuntime,
@@ -11918,39 +12486,75 @@ async fn load_one_extension(
     host: &JsRuntimeHost,
     spec: &JsExtensionLoadSpec,
 ) -> Result<()> {
+    let entry_paths = discover_related_extension_entries(&spec.entry_path);
+    if entry_paths.len() > 1 {
+        tracing::info!(
+            event = "ext.load.multi_entry",
+            extension_id = %spec.extension_id,
+            root_entry = %spec.entry_path.display(),
+            resolved_entries = entry_paths.len(),
+            "Loading extension package with multiple entrypoints"
+        );
+    }
+
     // Register the extension's root directory so `readFileSync` can access
     // bundled assets (HTML templates, markdown docs, etc.) within the
     // extension's own directory tree, and so the resolver can detect
     // monorepo escape patterns (Pattern 3).
-    if let Some(ext_dir) = spec.entry_path.parent() {
-        if let Ok(canonical) = std::fs::canonicalize(ext_dir).map(strip_unc_prefix) {
-            runtime.add_extension_root_with_id(canonical, Some(spec.extension_id.as_str()));
+    for entry_path in &entry_paths {
+        if let Some(ext_dir) = entry_path.parent() {
+            if let Ok(canonical) = std::fs::canonicalize(ext_dir).map(strip_unc_prefix) {
+                runtime.add_extension_root_with_id(canonical, Some(spec.extension_id.as_str()));
+            }
         }
     }
 
-    // QuickJS module resolver requires forward-slash paths.
-    let entry_specifier = spec.entry_path.display().to_string().replace('\\', "/");
     let meta = json!({
         "name": spec.name,
         "version": spec.version,
         "apiVersion": spec.api_version,
     });
-    let task_id = format!("task-load-{}", Uuid::new_v4());
 
-    runtime
-        .with_ctx(|ctx| {
-            let global = ctx.globals();
-            let load_fn: rquickjs::Function<'_> = global.get("__pi_load_extension")?;
-            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-            let meta_value = json_to_js(&ctx, &meta)?;
-            let promise: rquickjs::Value<'_> =
-                load_fn.call((spec.extension_id.clone(), entry_specifier, meta_value))?;
-            let _task: String = task_start.call((task_id.clone(), promise))?;
-            Ok(())
-        })
-        .await?;
+    for (entry_index, entry_path) in entry_paths.into_iter().enumerate() {
+        // QuickJS module resolver requires forward-slash paths.
+        let entry_specifier = entry_path.display().to_string().replace('\\', "/");
+        let task_id = format!("task-load-{}", Uuid::new_v4());
+        let meta_value = meta.clone();
 
-    let _ = await_js_task(runtime, host, &task_id, Duration::from_secs(10)).await?;
+        let bootstrap_result = runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let load_fn: rquickjs::Function<'_> = global.get("__pi_load_extension")?;
+                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+                let meta_js = json_to_js(&ctx, &meta_value)?;
+                let promise: rquickjs::Value<'_> =
+                    load_fn.call((spec.extension_id.clone(), entry_specifier.clone(), meta_js))?;
+                let _task: String = task_start.call((task_id.clone(), promise))?;
+                Ok(())
+            })
+            .await;
+        let load_result = match bootstrap_result {
+            Ok(()) => await_js_task(runtime, host, &task_id, Duration::from_secs(10))
+                .await
+                .map(|_| ()),
+            Err(err) => Err(err),
+        };
+
+        match load_result {
+            Ok(()) => {}
+            Err(err) if entry_index == 0 => return Err(err),
+            Err(err) => {
+                tracing::warn!(
+                    event = "ext.load.multi_entry.skipped",
+                    extension_id = %spec.extension_id,
+                    entry = %entry_specifier,
+                    error = %err,
+                    "Skipping non-primary entrypoint after load failure"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -16434,12 +17038,23 @@ impl ExtensionManager {
                 active_tools: ext_active_tools,
             } = snapshot;
             all_providers.extend(providers);
-            all_flags.extend(flags.clone());
+            let extension_name = if name.is_empty() {
+                id.clone()
+            } else {
+                name.clone()
+            };
+            all_flags.extend(flags.iter().cloned().map(|mut flag| {
+                if let Some(obj) = flag.as_object_mut() {
+                    obj.entry("extension_id".to_string())
+                        .or_insert_with(|| Value::String(extension_name.clone()));
+                }
+                flag
+            }));
             if let Some(list) = ext_active_tools {
                 active_tools = Some(list);
             }
             payloads.push(RegisterPayload {
-                name: if name.is_empty() { id } else { name },
+                name: extension_name,
                 version,
                 api_version: if api_version.is_empty() {
                     PROTOCOL_VERSION.to_string()
@@ -16919,11 +17534,13 @@ impl ExtensionManager {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let flag_type = flag.get("type").and_then(Value::as_str).unwrap_or("string");
+                let extension_id = flag.get("extension_id").and_then(Value::as_str);
                 flags.push(json!({
                     "name": name,
                     "description": description,
                     "type": flag_type,
                     "default": flag.get("default").cloned(),
+                    "extension_id": extension_id,
                     "source": "extension",
                 }));
             }
@@ -16948,6 +17565,7 @@ impl ExtensionManager {
                         "description": description,
                         "type": flag_type,
                         "default": flag.get("default").cloned(),
+                        "extension_id": ext.name,
                         "source": "extension",
                     }));
                 }
@@ -17071,7 +17689,6 @@ impl ExtensionManager {
         tx.is_some_and(|sender| sender.send(&cx, response).is_ok())
     }
 
-    #[allow(clippy::too_many_lines)]
     #[allow(clippy::too_many_lines)]
     async fn dispatch_event_value(
         &self,
@@ -17569,6 +18186,11 @@ pub fn extension_event_from_agent(
         AgentEvent::ToolExecutionStart { .. } => ExtensionEventName::ToolExecutionStart,
         AgentEvent::ToolExecutionUpdate { .. } => ExtensionEventName::ToolExecutionUpdate,
         AgentEvent::ToolExecutionEnd { .. } => ExtensionEventName::ToolExecutionEnd,
+        // Session-level compaction/retry events are not dispatched to extensions.
+        AgentEvent::AutoCompactionStart { .. }
+        | AgentEvent::AutoCompactionEnd { .. }
+        | AgentEvent::AutoRetryStart { .. }
+        | AgentEvent::AutoRetryEnd { .. } => return None,
     };
 
     let payload = serde_json::to_value(event).ok();
@@ -17622,6 +18244,273 @@ mod tests {
                 )
             })
             .unwrap()
+    }
+
+    #[test]
+    fn parse_pi_extensions_accepts_string_and_array_forms() {
+        let temp = tempdir().expect("tempdir");
+        let package_json = temp.path().join("package.json");
+
+        std::fs::write(&package_json, r#"{ "pi": { "extensions": "./index.ts" } }"#)
+            .expect("write package.json");
+        assert_eq!(
+            parse_pi_extensions_from_package(&package_json),
+            vec!["./index.ts".to_string()]
+        );
+
+        std::fs::write(
+            &package_json,
+            r#"{ "pi": { "extensions": ["./a.ts", "./b.ts"] } }"#,
+        )
+        .expect("write package.json array");
+        assert_eq!(
+            parse_pi_extensions_from_package(&package_json),
+            vec!["./a.ts".to_string(), "./b.ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn discover_sibling_index_entries_keeps_primary_even_when_not_sorted_first() {
+        let temp = tempdir().expect("tempdir");
+        let cluster = temp.path().join("bundle");
+        let dir_a = cluster.join("a-ext");
+        let dir_b = cluster.join("b-ext");
+        let dir_c = cluster.join("c-ext");
+        std::fs::create_dir_all(&dir_a).expect("mkdir a-ext");
+        std::fs::create_dir_all(&dir_b).expect("mkdir b-ext");
+        std::fs::create_dir_all(&dir_c).expect("mkdir c-ext");
+
+        let a_index = dir_a.join("index.ts");
+        let b_index = dir_b.join("index.ts");
+        let c_index = dir_c.join("index.ts");
+        std::fs::write(&a_index, "export default {};\n").expect("write a index");
+        std::fs::write(&b_index, "export default {};\n").expect("write b index");
+        std::fs::write(&c_index, "export default {};\n").expect("write c index");
+
+        let discovered = discover_sibling_index_entries(&b_index);
+        assert_eq!(discovered.len(), 3);
+        assert!(discovered.contains(&safe_canonicalize(&a_index)));
+        assert!(discovered.contains(&safe_canonicalize(&b_index)));
+        assert!(discovered.contains(&safe_canonicalize(&c_index)));
+    }
+
+    #[test]
+    fn discover_sibling_index_entries_ignores_huge_parent_clusters() {
+        let temp = tempdir().expect("tempdir");
+        let cluster = temp.path().join("bundle");
+        std::fs::create_dir_all(&cluster).expect("mkdir bundle");
+
+        let primary_dir = cluster.join("pkg-00");
+        std::fs::create_dir_all(&primary_dir).expect("mkdir primary dir");
+        let primary = primary_dir.join("index.ts");
+        std::fs::write(&primary, "export default {};\n").expect("write primary");
+
+        for idx in 1..=MAX_BUNDLE_CLUSTER_DIRS {
+            let dir = cluster.join(format!("pkg-{idx:02}"));
+            std::fs::create_dir_all(&dir).expect("mkdir sibling dir");
+            std::fs::write(dir.join("index.ts"), "export default {};\n")
+                .expect("write sibling index");
+        }
+
+        let discovered = discover_sibling_index_entries(&primary);
+        assert!(
+            discovered.is_empty(),
+            "large clusters should not trigger sibling index expansion"
+        );
+    }
+
+    #[test]
+    fn discover_extensions_dir_entries_keeps_primary_when_not_first() {
+        let temp = tempdir().expect("tempdir");
+        let extensions_dir = temp.path().join("extensions");
+        std::fs::create_dir_all(&extensions_dir).expect("mkdir extensions");
+        let alpha = extensions_dir.join("alpha.ts");
+        let beta = extensions_dir.join("beta.ts");
+        std::fs::write(&alpha, "export default {};\n").expect("write alpha");
+        std::fs::write(&beta, "export default {};\n").expect("write beta");
+
+        let discovered = discover_extensions_dir_entries(&beta);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&safe_canonicalize(&alpha)));
+        assert!(discovered.contains(&safe_canonicalize(&beta)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_includes_package_array_when_primary_not_first() {
+        let temp = tempdir().expect("tempdir");
+        let package_dir = temp.path().join("pkg");
+        let commands_dir = package_dir.join("commands");
+        std::fs::create_dir_all(&commands_dir).expect("mkdir commands");
+
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{ "pi": { "extensions": ["./commands/a.ts", "./commands/b.ts"] } }"#,
+        )
+        .expect("write package.json");
+
+        let a_path = commands_dir.join("a.ts");
+        let b_path = commands_dir.join("b.ts");
+        std::fs::write(&a_path, "export default {};\n").expect("write a.ts");
+        std::fs::write(&b_path, "export default {};\n").expect("write b.ts");
+
+        let discovered = discover_related_extension_entries(&b_path);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&safe_canonicalize(&a_path)));
+        assert!(discovered.contains(&safe_canonicalize(&b_path)));
+    }
+
+    #[test]
+    fn collect_extension_entries_from_dir_includes_nested_index_entries() {
+        let temp = tempdir().expect("tempdir");
+        let extensions_dir = temp.path().join("extensions");
+        let mcp_dir = extensions_dir.join("mcp");
+        let subagent_dir = extensions_dir.join("subagent");
+        std::fs::create_dir_all(&mcp_dir).expect("mkdir mcp");
+        std::fs::create_dir_all(&subagent_dir).expect("mkdir subagent");
+        let powerline = extensions_dir.join("powerline-status.ts");
+        let mcp_index = mcp_dir.join("index.ts");
+        let subagent_index = subagent_dir.join("index.ts");
+        std::fs::write(&powerline, "export default {};\n").expect("write powerline");
+        std::fs::write(&mcp_index, "export default {};\n").expect("write mcp index");
+        std::fs::write(&subagent_index, "export default {};\n").expect("write subagent index");
+
+        let discovered = collect_extension_entries_from_dir(&extensions_dir);
+        assert!(discovered.contains(&safe_canonicalize(&powerline)));
+        assert!(discovered.contains(&safe_canonicalize(&mcp_index)));
+        assert!(discovered.contains(&safe_canonicalize(&subagent_index)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_prefers_ancestor_bundle_with_more_entries() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("pi-extensions");
+        let nested = root.join("agent-guidance");
+        let code_actions = root.join("code-actions");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        std::fs::create_dir_all(&code_actions).expect("mkdir code-actions");
+
+        let nested_entry = nested.join("agent-guidance.ts");
+        let code_entry = code_actions.join("index.ts");
+        std::fs::write(&nested_entry, "export default {};\n").expect("write nested");
+        std::fs::write(&code_entry, "export default {};\n").expect("write code");
+
+        std::fs::write(
+            nested.join("package.json"),
+            r#"{ "pi": { "extensions": ["./agent-guidance.ts"] } }"#,
+        )
+        .expect("write nested package");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "pi": { "extensions": ["./agent-guidance/agent-guidance.ts", "./code-actions/index.ts"] } }"#,
+        )
+        .expect("write root package");
+
+        let discovered = discover_related_extension_entries(&nested_entry);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&safe_canonicalize(&nested_entry)));
+        assert!(discovered.contains(&safe_canonicalize(&code_entry)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_includes_flat_siblings_without_manifest() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("flat");
+        std::fs::create_dir_all(&root).expect("mkdir flat");
+
+        let a = root.join("a.ts");
+        let b = root.join("b.ts");
+        std::fs::write(&a, "export default {};\n").expect("write a");
+        std::fs::write(&b, "export default {};\n").expect("write b");
+
+        let discovered = discover_related_extension_entries(&a);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&safe_canonicalize(&a)));
+        assert!(discovered.contains(&safe_canonicalize(&b)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_includes_likely_example_extension_entries() {
+        let temp = tempdir().expect("tempdir");
+        let package_dir = temp.path().join("pkg");
+        let extensions_dir = package_dir.join("extensions");
+        let examples_dir = package_dir.join("examples");
+        std::fs::create_dir_all(&extensions_dir).expect("mkdir extensions");
+        std::fs::create_dir_all(&examples_dir).expect("mkdir examples");
+
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{ "pi": { "extensions": ["./extensions/main.ts"] } }"#,
+        )
+        .expect("write package.json");
+
+        let primary = extensions_dir.join("main.ts");
+        let example_entry = examples_dir.join("test-extension.ts");
+        let helper = examples_dir.join("helper.ts");
+
+        std::fs::write(&primary, "export default {};\n").expect("write primary");
+        std::fs::write(
+            &example_entry,
+            "export default function (pi) { pi.registerCommand('demo', { handler() {} }); }\n",
+        )
+        .expect("write example entry");
+        std::fs::write(&helper, "export const helper = true;\n").expect("write helper");
+
+        let discovered = discover_related_extension_entries(&primary);
+        assert!(discovered.contains(&safe_canonicalize(&primary)));
+        assert!(discovered.contains(&safe_canonicalize(&example_entry)));
+        assert!(
+            !discovered.contains(&safe_canonicalize(&helper)),
+            "non-extension helper files in examples should be ignored"
+        );
+    }
+
+    #[test]
+    fn discover_related_extension_entries_includes_sibling_index_when_helper_files_exist() {
+        let temp = tempdir().expect("tempdir");
+        let cluster = temp.path().join("bundle");
+        let a_dir = cluster.join("a-ext");
+        let b_dir = cluster.join("b-ext");
+        std::fs::create_dir_all(&a_dir).expect("mkdir a-ext");
+        std::fs::create_dir_all(&b_dir).expect("mkdir b-ext");
+
+        let a_index = a_dir.join("index.ts");
+        let a_helper = a_dir.join("helper.ts");
+        let b_index = b_dir.join("index.ts");
+        std::fs::write(&a_index, "export default {};\n").expect("write a index");
+        std::fs::write(&a_helper, "export const helper = true;\n").expect("write a helper");
+        std::fs::write(&b_index, "export default {};\n").expect("write b index");
+
+        let discovered = discover_related_extension_entries(&a_index);
+        assert!(discovered.contains(&safe_canonicalize(&a_index)));
+        assert!(discovered.contains(&safe_canonicalize(&a_helper)));
+        assert!(
+            discovered.contains(&safe_canonicalize(&b_index)),
+            "sibling index entries should still be included when local helpers are present"
+        );
+    }
+
+    #[test]
+    fn discover_workspace_bundle_entries_ignores_huge_parent_clusters() {
+        let temp = tempdir().expect("tempdir");
+        let cluster = temp.path().join("cluster");
+        std::fs::create_dir_all(&cluster).expect("mkdir cluster");
+        let package_dir = cluster.join("pkg-00");
+        std::fs::create_dir_all(&package_dir).expect("mkdir package dir");
+
+        for idx in 0..=MAX_BUNDLE_CLUSTER_DIRS {
+            let dir = cluster.join(format!("pkg-{idx:02}"));
+            std::fs::create_dir_all(&dir).expect("mkdir sibling package");
+            let entry = dir.join("index.ts");
+            std::fs::write(&entry, "export default {};\n").expect("write sibling entry");
+            std::fs::write(
+                dir.join("package.json"),
+                r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
+            )
+            .expect("write sibling package");
+        }
+
+        let discovered = discover_workspace_bundle_entries(&package_dir);
+        assert!(discovered.is_empty());
     }
 
     #[allow(clippy::too_many_lines)]
@@ -18350,6 +19239,70 @@ mod tests {
             assert!(wrote, "expected out.txt to be created after pumping");
             let contents = std::fs::read_to_string(&out_path).expect("read out.txt");
             assert_eq!(contents, "hi");
+        });
+    }
+
+    #[test]
+    fn multi_entry_loader_skips_failing_non_primary_entrypoints() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let bundle_root = dir.path().join("bundle");
+            let primary_dir = bundle_root.join("a-primary");
+            let failing_dir = bundle_root.join("b-failing");
+            std::fs::create_dir_all(&primary_dir).expect("mkdir primary");
+            std::fs::create_dir_all(&failing_dir).expect("mkdir failing");
+
+            let primary_entry = primary_dir.join("index.ts");
+            std::fs::write(
+                &primary_entry,
+                r#"
+                export default function init(pi) {
+                  pi.registerCommand("primary-ok", {
+                    description: "ok",
+                    handler: async () => "ok",
+                  });
+                }
+                "#,
+            )
+            .expect("write primary entry");
+
+            let failing_entry = failing_dir.join("index.ts");
+            std::fs::write(
+                &failing_entry,
+                r#"
+                export default function init(_pi) {
+                  throw new Error("secondary entry failed");
+                }
+                "#,
+            )
+            .expect("write failing entry");
+
+            let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime);
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&primary_entry).expect("load spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("primary entry should load despite secondary failure");
+
+            assert!(manager.has_command("primary-ok"));
+            assert!(!manager.has_command("secondary-should-not-exist"));
         });
     }
 
