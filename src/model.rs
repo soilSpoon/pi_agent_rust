@@ -402,6 +402,7 @@ impl std::fmt::Display for ThinkingLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
     use std::collections::BTreeSet;
 
@@ -1293,5 +1294,347 @@ mod tests {
         });
         let msg: CustomMessage = serde_json::from_value(json).expect("deserialize");
         assert!(!msg.display);
+    }
+
+    // ── Proptest serde invariants ───────────────────────────────────────
+
+    fn arbitrary_small_string() -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<u8>(), 0..128)
+            .prop_map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn interesting_text_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            arbitrary_small_string(),
+            Just(String::new()),
+            Just("[]".to_string()),
+            Just("{}".to_string()),
+            Just("cafe\u{0301}".to_string()),
+            Just("emoji 😀".to_string()),
+        ]
+    }
+
+    fn scalar_json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|n| json!(n)),
+            any::<u64>().prop_map(|n| json!(n)),
+            interesting_text_strategy().prop_map(serde_json::Value::String),
+        ]
+    }
+
+    fn bounded_json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            scalar_json_value_strategy(),
+            prop::collection::vec(scalar_json_value_strategy(), 0..5)
+                .prop_map(serde_json::Value::Array),
+            prop::collection::btree_map(
+                arbitrary_small_string(),
+                scalar_json_value_strategy(),
+                0..5
+            )
+            .prop_map(|map| {
+                serde_json::Value::Object(
+                    map.into_iter()
+                        .collect::<serde_json::Map<String, serde_json::Value>>(),
+                )
+            }),
+        ]
+    }
+
+    fn stop_reason_strategy() -> impl Strategy<Value = StopReason> {
+        prop_oneof![
+            Just(StopReason::Stop),
+            Just(StopReason::Length),
+            Just(StopReason::ToolUse),
+            Just(StopReason::Error),
+            Just(StopReason::Aborted),
+        ]
+    }
+
+    fn usage_strategy() -> impl Strategy<Value = Usage> {
+        (
+            any::<u16>(),
+            any::<u16>(),
+            any::<u16>(),
+            any::<u16>(),
+            any::<u16>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+        )
+            .prop_map(
+                |(
+                    input,
+                    output,
+                    cache_read,
+                    cache_write,
+                    total_tokens,
+                    cost_input,
+                    cost_output,
+                    cost_cache_read,
+                    cost_cache_write,
+                    cost_total,
+                )| Usage {
+                    input: u64::from(input),
+                    output: u64::from(output),
+                    cache_read: u64::from(cache_read),
+                    cache_write: u64::from(cache_write),
+                    total_tokens: u64::from(total_tokens),
+                    cost: Cost {
+                        input: f64::from(cost_input) / 1_000_000.0,
+                        output: f64::from(cost_output) / 1_000_000.0,
+                        cache_read: f64::from(cost_cache_read) / 1_000_000.0,
+                        cache_write: f64::from(cost_cache_write) / 1_000_000.0,
+                        total: f64::from(cost_total) / 1_000_000.0,
+                    },
+                },
+            )
+    }
+
+    fn text_content_strategy() -> impl Strategy<Value = TextContent> {
+        (
+            interesting_text_strategy(),
+            prop::option::of(interesting_text_strategy()),
+        )
+            .prop_map(|(text, text_signature)| TextContent {
+                text,
+                text_signature,
+            })
+    }
+
+    fn thinking_content_strategy() -> impl Strategy<Value = ThinkingContent> {
+        (
+            interesting_text_strategy(),
+            prop::option::of(interesting_text_strategy()),
+        )
+            .prop_map(|(thinking, thinking_signature)| ThinkingContent {
+                thinking,
+                thinking_signature,
+            })
+    }
+
+    fn image_content_strategy() -> impl Strategy<Value = ImageContent> {
+        (
+            interesting_text_strategy(),
+            prop_oneof![
+                Just("image/png".to_string()),
+                Just("image/jpeg".to_string()),
+                Just("image/webp".to_string()),
+                interesting_text_strategy(),
+            ],
+        )
+            .prop_map(|(data, mime_type)| ImageContent { data, mime_type })
+    }
+
+    fn tool_call_strategy() -> impl Strategy<Value = ToolCall> {
+        (
+            interesting_text_strategy(),
+            interesting_text_strategy(),
+            bounded_json_value_strategy(),
+            prop::option::of(interesting_text_strategy()),
+        )
+            .prop_map(|(id, name, arguments, thought_signature)| ToolCall {
+                id,
+                name,
+                arguments,
+                thought_signature,
+            })
+    }
+
+    fn content_block_strategy() -> impl Strategy<Value = ContentBlock> {
+        prop_oneof![
+            text_content_strategy().prop_map(ContentBlock::Text),
+            thinking_content_strategy().prop_map(ContentBlock::Thinking),
+            image_content_strategy().prop_map(ContentBlock::Image),
+            tool_call_strategy().prop_map(ContentBlock::ToolCall),
+        ]
+    }
+
+    fn content_block_json_strategy() -> impl Strategy<Value = serde_json::Value> {
+        content_block_strategy()
+            .prop_map(|block| serde_json::to_value(block).expect("content block should serialize"))
+    }
+
+    fn invalid_content_block_json_strategy() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            interesting_text_strategy().prop_map(|text| json!({ "text": text })),
+            interesting_text_strategy().prop_map(|text| json!({ "type": "unknown", "text": text })),
+            Just(json!({ "type": 42, "text": "bad-discriminator-type" })),
+            Just(json!({ "type": "text" })),
+            Just(json!({ "type": "image", "mimeType": "image/png" })),
+            Just(json!({ "type": "toolCall", "id": "tool-only-id" })),
+        ]
+    }
+
+    fn user_content_strategy() -> impl Strategy<Value = UserContent> {
+        prop_oneof![
+            interesting_text_strategy().prop_map(UserContent::Text),
+            prop::collection::vec(content_block_strategy(), 0..6).prop_map(UserContent::Blocks),
+        ]
+    }
+
+    fn assistant_message_strategy() -> impl Strategy<Value = AssistantMessage> {
+        (
+            prop::collection::vec(content_block_strategy(), 0..6),
+            interesting_text_strategy(),
+            interesting_text_strategy(),
+            interesting_text_strategy(),
+            usage_strategy(),
+            stop_reason_strategy(),
+            prop::option::of(interesting_text_strategy()),
+            any::<i64>(),
+        )
+            .prop_map(
+                |(content, api, provider, model, usage, stop_reason, error_message, timestamp)| {
+                    AssistantMessage {
+                        content,
+                        api,
+                        provider,
+                        model,
+                        usage,
+                        stop_reason,
+                        error_message,
+                        timestamp,
+                    }
+                },
+            )
+    }
+
+    fn tool_result_message_strategy() -> impl Strategy<Value = ToolResultMessage> {
+        (
+            interesting_text_strategy(),
+            interesting_text_strategy(),
+            prop::collection::vec(content_block_strategy(), 0..6),
+            prop::option::of(bounded_json_value_strategy()),
+            any::<bool>(),
+            any::<i64>(),
+        )
+            .prop_map(
+                |(tool_call_id, tool_name, content, details, is_error, timestamp)| {
+                    ToolResultMessage {
+                        tool_call_id,
+                        tool_name,
+                        content,
+                        details,
+                        is_error,
+                        timestamp,
+                    }
+                },
+            )
+    }
+
+    fn custom_message_strategy() -> impl Strategy<Value = CustomMessage> {
+        (
+            interesting_text_strategy(),
+            interesting_text_strategy(),
+            any::<bool>(),
+            prop::option::of(bounded_json_value_strategy()),
+            any::<i64>(),
+        )
+            .prop_map(|(content, custom_type, display, details, timestamp)| {
+                CustomMessage {
+                    content,
+                    custom_type,
+                    display,
+                    details,
+                    timestamp,
+                }
+            })
+    }
+
+    fn message_strategy() -> impl Strategy<Value = Message> {
+        prop_oneof![
+            (user_content_strategy(), any::<i64>())
+                .prop_map(|(content, timestamp)| Message::User(UserMessage { content, timestamp })),
+            assistant_message_strategy().prop_map(Message::Assistant),
+            tool_result_message_strategy().prop_map(Message::ToolResult),
+            custom_message_strategy().prop_map(Message::Custom),
+        ]
+    }
+
+    fn non_string_or_array_json_strategy() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|n| json!(n)),
+            prop::collection::btree_map(
+                arbitrary_small_string(),
+                scalar_json_value_strategy(),
+                0..4
+            )
+            .prop_map(|map| {
+                serde_json::Value::Object(
+                    map.into_iter()
+                        .collect::<serde_json::Map<String, serde_json::Value>>(),
+                )
+            }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, .. ProptestConfig::default() })]
+
+        #[test]
+        fn proptest_user_content_untagged_text_vs_blocks(
+            text in interesting_text_strategy(),
+            blocks in prop::collection::vec(content_block_json_strategy(), 0..5),
+        ) {
+            let parsed_text: UserContent = serde_json::from_value(serde_json::Value::String(text.clone()))
+                .expect("string must deserialize as UserContent::Text");
+            prop_assert!(matches!(parsed_text, UserContent::Text(ref s) if s == &text));
+
+            let parsed_blocks: UserContent = serde_json::from_value(serde_json::Value::Array(blocks.clone()))
+                .expect("array of content-block JSON must deserialize as UserContent::Blocks");
+            match parsed_blocks {
+                UserContent::Blocks(parsed) => prop_assert_eq!(parsed.len(), blocks.len()),
+                UserContent::Text(_) => {
+                    prop_assert!(false, "array input must not deserialize as UserContent::Text");
+                }
+            }
+        }
+
+        #[test]
+        fn proptest_user_content_rejects_non_string_or_array(value in non_string_or_array_json_strategy()) {
+            let result = serde_json::from_value::<UserContent>(value);
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn proptest_content_block_roundtrip(block in content_block_strategy()) {
+            let serialized = serde_json::to_value(&block).expect("content block should serialize");
+            let parsed: ContentBlock = serde_json::from_value(serialized.clone())
+                .expect("serialized content block should deserialize");
+            let reserialized = serde_json::to_value(parsed).expect("re-serialize should succeed");
+            prop_assert_eq!(reserialized, serialized);
+        }
+
+        #[test]
+        fn proptest_content_block_invalid_discriminator_errors(payload in invalid_content_block_json_strategy()) {
+            let result = serde_json::from_value::<ContentBlock>(payload);
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn proptest_message_roundtrip_and_unknown_fields(
+            message in message_strategy(),
+            extra_value in bounded_json_value_strategy(),
+        ) {
+            let serialized = serde_json::to_value(&message).expect("message should serialize");
+            let parsed: Message = serde_json::from_value(serialized.clone())
+                .expect("serialized message should deserialize");
+            let reserialized = serde_json::to_value(parsed).expect("re-serialize should succeed");
+            prop_assert_eq!(reserialized, serialized);
+
+            let mut with_extra = serialized.clone();
+            if let serde_json::Value::Object(ref mut obj) = with_extra {
+                obj.insert("extraFieldProptest".to_string(), extra_value);
+            }
+            let parsed_with_extra = serde_json::from_value::<Message>(with_extra);
+            prop_assert!(parsed_with_extra.is_ok());
+        }
     }
 }
