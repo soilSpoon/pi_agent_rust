@@ -577,6 +577,121 @@ impl PiApp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MessageRenderCache — per-message rendered content memoization (PERF-1)
+// ---------------------------------------------------------------------------
+
+use crate::interactive::state::MessageRole;
+use std::cell::RefCell;
+
+/// Lightweight cache key for a rendered conversation message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MessageCacheKey {
+    content_hash: u64,
+    collapsed: bool,
+    role: MessageRole,
+}
+
+/// Per-message render cache that stores the rendered output for each
+/// `ConversationMessage`. Avoids re-rendering unchanged messages every frame.
+///
+/// Uses interior mutability (`RefCell`) because `view(&self)` cannot take
+/// `&mut self` — same pattern as `FrameTimingStats`.
+pub struct MessageRenderCache {
+    /// Cached entries indexed by message position. `None` = cache miss.
+    entries: RefCell<Vec<Option<(MessageCacheKey, String)>>>,
+    /// Bumped on global invalidation: terminal resize, theme change,
+    /// toggle-thinking, tool-expand toggle. All entries from a previous
+    /// generation are considered stale.
+    generation: std::cell::Cell<u64>,
+    /// The generation at which each entry was cached. Stored separately
+    /// to avoid duplicating generation in every entry.
+    entry_generations: RefCell<Vec<u64>>,
+}
+
+impl MessageRenderCache {
+    #[allow(clippy::missing_const_for_fn)]
+    pub(super) fn new() -> Self {
+        Self {
+            entries: RefCell::new(Vec::new()),
+            generation: std::cell::Cell::new(0),
+            entry_generations: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Bump the generation counter, causing all cached entries to be
+    /// considered stale on next lookup. O(1) — does not touch entries.
+    pub(super) fn invalidate_all(&self) {
+        self.generation.set(self.generation.get() + 1);
+    }
+
+    /// Clear all cached entries. Used on `/clear` or conversation reset.
+    pub(super) fn clear(&self) {
+        self.entries.borrow_mut().clear();
+        self.entry_generations.borrow_mut().clear();
+    }
+
+    /// Look up the cached rendered string for message at `index`.
+    /// Returns `Some(&str)` on cache hit, `None` on miss.
+    pub(super) fn get(&self, index: usize, key: &MessageCacheKey) -> Option<String> {
+        let entries = self.entries.borrow();
+        let gens = self.entry_generations.borrow();
+        if index >= entries.len() {
+            return None;
+        }
+        let generation = self.generation.get();
+        if gens[index] != generation {
+            return None;
+        }
+        entries[index].as_ref().and_then(|(cached_key, rendered)| {
+            if cached_key == key {
+                Some(rendered.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Store a rendered string for message at `index`.
+    pub(super) fn put(&self, index: usize, key: MessageCacheKey, rendered: String) {
+        let mut entries = self.entries.borrow_mut();
+        let mut gens = self.entry_generations.borrow_mut();
+        // Grow vectors if needed.
+        if index >= entries.len() {
+            entries.resize_with(index + 1, || None);
+            gens.resize(index + 1, 0);
+        }
+        let generation = self.generation.get();
+        entries[index] = Some((key, rendered));
+        gens[index] = generation;
+    }
+
+    /// Compute the cache key for a conversation message.
+    pub(super) fn compute_key(
+        msg: &super::ConversationMessage,
+        thinking_visible: bool,
+        tools_expanded: bool,
+    ) -> MessageCacheKey {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        msg.content.hash(&mut hasher);
+        if thinking_visible {
+            if let Some(thinking) = &msg.thinking {
+                thinking.hash(&mut hasher);
+            }
+        }
+        // Include tools_expanded in hash for tool messages since it affects rendering
+        if msg.role == MessageRole::Tool {
+            tools_expanded.hash(&mut hasher);
+        }
+        MessageCacheKey {
+            content_hash: hasher.finish(),
+            collapsed: msg.collapsed,
+            role: msg.role,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,5 +1135,100 @@ mod tests {
         assert!(result.is_some());
         #[cfg(not(target_os = "linux"))]
         assert!(result.is_none());
+    }
+
+    // --- MessageRenderCache tests (PERF-1) ---
+
+    #[test]
+    fn cache_hit_returns_same_content() {
+        let cache = MessageRenderCache::new();
+        let msg = ConversationMessage::new(MessageRole::User, "Hello".to_string(), None);
+        let key = MessageRenderCache::compute_key(&msg, false, true);
+        cache.put(0, key.clone(), "rendered-hello".to_string());
+        assert_eq!(cache.get(0, &key), Some("rendered-hello".to_string()));
+    }
+
+    #[test]
+    fn cache_miss_after_content_change() {
+        let cache = MessageRenderCache::new();
+        let msg1 = ConversationMessage::new(MessageRole::User, "Hello".to_string(), None);
+        let key1 = MessageRenderCache::compute_key(&msg1, false, true);
+        cache.put(0, key1, "rendered-hello".to_string());
+
+        let msg2 = ConversationMessage::new(MessageRole::User, "Goodbye".to_string(), None);
+        let key2 = MessageRenderCache::compute_key(&msg2, false, true);
+        assert_eq!(cache.get(0, &key2), None);
+    }
+
+    #[test]
+    fn tool_message_cache_miss_when_collapse_toggles() {
+        let cache = MessageRenderCache::new();
+        let mut msg = ConversationMessage::tool("Tool bash:\nline1\nline2".to_string());
+        let key_expanded = MessageRenderCache::compute_key(&msg, false, true);
+        cache.put(0, key_expanded.clone(), "expanded-output".to_string());
+
+        // Toggle collapse
+        msg.collapsed = !msg.collapsed;
+        let key_collapsed = MessageRenderCache::compute_key(&msg, false, true);
+        assert_ne!(key_expanded, key_collapsed);
+        assert_eq!(cache.get(0, &key_collapsed), None);
+    }
+
+    #[test]
+    fn generation_bump_forces_full_miss() {
+        let cache = MessageRenderCache::new();
+        let msg = ConversationMessage::new(MessageRole::Assistant, "Response".to_string(), None);
+        let key = MessageRenderCache::compute_key(&msg, false, true);
+        cache.put(0, key.clone(), "old-render".to_string());
+
+        // Simulate terminal resize → generation bump
+        cache.invalidate_all();
+        assert_eq!(cache.get(0, &key), None);
+    }
+
+    #[test]
+    fn clear_removes_all_entries() {
+        let cache = MessageRenderCache::new();
+        let msg = ConversationMessage::new(MessageRole::User, "Hello".to_string(), None);
+        let key = MessageRenderCache::compute_key(&msg, false, true);
+        cache.put(0, key.clone(), "rendered".to_string());
+        cache.put(1, key.clone(), "rendered2".to_string());
+        cache.clear();
+        assert_eq!(cache.get(0, &key), None);
+        assert_eq!(cache.get(1, &key), None);
+    }
+
+    #[test]
+    fn thinking_visibility_changes_key() {
+        let msg = ConversationMessage::new(
+            MessageRole::Assistant,
+            "Response".to_string(),
+            Some("Thinking...".to_string()),
+        );
+        let key_visible = MessageRenderCache::compute_key(&msg, true, true);
+        let key_hidden = MessageRenderCache::compute_key(&msg, false, true);
+        assert_ne!(
+            key_visible, key_hidden,
+            "Thinking visibility should change the key"
+        );
+    }
+
+    #[test]
+    fn tools_expanded_changes_key_for_tool_messages() {
+        let msg = ConversationMessage::tool("Tool output\nline1\nline2".to_string());
+        let key_expanded = MessageRenderCache::compute_key(&msg, false, true);
+        let key_collapsed = MessageRenderCache::compute_key(&msg, false, false);
+        assert_ne!(
+            key_expanded, key_collapsed,
+            "tools_expanded should change key for tool messages"
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_index_returns_none() {
+        let cache = MessageRenderCache::new();
+        let msg = ConversationMessage::new(MessageRole::User, "Hello".to_string(), None);
+        let key = MessageRenderCache::compute_key(&msg, false, true);
+        assert_eq!(cache.get(42, &key), None);
     }
 }
