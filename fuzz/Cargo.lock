@@ -2981,8 +2981,11 @@ name = "pi_agent_rust-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "futures",
  "libfuzzer-sys",
  "pi_agent_rust",
+ "serde_json",
+ "tempfile",
  "vergen",
  "vergen-gix",
 ]
