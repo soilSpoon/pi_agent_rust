@@ -253,6 +253,15 @@ Artifacts:
 - `tests/full_suite_gate/certification_events.jsonl`
 - `tests/full_suite_gate/certification_report.md`
 
+### Drop-in certification contract gate (bd-35t7i)
+
+Before release messaging can claim strict drop-in parity, evaluate
+`docs/dropin-certification-contract.json` and emit
+`docs/dropin-certification-verdict.json` (`pi.dropin.certification_verdict.v1`).
+
+Blocking rule:
+- if `overall_verdict != CERTIFIED`, release language must not claim strict drop-in replacement.
+
 ### Gate reproduce commands
 
 Every gate includes a `reproduce_command` field. To replay a specific gate failure:

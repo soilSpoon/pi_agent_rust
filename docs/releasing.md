@@ -34,10 +34,11 @@ Release notes are extracted from `CHANGELOG.md` on a best-effort basis; ensure t
 ## When do we call it 1.0?
 We call it `1.0.0` when:
 - CI is green on Linux/macOS/Windows (`.github/workflows/ci.yml`)
-- Core CLI modes are stable (print + interactive + RPC) and conformance tests are green
+- Required execution surfaces are parity-stable (interactive + print + JSON mode + RPC + SDK contract) with conformance evidence green
 - Extension runtime surface and security policy are stable enough that we can commit to not breaking users without an intentional SemVer bump
+- Drop-in certification artifacts report `CERTIFIED` for strict replacement claims
 
-Until then, `0.x` releases are allowed to break behavior when it improves correctness/parity.
+Until then, `0.x` releases may still change behavior to improve correctness/parity, and release messaging must not claim strict drop-in replacement.
 
 ## Cutting a release (patch/minor)
 1) **Pick version** (SemVer):
