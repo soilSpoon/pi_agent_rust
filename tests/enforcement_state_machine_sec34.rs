@@ -39,6 +39,7 @@ fn permissive_policy() -> ExtensionPolicy {
 const fn default_risk_config() -> RuntimeRiskConfig {
     RuntimeRiskConfig {
         enabled: true,
+        enforce: true,
         alpha: 0.01,
         window_size: 64,
         ledger_limit: 1024,
@@ -281,6 +282,7 @@ fn quarantine_locks_to_terminate() {
     // Use small window for faster convergence to unsafe posterior
     let config = RuntimeRiskConfig {
         enabled: true,
+        enforce: true,
         alpha: 0.01,
         window_size: 16,
         ledger_limit: 512,
@@ -662,6 +664,7 @@ fn disabled_scorer_allows_all() {
     let harness = TestHarness::new("disabled_scorer_allows_all");
     let config = RuntimeRiskConfig {
         enabled: false,
+        enforce: true,
         alpha: 0.01,
         window_size: 64,
         ledger_limit: 1024,
