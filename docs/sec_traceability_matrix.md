@@ -7,7 +7,7 @@ Version: 1.0.0 | Generated: 2026-02-14 | Bead: bd-2jkio (SEC-6.5)
 This matrix maps every SEC implementation bead to its concrete unit and integration test targets.
 A machine-readable version is available at `docs/sec_traceability_matrix.json`.
 
-**Grand total: 1,124 SEC-related tests** across 17 beads, 28 integration test files, and 2 source-level test modules.
+**Grand total: 1,155 SEC-related tests** across 18 beads, 29 integration test files, and 2 source-level test modules.
 
 ---
 
@@ -148,6 +148,35 @@ A machine-readable version is available at `docs/sec_traceability_matrix.json`.
 - [x] `ExtensionTrustState` Display impl
 - [x] Alert sequence IDs are monotonically increasing
 - [x] Kill -> lift -> kill again cycle works correctly
+
+---
+
+## WS6: Validation and Determinism Testing
+
+| Bead | Title | Unit | Integration | Total | Categories |
+|------|-------|------|-------------|-------|------------|
+| SEC-6.4 (bd-1a2cu) | Compatibility conformance + CI gates | 0 | 31 | 31 | success, conformance, regression |
+
+**Integration test files:**
+- `tests/sec_compatibility_conformance.rs` (31 tests) - SEC-6.4
+
+### SEC-6.4 Assertion Checklist
+
+- [x] Benign capabilities (read/write/http/events/session) allowed in all profiles
+- [x] Dangerous capabilities (exec/env) denied in safe/standard, allowed in permissive
+- [x] Per-extension override cannot bypass deny_caps
+- [x] Per-extension deny overrides default allow
+- [x] Policy explanation covers all capabilities with reasons
+- [x] Profile transition validation (downgrade/upgrade detection)
+- [x] Compatibility scanner: benign extensions pass, dangerous flagged
+- [x] Trust lifecycle: Pending → Acknowledged → Trusted → Killed
+- [x] Kill-switch emits security alert and audit entry
+- [x] Lift kill-switch emits additional alert
+- [x] Onboarding accept/reject records decision
+- [x] Waiver format and duration validation
+- [x] Cross-profile consistency matrix
+- [x] Serde roundtrip for all profiles
+- [x] CI gate artifact (`sec_conformance_verdict.json`) generated with 95% threshold
 
 ---
 

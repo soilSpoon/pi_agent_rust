@@ -418,6 +418,40 @@
       },
       "integration_tests": [],
       "total_test_count": 3
+    },
+    {
+      "bead_id": "bd-1a2cu",
+      "sec_id": "SEC-6.4",
+      "title": "Compatibility conformance + CI security quality gates",
+      "status": "closed",
+      "unit_tests": {
+        "file": null,
+        "test_prefix": null,
+        "count": 0,
+        "categories": []
+      },
+      "integration_tests": [
+        {
+          "file": "tests/sec_compatibility_conformance.rs",
+          "count": 31,
+          "categories": ["success", "conformance", "regression", "serde"]
+        }
+      ],
+      "total_test_count": 31,
+      "assertion_details": {
+        "benign_capability_compatibility": 5,
+        "dangerous_capability_gating": 4,
+        "deny_cap_precedence": 4,
+        "profile_transition": 5,
+        "trust_lifecycle": 6,
+        "kill_switch_alerts": 2,
+        "waiver_validation": 2,
+        "compatibility_scanner": 2,
+        "serde_roundtrip": 3,
+        "cross_profile_matrix": 4,
+        "regression_guards": 5,
+        "ci_gate_artifact": 1
+      }
     }
   ],
   "cross_cutting_test_files": [
@@ -453,13 +487,13 @@
     }
   ],
   "summary": {
-    "total_sec_beads": 17,
+    "total_sec_beads": 18,
     "beads_with_unit_tests": 17,
-    "beads_with_integration_tests": 15,
+    "beads_with_integration_tests": 16,
     "total_unit_tests": 301,
-    "total_integration_tests": 621,
+    "total_integration_tests": 652,
     "total_cross_cutting_tests": 202,
-    "grand_total": 1124,
+    "grand_total": 1155,
     "coverage_categories": [
       "success (happy path)",
       "failure (expected errors)",
