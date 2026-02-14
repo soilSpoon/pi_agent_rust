@@ -29,7 +29,7 @@ use pi::vcr::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -103,6 +103,54 @@ fn new_locked_tui_session(name: &str) -> Option<(TmuxE2eLock, TuiSession)> {
     let lock = TmuxE2eLock::acquire();
     let session = TuiSession::new(name)?;
     Some((lock, session))
+}
+
+fn setup_config_ui_fixture(session: &TuiSession, package_name: &str) -> PathBuf {
+    let package_root = session.harness.create_dir(package_name);
+    fs::create_dir_all(package_root.join("extensions")).expect("create package extensions");
+    fs::create_dir_all(package_root.join("skills/demo")).expect("create package skills");
+    fs::create_dir_all(package_root.join("prompts")).expect("create package prompts");
+    fs::create_dir_all(package_root.join("themes")).expect("create package themes");
+    fs::write(
+        package_root.join("extensions/config-toggle.js"),
+        "export default function init() {}\n",
+    )
+    .expect("write extension fixture");
+    fs::write(
+        package_root.join("skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: demo skill\n---\n",
+    )
+    .expect("write skill fixture");
+    fs::write(package_root.join("prompts/welcome.md"), "# Welcome\n").expect("write prompt");
+    fs::write(
+        package_root.join("themes/night.json"),
+        "{\"name\":\"night\"}\n",
+    )
+    .expect("write theme");
+    session
+        .harness
+        .record_artifact("config-ui-pkg.dir", &package_root);
+
+    let project_settings = session.harness.temp_dir().join(".pi").join("settings.json");
+    fs::create_dir_all(
+        project_settings
+            .parent()
+            .expect("project settings parent must exist"),
+    )
+    .expect("create project settings dir");
+    fs::write(
+        &project_settings,
+        serde_json::to_string_pretty(&json!({
+            "packages": [package_name]
+        }))
+        .expect("serialize project settings"),
+    )
+    .expect("write project settings");
+    session
+        .harness
+        .record_artifact("config-ui.project.settings.json", &project_settings);
+
+    project_settings
 }
 
 fn vcr_interactive_args() -> Vec<&'static str> {
@@ -914,6 +962,161 @@ fn e2e_tui_startup_and_exit() {
     assert!(
         !session.steps().is_empty(),
         "Expected at least one recorded step"
+    );
+}
+
+#[test]
+fn e2e_tui_config_subcommand_save_persists_resource_filters() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_config_subcommand_save_persists_resource_filters")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let project_settings = setup_config_ui_fixture(&session, "config-ui-pkg");
+    let config_path = session.harness.temp_dir().join("env").join("config.toml");
+    fs::write(
+        &config_path,
+        "{\n  \"defaultProvider\": \"openai\",\n  \"defaultModel\": \"gpt-4.1\",\n  \"defaultThinkingLevel\": \"high\"\n}\n",
+    )
+    .expect("write config summary fixture");
+    session
+        .harness
+        .record_artifact("config-ui.global.settings.json", &config_path);
+
+    session.launch(&["config"]);
+    let startup = session.wait_and_capture("config_ui_startup", "Pi Config UI", STARTUP_TIMEOUT);
+    assert!(
+        startup.contains("Project package: config-ui-pkg"),
+        "Expected package header in config UI; got:\n{startup}"
+    );
+    assert!(
+        startup.contains("provider=openai  model=gpt-4.1  thinking=high"),
+        "Expected settings summary in config UI; got:\n{startup}"
+    );
+
+    let moved = session.send_key_and_wait("move_to_skill", "Down", "> [x] skill", COMMAND_TIMEOUT);
+    assert!(
+        moved.contains("skills/demo/SKILL.md"),
+        "Expected skill resource row after moving selection; got:\n{moved}"
+    );
+
+    let toggled =
+        session.send_key_and_wait("toggle_skill_off", "Space", "> [ ] skill", COMMAND_TIMEOUT);
+    assert!(
+        toggled.contains("> [ ] skill"),
+        "Expected skill toggle to update row marker; got:\n{toggled}"
+    );
+
+    let saved = session.send_key_and_wait(
+        "save_and_exit",
+        "Enter",
+        "Saved package resource toggles.",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        saved.contains("Saved package resource toggles."),
+        "Expected save confirmation; got:\n{saved}"
+    );
+
+    session.exit_gracefully();
+    session.write_artifacts();
+    assert!(
+        !session.tmux.session_exists(),
+        "Config session should exit after Enter/save"
+    );
+
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(&project_settings).expect("read project settings"),
+    )
+    .expect("parse project settings");
+    let package = settings["packages"]
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(Value::as_object)
+        .expect("expected saved package object");
+    assert_eq!(
+        package
+            .get("source")
+            .and_then(Value::as_str)
+            .expect("source should be persisted"),
+        "config-ui-pkg"
+    );
+    assert_eq!(
+        package
+            .get("extensions")
+            .and_then(Value::as_array)
+            .expect("extensions filter should be persisted")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>(),
+        vec!["extensions/config-toggle.js"]
+    );
+    assert_eq!(
+        package
+            .get("skills")
+            .and_then(Value::as_array)
+            .expect("skills filter should be persisted")
+            .len(),
+        0,
+        "skill should be disabled after toggle + save"
+    );
+}
+
+#[test]
+fn e2e_tui_config_subcommand_cancel_keeps_settings_unchanged() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_config_subcommand_cancel_keeps_settings_unchanged")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let project_settings = setup_config_ui_fixture(&session, "config-ui-cancel-pkg");
+    session.launch(&["config"]);
+    let startup = session.wait_and_capture("config_ui_startup", "Pi Config UI", STARTUP_TIMEOUT);
+    assert!(
+        startup.contains("Project package: config-ui-cancel-pkg"),
+        "Expected package header in config UI; got:\n{startup}"
+    );
+
+    let toggled = session.send_key_and_wait(
+        "toggle_extension_off",
+        "Space",
+        "> [ ] extension",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        toggled.contains("> [ ] extension"),
+        "Expected extension toggle to update row marker; got:\n{toggled}"
+    );
+
+    let cancelled =
+        session.send_key_and_wait("cancel_and_exit", "q", "No changes saved.", COMMAND_TIMEOUT);
+    assert!(
+        cancelled.contains("No changes saved."),
+        "Expected cancel message; got:\n{cancelled}"
+    );
+
+    session.exit_gracefully();
+    session.write_artifacts();
+    assert!(
+        !session.tmux.session_exists(),
+        "Config session should exit after q/cancel"
+    );
+
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(&project_settings).expect("read project settings"),
+    )
+    .expect("parse project settings");
+    assert_eq!(
+        settings["packages"]
+            .as_array()
+            .and_then(|items| items.first())
+            .expect("packages entry should still exist"),
+        "config-ui-cancel-pkg",
+        "cancel flow should not rewrite settings package entry"
     );
 }
 

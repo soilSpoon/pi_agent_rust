@@ -1027,6 +1027,80 @@ fn e2e_cli_config_subcommand_json_output() {
 }
 
 #[test]
+fn e2e_cli_config_show_reports_empty_packages_when_none_configured() {
+    let harness =
+        CliTestHarness::new("e2e_cli_config_show_reports_empty_packages_when_none_configured");
+    let result = harness.run(&["config", "--show"]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(&harness.harness, &result.stdout, "Package resources:");
+    assert_contains(&harness.harness, &result.stdout, "(no configured packages)");
+}
+
+#[test]
+fn e2e_cli_config_show_lists_discovered_package_resources() {
+    let harness = CliTestHarness::new("e2e_cli_config_show_lists_discovered_package_resources");
+
+    let package_root = harness.harness.create_dir("config-ui-pkg");
+    fs::create_dir_all(package_root.join("extensions")).expect("create package extensions");
+    fs::create_dir_all(package_root.join("skills/demo")).expect("create package skills");
+    fs::create_dir_all(package_root.join("prompts")).expect("create package prompts");
+    fs::create_dir_all(package_root.join("themes")).expect("create package themes");
+    fs::write(
+        package_root.join("extensions/config-toggle.js"),
+        "export default function init() {}\n",
+    )
+    .expect("write extension fixture");
+    fs::write(
+        package_root.join("skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: demo skill\n---\n",
+    )
+    .expect("write skill fixture");
+    fs::write(package_root.join("prompts/welcome.md"), "# Welcome\n")
+        .expect("write prompt fixture");
+    fs::write(
+        package_root.join("themes/night.json"),
+        "{\"name\":\"night\"}\n",
+    )
+    .expect("write theme fixture");
+    harness
+        .harness
+        .record_artifact("config-ui-pkg.dir", &package_root);
+
+    let project_settings = harness.harness.temp_dir().join(".pi").join("settings.json");
+    fs::create_dir_all(
+        project_settings
+            .parent()
+            .expect("project settings parent must exist"),
+    )
+    .expect("create project settings dir");
+    fs::write(
+        &project_settings,
+        serde_json::to_string_pretty(&json!({
+            "packages": ["config-ui-pkg"]
+        }))
+        .expect("serialize project settings"),
+    )
+    .expect("write project settings");
+    harness
+        .harness
+        .record_artifact("config.project.settings.json", &project_settings);
+
+    let result = harness.run(&["config", "--show"]);
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(&harness.harness, &result.stdout, "Package resources:");
+    assert_contains(&harness.harness, &result.stdout, "[project] config-ui-pkg");
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        "extensions/config-toggle.js",
+    );
+    assert_contains(&harness.harness, &result.stdout, "skills/demo/SKILL.md");
+    assert_contains(&harness.harness, &result.stdout, "prompts/welcome.md");
+    assert_contains(&harness.harness, &result.stdout, "themes/night.json");
+}
+
+#[test]
 fn e2e_cli_export_html_creates_file_and_contains_metadata() {
     let harness = CliTestHarness::new("e2e_cli_export_html_creates_file_and_contains_metadata");
     let session_path = harness.harness.temp_path("session.jsonl");
@@ -2385,6 +2459,7 @@ fn parse_json_mode_stdout_lines(stdout: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn assert_json_mode_lifecycle_shape(lines: &[serde_json::Value]) {
     assert!(
         !lines.is_empty(),
