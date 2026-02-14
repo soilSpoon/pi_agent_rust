@@ -611,6 +611,215 @@ SAP AI Core auth:
 Interactive slash help currently advertises `/login` as Anthropic-first (`../src/interactive.rs`).
 For non-Anthropic providers, prefer explicit env/auth.json setup unless extension/provider-specific OAuth wiring is confirmed in your target flow.
 
+## Mandatory test and logging obligations
+
+This section defines the minimum required test and logging evidence for adding or modifying providers. Every provider entry in `PROVIDER_METADATA` has `test_obligations: TEST_REQUIRED`, which sets all four categories to `true`.
+
+### Test obligation categories
+
+The `ProviderTestObligations` struct (`src/provider_metadata.rs`) enforces four mandatory categories:
+
+| Category | Test suite | What it proves |
+|----------|-----------|----------------|
+| **unit** | `tests/provider_factory.rs` | Factory dispatch resolves the correct `ProviderRouteKind`; base URL normalization is correct; API/provider type round-trips work |
+| **contract** | `tests/provider_native_contract.rs` | HTTP request payload shape, auth header construction, tool schema translation, and SSE→`StreamEvent` decoding are correct (native adapters only; OpenAI-compatible presets inherit the OpenAI contract) |
+| **conformance** | `tests/provider_native_verify.rs` | VCR-backed playback of canonical scenarios produces expected stream events, tool calls, error codes, and stop reasons |
+| **e2e** | `tests/e2e_provider_scenarios.rs` | Multi-provider deterministic workflows including text generation, tool calling, error handling, event ordering, and request body stability |
+
+Live parity (optional, CI-gated):
+
+| Suite | Gate | What it proves |
+|-------|------|----------------|
+| `tests/e2e_cross_provider_parity.rs` | `CI_E2E_TESTS=1` | Real API calls across 10 providers produce consistent event sequences, token usage, and error semantics |
+
+### Minimum test counts per provider type
+
+**OpenAI-compatible preset** (metadata + factory only):
+- 1 factory dispatch test (wave batch test covers this)
+- 3 drift-prevention snapshot updates (canonical ID, aliases, base URL)
+- 3 VCR conformance scenarios: `simple_text`, `tool_call_single`, `error_auth_401`
+
+**Native adapter** (dedicated `.rs` file):
+- All of the above, plus:
+- Contract tests for request shape, auth headers, tool schema, and response decoding
+- 3 additional VCR conformance scenarios: `unicode_text`, `error_bad_request_400`, `error_rate_limit_429`
+- At least 1 E2E family-level scenario
+
+### Canonical VCR scenarios
+
+The verification harness (`tests/provider_native_verify.rs`) defines 7 canonical scenarios. Each scenario has a structured expectation:
+
+| Scenario tag | Messages | Tools | Expectation type | Key assertions |
+|-------------|----------|-------|-----------------|----------------|
+| `simple_text` | 1 user message | none | `Stream` | `min_text_deltas >= 1`, stop reason `EndTurn` |
+| `unicode_text` | 1 user message (JP/emoji) | none | `Stream` | `require_unicode = true`, non-ASCII in output |
+| `tool_call_single` | 1 user message | 1 tool def | `Stream` | `min_tool_calls >= 1`, stop reason `ToolUse` |
+| `tool_call_multiple` | 1 user message | 2 tool defs | `Stream` | `min_tool_calls >= 2` |
+| `error_auth_401` | 1 user message | none | `Error` | HTTP 401 status |
+| `error_bad_request_400` | malformed | none | `Error` | HTTP 400 status |
+| `error_rate_limit_429` | 1 user message | none | `Error` | HTTP 429 status |
+
+### VCR cassette naming convention
+
+Format: `verify_{provider_id}_{scenario_tag}.json`
+
+Examples:
+```
+tests/fixtures/vcr/verify_anthropic_simple_text.json
+tests/fixtures/vcr/verify_openai_tool_call_single.json
+tests/fixtures/vcr/verify_gemini_error_rate_limit_429.json
+tests/fixtures/vcr/verify_groq_error_auth_401.json
+```
+
+Place all cassettes in `tests/fixtures/vcr/`. The harness discovers them by convention.
+
+### Failure-path expectations
+
+Every provider **must** demonstrate correct error handling for these failure modes:
+
+| Failure mode | HTTP status | Required evidence |
+|-------------|------------|-------------------|
+| Invalid/missing API key | 401 | VCR cassette `verify_{provider}_error_auth_401.json`; provider returns error event (not panic) |
+| Malformed request body | 400 | VCR cassette `verify_{provider}_error_bad_request_400.json`; error message is parseable |
+| Rate limit exceeded | 429 | VCR cassette `verify_{provider}_error_rate_limit_429.json`; error includes rate-limit context |
+
+Contract tests (`provider_native_contract.rs`) for native adapters additionally validate:
+- Auth failure produces structured error (not raw HTTP body)
+- Rate limit errors include retry-after hints when available
+- Server errors (5xx) are propagated as `StreamEvent::Error`
+
+### JSONL logging obligations
+
+All provider tests that use `TestHarness` must emit JSONL logs conforming to these schemas:
+
+**Log schema (`pi.test.log.v2`)** — mandatory fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schema` | string | Must be `"pi.test.log.v2"` |
+| `type` | string | Must be `"log"` |
+| `trace_id` | string | Trace correlation ID (required in v2) |
+| `seq` | integer | Monotonically increasing sequence number |
+| `ts` | string | ISO-8601 timestamp |
+| `t_ms` | integer | Elapsed milliseconds since test start |
+| `level` | string | One of: `debug`, `info`, `warn`, `error` |
+| `category` | string | Structured category (e.g., `setup`, `action`, `verify`, `teardown`) |
+| `message` | string | Human-readable log message |
+
+Optional fields: `span_id`, `parent_span_id`, `test`, `context` (key-value map).
+
+**Artifact schema (`pi.test.artifact.v1`)** — mandatory fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schema` | string | Must be `"pi.test.artifact.v1"` |
+| `type` | string | Must be `"artifact"` |
+| `seq` | integer | Sequence number |
+| `ts` | string | ISO-8601 timestamp |
+| `t_ms` | integer | Elapsed milliseconds |
+| `name` | string | Logical artifact name (e.g., `verification_report`) |
+| `path` | string | File path to the artifact |
+
+Optional fields: `test`, `size_bytes`, `sha256`.
+
+### Logging category conventions
+
+Use these categories consistently across provider tests:
+
+| Category | When to use |
+|----------|------------|
+| `setup` | Test harness initialization, mock server start, VCR cassette loading |
+| `action` | Provider creation, stream start, request sending |
+| `verify` | Assertion checks, event sequence validation |
+| `teardown` | Cleanup, resource release |
+| `stream` | Individual stream event processing |
+| `error` | Error handling paths |
+
+### JSONL normalization and redaction
+
+When producing deterministic test output (for snapshot comparison or CI), use `TestLogger::dump_jsonl_normalized()` which replaces:
+
+| Placeholder | Replaces |
+|------------|---------|
+| `<TIMESTAMP>` | All ISO-8601 timestamps |
+| `<PROJECT_ROOT>` | Cargo manifest directory |
+| `<TEST_ROOT>` | Temp directory path |
+| `<RUN_ID>` | `run-{uuid}` patterns |
+| `<UUID>` | UUID strings |
+| `<PORT>` | `http://127.0.0.1:{port}` |
+| `<TRACE_ID>` | Trace IDs |
+| `<SPAN_ID>` | Span IDs |
+
+Sensitive fields are automatically redacted in JSONL context maps: `api_key`, `authorization`, `bearer`, `cookie`, `credential`, `password`, `private_key`, `secret`, `token`.
+
+### Event sequence validation rules
+
+E2E tests (`e2e_provider_scenarios.rs`) validate that stream events follow this ordering:
+
+```
+Start? → (TextDelta | ThinkingDelta | ToolCallStart | ToolCallDelta)* → Done | Error
+```
+
+Specific rules:
+- `Start` event (if present) must be first — Bedrock is exempted (`require_start_event: false`)
+- `Done` event must have a valid `StopReason` (`EndTurn`, `ToolUse`, `MaxTokens`, `StopSequence`)
+- `Error` events terminate the stream; no events follow
+- `ToolCallStart` must precede any `ToolCallDelta` for the same tool index
+- Token usage (`input_tokens`, `output_tokens`) must be reported in the `Done` event
+
+### Cross-provider parity record schema
+
+Live parity tests (`e2e_cross_provider_parity.rs`) emit `ParityRecord` entries with:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `check` | yes | Parity check name |
+| `provider` | yes | Provider canonical ID |
+| `status` | yes | `pass`, `fail`, or `skip` |
+| `event_count` | yes | Total stream events received |
+| `sequence_valid` | yes | Whether event ordering is correct |
+| `sequence` | yes | Array of event type names in order |
+| `usage_total_tokens` | yes | Total tokens reported |
+| `elapsed_ms` | yes | Wall-clock time |
+
+### Drift-prevention snapshot tests
+
+These tests in `tests/provider_metadata_comprehensive.rs` use hard-coded snapshots that **must be updated** when adding or modifying providers:
+
+| Test | Update trigger |
+|------|---------------|
+| `canonical_id_snapshot_detects_additions_and_removals` | Adding/removing any canonical ID |
+| `alias_mapping_snapshot_is_current` | Any change to alias arrays |
+| `base_url_snapshot_for_key_providers` | Changing base URL for key providers |
+| `vcr_fixture_coverage_for_core_providers` | Adding a new core provider |
+| `gap_providers_have_setup_documentation` | Adding a new gap-class provider |
+| `no_accidental_duplicate_routing_defaults` | Adding provider with same (api, base_url) pair |
+
+### Quick verification commands
+
+After adding or modifying a provider, run these in order:
+
+```bash
+# 1. Conformance (VCR playback)
+cargo test --test provider_native_verify {provider}_conformance:: -- --nocapture
+
+# 2. Factory dispatch
+cargo test --test provider_factory -- --nocapture
+
+# 3. Metadata invariants + drift snapshots
+cargo test --test provider_metadata_comprehensive -- --nocapture
+
+# 4. Contract tests (native adapters only)
+cargo test --test provider_native_contract {provider}_contract:: -- --nocapture
+
+# 5. E2E scenarios
+cargo test --test e2e_provider_scenarios -- --nocapture
+
+# 6. Quality gates
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
 ## Validation commands for doc and onboarding changes
 
 Targeted checks (fast):
