@@ -25,9 +25,8 @@ use pi::extensions::{
     ExecMediationLedgerEntry, ExtensionManager, ExtensionPolicy, ExtensionPolicyMode,
     HostCallContext, HostCallPayload, IncidentBundleFilter, IncidentBundleRedactionPolicy,
     RuntimeRiskConfig, SecretBrokerLedgerEntry, SecurityAlert, SecurityAlertCategory,
-    SecurityAlertFilter, SecurityAlertSeverity,
-    build_incident_evidence_bundle, dispatch_host_call_shared, query_security_alerts,
-    verify_incident_evidence_bundle,
+    SecurityAlertFilter, SecurityAlertSeverity, build_incident_evidence_bundle,
+    dispatch_host_call_shared, query_security_alerts, verify_incident_evidence_bundle,
 };
 use pi::tools::ToolRegistry;
 use serde_json::json;
@@ -162,9 +161,7 @@ fn emergency_kill_switch(
 ) {
     let ext_id = tracker.extension_id().to_string();
     tracker.demote(reason).expect("demotion must succeed");
-    manager.record_security_alert(SecurityAlert::from_quarantine(
-        &ext_id, reason, 0.95,
-    ));
+    manager.record_security_alert(SecurityAlert::from_quarantine(&ext_id, reason, 0.95));
 }
 
 /// Emit a structured JSONL event line for this scenario.
@@ -179,10 +176,9 @@ fn emit_scenario_event(
     score: f64,
     reason_codes: &[&str],
 ) {
-    harness.log().info_ctx(
-        "scenario_event",
-        format!("{scenario}/{step}"),
-        |ctx_log| {
+    harness
+        .log()
+        .info_ctx("scenario_event", format!("{scenario}/{step}"), |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), scenario.to_string()));
             ctx_log.push(("step".into(), step.to_string()));
@@ -190,12 +186,8 @@ fn emit_scenario_event(
             ctx_log.push(("capability".into(), capability.to_string()));
             ctx_log.push(("action".into(), action.to_string()));
             ctx_log.push(("risk_score".into(), format!("{score:.4}")));
-            ctx_log.push((
-                "reason_codes".into(),
-                reason_codes.join(","),
-            ));
-        },
-    );
+            ctx_log.push(("reason_codes".into(), reason_codes.join(",")));
+        });
 }
 
 // ============================================================================
@@ -209,8 +201,14 @@ fn scenario_benign_workflow_no_alerts() {
     let ctx = make_ctx(&tools, &http, &manager, &policy, "ext.benign");
 
     emit_scenario_event(
-        &harness, "benign_workflow", "start", "ext.benign",
-        "none", "setup", 0.0, &[],
+        &harness,
+        "benign_workflow",
+        "start",
+        "ext.benign",
+        "none",
+        "setup",
+        0.0,
+        &[],
     );
 
     // Dispatch several benign calls.
@@ -221,8 +219,14 @@ fn scenario_benign_workflow_no_alerts() {
     });
 
     emit_scenario_event(
-        &harness, "benign_workflow", "calls_complete", "ext.benign",
-        "log", "allow", 0.0, &[],
+        &harness,
+        "benign_workflow",
+        "calls_complete",
+        "ext.benign",
+        "log",
+        "allow",
+        0.0,
+        &[],
     );
 
     // Telemetry should record all calls.
@@ -256,17 +260,23 @@ fn scenario_benign_workflow_no_alerts() {
     );
 
     emit_scenario_event(
-        &harness, "benign_workflow", "verify", "ext.benign",
-        "log", "pass", 0.0, &["no_alerts"],
+        &harness,
+        "benign_workflow",
+        "verify",
+        "ext.benign",
+        "log",
+        "pass",
+        0.0,
+        &["no_alerts"],
     );
 
-    harness.log().info_ctx(
-        "scenario_result", "benign workflow passed", |ctx_log| {
+    harness
+        .log()
+        .info_ctx("scenario_result", "benign workflow passed", |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "benign_workflow".into()));
             ctx_log.push(("result".into(), "pass".into()));
-        },
-    );
+        });
 }
 
 // ============================================================================
@@ -280,8 +290,14 @@ fn scenario_adversarial_escalation_triggers_alerts() {
     let ctx = make_ctx(&tools, &http, &manager, &policy, "ext.adversary");
 
     emit_scenario_event(
-        &harness, "adversarial_escalation", "start", "ext.adversary",
-        "none", "setup", 0.0, &[],
+        &harness,
+        "adversarial_escalation",
+        "start",
+        "ext.adversary",
+        "none",
+        "setup",
+        0.0,
+        &[],
     );
 
     // Phase 1: Start with a few benign calls.
@@ -292,8 +308,14 @@ fn scenario_adversarial_escalation_triggers_alerts() {
     });
 
     emit_scenario_event(
-        &harness, "adversarial_escalation", "benign_phase", "ext.adversary",
-        "log", "allow", 0.0, &[],
+        &harness,
+        "adversarial_escalation",
+        "benign_phase",
+        "ext.adversary",
+        "log",
+        "allow",
+        0.0,
+        &[],
     );
 
     // Phase 2: Switch to adversarial exec calls.
@@ -309,8 +331,14 @@ fn scenario_adversarial_escalation_triggers_alerts() {
     }
 
     emit_scenario_event(
-        &harness, "adversarial_escalation", "adversarial_phase", "ext.adversary",
-        "exec", "deny", 1.0, &["dangerous_capability_escalation"],
+        &harness,
+        "adversarial_escalation",
+        "adversarial_phase",
+        "ext.adversary",
+        "exec",
+        "deny",
+        1.0,
+        &["dangerous_capability_escalation"],
     );
 
     // Risk scores should escalate.
@@ -337,16 +365,27 @@ fn scenario_adversarial_escalation_triggers_alerts() {
     }
 
     emit_scenario_event(
-        &harness, "adversarial_escalation", "verify", "ext.adversary",
-        "exec", "pass", 1.0, &["risk_escalation_confirmed"],
+        &harness,
+        "adversarial_escalation",
+        "verify",
+        "ext.adversary",
+        "exec",
+        "pass",
+        1.0,
+        &["risk_escalation_confirmed"],
     );
 
     harness.log().info_ctx(
-        "scenario_result", "adversarial escalation detected", |ctx_log| {
+        "scenario_result",
+        "adversarial escalation detected",
+        |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "adversarial_escalation".into()));
             ctx_log.push(("result".into(), "pass".into()));
-            ctx_log.push(("exec_mediations".into(), exec_artifact.entries.len().to_string()));
+            ctx_log.push((
+                "exec_mediations".into(),
+                exec_artifact.entries.len().to_string(),
+            ));
         },
     );
 }
@@ -364,8 +403,14 @@ fn scenario_trust_lifecycle_full_cycle() {
     let mut tracker = ExtensionTrustTracker::new("ext.lifecycle", ExtensionTrustState::Quarantined);
 
     emit_scenario_event(
-        &harness, "trust_lifecycle", "start", "ext.lifecycle",
-        "none", "quarantined", 0.0, &[],
+        &harness,
+        "trust_lifecycle",
+        "start",
+        "ext.lifecycle",
+        "none",
+        "quarantined",
+        0.0,
+        &[],
     );
 
     // Step 1: Extension starts in quarantine — exec blocked.
@@ -380,24 +425,43 @@ fn scenario_trust_lifecycle_full_cycle() {
     );
 
     // Step 2: Operator promotes to restricted.
-    tracker.promote("passed preflight review", true, Some(30), Some(InstallRecommendation::Review))
+    tracker
+        .promote(
+            "passed preflight review",
+            true,
+            Some(30),
+            Some(InstallRecommendation::Review),
+        )
         .expect("promote to restricted");
     assert_eq!(tracker.state(), ExtensionTrustState::Restricted);
 
     emit_scenario_event(
-        &harness, "trust_lifecycle", "promoted_restricted", "ext.lifecycle",
-        "none", "restrict", 0.0, &["preflight_passed"],
+        &harness,
+        "trust_lifecycle",
+        "promoted_restricted",
+        "ext.lifecycle",
+        "none",
+        "restrict",
+        0.0,
+        &["preflight_passed"],
     );
 
     // Step 3: Operator promotes to trusted.
-    tracker.promote("extended observation period clean", true, Some(80), None)
+    tracker
+        .promote("extended observation period clean", true, Some(80), None)
         .expect("promote to trusted");
     assert_eq!(tracker.state(), ExtensionTrustState::Trusted);
     assert!(is_hostcall_allowed_for_trust(tracker.state(), "exec"));
 
     emit_scenario_event(
-        &harness, "trust_lifecycle", "promoted_trusted", "ext.lifecycle",
-        "exec", "allow", 0.0, &["observation_clean"],
+        &harness,
+        "trust_lifecycle",
+        "promoted_trusted",
+        "ext.lifecycle",
+        "exec",
+        "allow",
+        0.0,
+        &["observation_clean"],
     );
 
     // Step 4: Anomaly detected — emergency kill-switch.
@@ -406,18 +470,36 @@ fn scenario_trust_lifecycle_full_cycle() {
     assert!(!is_hostcall_allowed_for_trust(tracker.state(), "exec"));
 
     emit_scenario_event(
-        &harness, "trust_lifecycle", "kill_switch", "ext.lifecycle",
-        "none", "quarantine", 0.95, &["anomalous_burst"],
+        &harness,
+        "trust_lifecycle",
+        "kill_switch",
+        "ext.lifecycle",
+        "none",
+        "quarantine",
+        0.95,
+        &["anomalous_burst"],
     );
 
     // Step 5: Re-onboard after triage.
-    tracker.promote("triage complete, root cause fixed", true, Some(40), Some(InstallRecommendation::Review))
+    tracker
+        .promote(
+            "triage complete, root cause fixed",
+            true,
+            Some(40),
+            Some(InstallRecommendation::Review),
+        )
         .expect("re-promote after triage");
     assert_eq!(tracker.state(), ExtensionTrustState::Restricted);
 
     emit_scenario_event(
-        &harness, "trust_lifecycle", "re_onboarded", "ext.lifecycle",
-        "none", "restrict", 0.0, &["triage_complete"],
+        &harness,
+        "trust_lifecycle",
+        "re_onboarded",
+        "ext.lifecycle",
+        "none",
+        "restrict",
+        0.0,
+        &["triage_complete"],
     );
 
     // Verify audit trail completeness.
@@ -427,17 +509,20 @@ fn scenario_trust_lifecycle_full_cycle() {
     // Verify alert was recorded.
     let alerts = manager.security_alert_artifact();
     assert!(alerts.alert_count >= 1);
-    let quarantine_alert = alerts.alerts.iter().find(|a| a.category == SecurityAlertCategory::Quarantine);
+    let quarantine_alert = alerts
+        .alerts
+        .iter()
+        .find(|a| a.category == SecurityAlertCategory::Quarantine);
     assert!(quarantine_alert.is_some(), "quarantine alert must exist");
 
-    harness.log().info_ctx(
-        "scenario_result", "trust lifecycle complete", |ctx_log| {
+    harness
+        .log()
+        .info_ctx("scenario_result", "trust lifecycle complete", |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "trust_lifecycle".into()));
             ctx_log.push(("result".into(), "pass".into()));
             ctx_log.push(("transitions".into(), history.len().to_string()));
-        },
-    );
+        });
 }
 
 // ============================================================================
@@ -453,8 +538,14 @@ fn scenario_multi_extension_isolation() {
     let ctx_evil = make_ctx(&tools, &http, &manager, &policy, "ext.evil");
 
     emit_scenario_event(
-        &harness, "multi_ext_isolation", "start", "ext.*",
-        "none", "setup", 0.0, &[],
+        &harness,
+        "multi_ext_isolation",
+        "start",
+        "ext.*",
+        "none",
+        "setup",
+        0.0,
+        &[],
     );
 
     // Safe extension does normal work.
@@ -497,8 +588,14 @@ fn scenario_multi_extension_isolation() {
     assert!(!is_hostcall_allowed_for_trust(tracker_evil.state(), "exec"));
 
     emit_scenario_event(
-        &harness, "multi_ext_isolation", "verify", "ext.*",
-        "none", "pass", 0.0, &["isolation_confirmed"],
+        &harness,
+        "multi_ext_isolation",
+        "verify",
+        "ext.*",
+        "none",
+        "pass",
+        0.0,
+        &["isolation_confirmed"],
     );
 
     // Build filtered bundle for evil extension only.
@@ -514,23 +611,39 @@ fn scenario_multi_extension_isolation() {
     let secret = manager.secret_broker_artifact();
 
     let bundle = build_incident_evidence_bundle(
-        &ledger, &alerts, &telemetry, &exec, &secret, &[], &filter, &redaction, 0,
+        &ledger,
+        &alerts,
+        &telemetry,
+        &exec,
+        &secret,
+        &[],
+        &filter,
+        &redaction,
+        0,
     );
 
     // Bundle should contain only evil extension entries.
     for entry in &bundle.risk_ledger.entries {
-        assert_eq!(entry.extension_id, "ext.evil", "bundle must only contain evil entries");
+        assert_eq!(
+            entry.extension_id, "ext.evil",
+            "bundle must only contain evil entries"
+        );
     }
     for alert in &bundle.security_alerts.alerts {
         assert_eq!(alert.extension_id, "ext.evil");
     }
 
     harness.log().info_ctx(
-        "scenario_result", "multi-extension isolation verified", |ctx_log| {
+        "scenario_result",
+        "multi-extension isolation verified",
+        |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "multi_ext_isolation".into()));
             ctx_log.push(("result".into(), "pass".into()));
-            ctx_log.push(("evil_ledger_entries".into(), bundle.summary.ledger_entry_count.to_string()));
+            ctx_log.push((
+                "evil_ledger_entries".into(),
+                bundle.summary.ledger_entry_count.to_string(),
+            ));
         },
     );
 }
@@ -546,8 +659,14 @@ fn scenario_incident_evidence_forensic_flow() {
     let ctx = make_ctx(&tools, &http, &manager, &policy, "ext.incident");
 
     emit_scenario_event(
-        &harness, "incident_evidence", "start", "ext.incident",
-        "none", "setup", 0.0, &[],
+        &harness,
+        "incident_evidence",
+        "start",
+        "ext.incident",
+        "none",
+        "setup",
+        0.0,
+        &[],
     );
 
     // Phase 1: Normal operations.
@@ -574,12 +693,20 @@ fn scenario_incident_evidence_forensic_flow() {
 
     // Phase 4: Trigger quarantine alert.
     manager.record_security_alert(SecurityAlert::from_quarantine(
-        "ext.incident", "critical risk threshold exceeded", 0.98,
+        "ext.incident",
+        "critical risk threshold exceeded",
+        0.98,
     ));
 
     emit_scenario_event(
-        &harness, "incident_evidence", "incident_recorded", "ext.incident",
-        "exec", "terminate", 0.98, &["critical_risk_threshold"],
+        &harness,
+        "incident_evidence",
+        "incident_recorded",
+        "ext.incident",
+        "exec",
+        "terminate",
+        0.98,
+        &["critical_risk_threshold"],
     );
 
     // Phase 5: Export bundle with redaction.
@@ -592,7 +719,14 @@ fn scenario_incident_evidence_forensic_flow() {
     let redaction = IncidentBundleRedactionPolicy::default();
 
     let bundle = build_incident_evidence_bundle(
-        &ledger, &alerts, &telemetry, &exec, &secret, &[], &filter, &redaction,
+        &ledger,
+        &alerts,
+        &telemetry,
+        &exec,
+        &secret,
+        &[],
+        &filter,
+        &redaction,
         1_700_000_000_000,
     );
 
@@ -613,8 +747,14 @@ fn scenario_incident_evidence_forensic_flow() {
     }
 
     emit_scenario_event(
-        &harness, "incident_evidence", "bundle_exported", "ext.incident",
-        "none", "export", 0.0, &["bundle_valid"],
+        &harness,
+        "incident_evidence",
+        "bundle_exported",
+        "ext.incident",
+        "none",
+        "export",
+        0.0,
+        &["bundle_valid"],
     );
 
     // Serialize bundle as artifact.
@@ -624,7 +764,9 @@ fn scenario_incident_evidence_forensic_flow() {
     harness.record_artifact("incident_bundle", &bundle_path);
 
     harness.log().info_ctx(
-        "scenario_result", "incident evidence flow complete", |ctx_log| {
+        "scenario_result",
+        "incident evidence flow complete",
+        |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "incident_evidence".into()));
             ctx_log.push(("result".into(), "pass".into()));
@@ -651,8 +793,14 @@ fn scenario_shadow_vs_enforcement_mode() {
     let ctx_shadow = make_ctx(&tools_s, &http_s, &mgr_shadow, &policy_s, "ext.shadow");
 
     emit_scenario_event(
-        &harness, "shadow_vs_enforce", "start", "ext.*",
-        "none", "setup", 0.0, &[],
+        &harness,
+        "shadow_vs_enforce",
+        "start",
+        "ext.*",
+        "none",
+        "setup",
+        0.0,
+        &[],
     );
 
     // Run identical workloads through both.
@@ -686,21 +834,41 @@ fn scenario_shadow_vs_enforcement_mode() {
     );
 
     // Config flags should differ.
-    assert!(mgr_enforce.runtime_risk_config().enforce, "enforce mode must enforce");
-    assert!(!mgr_shadow.runtime_risk_config().enforce, "shadow mode must not enforce");
+    assert!(
+        mgr_enforce.runtime_risk_config().enforce,
+        "enforce mode must enforce"
+    );
+    assert!(
+        !mgr_shadow.runtime_risk_config().enforce,
+        "shadow mode must not enforce"
+    );
 
     emit_scenario_event(
-        &harness, "shadow_vs_enforce", "verify", "ext.*",
-        "none", "pass", 0.0, &["telemetry_parity"],
+        &harness,
+        "shadow_vs_enforce",
+        "verify",
+        "ext.*",
+        "none",
+        "pass",
+        0.0,
+        &["telemetry_parity"],
     );
 
     harness.log().info_ctx(
-        "scenario_result", "shadow vs enforcement modes diverge correctly", |ctx_log| {
+        "scenario_result",
+        "shadow vs enforcement modes diverge correctly",
+        |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "shadow_vs_enforce".into()));
             ctx_log.push(("result".into(), "pass".into()));
-            ctx_log.push(("enforce_entries".into(), ledger_enforce.entries.len().to_string()));
-            ctx_log.push(("shadow_entries".into(), ledger_shadow.entries.len().to_string()));
+            ctx_log.push((
+                "enforce_entries".into(),
+                ledger_enforce.entries.len().to_string(),
+            ));
+            ctx_log.push((
+                "shadow_entries".into(),
+                ledger_shadow.entries.len().to_string(),
+            ));
         },
     );
 }
@@ -718,8 +886,14 @@ fn scenario_rollback_recovery_after_incident() {
     let mut tracker = ExtensionTrustTracker::new("ext.rollback", ExtensionTrustState::Trusted);
 
     emit_scenario_event(
-        &harness, "rollback_recovery", "start", "ext.rollback",
-        "none", "trusted", 0.0, &[],
+        &harness,
+        "rollback_recovery",
+        "start",
+        "ext.rollback",
+        "none",
+        "trusted",
+        0.0,
+        &[],
     );
 
     // Phase 1: Normal operation while trusted.
@@ -745,8 +919,14 @@ fn scenario_rollback_recovery_after_incident() {
     assert_eq!(tracker.state(), ExtensionTrustState::Quarantined);
 
     emit_scenario_event(
-        &harness, "rollback_recovery", "kill_switch", "ext.rollback",
-        "exec", "terminate", 0.95, &["adversarial_burst"],
+        &harness,
+        "rollback_recovery",
+        "kill_switch",
+        "ext.rollback",
+        "exec",
+        "terminate",
+        0.95,
+        &["adversarial_burst"],
     );
 
     // Phase 3: Export evidence bundle for triage.
@@ -784,12 +964,24 @@ fn scenario_rollback_recovery_after_incident() {
     }
 
     emit_scenario_event(
-        &harness, "rollback_recovery", "evidence_exported", "ext.rollback",
-        "none", "export", 0.0, &["bundle_exported"],
+        &harness,
+        "rollback_recovery",
+        "evidence_exported",
+        "ext.rollback",
+        "none",
+        "export",
+        0.0,
+        &["bundle_exported"],
     );
 
     // Phase 4: Recovery — re-promote after triage.
-    tracker.promote("root cause fixed, patch applied", true, Some(40), Some(InstallRecommendation::Review))
+    tracker
+        .promote(
+            "root cause fixed, patch applied",
+            true,
+            Some(40),
+            Some(InstallRecommendation::Review),
+        )
         .expect("re-promote after triage");
     assert_eq!(tracker.state(), ExtensionTrustState::Restricted);
 
@@ -797,23 +989,32 @@ fn scenario_rollback_recovery_after_incident() {
     assert!(is_hostcall_allowed_for_trust(tracker.state(), "log"));
 
     emit_scenario_event(
-        &harness, "rollback_recovery", "recovered", "ext.rollback",
-        "none", "restricted", 0.0, &["patch_applied"],
+        &harness,
+        "rollback_recovery",
+        "recovered",
+        "ext.rollback",
+        "none",
+        "restricted",
+        0.0,
+        &["patch_applied"],
     );
 
     // Verify complete audit trail.
     let history = tracker.history();
     assert_eq!(history.len(), 2, "T→Q and Q→R transitions");
 
-    harness.log().info_ctx(
-        "scenario_result", "rollback recovery complete", |ctx_log| {
+    harness
+        .log()
+        .info_ctx("scenario_result", "rollback recovery complete", |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "rollback_recovery".into()));
             ctx_log.push(("result".into(), "pass".into()));
             ctx_log.push(("transitions".into(), history.len().to_string()));
-            ctx_log.push(("bundle_entries".into(), bundle.summary.ledger_entry_count.to_string()));
-        },
-    );
+            ctx_log.push((
+                "bundle_entries".into(),
+                bundle.summary.ledger_entry_count.to_string(),
+            ));
+        });
 }
 
 // ============================================================================
@@ -827,22 +1028,38 @@ fn scenario_alert_category_coverage() {
     manager.set_runtime_risk_config(default_risk_config());
 
     emit_scenario_event(
-        &harness, "alert_category_coverage", "start", "ext.coverage",
-        "none", "setup", 0.0, &[],
+        &harness,
+        "alert_category_coverage",
+        "start",
+        "ext.coverage",
+        "none",
+        "setup",
+        0.0,
+        &[],
     );
 
     // Record one alert of each category.
     manager.record_security_alert(SecurityAlert::from_policy_denial(
-        "ext.coverage", "exec", "spawn", "denied by policy", "deny_caps",
+        "ext.coverage",
+        "exec",
+        "spawn",
+        "denied by policy",
+        "deny_caps",
     ));
     manager.record_security_alert(SecurityAlert::from_exec_mediation(
-        "ext.coverage", "rm -rf /", Some("recursive_delete"), "dangerous command",
+        "ext.coverage",
+        "rm -rf /",
+        Some("recursive_delete"),
+        "dangerous command",
     ));
     manager.record_security_alert(SecurityAlert::from_secret_redaction(
-        "ext.coverage", "AWS_SECRET_KEY",
+        "ext.coverage",
+        "AWS_SECRET_KEY",
     ));
     manager.record_security_alert(SecurityAlert::from_quarantine(
-        "ext.coverage", "critical anomaly", 0.99,
+        "ext.coverage",
+        "critical anomaly",
+        0.99,
     ));
 
     let artifact = manager.security_alert_artifact();
@@ -872,17 +1089,27 @@ fn scenario_alert_category_coverage() {
     );
     // Quarantine alerts are Critical severity.
     assert!(
-        critical_only.iter().any(|a| a.category == SecurityAlertCategory::Quarantine),
+        critical_only
+            .iter()
+            .any(|a| a.category == SecurityAlertCategory::Quarantine),
         "critical filter must include quarantine alerts"
     );
 
     emit_scenario_event(
-        &harness, "alert_category_coverage", "verify", "ext.coverage",
-        "none", "pass", 0.0, &["all_categories_covered"],
+        &harness,
+        "alert_category_coverage",
+        "verify",
+        "ext.coverage",
+        "none",
+        "pass",
+        0.0,
+        &["all_categories_covered"],
     );
 
     harness.log().info_ctx(
-        "scenario_result", "alert category coverage complete", |ctx_log| {
+        "scenario_result",
+        "alert category coverage complete",
+        |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "alert_category_coverage".into()));
             ctx_log.push(("result".into(), "pass".into()));
@@ -902,8 +1129,14 @@ fn scenario_secret_broker_redaction_in_bundle() {
     let ctx = make_ctx(&tools, &http, &manager, &policy, "ext.secrets");
 
     emit_scenario_event(
-        &harness, "secret_broker", "start", "ext.secrets",
-        "none", "setup", 0.0, &[],
+        &harness,
+        "secret_broker",
+        "start",
+        "ext.secrets",
+        "none",
+        "setup",
+        0.0,
+        &[],
     );
 
     // Normal operations.
@@ -921,13 +1154,17 @@ fn scenario_secret_broker_redaction_in_bundle() {
     // Record redaction alerts.
     for var_name in &["API_KEY", "DB_PASSWORD", "AWS_SECRET", "STRIPE_KEY"] {
         manager.record_security_alert(SecurityAlert::from_secret_redaction(
-            "ext.secrets", var_name,
+            "ext.secrets",
+            var_name,
         ));
     }
 
     // Export bundle WITH redaction.
     let redaction = IncidentBundleRedactionPolicy::default();
-    assert!(redaction.redact_name_hash, "default policy redacts name hashes");
+    assert!(
+        redaction.redact_name_hash,
+        "default policy redacts name hashes"
+    );
 
     let bundle = build_incident_evidence_bundle(
         &manager.runtime_risk_ledger_artifact(),
@@ -943,7 +1180,10 @@ fn scenario_secret_broker_redaction_in_bundle() {
 
     // Secret broker entries should have redacted name hashes.
     for entry in &bundle.secret_broker.entries {
-        assert_eq!(entry.name_hash, "[REDACTED]", "name hashes must be redacted");
+        assert_eq!(
+            entry.name_hash, "[REDACTED]",
+            "name hashes must be redacted"
+        );
     }
     assert_eq!(bundle.summary.secret_broker_count, 4);
 
@@ -960,12 +1200,20 @@ fn scenario_secret_broker_redaction_in_bundle() {
     assert_eq!(secret_alerts.len(), 4);
 
     emit_scenario_event(
-        &harness, "secret_broker", "verify", "ext.secrets",
-        "env", "redact", 0.0, &["secrets_redacted"],
+        &harness,
+        "secret_broker",
+        "verify",
+        "ext.secrets",
+        "env",
+        "redact",
+        0.0,
+        &["secrets_redacted"],
     );
 
     harness.log().info_ctx(
-        "scenario_result", "secret broker redaction verified", |ctx_log| {
+        "scenario_result",
+        "secret broker redaction verified",
+        |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "secret_broker".into()));
             ctx_log.push(("result".into(), "pass".into()));
@@ -986,8 +1234,14 @@ fn scenario_jsonl_artifact_contract() {
     let ctx = make_ctx(&tools, &http, &manager, &policy, "ext.contract");
 
     emit_scenario_event(
-        &harness, "jsonl_contract", "start", "ext.contract",
-        "none", "setup", 0.0, &[],
+        &harness,
+        "jsonl_contract",
+        "start",
+        "ext.contract",
+        "none",
+        "setup",
+        0.0,
+        &[],
     );
 
     // Build a full trace.
@@ -1006,7 +1260,9 @@ fn scenario_jsonl_artifact_contract() {
     }
 
     manager.record_security_alert(SecurityAlert::from_quarantine(
-        "ext.contract", "contract test", 0.9,
+        "ext.contract",
+        "contract test",
+        0.9,
     ));
 
     // Export all artifacts.
@@ -1018,7 +1274,10 @@ fn scenario_jsonl_artifact_contract() {
 
     // Verify ledger artifact schema fields.
     let ledger_json: serde_json::Value = serde_json::to_value(&ledger).expect("ledger to value");
-    assert!(ledger_json.get("schema").is_some(), "ledger must have schema");
+    assert!(
+        ledger_json.get("schema").is_some(),
+        "ledger must have schema"
+    );
     assert!(ledger_json.get("generated_at_ms").is_some());
     assert!(ledger_json.get("entry_count").is_some());
     assert!(ledger_json.get("data_hash").is_some());
@@ -1027,8 +1286,15 @@ fn scenario_jsonl_artifact_contract() {
     // Verify each ledger entry has required fields.
     for entry in ledger_json["entries"].as_array().unwrap() {
         for field in &[
-            "ts_ms", "extension_id", "call_id", "capability", "method",
-            "params_hash", "policy_reason", "risk_score", "selected_action",
+            "ts_ms",
+            "extension_id",
+            "call_id",
+            "capability",
+            "method",
+            "params_hash",
+            "policy_reason",
+            "risk_score",
+            "selected_action",
             "ledger_hash",
         ] {
             assert!(entry.get(field).is_some(), "entry missing field: {field}");
@@ -1044,9 +1310,19 @@ fn scenario_jsonl_artifact_contract() {
 
     for alert in alert_json["alerts"].as_array().unwrap() {
         for field in &[
-            "schema", "ts_ms", "sequence_id", "extension_id", "category",
-            "severity", "capability", "method", "reason_codes", "summary",
-            "action", "risk_score", "context_hash",
+            "schema",
+            "ts_ms",
+            "sequence_id",
+            "extension_id",
+            "category",
+            "severity",
+            "capability",
+            "method",
+            "reason_codes",
+            "summary",
+            "action",
+            "risk_score",
+            "context_hash",
         ] {
             assert!(alert.get(field).is_some(), "alert missing field: {field}");
         }
@@ -1057,19 +1333,38 @@ fn scenario_jsonl_artifact_contract() {
     assert!(telem_json.get("schema").is_some());
     for event in telem_json["entries"].as_array().unwrap() {
         for field in &[
-            "schema", "ts_ms", "extension_id", "call_id", "capability",
-            "method", "risk_score", "selected_action", "latency_ms",
+            "schema",
+            "ts_ms",
+            "extension_id",
+            "call_id",
+            "capability",
+            "method",
+            "risk_score",
+            "selected_action",
+            "latency_ms",
             "redaction_summary",
         ] {
-            assert!(event.get(field).is_some(), "telemetry missing field: {field}");
+            assert!(
+                event.get(field).is_some(),
+                "telemetry missing field: {field}"
+            );
         }
     }
 
     // Verify exec mediation artifact.
     let exec_json: serde_json::Value = serde_json::to_value(&exec).expect("exec to value");
     for entry in exec_json["entries"].as_array().unwrap() {
-        for field in &["ts_ms", "extension_id", "command_hash", "decision", "reason"] {
-            assert!(entry.get(field).is_some(), "exec entry missing field: {field}");
+        for field in &[
+            "ts_ms",
+            "extension_id",
+            "command_hash",
+            "decision",
+            "reason",
+        ] {
+            assert!(
+                entry.get(field).is_some(),
+                "exec entry missing field: {field}"
+            );
         }
     }
 
@@ -1077,13 +1372,22 @@ fn scenario_jsonl_artifact_contract() {
     let secret_json: serde_json::Value = serde_json::to_value(&secret).expect("secret to value");
     for entry in secret_json["entries"].as_array().unwrap() {
         for field in &["ts_ms", "extension_id", "name_hash", "redacted", "reason"] {
-            assert!(entry.get(field).is_some(), "secret entry missing field: {field}");
+            assert!(
+                entry.get(field).is_some(),
+                "secret entry missing field: {field}"
+            );
         }
     }
 
     emit_scenario_event(
-        &harness, "jsonl_contract", "verify", "ext.contract",
-        "none", "pass", 0.0, &["schema_complete"],
+        &harness,
+        "jsonl_contract",
+        "verify",
+        "ext.contract",
+        "none",
+        "pass",
+        0.0,
+        &["schema_complete"],
     );
 
     // Write all artifacts as JSONL for CI consumption.
@@ -1096,7 +1400,11 @@ fn scenario_jsonl_artifact_contract() {
 
     std::fs::write(&ledger_path, serde_json::to_string_pretty(&ledger).unwrap()).unwrap();
     std::fs::write(&alerts_path, serde_json::to_string_pretty(&alerts).unwrap()).unwrap();
-    std::fs::write(&telem_path, serde_json::to_string_pretty(&telemetry).unwrap()).unwrap();
+    std::fs::write(
+        &telem_path,
+        serde_json::to_string_pretty(&telemetry).unwrap(),
+    )
+    .unwrap();
     std::fs::write(&exec_path, serde_json::to_string_pretty(&exec).unwrap()).unwrap();
     std::fs::write(&secret_path, serde_json::to_string_pretty(&secret).unwrap()).unwrap();
 
@@ -1107,7 +1415,9 @@ fn scenario_jsonl_artifact_contract() {
     harness.record_artifact("secret_broker", &secret_path);
 
     harness.log().info_ctx(
-        "scenario_result", "JSONL artifact contract verified", |ctx_log| {
+        "scenario_result",
+        "JSONL artifact contract verified",
+        |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "jsonl_contract".into()));
             ctx_log.push(("result".into(), "pass".into()));
@@ -1127,8 +1437,14 @@ fn scenario_deterministic_artifact_manifests() {
     let ctx = make_ctx(&tools, &http, &manager, &policy, "ext.determinism");
 
     emit_scenario_event(
-        &harness, "deterministic_artifacts", "start", "ext.determinism",
-        "none", "setup", 0.0, &[],
+        &harness,
+        "deterministic_artifacts",
+        "start",
+        "ext.determinism",
+        "none",
+        "setup",
+        0.0,
+        &[],
     );
 
     // Run a workload, then build the bundle twice from the same manager
@@ -1168,12 +1484,20 @@ fn scenario_deterministic_artifact_manifests() {
     assert_eq!(bundle1.summary, bundle2.summary);
 
     emit_scenario_event(
-        &harness, "deterministic_artifacts", "verify", "ext.determinism",
-        "none", "pass", 0.0, &["hashes_match"],
+        &harness,
+        "deterministic_artifacts",
+        "verify",
+        "ext.determinism",
+        "none",
+        "pass",
+        0.0,
+        &["hashes_match"],
     );
 
     harness.log().info_ctx(
-        "scenario_result", "deterministic artifact manifests verified", |ctx_log| {
+        "scenario_result",
+        "deterministic artifact manifests verified",
+        |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-3fa19".into()));
             ctx_log.push(("scenario".into(), "deterministic_artifacts".into()));
             ctx_log.push(("result".into(), "pass".into()));

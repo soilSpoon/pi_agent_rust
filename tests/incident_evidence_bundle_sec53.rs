@@ -473,7 +473,10 @@ fn bundle_serde_roundtrip() {
 
     assert_eq!(restored.schema, bundle.schema);
     assert_eq!(restored.bundle_hash, bundle.bundle_hash);
-    assert_eq!(restored.summary.ledger_entry_count, bundle.summary.ledger_entry_count);
+    assert_eq!(
+        restored.summary.ledger_entry_count,
+        bundle.summary.ledger_entry_count
+    );
     assert_eq!(restored.summary.alert_count, bundle.summary.alert_count);
     assert_eq!(
         restored.risk_ledger.entries.len(),
@@ -500,8 +503,7 @@ fn bundle_serde_roundtrip() {
     // verify self-consistency by double-serialization: serialize the
     // restored bundle again and confirm the second roundtrip is stable.
     let json2 = serde_json::to_string_pretty(&restored).expect("re-serialize");
-    let restored2: IncidentEvidenceBundle =
-        serde_json::from_str(&json2).expect("re-deserialize");
+    let restored2: IncidentEvidenceBundle = serde_json::from_str(&json2).expect("re-deserialize");
     assert_eq!(
         serde_json::to_string(&restored.risk_ledger).unwrap(),
         serde_json::to_string(&restored2.risk_ledger).unwrap(),
@@ -856,6 +858,132 @@ fn summary_tracks_peak_risk_and_enforcement() {
             ctx_log.push((
                 "deny_terminate".into(),
                 bundle.summary.deny_or_terminate_count.to_string(),
+            ));
+        },
+    );
+}
+
+// ============================================================================
+// Test 14: ExtensionManager::export_incident_bundle convenience method
+// ============================================================================
+
+#[test]
+fn manager_export_incident_bundle_delegates_correctly() {
+    let harness = TestHarness::new("manager_export_incident_bundle");
+    let (tools, http, manager, policy) = setup(&harness, default_risk_config());
+    let ctx = make_ctx(&tools, &http, &manager, &policy, "ext.export");
+
+    populate_manager(&ctx, 5, 3);
+
+    // Record some exec mediation and secret broker entries.
+    for i in 0..3 {
+        manager.record_exec_mediation(sample_exec_mediation("ext.export", i));
+        manager.record_secret_broker(sample_secret_broker("ext.export", i));
+    }
+
+    // Export via the convenience method.
+    let filter = IncidentBundleFilter::default();
+    let redaction = IncidentBundleRedactionPolicy::default();
+    let bundle = manager.export_incident_bundle(&filter, &redaction);
+
+    // Basic schema check.
+    assert_eq!(bundle.schema, INCIDENT_EVIDENCE_BUNDLE_SCHEMA_VERSION);
+
+    // Summary should have non-zero entries.
+    assert!(
+        bundle.summary.ledger_entry_count > 0,
+        "ledger should have entries"
+    );
+    assert!(
+        bundle.summary.exec_mediation_count >= 3,
+        "exec mediation should have at least 3 entries"
+    );
+    assert!(
+        bundle.summary.secret_broker_count >= 3,
+        "secret broker should have at least 3 entries"
+    );
+
+    // Summary counts match sub-artifact lengths.
+    assert_eq!(
+        bundle.summary.ledger_entry_count,
+        bundle.risk_ledger.entries.len(),
+    );
+    assert_eq!(
+        bundle.summary.exec_mediation_count,
+        bundle.exec_mediation.entries.len(),
+    );
+    assert_eq!(
+        bundle.summary.secret_broker_count,
+        bundle.secret_broker.entries.len(),
+    );
+
+    // Bundle hash is non-empty.
+    assert!(!bundle.bundle_hash.is_empty());
+
+    harness.log().info_ctx(
+        "manager_export",
+        "export_incident_bundle delegates correctly",
+        |ctx_log| {
+            ctx_log.push(("issue_id".into(), "bd-11mqo".into()));
+            ctx_log.push((
+                "ledger".into(),
+                bundle.summary.ledger_entry_count.to_string(),
+            ));
+            ctx_log.push((
+                "exec".into(),
+                bundle.summary.exec_mediation_count.to_string(),
+            ));
+            ctx_log.push((
+                "secret".into(),
+                bundle.summary.secret_broker_count.to_string(),
+            ));
+        },
+    );
+}
+
+// ============================================================================
+// Test 15: Export with filter narrows scope
+// ============================================================================
+
+#[test]
+fn manager_export_with_filter() {
+    let harness = TestHarness::new("manager_export_with_filter");
+    let (tools, http, manager, policy) = setup(&harness, default_risk_config());
+    let ctx = make_ctx(&tools, &http, &manager, &policy, "ext.filter");
+
+    populate_manager(&ctx, 10, 0);
+
+    // Export unfiltered.
+    let unfiltered = manager.export_incident_bundle(
+        &IncidentBundleFilter::default(),
+        &IncidentBundleRedactionPolicy::default(),
+    );
+
+    // Export with extension filter for a non-existent extension.
+    let filtered = manager.export_incident_bundle(
+        &IncidentBundleFilter {
+            extension_id: Some("nonexistent_ext".to_string()),
+            ..Default::default()
+        },
+        &IncidentBundleRedactionPolicy::default(),
+    );
+
+    // Filtered bundle should have zero entries for non-existent ext.
+    assert!(filtered.summary.ledger_entry_count <= unfiltered.summary.ledger_entry_count,);
+    assert_eq!(filtered.summary.ledger_entry_count, 0);
+
+    harness.log().info_ctx(
+        "manager_filter",
+        "export with filter narrows scope",
+        |ctx_log| {
+            ctx_log.push(("issue_id".into(), "bd-11mqo".into()));
+            ctx_log.push((
+                "unfiltered".into(),
+                unfiltered.summary.ledger_entry_count.to_string(),
+            ));
+            ctx_log.push((
+                "filtered".into(),
+                filtered.summary.ledger_entry_count.to_string(),
             ));
         },
     );

@@ -4,16 +4,15 @@
 //! generation, verification, forensic replay, and JSON round-trip stability.
 
 use pi::extensions::{
-    build_incident_evidence_bundle, compute_incident_bundle_hash,
-    verify_incident_evidence_bundle, ExecMediationArtifact, ExecMediationLedgerEntry,
-    IncidentBundleFilter, IncidentBundleRedactionPolicy, IncidentEvidenceBundle,
-    QuotaBreachEvent, RuntimeHostcallTelemetryArtifact, RuntimeHostcallTelemetryEvent,
-    RuntimeRiskActionValue, RuntimeRiskLedgerArtifact, RuntimeRiskLedgerArtifactEntry,
-    RuntimeRiskStateLabelValue, SecretBrokerArtifact, SecretBrokerLedgerEntry, SecurityAlert,
-    SecurityAlertAction, SecurityAlertArtifact, SecurityAlertCategory,
-    SecurityAlertCategoryCounts, SecurityAlertSeverity, SecurityAlertSeverityCounts,
-    INCIDENT_EVIDENCE_BUNDLE_SCHEMA_VERSION, RUNTIME_HOSTCALL_TELEMETRY_SCHEMA_VERSION,
-    RUNTIME_RISK_LEDGER_SCHEMA_VERSION, SECURITY_ALERT_SCHEMA_VERSION,
+    ExecMediationArtifact, ExecMediationLedgerEntry, INCIDENT_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    IncidentBundleFilter, IncidentBundleRedactionPolicy, IncidentEvidenceBundle, QuotaBreachEvent,
+    RUNTIME_HOSTCALL_TELEMETRY_SCHEMA_VERSION, RUNTIME_RISK_LEDGER_SCHEMA_VERSION,
+    RuntimeHostcallTelemetryArtifact, RuntimeHostcallTelemetryEvent, RuntimeRiskActionValue,
+    RuntimeRiskLedgerArtifact, RuntimeRiskLedgerArtifactEntry, RuntimeRiskStateLabelValue,
+    SECURITY_ALERT_SCHEMA_VERSION, SecretBrokerArtifact, SecretBrokerLedgerEntry, SecurityAlert,
+    SecurityAlertAction, SecurityAlertArtifact, SecurityAlertCategory, SecurityAlertCategoryCounts,
+    SecurityAlertSeverity, SecurityAlertSeverityCounts, build_incident_evidence_bundle,
+    compute_incident_bundle_hash, verify_incident_evidence_bundle,
 };
 
 // ---------------------------------------------------------------------------
@@ -21,9 +20,9 @@ use pi::extensions::{
 // ---------------------------------------------------------------------------
 
 use pi::extensions::{
+    RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION, RuntimeRiskExpectedLossEvidence,
     RuntimeRiskExplanationBudgetState, RuntimeRiskExplanationLevelValue,
-    RuntimeRiskExpectedLossEvidence, RuntimeRiskPosteriorEvidence,
-    RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION,
+    RuntimeRiskPosteriorEvidence,
 };
 
 fn make_ledger_entry(ts_ms: i64, ext_id: &str, risk: f64) -> RuntimeRiskLedgerArtifactEntry {
@@ -307,7 +306,7 @@ fn bundle_summary_counts_match_artifacts() {
 fn bundle_peak_risk_and_deny_count() {
     let ledger = ledger_artifact(vec![
         make_ledger_entry(1000, "ext-a", 0.3),
-        make_ledger_entry(2000, "ext-a", 0.9), // deny
+        make_ledger_entry(2000, "ext-a", 0.9),  // deny
         make_ledger_entry(3000, "ext-a", 0.75), // deny
     ]);
     let bundle = build_default_bundle(
@@ -698,19 +697,13 @@ fn default_redaction_redacts_hashes() {
     );
 
     // Exec command_hash redacted
-    assert_eq!(
-        bundle.exec_mediation.entries[0].command_hash,
-        "[REDACTED]"
-    );
+    assert_eq!(bundle.exec_mediation.entries[0].command_hash, "[REDACTED]");
 
     // Secret name_hash redacted
     assert_eq!(bundle.secret_broker.entries[0].name_hash, "[REDACTED]");
 
     // Alert context_hash redacted
-    assert_eq!(
-        bundle.security_alerts.alerts[0].context_hash,
-        "[REDACTED]"
-    );
+    assert_eq!(bundle.security_alerts.alerts[0].context_hash, "[REDACTED]");
 
     // But remediation is NOT redacted by default
     assert_eq!(bundle.security_alerts.alerts[0].remediation, "Fix it");
@@ -834,7 +827,12 @@ fn tampered_bundle_fails_verification() {
     let report = verify_incident_evidence_bundle(&bundle);
     assert!(!report.valid);
     assert_ne!(report.bundle_hash, report.recomputed_hash);
-    assert!(report.errors.iter().any(|e: &String| e.contains("bundle_hash")));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e: &String| e.contains("bundle_hash"))
+    );
 }
 
 #[test]
@@ -943,19 +941,18 @@ fn filtered_bundle_only_includes_filtered_ledger_entries() {
 
     // Filtered ledger only has ext-a entries
     assert_eq!(bundle.risk_ledger.entries.len(), 2);
-    assert!(bundle
-        .risk_ledger
-        .entries
-        .iter()
-        .all(|e| e.extension_id == "ext-a"));
+    assert!(
+        bundle
+            .risk_ledger
+            .entries
+            .iter()
+            .all(|e| e.extension_id == "ext-a")
+    );
 
     // If replay was generated, it should only contain filtered entries
     if let Some(replay) = bundle.risk_replay.as_ref() {
         assert_eq!(replay.entry_count, 2);
-        assert!(replay
-            .steps
-            .iter()
-            .all(|s| s.extension_id == "ext-a"));
+        assert!(replay.steps.iter().all(|s| s.extension_id == "ext-a"));
     }
 }
 
@@ -978,8 +975,7 @@ fn bundle_json_roundtrip() {
     let bundle = build_default_bundle(&ledger, &alerts, &telem, &exec, &secret, &quotas);
 
     let json = serde_json::to_string_pretty(&bundle).expect("serialize");
-    let deserialized: IncidentEvidenceBundle =
-        serde_json::from_str(&json).expect("deserialize");
+    let deserialized: IncidentEvidenceBundle = serde_json::from_str(&json).expect("deserialize");
 
     assert_eq!(bundle, deserialized);
     assert_eq!(bundle.bundle_hash, deserialized.bundle_hash);
@@ -999,8 +995,7 @@ fn bundle_filter_json_roundtrip() {
     };
 
     let json = serde_json::to_string(&filter).expect("serialize");
-    let deserialized: IncidentBundleFilter =
-        serde_json::from_str(&json).expect("deserialize");
+    let deserialized: IncidentBundleFilter = serde_json::from_str(&json).expect("deserialize");
 
     assert_eq!(filter, deserialized);
 }
@@ -1218,7 +1213,12 @@ fn compute_hash_is_hex_sha256() {
     );
 
     assert_eq!(bundle.bundle_hash.len(), 64); // SHA-256 hex = 64 chars
-    assert!(bundle.bundle_hash.chars().all(|c: char| c.is_ascii_hexdigit()));
+    assert!(
+        bundle
+            .bundle_hash
+            .chars()
+            .all(|c: char| c.is_ascii_hexdigit())
+    );
 
     // Recomputing gives same hash
     let recomputed = compute_incident_bundle_hash(&bundle);
