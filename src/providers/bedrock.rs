@@ -236,7 +236,7 @@ impl BedrockProvider {
 
         if messages.is_empty() {
             messages.push(BedrockMessage {
-                role: "user".to_string(),
+                role: "user",
                 content: vec![BedrockContent::Text {
                     text: "Hello".to_string(),
                 }],
@@ -477,7 +477,7 @@ struct BedrockSystemContent {
 
 #[derive(Debug, Serialize)]
 struct BedrockMessage {
-    role: String,
+    role: &'static str,
     content: Vec<BedrockContent>,
 }
 
@@ -588,7 +588,7 @@ fn convert_user_message(message: &crate::model::UserMessage) -> Option<BedrockMe
         None
     } else {
         Some(BedrockMessage {
-            role: "user".to_string(),
+            role: "user",
             content,
         })
     }
@@ -622,7 +622,7 @@ fn convert_assistant_message(message: &AssistantMessage) -> Option<BedrockMessag
         None
     } else {
         Some(BedrockMessage {
-            role: "assistant".to_string(),
+            role: "assistant",
             content,
         })
     }
@@ -646,7 +646,7 @@ fn convert_tool_result_message(message: &ToolResultMessage) -> BedrockMessage {
     };
 
     BedrockMessage {
-        role: "user".to_string(),
+        role: "user",
         content: vec![BedrockContent::ToolResult {
             tool_result: BedrockToolResult {
                 tool_use_id: message.tool_call_id.clone(),

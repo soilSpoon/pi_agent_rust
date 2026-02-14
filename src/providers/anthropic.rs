@@ -110,7 +110,7 @@ impl AnthropicProvider {
                     },
                 );
                 Some(AnthropicThinking {
-                    r#type: "enabled".to_string(),
+                    r#type: "enabled",
                     budget_tokens: budget,
                 })
             }
@@ -260,13 +260,7 @@ impl Provider for AnthropicProvider {
                             state.done = true;
                             let reason = state.partial.stop_reason;
                             let message = std::mem::take(&mut state.partial);
-                            return Some((
-                                Ok(StreamEvent::Done {
-                                    reason,
-                                    message,
-                                }),
-                                state,
-                            ));
+                            return Some((Ok(StreamEvent::Done { reason, message }), state));
                         }
                     }
                 }
@@ -343,7 +337,7 @@ where
             AnthropicStreamEvent::ContentBlockStart {
                 index,
                 content_block,
-            } => Ok(self.handle_content_block_start(index, content_block)),
+            } => Ok(Some(self.handle_content_block_start(index, content_block))),
             AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
                 Ok(self.handle_content_block_delta(index, delta))
             }
@@ -351,7 +345,7 @@ where
                 Ok(self.handle_content_block_stop(index))
             }
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
-                self.handle_message_delta(delta, usage);
+                self.handle_message_delta(&delta, usage);
                 Ok(None)
             }
             AnthropicStreamEvent::MessageStop => {
@@ -389,18 +383,18 @@ where
         &mut self,
         index: u32,
         content_block: AnthropicContentBlock,
-    ) -> Option<StreamEvent> {
+    ) -> StreamEvent {
         let content_index = index as usize;
 
-        match content_block.r#type.as_str() {
-            "text" => {
+        match content_block {
+            AnthropicContentBlock::Text => {
                 self.current_text.clear();
                 self.partial
                     .content
                     .push(ContentBlock::Text(TextContent::new("")));
-                Some(StreamEvent::TextStart { content_index })
+                StreamEvent::TextStart { content_index }
             }
-            "thinking" => {
+            AnthropicContentBlock::Thinking => {
                 self.current_thinking.clear();
                 self.partial
                     .content
@@ -408,21 +402,20 @@ where
                         thinking: String::new(),
                         thinking_signature: None,
                     }));
-                Some(StreamEvent::ThinkingStart { content_index })
+                StreamEvent::ThinkingStart { content_index }
             }
-            "tool_use" => {
+            AnthropicContentBlock::ToolUse { id, name } => {
                 self.current_tool_json.clear();
-                self.current_tool_id = content_block.id;
-                self.current_tool_name = content_block.name;
+                self.current_tool_id = id;
+                self.current_tool_name = name;
                 self.partial.content.push(ContentBlock::ToolCall(ToolCall {
                     id: self.current_tool_id.clone().unwrap_or_default(),
                     name: self.current_tool_name.clone().unwrap_or_default(),
                     arguments: serde_json::Value::Null,
                     thought_signature: None,
                 }));
-                Some(StreamEvent::ToolCallStart { content_index })
+                StreamEvent::ToolCallStart { content_index }
             }
-            _ => None,
         }
     }
 
@@ -433,9 +426,9 @@ where
     ) -> Option<StreamEvent> {
         let idx = index as usize;
 
-        match delta.r#type.as_str() {
-            "text_delta" => {
-                if let Some(text) = delta.text {
+        match delta {
+            AnthropicDelta::TextDelta { text } => {
+                if let Some(text) = text {
                     self.current_text.push_str(&text);
                     if let Some(ContentBlock::Text(t)) = self.partial.content.get_mut(idx) {
                         t.text.push_str(&text);
@@ -448,8 +441,8 @@ where
                     None
                 }
             }
-            "thinking_delta" => {
-                if let Some(thinking) = delta.thinking {
+            AnthropicDelta::ThinkingDelta { thinking } => {
+                if let Some(thinking) = thinking {
                     self.current_thinking.push_str(&thinking);
                     if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx) {
                         t.thinking.push_str(&thinking);
@@ -462,8 +455,8 @@ where
                     None
                 }
             }
-            "input_json_delta" => {
-                if let Some(partial_json) = delta.partial_json {
+            AnthropicDelta::InputJsonDelta { partial_json } => {
+                if let Some(partial_json) = partial_json {
                     self.current_tool_json.push_str(&partial_json);
                     Some(StreamEvent::ToolCallDelta {
                         content_index: idx,
@@ -473,18 +466,17 @@ where
                     None
                 }
             }
-            "signature_delta" => {
+            AnthropicDelta::SignatureDelta { signature } => {
                 // The Anthropic API sends signature_delta for thinking blocks
                 // to deliver the thinking_signature required for multi-turn
                 // extended thinking conversations.
-                if let Some(sig) = delta.signature {
+                if let Some(sig) = signature {
                     if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx) {
                         t.thinking_signature = Some(sig);
                     }
                 }
                 None
             }
-            _ => None,
         }
     }
 
@@ -540,17 +532,19 @@ where
         }
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     fn handle_message_delta(
         &mut self,
-        delta: AnthropicMessageDelta,
+        delta: &AnthropicMessageDelta,
         usage: Option<AnthropicDeltaUsage>,
     ) {
         if let Some(stop_reason) = delta.stop_reason {
-            self.partial.stop_reason = match stop_reason.as_str() {
-                "max_tokens" => StopReason::Length,
-                "tool_use" => StopReason::ToolUse,
-                // "end_turn" and any other value map to Stop
-                _ => StopReason::Stop,
+            self.partial.stop_reason = match stop_reason {
+                AnthropicStopReason::MaxTokens => StopReason::Length,
+                AnthropicStopReason::ToolUse => StopReason::ToolUse,
+                AnthropicStopReason::EndTurn | AnthropicStopReason::StopSequence => {
+                    StopReason::Stop
+                }
             };
         }
 
@@ -583,13 +577,13 @@ pub struct AnthropicRequest {
 
 #[derive(Debug, Serialize)]
 struct AnthropicThinking {
-    r#type: String,
+    r#type: &'static str,
     budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
 struct AnthropicMessage {
-    role: String,
+    role: &'static str,
     content: Vec<AnthropicContent>,
 }
 
@@ -621,7 +615,7 @@ enum AnthropicContent {
 
 #[derive(Debug, Serialize)]
 struct AnthropicImageSource {
-    r#type: String,
+    r#type: &'static str,
     media_type: String,
     data: String,
 }
@@ -697,32 +691,65 @@ struct AnthropicDeltaUsage {
     output_tokens: u64,
 }
 
+/// Content block type from `content_block_start`.
+///
+/// Using a tagged enum avoids allocating a `String` for the type field.
 #[derive(Debug, Deserialize)]
-struct AnthropicContentBlock {
-    r#type: String,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicContentBlock {
+    Text,
+    Thinking,
+    ToolUse {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
 }
 
+/// Per-token delta from the Anthropic streaming API.
+///
+/// Using a tagged enum instead of a flat struct with `r#type: String` avoids
+/// allocating a `String` for the type discriminant on every content_block_delta
+/// event (the hottest path — one allocation per streamed token).
 #[derive(Debug, Deserialize)]
-struct AnthropicDelta {
-    r#type: String,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    thinking: Option<String>,
-    #[serde(default)]
-    partial_json: Option<String>,
-    #[serde(default)]
-    signature: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)] // Variant names mirror Anthropic API type discriminants
+enum AnthropicDelta {
+    TextDelta {
+        #[serde(default)]
+        text: Option<String>,
+    },
+    ThinkingDelta {
+        #[serde(default)]
+        thinking: Option<String>,
+    },
+    InputJsonDelta {
+        #[serde(default)]
+        partial_json: Option<String>,
+    },
+    SignatureDelta {
+        #[serde(default)]
+        signature: Option<String>,
+    },
+}
+
+/// Stop reason from `message_delta`.
+///
+/// Using an enum avoids allocating a `String` for the stop reason.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AnthropicStopReason {
+    EndTurn,
+    MaxTokens,
+    ToolUse,
+    StopSequence,
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicMessageDelta {
     #[serde(default)]
-    stop_reason: Option<String>,
+    stop_reason: Option<AnthropicStopReason>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -737,17 +764,17 @@ struct AnthropicError {
 fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage {
     match message {
         Message::User(user) => AnthropicMessage {
-            role: "user".to_string(),
+            role: "user",
             content: convert_user_content(&user.content),
         },
         Message::Custom(custom) => AnthropicMessage {
-            role: "user".to_string(),
+            role: "user",
             content: vec![AnthropicContent::Text {
                 text: custom.content.clone(),
             }],
         },
         Message::Assistant(assistant) => AnthropicMessage {
-            role: "assistant".to_string(),
+            role: "assistant",
             content: assistant
                 .content
                 .iter()
@@ -755,7 +782,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage {
                 .collect(),
         },
         Message::ToolResult(result) => AnthropicMessage {
-            role: "user".to_string(),
+            role: "user",
             content: vec![AnthropicContent::ToolResult {
                 tool_use_id: result.tool_call_id.clone(),
                 content: result
@@ -767,7 +794,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage {
                         }),
                         ContentBlock::Image(img) => Some(AnthropicToolResultContent::Image {
                             source: AnthropicImageSource {
-                                r#type: "base64".to_string(),
+                                r#type: "base64",
                                 media_type: img.mime_type.clone(),
                                 data: img.data.clone(),
                             },
@@ -792,7 +819,7 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent> {
                 }),
                 ContentBlock::Image(img) => Some(AnthropicContent::Image {
                     source: AnthropicImageSource {
-                        r#type: "base64".to_string(),
+                        r#type: "base64",
                         media_type: img.mime_type.clone(),
                         data: img.data.clone(),
                     },
@@ -1975,6 +2002,50 @@ mod tests {
                     let _ = state.process_event(event);
                 }
             }
+        }
+    }
+}
+
+// ============================================================================
+// Fuzzing support
+// ============================================================================
+
+#[cfg(feature = "fuzzing")]
+pub mod fuzz {
+    use super::*;
+    use futures::stream;
+    use std::pin::Pin;
+
+    type FuzzStream =
+        Pin<Box<futures::stream::Empty<std::result::Result<Vec<u8>, std::io::Error>>>>;
+
+    /// Opaque wrapper around the Anthropic stream processor state.
+    pub struct Processor(StreamState<FuzzStream>);
+
+    impl Default for Processor {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Processor {
+        /// Create a fresh processor with default state.
+        pub fn new() -> Self {
+            let empty = stream::empty::<std::result::Result<Vec<u8>, std::io::Error>>();
+            Self(StreamState::new(
+                crate::sse::SseStream::new(Box::pin(empty)),
+                "claude-fuzz".into(),
+                "anthropic-messages".into(),
+                "anthropic".into(),
+            ))
+        }
+
+        /// Feed one SSE data payload and return any emitted `StreamEvent`s.
+        pub fn process_event(&mut self, data: &str) -> crate::error::Result<Vec<StreamEvent>> {
+            Ok(self
+                .0
+                .process_event(data)?
+                .map_or_else(Vec::new, |event| vec![event]))
         }
     }
 }

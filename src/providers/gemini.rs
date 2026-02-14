@@ -97,9 +97,7 @@ impl GeminiProvider {
 
         let tool_config = if tools.is_some() {
             Some(GeminiToolConfig {
-                function_calling_config: GeminiFunctionCallingConfig {
-                    mode: "AUTO".to_string(),
-                },
+                function_calling_config: GeminiFunctionCallingConfig { mode: "AUTO" },
             })
         } else {
             None
@@ -241,13 +239,7 @@ impl Provider for GeminiProvider {
                             state.finished = true;
                             let reason = state.partial.stop_reason;
                             let message = std::mem::take(&mut state.partial);
-                            return Some((
-                                Ok(StreamEvent::Done {
-                                    reason,
-                                    message,
-                                }),
-                                state,
-                            ));
+                            return Some((Ok(StreamEvent::Done { reason, message }), state));
                         }
                     }
                 }
@@ -524,7 +516,7 @@ pub(crate) struct GeminiToolConfig {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct GeminiFunctionCallingConfig {
-    pub(crate) mode: String,
+    pub(crate) mode: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -579,11 +571,11 @@ pub(crate) struct GeminiUsageMetadata {
 pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
     match message {
         Message::User(user) => vec![GeminiContent {
-            role: Some("user".to_string()),
+            role: Some("user".into()),
             parts: convert_user_content_to_parts(&user.content),
         }],
         Message::Custom(custom) => vec![GeminiContent {
-            role: Some("user".to_string()),
+            role: Some("user".into()),
             parts: vec![GeminiPart::Text {
                 text: custom.content.clone(),
             }],
@@ -617,7 +609,7 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
             }
 
             vec![GeminiContent {
-                role: Some("model".to_string()),
+                role: Some("model".into()),
                 parts,
             }]
         }
@@ -640,7 +632,7 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
             };
 
             vec![GeminiContent {
-                role: Some("user".to_string()),
+                role: Some("user".into()),
                 parts: vec![GeminiPart::FunctionResponse {
                     function_response: GeminiFunctionResponse {
                         name: result.tool_name.clone(),
@@ -1545,6 +1537,48 @@ mod tests {
                     let _ = state.process_event(event);
                 }
             }
+        }
+    }
+}
+
+// ============================================================================
+// Fuzzing support
+// ============================================================================
+
+#[cfg(feature = "fuzzing")]
+pub mod fuzz {
+    use super::*;
+    use futures::stream;
+    use std::pin::Pin;
+
+    type FuzzStream =
+        Pin<Box<futures::stream::Empty<std::result::Result<Vec<u8>, std::io::Error>>>>;
+
+    /// Opaque wrapper around the Gemini stream processor state.
+    pub struct Processor(StreamState<FuzzStream>);
+
+    impl Default for Processor {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Processor {
+        /// Create a fresh processor with default state.
+        pub fn new() -> Self {
+            let empty = stream::empty::<std::result::Result<Vec<u8>, std::io::Error>>();
+            Self(StreamState::new(
+                crate::sse::SseStream::new(Box::pin(empty)),
+                "gemini-fuzz".into(),
+                "google-generative".into(),
+                "google".into(),
+            ))
+        }
+
+        /// Feed one SSE data payload and return any emitted `StreamEvent`s.
+        pub fn process_event(&mut self, data: &str) -> crate::error::Result<Vec<StreamEvent>> {
+            self.0.process_event(data)?;
+            Ok(self.0.pending_events.drain(..).collect())
         }
     }
 }

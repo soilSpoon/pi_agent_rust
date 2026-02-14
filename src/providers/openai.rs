@@ -31,6 +31,25 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 const OPENROUTER_DEFAULT_HTTP_REFERER: &str = "https://github.com/Dicklesworthstone/pi_agent_rust";
 const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
 
+/// Map a role string (which may come from compat config at runtime) to a `&'static str`.
+///
+/// The OpenAI API uses a small, well-known set of role names.  When the value
+/// matches one of these we return the corresponding string literal (zero
+/// allocation).  For an unknown role name (extremely rare – only possible via
+/// exotic compat overrides) we leak a heap copy so that callers can always
+/// work with `&'static str`.
+fn to_static_role(role: &str) -> &'static str {
+    match role {
+        "system" => "system",
+        "developer" => "developer",
+        "user" => "user",
+        "assistant" => "assistant",
+        "tool" => "tool",
+        "function" => "function",
+        other => Box::leak(other.to_string().into_boxed_str()),
+    }
+}
+
 fn map_has_any_header(headers: &std::collections::HashMap<String, String>, names: &[&str]) -> bool {
     headers
         .keys()
@@ -217,7 +236,7 @@ impl OpenAIProvider {
         // Add system prompt as first message
         if let Some(system) = &context.system_prompt {
             messages.push(OpenAIMessage {
-                role: system_role.to_string(),
+                role: to_static_role(system_role),
                 content: Some(OpenAIContent::Text(system.clone())),
                 tool_calls: None,
                 tool_call_id: None,
@@ -387,13 +406,7 @@ impl Provider for OpenAIProvider {
                                 state.done = true;
                                 let reason = state.partial.stop_reason;
                                 let message = std::mem::take(&mut state.partial);
-                                return Some((
-                                    Ok(StreamEvent::Done {
-                                        reason,
-                                        message,
-                                    }),
-                                    state,
-                                ));
+                                return Some((Ok(StreamEvent::Done { reason, message }), state));
                             }
 
                             if let Err(e) = state.process_event(&msg.data) {
@@ -414,13 +427,7 @@ impl Provider for OpenAIProvider {
                             state.done = true;
                             let reason = state.partial.stop_reason;
                             let message = std::mem::take(&mut state.partial);
-                            return Some((
-                                Ok(StreamEvent::Done {
-                                    reason,
-                                    message,
-                                }),
-                                state,
-                            ));
+                            return Some((Ok(StreamEvent::Done { reason, message }), state));
                         }
                     }
                 }
@@ -770,7 +777,7 @@ struct OpenAIStreamOptions {
 
 #[derive(Debug, Serialize)]
 struct OpenAIMessage {
-    role: String,
+    role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<OpenAIContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -801,7 +808,7 @@ struct OpenAIImageUrl {
 #[derive(Debug, Serialize)]
 struct OpenAIToolCallRef {
     id: String,
-    r#type: String,
+    r#type: &'static str,
     function: OpenAIFunctionRef,
 }
 
@@ -813,7 +820,7 @@ struct OpenAIFunctionRef {
 
 #[derive(Debug, Serialize)]
 struct OpenAITool {
-    r#type: String,
+    r#type: &'static str,
     function: OpenAIFunction,
 }
 
@@ -892,13 +899,13 @@ struct OpenAIChunkError {
 fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
     match message {
         Message::User(user) => vec![OpenAIMessage {
-            role: "user".to_string(),
+            role: "user",
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
         }],
         Message::Custom(custom) => vec![OpenAIMessage {
-            role: "user".to_string(),
+            role: "user",
             content: Some(OpenAIContent::Text(custom.content.clone())),
             tool_calls: None,
             tool_call_id: None,
@@ -924,7 +931,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
                 .filter_map(|b| match b {
                     ContentBlock::ToolCall(tc) => Some(OpenAIToolCallRef {
                         id: tc.id.clone(),
-                        r#type: "function".to_string(),
+                        r#type: "function",
                         function: OpenAIFunctionRef {
                             name: tc.name.clone(),
                             arguments: tc.arguments.to_string(),
@@ -947,7 +954,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
             };
 
             messages.push(OpenAIMessage {
-                role: "assistant".to_string(),
+                role: "assistant",
                 content,
                 tool_calls,
                 tool_call_id: None,
@@ -968,7 +975,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
                 .join("\n");
 
             vec![OpenAIMessage {
-                role: "tool".to_string(),
+                role: "tool",
                 content: Some(OpenAIContent::Text(content)),
                 tool_calls: None,
                 tool_call_id: Some(result.tool_call_id.clone()),
@@ -1004,7 +1011,7 @@ fn convert_user_content(content: &UserContent) -> OpenAIContent {
 
 fn convert_tool_to_openai(tool: &ToolDef) -> OpenAITool {
     OpenAITool {
-        r#type: "function".to_string(),
+        r#type: "function",
         function: OpenAIFunction {
             name: tool.name.clone(),
             description: tool.description.clone(),
@@ -2151,6 +2158,48 @@ mod tests {
                     let _ = state.process_event(event);
                 }
             }
+        }
+    }
+}
+
+// ============================================================================
+// Fuzzing support
+// ============================================================================
+
+#[cfg(feature = "fuzzing")]
+pub mod fuzz {
+    use super::*;
+    use futures::stream;
+    use std::pin::Pin;
+
+    type FuzzStream =
+        Pin<Box<futures::stream::Empty<std::result::Result<Vec<u8>, std::io::Error>>>>;
+
+    /// Opaque wrapper around the OpenAI stream processor state.
+    pub struct Processor(StreamState<FuzzStream>);
+
+    impl Default for Processor {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Processor {
+        /// Create a fresh processor with default state.
+        pub fn new() -> Self {
+            let empty = stream::empty::<std::result::Result<Vec<u8>, std::io::Error>>();
+            Self(StreamState::new(
+                crate::sse::SseStream::new(Box::pin(empty)),
+                "gpt-fuzz".into(),
+                "openai".into(),
+                "openai".into(),
+            ))
+        }
+
+        /// Feed one SSE data payload and return any emitted `StreamEvent`s.
+        pub fn process_event(&mut self, data: &str) -> crate::error::Result<Vec<StreamEvent>> {
+            self.0.process_event(data)?;
+            Ok(self.0.pending_events.drain(..).collect())
         }
     }
 }
