@@ -110,16 +110,16 @@ pub struct PackageManager {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PackageLockAction {
+pub enum PackageLockAction {
     Install,
     Update,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct PackageLockfile {
-    schema: String,
+pub struct PackageLockfile {
+    pub schema: String,
     #[serde(default)]
-    entries: Vec<PackageLockEntry>,
+    pub entries: Vec<PackageLockEntry>,
 }
 
 impl Default for PackageLockfile {
@@ -132,18 +132,18 @@ impl Default for PackageLockfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct PackageLockEntry {
-    identity: String,
-    source: String,
-    source_kind: PackageSourceKind,
-    resolved: PackageResolvedProvenance,
-    digest_sha256: String,
-    trust_state: PackageEntryTrustState,
+pub struct PackageLockEntry {
+    pub identity: String,
+    pub source: String,
+    pub source_kind: PackageSourceKind,
+    pub resolved: PackageResolvedProvenance,
+    pub digest_sha256: String,
+    pub trust_state: PackageEntryTrustState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum PackageSourceKind {
+pub enum PackageSourceKind {
     Npm,
     Git,
     Local,
@@ -151,7 +151,7 @@ enum PackageSourceKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum PackageResolvedProvenance {
+pub enum PackageResolvedProvenance {
     Npm {
         name: String,
         requested_spec: String,
@@ -175,42 +175,42 @@ enum PackageResolvedProvenance {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum PackageEntryTrustState {
+pub enum PackageEntryTrustState {
     Trusted,
     Rejected,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct PackageTrustAuditEvent {
-    schema: &'static str,
-    timestamp: String,
-    action: String,
-    scope: String,
-    source: String,
-    identity: String,
-    from_state: String,
-    to_state: String,
-    reason_codes: Vec<String>,
-    remediation: Option<String>,
-    details: serde_json::Value,
+pub struct PackageTrustAuditEvent {
+    pub schema: &'static str,
+    pub timestamp: String,
+    pub action: String,
+    pub scope: String,
+    pub source: String,
+    pub identity: String,
+    pub from_state: String,
+    pub to_state: String,
+    pub reason_codes: Vec<String>,
+    pub remediation: Option<String>,
+    pub details: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
-struct LockTransitionPlan {
-    reason_codes: Vec<String>,
-    from_state: String,
-    to_state: String,
+pub struct LockTransitionPlan {
+    pub reason_codes: Vec<String>,
+    pub from_state: String,
+    pub to_state: String,
 }
 
 #[derive(Debug, Clone)]
-struct PackageLockMismatch {
-    code: &'static str,
-    reason: String,
-    remediation: String,
+pub struct PackageLockMismatch {
+    pub code: &'static str,
+    pub reason: String,
+    pub remediation: String,
 }
 
-const PACKAGE_LOCK_SCHEMA: &str = "pi.package_lock.v1";
-const PACKAGE_TRUST_AUDIT_SCHEMA: &str = "pi.package_trust_audit.v1";
+pub const PACKAGE_LOCK_SCHEMA: &str = "pi.package_lock.v1";
+pub const PACKAGE_TRUST_AUDIT_SCHEMA: &str = "pi.package_trust_audit.v1";
 
 impl PackageManager {
     pub const fn new(cwd: PathBuf) -> Self {
@@ -2913,7 +2913,7 @@ fn verification_error(code: &str, reason: &str, remediation: &str) -> Error {
     )
 }
 
-fn evaluate_lock_transition(
+pub fn evaluate_lock_transition(
     existing: Option<&PackageLockEntry>,
     candidate: &PackageLockEntry,
     action: PackageLockAction,
@@ -3005,7 +3005,7 @@ const fn allow_lock_entry_update(candidate: &PackageLockEntry, action: PackageLo
     }
 }
 
-fn sort_lock_entries(entries: &mut [PackageLockEntry]) {
+pub fn sort_lock_entries(entries: &mut [PackageLockEntry]) {
     entries.sort_by(|left, right| {
         left.identity
             .cmp(&right.identity)
@@ -3013,7 +3013,7 @@ fn sort_lock_entries(entries: &mut [PackageLockEntry]) {
     });
 }
 
-fn read_package_lockfile(path: &Path) -> Result<PackageLockfile> {
+pub fn read_package_lockfile(path: &Path) -> Result<PackageLockfile> {
     if !path.exists() {
         return Ok(PackageLockfile::default());
     }
@@ -3032,7 +3032,7 @@ fn read_package_lockfile(path: &Path) -> Result<PackageLockfile> {
     Ok(lockfile)
 }
 
-fn write_package_lockfile_atomic(path: &Path, lockfile: &PackageLockfile) -> Result<()> {
+pub fn write_package_lockfile_atomic(path: &Path, lockfile: &PackageLockfile) -> Result<()> {
     let value = serde_json::to_value(lockfile)?;
     write_settings_json_atomic(path, &value)
 }
@@ -3047,7 +3047,7 @@ fn is_exact_npm_version(value: &str) -> bool {
         })
 }
 
-fn digest_package_path(path: &Path) -> Result<String> {
+pub fn digest_package_path(path: &Path) -> Result<String> {
     if path.is_file() {
         let mut hasher = Sha256::new();
         hasher.update(b"file\0");
