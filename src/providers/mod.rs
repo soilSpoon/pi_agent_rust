@@ -833,6 +833,7 @@ pub fn create_provider(
                 azure::AzureOpenAIProvider::new(runtime.resource, runtime.deployment)
                     .with_api_version(runtime.api_version)
                     .with_endpoint_url(runtime.endpoint_url)
+                    .with_compat(entry.compat.clone())
                     .with_client(client),
             ))
         }

@@ -333,7 +333,9 @@ where
                         // Accumulate text into partial
                         let last_is_text =
                             matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
-                        let content_index = if !last_is_text {
+                        let content_index = if last_is_text {
+                            self.partial.content.len() - 1
+                        } else {
                             let idx = self.partial.content.len();
                             self.partial
                                 .content
@@ -343,8 +345,6 @@ where
                                 partial: self.partial.clone(),
                             });
                             idx
-                        } else {
-                            self.partial.content.len() - 1
                         };
 
                         if let Some(ContentBlock::Text(t)) =

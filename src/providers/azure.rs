@@ -11,6 +11,7 @@ use crate::http::client::Client;
 use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, Usage, UserContent,
 };
+use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::sse::SseStream;
 use async_trait::async_trait;
@@ -42,6 +43,7 @@ pub struct AzureOpenAIProvider {
     api_version: String,
     /// Optional override for the full endpoint URL (primarily for deterministic tests).
     endpoint_url_override: Option<String>,
+    compat: Option<CompatConfig>,
 }
 
 impl AzureOpenAIProvider {
@@ -57,6 +59,7 @@ impl AzureOpenAIProvider {
             resource: resource.into(),
             api_version: DEFAULT_API_VERSION.to_string(),
             endpoint_url_override: None,
+            compat: None,
         }
     }
 
@@ -84,6 +87,13 @@ impl AzureOpenAIProvider {
         self
     }
 
+    /// Attach provider-specific compatibility overrides.
+    #[must_use]
+    pub fn with_compat(mut self, compat: Option<CompatConfig>) -> Self {
+        self.compat = compat;
+        self
+    }
+
     /// Get the full endpoint URL.
     fn endpoint_url(&self) -> String {
         if let Some(url) = &self.endpoint_url_override {
@@ -98,7 +108,7 @@ impl AzureOpenAIProvider {
     /// Build the request body for Azure OpenAI (same format as OpenAI).
     #[allow(clippy::unused_self)]
     pub fn build_request(&self, context: &Context, options: &StreamOptions) -> AzureRequest {
-        let messages = Self::build_messages(context);
+        let messages = self.build_messages(context);
 
         let tools: Option<Vec<AzureTool>> = if context.tools.is_empty() {
             None
@@ -119,13 +129,18 @@ impl AzureOpenAIProvider {
     }
 
     /// Build the messages array with system prompt prepended.
-    fn build_messages(context: &Context) -> Vec<AzureMessage> {
+    fn build_messages(&self, context: &Context) -> Vec<AzureMessage> {
         let mut messages = Vec::new();
+        let system_role = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.system_role_name.as_deref())
+            .unwrap_or("system");
 
         // Add system prompt as first message
         if let Some(system) = &context.system_prompt {
             messages.push(AzureMessage {
-                role: "system".to_string(),
+                role: system_role.to_string(),
                 content: Some(AzureContent::Text(system.clone())),
                 tool_calls: None,
                 tool_call_id: None,
@@ -176,6 +191,15 @@ impl Provider for AzureOpenAIProvider {
             .post(&endpoint_url)
             .header("Accept", "text/event-stream")
             .header("api-key", &auth_value); // Azure uses api-key header, not Authorization
+
+        // Apply provider-specific custom headers from compat config.
+        if let Some(compat) = &self.compat {
+            if let Some(custom_headers) = &compat.custom_headers {
+                for (key, value) in custom_headers {
+                    request = request.header(key, value);
+                }
+            }
+        }
 
         for (key, value) in &options.headers {
             request = request.header(key, value);
