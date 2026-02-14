@@ -674,6 +674,33 @@ impl MessageRenderCache {
         })
     }
 
+    /// Append cached content for message at `index` directly into `output`.
+    ///
+    /// Returns `true` on cache hit, `false` on miss. This avoids allocating
+    /// a cloned `String` on every hit in the view hot path.
+    pub(super) fn append_cached(
+        &self,
+        output: &mut String,
+        index: usize,
+        key: &MessageCacheKey,
+    ) -> bool {
+        let entries = self.entries.borrow();
+        let gens = self.entry_generations.borrow();
+        if index >= entries.len() || index >= gens.len() {
+            return false;
+        }
+        if gens[index] != self.generation.get() {
+            return false;
+        }
+        if let Some((cached_key, rendered)) = &entries[index]
+            && cached_key == key
+        {
+            output.push_str(rendered);
+            return true;
+        }
+        false
+    }
+
     /// Store a rendered string for message at `index`.
     pub(super) fn put(&self, index: usize, key: MessageCacheKey, rendered: String) {
         let mut entries = self.entries.borrow_mut();
@@ -731,6 +758,14 @@ impl MessageRenderCache {
         self.prefix.borrow().clone()
     }
 
+    /// Append the cached prefix directly into `output`, avoiding a clone.
+    ///
+    /// PERF-7: This is the zero-copy alternative to `prefix_get()` for the
+    /// streaming hot path where we build into a reusable buffer.
+    pub(super) fn prefix_append_to(&self, output: &mut String) {
+        output.push_str(&self.prefix.borrow());
+    }
+
     /// Store a new prefix and snapshot the current message count / generation.
     pub(super) fn prefix_set(&self, content: &str, message_count: usize) {
         let mut p = self.prefix.borrow_mut();
@@ -755,6 +790,10 @@ pub struct RenderBuffers {
     /// Taken via `std::mem::take`, built into, then returned.
     /// The buffer is put back (capacity preserved) after use.
     conversation: RefCell<String>,
+    /// Reusable buffer for `render_header()`.
+    header: RefCell<String>,
+    /// Reusable buffer for `render_footer()`.
+    footer: RefCell<String>,
     /// Capacity of the previous frame's final view output.
     /// Used to pre-allocate the next frame's output String via
     /// `String::with_capacity()`, avoiding incremental grows.
@@ -765,10 +804,15 @@ pub struct RenderBuffers {
 /// 80 columns x 24 rows x 4 bytes (UTF-8 + ANSI escapes).
 const INITIAL_VIEW_CAPACITY: usize = 80 * 24 * 4;
 
+/// Initial capacity for header/footer buffers (small: ~512 bytes typical).
+const INITIAL_CHROME_CAPACITY: usize = 512;
+
 impl RenderBuffers {
     pub(super) fn new() -> Self {
         Self {
             conversation: RefCell::new(String::with_capacity(INITIAL_VIEW_CAPACITY)),
+            header: RefCell::new(String::with_capacity(INITIAL_CHROME_CAPACITY)),
+            footer: RefCell::new(String::with_capacity(INITIAL_CHROME_CAPACITY)),
             view_capacity_hint: std::cell::Cell::new(INITIAL_VIEW_CAPACITY),
         }
     }
@@ -785,6 +829,21 @@ impl RenderBuffers {
     /// Return the conversation buffer after use, preserving its heap capacity.
     pub(super) fn return_conversation_buffer(&self, buf: String) {
         *self.conversation.borrow_mut() = buf;
+    }
+
+    /// Borrow the header buffer mutably, clearing it for reuse.
+    /// The caller writes into the returned `RefMut` via `push_str` / `write!`.
+    pub(super) fn header_buf(&self) -> std::cell::RefMut<'_, String> {
+        let mut buf = self.header.borrow_mut();
+        buf.clear();
+        buf
+    }
+
+    /// Borrow the footer buffer mutably, clearing it for reuse.
+    pub(super) fn footer_buf(&self) -> std::cell::RefMut<'_, String> {
+        let mut buf = self.footer.borrow_mut();
+        buf.clear();
+        buf
     }
 
     /// Get the capacity hint for the next frame's view assembly.
@@ -1255,6 +1314,29 @@ mod tests {
     }
 
     #[test]
+    fn append_cached_writes_output_on_hit() {
+        let cache = MessageRenderCache::new();
+        let msg = ConversationMessage::new(MessageRole::User, "Hello".to_string(), None);
+        let key = MessageRenderCache::compute_key(&msg, false, true);
+        cache.put(0, key.clone(), "rendered-hello".to_string());
+
+        let mut output = String::new();
+        assert!(cache.append_cached(&mut output, 0, &key));
+        assert_eq!(output, "rendered-hello");
+    }
+
+    #[test]
+    fn append_cached_noop_on_miss() {
+        let cache = MessageRenderCache::new();
+        let msg = ConversationMessage::new(MessageRole::User, "Hello".to_string(), None);
+        let key = MessageRenderCache::compute_key(&msg, false, true);
+
+        let mut output = String::new();
+        assert!(!cache.append_cached(&mut output, 0, &key));
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn cache_miss_after_content_change() {
         let cache = MessageRenderCache::new();
         let msg1 = ConversationMessage::new(MessageRole::User, "Hello".to_string(), None);
@@ -1393,5 +1475,82 @@ mod tests {
         cache.prefix_set("new-prefix", 3);
         assert!(cache.prefix_valid(3));
         assert_eq!(cache.prefix_get(), "new-prefix");
+    }
+
+    // ========================================================================
+    // RenderBuffers unit tests (PERF-7)
+    // ========================================================================
+
+    #[test]
+    fn render_buffers_initial_capacity_hint() {
+        let rb = RenderBuffers::new();
+        assert_eq!(rb.view_capacity_hint(), INITIAL_VIEW_CAPACITY);
+    }
+
+    #[test]
+    fn render_buffers_capacity_hint_updates() {
+        let rb = RenderBuffers::new();
+        rb.set_view_capacity_hint(12_345);
+        assert_eq!(rb.view_capacity_hint(), 12_345);
+    }
+
+    #[test]
+    fn render_buffers_take_returns_cleared_buffer() {
+        let rb = RenderBuffers::new();
+        let buf = rb.take_conversation_buffer();
+        assert!(buf.is_empty());
+        assert!(buf.capacity() >= INITIAL_VIEW_CAPACITY);
+    }
+
+    #[test]
+    fn render_buffers_return_preserves_capacity() {
+        let rb = RenderBuffers::new();
+        let mut buf = rb.take_conversation_buffer();
+        // Write enough data to grow the buffer well beyond initial capacity.
+        let big = "x".repeat(INITIAL_VIEW_CAPACITY * 3);
+        buf.push_str(&big);
+        let grown_cap = buf.capacity();
+        rb.return_conversation_buffer(buf);
+
+        // Taking again should reuse the grown allocation (cleared but same cap).
+        let buf2 = rb.take_conversation_buffer();
+        assert!(buf2.is_empty());
+        assert_eq!(buf2.capacity(), grown_cap);
+    }
+
+    #[test]
+    fn render_buffers_take_without_return_gives_fresh() {
+        let rb = RenderBuffers::new();
+        let buf1 = rb.take_conversation_buffer();
+        // Don't return buf1 — simulates the buffer being consumed.
+        drop(buf1);
+        // Next take gets a fresh (empty, zero-cap) String.
+        let buf2 = rb.take_conversation_buffer();
+        assert!(buf2.is_empty());
+    }
+
+    #[test]
+    fn render_buffers_header_buf_cleared_on_each_call() {
+        let rb = RenderBuffers::new();
+        {
+            let mut hdr = rb.header_buf();
+            hdr.push_str("old header");
+        }
+        // Next call should return a cleared buffer with preserved capacity.
+        let hdr = rb.header_buf();
+        assert!(hdr.is_empty());
+        assert!(hdr.capacity() >= INITIAL_CHROME_CAPACITY);
+    }
+
+    #[test]
+    fn render_buffers_footer_buf_cleared_on_each_call() {
+        let rb = RenderBuffers::new();
+        {
+            let mut ftr = rb.footer_buf();
+            ftr.push_str("old footer");
+        }
+        let ftr = rb.footer_buf();
+        assert!(ftr.is_empty());
+        assert!(ftr.capacity() >= INITIAL_CHROME_CAPACITY);
     }
 }

@@ -1560,6 +1560,24 @@ impl PiApp {
         self.branch_picker.is_some()
     }
 
+    /// Return whether the conversation prefix cache is currently valid for
+    /// the current message count (integration test helper for PERF-2).
+    pub fn prefix_cache_valid_for_test(&self) -> bool {
+        self.message_render_cache.prefix_valid(self.messages.len())
+    }
+
+    /// Return the length of the cached conversation prefix
+    /// (integration test helper for PERF-2).
+    pub fn prefix_cache_len_for_test(&self) -> usize {
+        self.message_render_cache.prefix_get().len()
+    }
+
+    /// Return the current view capacity hint from render buffers
+    /// (integration test helper for PERF-7).
+    pub fn render_buffer_capacity_hint_for_test(&self) -> usize {
+        self.render_buffers.view_capacity_hint()
+    }
+
     /// Initialize the application.
     fn init(&self) -> Option<Cmd> {
         // Start text input cursor blink and spinner

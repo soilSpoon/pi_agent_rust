@@ -78,14 +78,14 @@ impl PiApp {
         // frame, avoiding incremental String grows during assembly.
         let mut output = String::with_capacity(self.render_buffers.view_capacity_hint());
 
-        // Header
-        output.push_str(&self.render_header());
+        // Header — PERF-7: render directly into output, no intermediate String.
+        self.render_header_into(&mut output);
         output.push('\n');
 
         // Modal overlays (e.g. /tree) take over the main view.
         if let Some(tree_ui) = &self.tree_ui {
             output.push_str(&view_tree_ui(tree_ui, &self.styles));
-            output.push_str(&self.render_footer());
+            self.render_footer_into(&mut output);
             return output;
         }
 
@@ -111,43 +111,50 @@ impl PiApp {
             raw
         };
 
-        // Update viewport content (we can't mutate self in view, so we render with current offset)
-        // The viewport will be updated in update() when new messages arrive
-        let viewport_content = if conversation_content.is_empty() {
-            if self.config.quiet_startup.unwrap_or(false) {
-                String::new()
-            } else {
-                self.styles
-                    .muted_italic
-                    .render("  Welcome to Pi! Type a message to begin, or /help for commands.")
-            }
-        } else {
-            conversation_content
-        };
-
         // Render conversation area (scrollable).
         // Use the per-frame effective height so that conditional chrome
         // (scroll indicator, tool status, status message, …) is accounted
         // for and the total output never exceeds term_height rows.
         let effective_vp = self.view_effective_conversation_height();
-        let conversation_lines: Vec<&str> = viewport_content.lines().collect();
-        let start = self
-            .conversation_viewport
-            .y_offset()
-            .min(conversation_lines.len().saturating_sub(1));
-        let end = (start + effective_vp).min(conversation_lines.len());
-        let visible_lines = conversation_lines.get(start..end).unwrap_or(&[]);
-        output.push_str(&visible_lines.join("\n"));
-        output.push('\n');
+        {
+            // PERF-7: Use Cow to avoid consuming conversation_content so
+            // the reusable buffer is always returned regardless of path.
+            use std::borrow::Cow;
+            let viewport_content: Cow<'_, str> = if conversation_content.is_empty() {
+                Cow::Owned(if self.config.quiet_startup.unwrap_or(false) {
+                    String::new()
+                } else {
+                    self.styles
+                        .muted_italic
+                        .render("  Welcome to Pi! Type a message to begin, or /help for commands.")
+                })
+            } else {
+                Cow::Borrowed(&conversation_content)
+            };
 
-        // Scroll indicator
-        if conversation_lines.len() > effective_vp {
-            let total = conversation_lines.len().saturating_sub(effective_vp);
-            let percent = (start * 100).checked_div(total).map_or(100, |p| p.min(100));
-            let indicator = format!("  [{percent}%] ↑/↓ PgUp/PgDn to scroll");
-            output.push_str(&self.styles.muted.render(&indicator));
+            let conversation_lines: Vec<&str> = viewport_content.lines().collect();
+            let start = self
+                .conversation_viewport
+                .y_offset()
+                .min(conversation_lines.len().saturating_sub(1));
+            let end = (start + effective_vp).min(conversation_lines.len());
+            let visible_lines = conversation_lines.get(start..end).unwrap_or(&[]);
+            output.push_str(&visible_lines.join("\n"));
             output.push('\n');
+
+            // Scroll indicator
+            if conversation_lines.len() > effective_vp {
+                let total = conversation_lines.len().saturating_sub(effective_vp);
+                let percent = (start * 100).checked_div(total).map_or(100, |p| p.min(100));
+                let indicator = format!("  [{percent}%] ↑/↓ PgUp/PgDn to scroll");
+                output.push_str(&self.styles.muted.render(&indicator));
+                output.push('\n');
+            }
         }
+        // PERF-7: Return the conversation buffer for reuse next frame.
+        // Always returned (even when empty) to preserve heap capacity.
+        self.render_buffers
+            .return_conversation_buffer(conversation_content);
 
         // Tool status
         if let Some(tool) = &self.current_tool {
@@ -244,13 +251,17 @@ impl PiApp {
             }
         }
 
-        // Footer with usage stats
-        output.push_str(&self.render_footer());
+        // Footer with usage stats — PERF-7: render directly into output.
+        self.render_footer_into(&mut output);
 
         // Clamp the output to `term_height` rows so the terminal never
         // scrolls in the alternate-screen buffer.
         let output = clamp_to_terminal_height(output, self.term_height);
         let output = normalize_raw_terminal_newlines(output);
+
+        // PERF-7: Remember this frame's output size so the next frame can
+        // pre-allocate with the right capacity.
+        self.render_buffers.set_view_capacity_hint(output.len());
 
         if let Some(start) = view_start {
             self.frame_timing
@@ -260,7 +271,9 @@ impl PiApp {
         output
     }
 
-    pub(super) fn render_header(&self) -> String {
+    /// PERF-7: Render the header directly into `output`, avoiding an
+    /// intermediate `String` allocation on the hot path.
+    fn render_header_into(&self, output: &mut String) {
         let model_label = format!("({})", self.model);
 
         // Branch indicator: show "Branch N/M" when session has multiple leaves.
@@ -309,14 +322,21 @@ impl PiApp {
             max_width,
         );
 
-        format!(
+        let _ = write!(
+            output,
             "  {} {}{}\n  {}\n  {}\n",
             self.styles.title.render("Pi"),
             self.styles.muted.render(&model_label),
             self.styles.accent.render(&branch_indicator),
             self.styles.muted.render(&hints_line),
             self.styles.muted.render(&resources_line),
-        )
+        );
+    }
+
+    pub(super) fn render_header(&self) -> String {
+        let mut buf = String::new();
+        self.render_header_into(&mut buf);
+        buf
     }
 
     pub(super) fn render_input(&self) -> String {
@@ -422,7 +442,9 @@ impl PiApp {
         output
     }
 
-    pub(super) fn render_footer(&self) -> String {
+    /// PERF-7: Render the footer directly into `output`, avoiding an
+    /// intermediate `String` allocation on the hot path.
+    fn render_footer_into(&self, output: &mut String) {
         let total_cost = self.total_usage.cost.total;
         let cost_str = if total_cost > 0.0 {
             format!(" (${total_cost:.4})")
@@ -451,7 +473,13 @@ impl PiApp {
         if footer.chars().count() > max_width {
             footer = truncate(&footer, max_width);
         }
-        format!("\n  {}\n", self.styles.muted.render(&footer))
+        let _ = write!(output, "\n  {}\n", self.styles.muted.render(&footer));
+    }
+
+    pub(super) fn render_footer(&self) -> String {
+        let mut buf = String::new();
+        self.render_footer_into(&mut buf);
+        buf
     }
 
     /// Render a single conversation message to a string (uncached path).
@@ -555,28 +583,35 @@ impl PiApp {
     pub fn build_conversation_content(&self) -> String {
         let is_streaming = !self.current_response.is_empty() || !self.current_thinking.is_empty();
 
+        // PERF-7: Reuse the pre-allocated conversation buffer from the
+        // previous frame. `take_conversation_buffer()` clears the buffer
+        // but preserves its heap capacity, avoiding a fresh allocation.
+        let mut output = self.render_buffers.take_conversation_buffer();
+
         // PERF-2 fast path: during streaming, reuse the cached prefix
         // (all finalized messages) and only rebuild the streaming tail.
         if is_streaming && self.message_render_cache.prefix_valid(self.messages.len()) {
-            let mut output = self.message_render_cache.prefix_get();
+            // PERF-7: Append prefix directly into the reusable buffer
+            // instead of cloning via prefix_get().
+            self.message_render_cache.prefix_append_to(&mut output);
             self.append_streaming_tail(&mut output);
             return output;
         }
 
         // Full rebuild: iterate all messages with per-message cache (PERF-1).
-        let mut output = String::new();
-
         for (index, msg) in self.messages.iter().enumerate() {
             let key =
                 MessageRenderCache::compute_key(msg, self.thinking_visible, self.tools_expanded);
 
-            if let Some(cached) = self.message_render_cache.get(index, &key) {
-                output.push_str(&cached);
-            } else {
-                let rendered = self.render_single_message(msg);
-                self.message_render_cache.put(index, key, rendered.clone());
-                output.push_str(&rendered);
+            if self
+                .message_render_cache
+                .append_cached(&mut output, index, &key)
+            {
+                continue;
             }
+            let rendered = self.render_single_message(msg);
+            self.message_render_cache.put(index, key, rendered.clone());
+            output.push_str(&rendered);
         }
 
         // Snapshot the prefix for future streaming frames (PERF-2).

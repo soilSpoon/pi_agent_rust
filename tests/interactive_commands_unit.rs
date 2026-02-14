@@ -507,8 +507,7 @@ fn resolve_strips_thinking_suffix_before_matching() {
 #[test]
 fn resolve_strips_thinking_suffix_with_glob() {
     let models = sample_models();
-    let result =
-        resolve_scoped_model_entries(&["claude-*:medium".to_string()], &models).unwrap();
+    let result = resolve_scoped_model_entries(&["claude-*:medium".to_string()], &models).unwrap();
     assert_eq!(result.len(), 2);
 }
 
