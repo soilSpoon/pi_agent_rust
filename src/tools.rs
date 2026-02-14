@@ -549,6 +549,11 @@ fn normalize_dot_segments(path: &Path) -> PathBuf {
     out
 }
 
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_normalize_dot_segments(path: &Path) -> PathBuf {
+    normalize_dot_segments(path)
+}
+
 /// Process `@file` arguments into a single text prefix and image attachments.
 ///
 /// Matches the legacy TypeScript behavior:
@@ -665,6 +670,11 @@ pub fn process_file_arguments(
 /// Public alias for `resolve_to_cwd` used by tools.
 fn resolve_path(file_path: &str, cwd: &Path) -> PathBuf {
     resolve_to_cwd(file_path, cwd)
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_resolve_path(file_path: &str, cwd: &Path) -> PathBuf {
+    resolve_path(file_path, cwd)
 }
 
 pub(crate) fn detect_supported_image_mime_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {

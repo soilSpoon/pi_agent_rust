@@ -118,4 +118,14 @@ pub mod fuzz_exports {
     };
     pub use crate::session::{Session, SessionEntry, SessionHeader, SessionMessage};
     pub use crate::sse::{SseEvent, SseParser};
+    pub use crate::tools::{fuzz_normalize_dot_segments, fuzz_resolve_path};
+
+    // Provider stream processor wrappers for coverage-guided fuzzing.
+    pub use crate::providers::anthropic::fuzz::Processor as AnthropicProcessor;
+    pub use crate::providers::azure::fuzz::Processor as AzureProcessor;
+    pub use crate::providers::cohere::fuzz::Processor as CohereProcessor;
+    pub use crate::providers::gemini::fuzz::Processor as GeminiProcessor;
+    pub use crate::providers::openai::fuzz::Processor as OpenAIProcessor;
+    pub use crate::providers::openai_responses::fuzz::Processor as OpenAIResponsesProcessor;
+    pub use crate::providers::vertex::fuzz::Processor as VertexProcessor;
 }
