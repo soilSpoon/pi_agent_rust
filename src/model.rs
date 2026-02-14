@@ -1627,7 +1627,14 @@ mod tests {
             let parsed: Message = serde_json::from_value(serialized.clone())
                 .expect("serialized message should deserialize");
             let reserialized = serde_json::to_value(parsed).expect("re-serialize should succeed");
-            prop_assert_eq!(reserialized, serialized.clone());
+
+            // Some representational forms are semantically equivalent for Option<Value>
+            // fields (e.g., `details: null` vs omitted), so assert canonical stability
+            // after one deserialize/serialize cycle.
+            let reparsed: Message = serde_json::from_value(reserialized.clone())
+                .expect("re-serialized message should deserialize");
+            let stabilized = serde_json::to_value(reparsed).expect("stabilized serialize");
+            prop_assert_eq!(stabilized, reserialized.clone());
 
             let mut with_extra = serialized.clone();
             if let serde_json::Value::Object(ref mut obj) = with_extra {

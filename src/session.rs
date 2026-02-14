@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1289,15 +1289,28 @@ impl Session {
     }
 
     fn next_entry_id(&self) -> String {
+        let use_entry_id_cache = session_entry_id_cache_enabled();
         for _ in 0..100 {
             let candidate = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-            if !self.entry_ids.contains(&candidate) {
+            let exists = if use_entry_id_cache {
+                self.entry_ids.contains(&candidate)
+            } else {
+                self.entries
+                    .iter()
+                    .any(|entry| entry.base_id().is_some_and(|id| id == candidate))
+            };
+            if !exists {
                 return candidate;
             }
         }
 
         // Extremely unlikely fallback: recover by rebuilding the set and retrying.
-        generate_entry_id(&self.entry_ids)
+        if use_entry_id_cache {
+            generate_entry_id(&self.entry_ids)
+        } else {
+            let existing = entry_id_set(&self.entries);
+            generate_entry_id(&existing)
+        }
     }
 
     // ========================================================================
@@ -2518,6 +2531,20 @@ fn entry_id_set(entries: &[SessionEntry]) -> HashSet<String> {
         .iter()
         .filter_map(|e| e.base_id().cloned())
         .collect()
+}
+
+fn parse_env_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn session_entry_id_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PI_SESSION_ENTRY_ID_CACHE").map_or(true, |value| parse_env_bool(&value))
+    })
 }
 
 fn ensure_entry_ids(entries: &mut [SessionEntry]) {

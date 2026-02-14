@@ -752,6 +752,150 @@ fn rpc_follow_up_missing_message_returns_error() {
     });
 }
 
+#[test]
+fn rpc_follow_up_aliases_missing_message_return_error() {
+    let harness = TestHarness::new("rpc_follow_up_aliases_missing_message_return_error");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
+        let options = make_rpc_options(&harness, &handle);
+
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let cx = asupersync::Cx::for_testing();
+
+        let aliases = [
+            ("a", r#"{"id":"a","type":"follow-up"}"#),
+            ("b", r#"{"id":"b","type":"queue-follow-up"}"#),
+            ("c", r#"{"id":"c","type":"followUp"}"#),
+        ];
+        for (id, cmd) in aliases {
+            in_tx.send(&cx, cmd.to_string()).await.expect("send alias");
+            let line = recv_line(&out_rx, "follow_up alias response")
+                .await
+                .expect("recv alias response");
+            let resp = assert_rpc_error(&line, "follow_up");
+            assert_eq!(resp["id"], id);
+            assert!(
+                resp["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Missing message"),
+                "Expected missing message error for alias {id}: {resp}"
+            );
+        }
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
+#[test]
+fn rpc_kebab_and_camel_aliases_dispatch_to_canonical_commands() {
+    let harness = TestHarness::new("rpc_kebab_and_camel_aliases_dispatch_to_canonical_commands");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
+        let options = make_rpc_options(&harness, &handle);
+
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        let cx = asupersync::Cx::for_testing();
+
+        in_tx
+            .send(&cx, r#"{"id":"1","type":"get-state"}"#.to_string())
+            .await
+            .expect("send get-state");
+        let line = recv_line(&out_rx, "get-state response")
+            .await
+            .expect("recv get-state");
+        assert_rpc_success(&line, "get_state");
+
+        in_tx
+            .send(
+                &cx,
+                r#"{"id":"2","type":"set-steering-mode","mode":"all"}"#.to_string(),
+            )
+            .await
+            .expect("send set-steering-mode");
+        let line = recv_line(&out_rx, "set-steering-mode response")
+            .await
+            .expect("recv set-steering-mode");
+        assert_rpc_success(&line, "set_steering_mode");
+
+        in_tx
+            .send(
+                &cx,
+                r#"{"id":"3","type":"setFollowUpMode","mode":"one-at-a-time"}"#.to_string(),
+            )
+            .await
+            .expect("send setFollowUpMode");
+        let line = recv_line(&out_rx, "setFollowUpMode response")
+            .await
+            .expect("recv setFollowUpMode");
+        assert_rpc_success(&line, "set_follow_up_mode");
+
+        in_tx
+            .send(
+                &cx,
+                r#"{"id":"4","type":"set-auto-compaction","enabled":false}"#.to_string(),
+            )
+            .await
+            .expect("send set-auto-compaction");
+        let line = recv_line(&out_rx, "set-auto-compaction response")
+            .await
+            .expect("recv set-auto-compaction");
+        assert_rpc_success(&line, "set_auto_compaction");
+
+        in_tx
+            .send(
+                &cx,
+                r#"{"id":"5","type":"setAutoRetry","enabled":false}"#.to_string(),
+            )
+            .await
+            .expect("send setAutoRetry");
+        let line = recv_line(&out_rx, "setAutoRetry response")
+            .await
+            .expect("recv setAutoRetry");
+        assert_rpc_success(&line, "set_auto_retry");
+
+        in_tx
+            .send(&cx, r#"{"id":"6","type":"set-model"}"#.to_string())
+            .await
+            .expect("send set-model");
+        let line = recv_line(&out_rx, "set-model response")
+            .await
+            .expect("recv set-model");
+        let resp = assert_rpc_error(&line, "set_model");
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Missing provider"),
+            "Expected Missing provider for set-model alias: {resp}"
+        );
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
 // ─── Empty JSON line ─────────────────────────────────────────────────────────
 
 #[test]
