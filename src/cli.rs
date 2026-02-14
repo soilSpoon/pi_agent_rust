@@ -44,6 +44,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "continue"
         | "resume"
         | "no-session"
+        | "no-migrations"
         | "print"
         | "verbose"
         | "no-tools"
@@ -314,6 +315,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_session: bool,
 
+    /// Skip startup migrations for legacy config/session/layout paths
+    #[arg(long)]
+    pub no_migrations: bool,
+
     // === Mode & Output ===
     /// Output mode for print mode (text, json, rpc)
     #[arg(long, value_parser = ["text", "json", "rpc"])]
@@ -492,6 +497,12 @@ mod tests {
     fn parse_no_session() {
         let cli = Cli::parse_from(["pi", "--no-session"]);
         assert!(cli.no_session);
+    }
+
+    #[test]
+    fn parse_no_migrations() {
+        let cli = Cli::parse_from(["pi", "--no-migrations"]);
+        assert!(cli.no_migrations);
     }
 
     #[test]
@@ -942,6 +953,7 @@ mod tests {
         assert!(!cli.print);
         assert!(!cli.verbose);
         assert!(!cli.no_session);
+        assert!(!cli.no_migrations);
         assert!(!cli.no_tools);
         assert!(!cli.no_extensions);
         assert!(!cli.no_skills);

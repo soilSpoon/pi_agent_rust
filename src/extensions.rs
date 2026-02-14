@@ -12039,7 +12039,7 @@ fn discover_auxiliary_example_entries(
     for dir_name in AUXILIARY_EXTENSION_DIR_NAMES {
         let candidate_dir = package_dir.join(dir_name);
         for candidate in collect_extension_entries_from_dir(&candidate_dir) {
-            if &candidate == canonical_primary {
+            if candidate == canonical_primary {
                 continue;
             }
             if !is_likely_auxiliary_extension_entry(&candidate) {

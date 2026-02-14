@@ -449,6 +449,13 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         return Ok(());
     }
 
+    if !cli.no_migrations {
+        let migration_report = pi::migrations::run_startup_migrations(&cwd);
+        for message in migration_report.messages() {
+            eprintln!("{message}");
+        }
+    }
+
     let mut config = Config::load()?;
     if let Some(theme_spec) = cli.theme.as_deref() {
         // Theme already validated above
