@@ -33,7 +33,7 @@ fn permissive_policy() -> ExtensionPolicy {
     }
 }
 
-fn default_risk_config() -> RuntimeRiskConfig {
+const fn default_risk_config() -> RuntimeRiskConfig {
     RuntimeRiskConfig {
         enabled: true,
         alpha: 0.01,

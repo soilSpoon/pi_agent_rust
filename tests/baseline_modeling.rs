@@ -1,3 +1,8 @@
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    clippy::suboptimal_flops
+)]
 //! Integration tests for SEC-3.2: Baseline modeling with robust statistics
 //! and Markov transition profiles.
 //!
@@ -20,6 +25,7 @@ use pi::extensions::{
 // Test helpers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn make_entry(
     ext_id: &str,
     capability: &str,
@@ -80,8 +86,8 @@ fn make_artifact(entries: Vec<RuntimeRiskLedgerArtifactEntry>) -> RuntimeRiskLed
     let mut prev: Option<String> = None;
     for mut e in entries {
         let hash = runtime_risk_compute_ledger_hash_artifact(&e, prev.as_deref());
-        e.ledger_hash = hash.clone();
-        e.prev_ledger_hash = prev.clone();
+        e.ledger_hash.clone_from(&hash);
+        e.prev_ledger_hash.clone_from(&prev);
         prev = Some(hash);
         hashed.push(e);
     }
@@ -440,15 +446,15 @@ fn baseline_mad_is_zero_for_constant_scores() {
 #[test]
 fn baseline_p5_and_p95_bracket_data() {
     let mut entries = Vec::new();
-    for i in 0..100 {
-        let score = i as f64 / 100.0;
+    for i in 0_u32..100 {
+        let score = f64::from(i) / 100.0;
         entries.push(make_entry(
             "ext.quant",
             "log",
             "log",
             score,
             RuntimeRiskStateLabelValue::SafeFast,
-            (i + 1) * 1000,
+            i64::from(i + 1) * 1000,
             &format!("c{i}"),
             None,
         ));
@@ -654,7 +660,12 @@ fn baseline_markov_stationary_distribution_sums_to_one() {
     let artifact = make_artifact(entries);
     let model = build_baseline_from_ledger(&artifact, "ext.stat").unwrap();
 
-    let sum: f64 = model.transition_matrix.stationary_distribution.iter().copied().sum();
+    let sum: f64 = model
+        .transition_matrix
+        .stationary_distribution
+        .iter()
+        .copied()
+        .sum();
     assert!(
         (sum - 1.0).abs() < 1e-8,
         "stationary distribution should sum to 1.0, got {sum}"
@@ -1420,13 +1431,14 @@ fn baseline_handles_many_capabilities() {
     let capabilities = ["log", "exec", "http", "env", "events", "session", "ui"];
     let mut entries = Vec::new();
     for (i, cap) in capabilities.iter().enumerate() {
+        let idx = u32::try_from(i).expect("capability index must fit u32");
         entries.push(make_entry(
             "ext.many",
             cap,
             cap,
-            0.10 + (i as f64 * 0.1),
+            f64::from(idx).mul_add(0.1, 0.10),
             RuntimeRiskStateLabelValue::SafeFast,
-            (i as i64 + 1) * 1000,
+            (i64::from(idx) + 1) * 1000,
             &format!("c{i}"),
             None,
         ));

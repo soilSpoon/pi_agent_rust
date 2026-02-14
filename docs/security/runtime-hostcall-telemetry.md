@@ -14,6 +14,7 @@ The telemetry event captures:
 - latency and outcome (`latency_ms`, `outcome`, `outcome_error_code`)
 - deterministic sequence context (`sequence`)
 - deterministic feature vector (`features`)
+- deterministic explanation payload (`explanation_level`, `explanation_summary`, `top_contributors`, `budget_state`)
 
 ## Schema
 
@@ -54,6 +55,25 @@ Each event records:
 - `extraction_latency_us`
 - `extraction_budget_us`
 - `extraction_budget_exceeded`
+
+## Explanation Payload (SEC-3.3A)
+
+Each event includes deterministic runtime-risk explanation metadata:
+- `explanation_level`: one of `compact`, `standard`, `full`
+- `explanation_summary`: stable human-readable action summary
+- `top_contributors`: contribution terms sorted by descending `magnitude`, tie-broken by `code`
+- `budget_state`: strict explanation budget status:
+  - `time_budget_ms`
+  - `elapsed_ms`
+  - `term_budget`
+  - `terms_emitted`
+  - `exhausted`
+  - `fallback_mode`
+
+Budget-exhaustion behavior is fail-closed for explanation generation:
+- on exhaustion, emit conservative deterministic summary payload
+- include explicit `budget_state.exhausted=true` and `budget_state.fallback_mode=true`
+- avoid speculative contributor terms in fallback mode
 
 ## Redaction and Safety
 

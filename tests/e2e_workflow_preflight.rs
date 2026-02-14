@@ -445,6 +445,7 @@ fn workflow_escalation_per_extension_override() {
         ],
         deny_caps: vec![], // Not in global deny — use per-ext allow
         per_extension: per_ext,
+        ..Default::default()
     };
 
     // trusted-ext gets exec

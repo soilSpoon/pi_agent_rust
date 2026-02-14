@@ -884,6 +884,23 @@ fn e2e_structured_jsonl_log_schema_compliance() {
                 ));
                 ctx.push(("latency_ms".into(), event.latency_ms.to_string()));
                 ctx.push(("redaction_summary".into(), event.redaction_summary.clone()));
+                ctx.push((
+                    "explanation_level".into(),
+                    format!("{:?}", event.explanation_level).to_lowercase(),
+                ));
+                ctx.push((
+                    "top_contributors".into(),
+                    event
+                        .top_contributors
+                        .iter()
+                        .map(|item| item.code.clone())
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                ));
+                ctx.push((
+                    "budget_state".into(),
+                    serde_json::to_string(&event.budget_state).expect("serialize budget_state"),
+                ));
             });
     }
 
@@ -925,6 +942,9 @@ fn e2e_structured_jsonl_log_schema_compliance() {
             "action",
             "latency_ms",
             "redaction_summary",
+            "explanation_level",
+            "top_contributors",
+            "budget_state",
         ] {
             assert!(
                 context.contains_key(key),

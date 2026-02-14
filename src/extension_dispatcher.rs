@@ -8072,6 +8072,7 @@ mod tests {
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
                 per_extension: HashMap::new(),
+                ..Default::default()
             };
             let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
 
@@ -8170,6 +8171,7 @@ mod tests {
                 default_caps: Vec::new(),
                 deny_caps: vec!["http".to_string()],
                 per_extension: HashMap::new(),
+                ..Default::default()
             };
             let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
 
@@ -8234,6 +8236,7 @@ mod tests {
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
                 per_extension,
+                ..Default::default()
             };
             let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
 
@@ -8288,6 +8291,7 @@ mod tests {
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
                 per_extension: HashMap::new(),
+                ..Default::default()
             };
             let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
 

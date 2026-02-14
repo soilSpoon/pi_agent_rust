@@ -1,6 +1,6 @@
 {
   "schema": "pi.ext.onboarding_queue.v2",
-  "generatedAt": "2026-02-14T05:41:13.567658135+00:00",
+  "generatedAt": "2026-02-14T08:28:53.904440329+00:00",
   "sourcePoolPath": "docs/extension-candidate-pool.json",
   "sourcePoolTotal": 1000,
   "eligibleUnvendored": 777,
@@ -532,7 +532,7 @@
       "githubWatchers": 2,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:15:24Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 21
     },
@@ -772,7 +772,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T06:58:42Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 31
     },
@@ -1996,7 +1996,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:03:29Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 82
     },
@@ -2020,7 +2020,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T05:59:20Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 83
     },
@@ -2212,7 +2212,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T06:09:52Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 91
     },
@@ -2934,7 +2934,7 @@
       "githubWatchers": 2,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:15:24Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 21
     },
@@ -3174,7 +3174,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T06:58:42Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 31
     },
@@ -4398,7 +4398,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:03:29Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 82
     },
@@ -4422,7 +4422,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T05:59:20Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 83
     },
@@ -4614,7 +4614,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T06:09:52Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 91
     },
@@ -5262,7 +5262,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-21T07:39:14Z",
-      "daysSinceUpdate": 23,
+      "daysSinceUpdate": 24,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 118
     },
@@ -5430,7 +5430,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T08:00:04Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 125
     },
@@ -5838,7 +5838,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-12T06:54:53Z",
-      "daysSinceUpdate": 1,
+      "daysSinceUpdate": 2,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; registration calls detected",
       "rank": 142
     },
@@ -5958,7 +5958,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:26:25Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present",
       "rank": 147
     },
@@ -6126,7 +6126,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-01T06:44:13Z",
-      "daysSinceUpdate": 12,
+      "daysSinceUpdate": 13,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present",
       "rank": 154
     },
@@ -6582,7 +6582,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-11T06:05:17Z",
-      "daysSinceUpdate": 2,
+      "daysSinceUpdate": 3,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present",
       "rank": 173
     },
@@ -6726,7 +6726,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-10T06:44:59Z",
-      "daysSinceUpdate": 34,
+      "daysSinceUpdate": 35,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present",
       "rank": 179
     },
@@ -6894,7 +6894,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-07T07:39:45Z",
-      "daysSinceUpdate": 37,
+      "daysSinceUpdate": 38,
       "notes": "Online npm discovery (npm_api_kw_pi_agent.json); not yet vendored/validated.",
       "rank": 186
     },
@@ -7374,7 +7374,7 @@
       "githubWatchers": 8,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-12T05:53:45Z",
-      "daysSinceUpdate": 1,
+      "daysSinceUpdate": 2,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=273.087); unvendored.",
       "rank": 206
     },
@@ -7422,7 +7422,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T07:38:55Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Online discovery via gh search (gh_pi_agent_extension_ts.json); not yet vendored/validated.",
       "rank": 208
     },
@@ -8022,7 +8022,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T06:38:20Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Online discovery via gh search (gh_pi_extension_ts.json); not yet vendored/validated.",
       "rank": 233
     },
@@ -8454,7 +8454,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-08T08:21:20Z",
-      "daysSinceUpdate": 5,
+      "daysSinceUpdate": 6,
       "notes": "Online discovery via gh search (gh_pi_extensions_ts.json); not yet vendored/validated.",
       "rank": 251
     },
@@ -8598,7 +8598,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-16T06:21:09Z",
-      "daysSinceUpdate": 28,
+      "daysSinceUpdate": 29,
       "notes": "Online npm discovery (npm_api_pi_coding_agent_extension.json); not yet vendored/validated.",
       "rank": 257
     },
@@ -8838,7 +8838,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T07:43:38Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Online GH discovery allowlist (pi-specific); not yet vendored/validated.",
       "rank": 267
     },
@@ -8886,7 +8886,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-11T07:19:02Z",
-      "daysSinceUpdate": 2,
+      "daysSinceUpdate": 3,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=141.158); unvendored.",
       "rank": 269
     },
@@ -9342,7 +9342,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T08:18:50.487Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=89.372); unvendored.",
       "rank": 288
     },
@@ -9366,7 +9366,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-02T07:06:21.850Z",
-      "daysSinceUpdate": 11,
+      "daysSinceUpdate": 12,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=69.119); unvendored.",
       "rank": 289
     },
@@ -9462,7 +9462,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-31T07:34:15.937Z",
-      "daysSinceUpdate": 13,
+      "daysSinceUpdate": 14,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=137.057); unvendored.",
       "rank": 293
     },
@@ -9606,7 +9606,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T07:59:46Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Online GH discovery allowlist (pi-specific); not yet vendored/validated.",
       "rank": 299
     },
@@ -10136,7 +10136,7 @@
       "githubWatchers": 2,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:15:24Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 21
     },
@@ -10376,7 +10376,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T06:58:42Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 31
     },
@@ -11600,7 +11600,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:03:29Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 82
     },
@@ -11624,7 +11624,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T05:59:20Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 83
     },
@@ -11816,7 +11816,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T06:09:52Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 91
     },
@@ -12464,7 +12464,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-21T07:39:14Z",
-      "daysSinceUpdate": 23,
+      "daysSinceUpdate": 24,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 118
     },
@@ -12632,7 +12632,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T08:00:04Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present; registration calls detected",
       "rank": 125
     },
@@ -13040,7 +13040,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-12T06:54:53Z",
-      "daysSinceUpdate": 1,
+      "daysSinceUpdate": 2,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; registration calls detected",
       "rank": 142
     },
@@ -13160,7 +13160,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:26:25Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present",
       "rank": 147
     },
@@ -13328,7 +13328,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-01T06:44:13Z",
-      "daysSinceUpdate": 12,
+      "daysSinceUpdate": 13,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present",
       "rank": 154
     },
@@ -13784,7 +13784,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-11T06:05:17Z",
-      "daysSinceUpdate": 2,
+      "daysSinceUpdate": 3,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present",
       "rank": 173
     },
@@ -13928,7 +13928,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-10T06:44:59Z",
-      "daysSinceUpdate": 34,
+      "daysSinceUpdate": 35,
       "notes": "Imported from extension-individual-enumeration (unvendored). Pi API import found; export default present",
       "rank": 179
     },
@@ -14096,7 +14096,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-07T07:39:45Z",
-      "daysSinceUpdate": 37,
+      "daysSinceUpdate": 38,
       "notes": "Online npm discovery (npm_api_kw_pi_agent.json); not yet vendored/validated.",
       "rank": 186
     },
@@ -14576,7 +14576,7 @@
       "githubWatchers": 8,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-12T05:53:45Z",
-      "daysSinceUpdate": 1,
+      "daysSinceUpdate": 2,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=273.087); unvendored.",
       "rank": 206
     },
@@ -14624,7 +14624,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T07:38:55Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Online discovery via gh search (gh_pi_agent_extension_ts.json); not yet vendored/validated.",
       "rank": 208
     },
@@ -15224,7 +15224,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T06:38:20Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Online discovery via gh search (gh_pi_extension_ts.json); not yet vendored/validated.",
       "rank": 233
     },
@@ -15656,7 +15656,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-08T08:21:20Z",
-      "daysSinceUpdate": 5,
+      "daysSinceUpdate": 6,
       "notes": "Online discovery via gh search (gh_pi_extensions_ts.json); not yet vendored/validated.",
       "rank": 251
     },
@@ -15800,7 +15800,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-16T06:21:09Z",
-      "daysSinceUpdate": 28,
+      "daysSinceUpdate": 29,
       "notes": "Online npm discovery (npm_api_pi_coding_agent_extension.json); not yet vendored/validated.",
       "rank": 257
     },
@@ -16040,7 +16040,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T07:43:38Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Online GH discovery allowlist (pi-specific); not yet vendored/validated.",
       "rank": 267
     },
@@ -16088,7 +16088,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-11T07:19:02Z",
-      "daysSinceUpdate": 2,
+      "daysSinceUpdate": 3,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=141.158); unvendored.",
       "rank": 269
     },
@@ -16544,7 +16544,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T08:18:50.487Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=89.372); unvendored.",
       "rank": 288
     },
@@ -16568,7 +16568,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-02T07:06:21.850Z",
-      "daysSinceUpdate": 11,
+      "daysSinceUpdate": 12,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=69.119); unvendored.",
       "rank": 289
     },
@@ -16664,7 +16664,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-31T07:34:15.937Z",
-      "daysSinceUpdate": 13,
+      "daysSinceUpdate": 14,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=137.057); unvendored.",
       "rank": 293
     },
@@ -16808,7 +16808,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T07:59:46Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Online GH discovery allowlist (pi-specific); not yet vendored/validated.",
       "rank": 299
     },
@@ -16928,7 +16928,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-11T07:19:02Z",
-      "daysSinceUpdate": 2,
+      "daysSinceUpdate": 3,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=116.494); unvendored.",
       "rank": 304
     },
@@ -17360,7 +17360,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T07:06:05Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Online npm discovery (npm_api_kw_pi_agent.json); not yet vendored/validated.",
       "rank": 322
     },
@@ -17600,7 +17600,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 59,
       "updatedAt": "2026-02-02T06:16:34.972Z",
-      "daysSinceUpdate": 11,
+      "daysSinceUpdate": 12,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=102.919); unvendored.",
       "rank": 332
     },
@@ -17648,7 +17648,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-20T07:17:00Z",
-      "daysSinceUpdate": 24,
+      "daysSinceUpdate": 25,
       "notes": "Online GH discovery allowlist (pi-specific); not yet vendored/validated.",
       "rank": 334
     },
@@ -18056,7 +18056,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:05:04Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=148.233); unvendored.",
       "rank": 351
     },
@@ -18152,7 +18152,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-03T07:12:56Z",
-      "daysSinceUpdate": 10,
+      "daysSinceUpdate": 11,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=147.553); unvendored.",
       "rank": 355
     },
@@ -18176,7 +18176,7 @@
       "githubWatchers": 1,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T06:46:09Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=216.655); unvendored.",
       "rank": 356
     },
@@ -18248,7 +18248,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T07:44:36Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=91.656); unvendored.",
       "rank": 359
     },
@@ -18800,7 +18800,7 @@
       "githubWatchers": 1,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-31T06:08:20Z",
-      "daysSinceUpdate": 13,
+      "daysSinceUpdate": 14,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=128.620); unvendored.",
       "rank": 382
     },
@@ -18824,7 +18824,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-11T06:45:09Z",
-      "daysSinceUpdate": 2,
+      "daysSinceUpdate": 3,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=69.420); unvendored.",
       "rank": 383
     },
@@ -18848,7 +18848,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-01T07:06:10Z",
-      "daysSinceUpdate": 12,
+      "daysSinceUpdate": 13,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=123.272); unvendored.",
       "rank": 384
     },
@@ -18896,7 +18896,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-09T08:15:09Z",
-      "daysSinceUpdate": 4,
+      "daysSinceUpdate": 5,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=170.616); unvendored.",
       "rank": 386
     },
@@ -18920,7 +18920,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-03T07:25:11Z",
-      "daysSinceUpdate": 10,
+      "daysSinceUpdate": 11,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=66.098); unvendored.",
       "rank": 387
     },
@@ -19184,7 +19184,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T07:14:06Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=160.261); unvendored.",
       "rank": 398
     },
@@ -19256,7 +19256,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-02T06:29:13Z",
-      "daysSinceUpdate": 11,
+      "daysSinceUpdate": 12,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=182.051); unvendored.",
       "rank": 401
     },
@@ -19304,7 +19304,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-03T08:23:53Z",
-      "daysSinceUpdate": 10,
+      "daysSinceUpdate": 11,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=137.593); unvendored.",
       "rank": 403
     },
@@ -19592,7 +19592,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-30T08:13:36Z",
-      "daysSinceUpdate": 14,
+      "daysSinceUpdate": 15,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=167.270); unvendored.",
       "rank": 415
     },
@@ -20048,7 +20048,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-12T05:47:38Z",
-      "daysSinceUpdate": 1,
+      "daysSinceUpdate": 2,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=145.699); unvendored.",
       "rank": 434
     },
@@ -20336,7 +20336,7 @@
       "githubWatchers": 1,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T06:25:40Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=133.784); unvendored.",
       "rank": 446
     },
@@ -20720,7 +20720,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-07T05:46:18.443Z",
-      "daysSinceUpdate": 6,
+      "daysSinceUpdate": 7,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=130.810); unvendored.",
       "rank": 462
     },
@@ -21200,7 +21200,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T06:13:53.377Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=108.267); unvendored.",
       "rank": 482
     },
@@ -21272,7 +21272,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T07:40:39Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=90.554); unvendored.",
       "rank": 485
     },
@@ -21296,7 +21296,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-03T08:03:38Z",
-      "daysSinceUpdate": 10,
+      "daysSinceUpdate": 11,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=75.731); unvendored.",
       "rank": 486
     },
@@ -21344,7 +21344,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T06:17:54.939Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=87.362); unvendored.",
       "rank": 488
     },
@@ -21560,7 +21560,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T07:33:39.440Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=120.347); unvendored.",
       "rank": 497
     },
@@ -21608,7 +21608,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T08:20:04.819Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=158.407); unvendored.",
       "rank": 499
     },
@@ -21728,7 +21728,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T07:31:08.004Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=99.386); unvendored.",
       "rank": 504
     },
@@ -21752,7 +21752,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T05:53:28.357Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=150.974); unvendored.",
       "rank": 505
     },
@@ -22376,7 +22376,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T07:07:48.741Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=172.401); unvendored.",
       "rank": 531
     },
@@ -22424,7 +22424,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-03T05:51:26.626Z",
-      "daysSinceUpdate": 10,
+      "daysSinceUpdate": 11,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=72.282); unvendored.",
       "rank": 533
     },
@@ -22544,7 +22544,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T07:20:38.973Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=151.989); unvendored.",
       "rank": 538
     },
@@ -22688,7 +22688,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T07:07:16.810Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=141.346); unvendored.",
       "rank": 544
     },
@@ -22808,7 +22808,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T08:15:52.472Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=104.874); unvendored.",
       "rank": 549
     },
@@ -22928,7 +22928,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-04T07:16:06.089Z",
-      "daysSinceUpdate": 9,
+      "daysSinceUpdate": 10,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=164.721); unvendored.",
       "rank": 554
     },
@@ -22952,7 +22952,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-02T06:49:22.890Z",
-      "daysSinceUpdate": 11,
+      "daysSinceUpdate": 12,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=195.018); unvendored.",
       "rank": 555
     },
@@ -23504,7 +23504,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-08T06:35:35Z",
-      "daysSinceUpdate": 5,
+      "daysSinceUpdate": 6,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=217.341); unvendored.",
       "rank": 578
     },
@@ -23936,7 +23936,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T06:50:48.010Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=155.792); unvendored.",
       "rank": 596
     },
@@ -24008,7 +24008,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-02T08:13:55Z",
-      "daysSinceUpdate": 11,
+      "daysSinceUpdate": 12,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=144.132); unvendored.",
       "rank": 599
     },
@@ -24704,7 +24704,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T07:35:03.595Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=191.739); unvendored.",
       "rank": 628
     },
@@ -24752,7 +24752,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-31T07:59:13Z",
-      "daysSinceUpdate": 13,
+      "daysSinceUpdate": 14,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=168.047); unvendored.",
       "rank": 630
     },
@@ -25136,7 +25136,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-01-31T06:19:52.608Z",
-      "daysSinceUpdate": 13,
+      "daysSinceUpdate": 14,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=189.388); unvendored.",
       "rank": 646
     },
@@ -25208,7 +25208,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T07:40:03.744Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=75.174); unvendored.",
       "rank": 649
     },
@@ -25280,7 +25280,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:24:10Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=181.917); unvendored.",
       "rank": 652
     },
@@ -25328,7 +25328,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-01T07:07:34.768Z",
-      "daysSinceUpdate": 12,
+      "daysSinceUpdate": 13,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=137.569); unvendored.",
       "rank": 654
     },
@@ -25376,7 +25376,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-02T07:21:14.508Z",
-      "daysSinceUpdate": 11,
+      "daysSinceUpdate": 12,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=71.939); unvendored.",
       "rank": 656
     },
@@ -25712,7 +25712,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T06:20:50.995Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=83.628); unvendored.",
       "rank": 670
     },
@@ -25736,7 +25736,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T07:10:01.894Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=122.764); unvendored.",
       "rank": 671
     },
@@ -25832,7 +25832,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T07:43:15.655Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=108.039); unvendored.",
       "rank": 675
     },
@@ -25880,7 +25880,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-08T06:15:40Z",
-      "daysSinceUpdate": 5,
+      "daysSinceUpdate": 6,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=185.730); unvendored.",
       "rank": 677
     },
@@ -25904,7 +25904,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-04T06:01:15.866Z",
-      "daysSinceUpdate": 9,
+      "daysSinceUpdate": 10,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=269.904); unvendored.",
       "rank": 678
     },
@@ -26096,7 +26096,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-03T06:33:22.879Z",
-      "daysSinceUpdate": 10,
+      "daysSinceUpdate": 11,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=174.636); unvendored.",
       "rank": 686
     },
@@ -26360,7 +26360,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T07:16:46.785Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=88.077); unvendored.",
       "rank": 697
     },
@@ -26576,7 +26576,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T06:29:21.593Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=199.469); unvendored.",
       "rank": 706
     },
@@ -26720,7 +26720,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T06:55:20.403Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=205.014); unvendored.",
       "rank": 712
     },
@@ -26792,7 +26792,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T07:15:58Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=132.495); unvendored.",
       "rank": 715
     },
@@ -27032,7 +27032,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-11T06:48:19Z",
-      "daysSinceUpdate": 2,
+      "daysSinceUpdate": 3,
       "notes": "Online GH discovery allowlist (pi-specific); not yet vendored/validated.",
       "rank": 725
     },
@@ -27296,7 +27296,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-10T07:26:14Z",
-      "daysSinceUpdate": 3,
+      "daysSinceUpdate": 4,
       "notes": "Online GH discovery allowlist (pi-specific); not yet vendored/validated.",
       "rank": 736
     },
@@ -27320,7 +27320,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T06:15:15Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Online GH discovery allowlist (pi-specific); not yet vendored/validated.",
       "rank": 737
     },
@@ -27368,7 +27368,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T06:38:53Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=148.864); unvendored.",
       "rank": 739
     },
@@ -27584,7 +27584,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-06T07:15:58Z",
-      "daysSinceUpdate": 7,
+      "daysSinceUpdate": 8,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=170.675); unvendored.",
       "rank": 748
     },
@@ -27608,7 +27608,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T06:38:53Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=123.008); unvendored.",
       "rank": 749
     },
@@ -27752,7 +27752,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T06:38:53Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=143.606); unvendored.",
       "rank": 755
     },
@@ -27824,7 +27824,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T07:46:09.498Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=83.747); unvendored.",
       "rank": 758
     },
@@ -27992,7 +27992,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:01:36Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=186.484); unvendored.",
       "rank": 765
     },
@@ -28016,7 +28016,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-05T07:46:19.013Z",
-      "daysSinceUpdate": 8,
+      "daysSinceUpdate": 9,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=100.307); unvendored.",
       "rank": 766
     },
@@ -28232,7 +28232,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:01:36Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=177.340); unvendored.",
       "rank": 775
     },
@@ -28256,7 +28256,7 @@
       "githubWatchers": 0,
       "npmDownloadsMonthly": 0,
       "updatedAt": "2026-02-13T08:01:36Z",
-      "daysSinceUpdate": 0,
+      "daysSinceUpdate": 1,
       "notes": "Bulk online candidate expansion to 1000 (npm_q_openclaw.json, priority=1, score=225.094); unvendored.",
       "rank": 776
     },

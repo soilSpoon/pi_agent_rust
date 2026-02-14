@@ -1,6 +1,6 @@
 # Extension Onboarding Queue
 
-Generated: 2026-02-14T05:41:13.567658135+00:00
+Generated: 2026-02-14T08:28:53.904440329+00:00
 Source pool: `docs/extension-candidate-pool.json` (1000 total)
 Eligible (unvendored): **777**
 Pi-relevant (heuristic): **322**

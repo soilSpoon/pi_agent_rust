@@ -3152,6 +3152,7 @@ import chokidar from "chokidar";
             default_caps: vec!["read".to_string(), "write".to_string()],
             deny_caps: vec![], // No global deny — test per-extension allow
             per_extension: per_ext,
+            ..Default::default()
         };
         let analyzer = PreflightAnalyzer::new(&policy, Some("my-ext"));
         let source = r#"
