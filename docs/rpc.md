@@ -78,14 +78,23 @@ Communication is via **JSON Lines** over stdin/stdout. Each line must be a valid
 - **set_steering_mode**: "one-at-a-time" or "all".
 - **set_follow_up_mode**: "one-at-a-time" or "all".
 
+### Extension UI
+- **extension_ui_response**: Reply to a pending extension UI request.
+  - Params: `requestId` (preferred) or legacy alias `id`, plus one of:
+    - `confirmed` (boolean) for `confirm`
+    - `value` (string/boolean depending on method) for `select`/`input`/`editor`
+    - `cancelled` (`true`) to cancel
+
 ## Events
 
 - `agent_start`: Agent started working.
 - `text_delta`: Assistant text output chunk.
 - `thinking_delta`: Assistant thinking output chunk.
-- `tool_start`: Tool execution started.
-- `tool_update`: Streaming tool output.
-- `tool_end`: Tool execution finished.
+- `tool_execution_start`: Tool execution started.
+- `tool_execution_update`: Streaming tool output.
+- `tool_execution_end`: Tool execution finished.
+- `extension_ui_request`: Extension requested host UI interaction (confirm/select/input/editor/notify/etc.).
 - `agent_end`: Turn complete.
 - `auto_retry_start` / `auto_retry_end`: Transient error retries.
 - `auto_compaction_start` / `auto_compaction_end`: Auto-compaction status.
+- `extension_error`: Extension event dispatch/runtime error.

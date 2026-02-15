@@ -442,15 +442,16 @@
 | `content_block_end` | Y | Y | Content block end |
 | `tool_call_start` | Y | Y | Tool call started |
 | `tool_call_end` | Y | Y | Tool call end |
-| `tool_start` | Y | Y | Tool execution start |
-| `tool_end` | Y | Y | Tool execution end |
+| `tool_execution_start` | Y | Y | Tool execution start |
+| `tool_execution_update` | Y | Y | Tool execution streaming update |
+| `tool_execution_end` | Y | Y | Tool execution end |
 | `message` | Y | Y | Message added |
 | `message_update` | Y | Y | Message updated |
 | `error` | Y | Y | Error occurred |
-| `auto_compaction_start` | Y | N | **GAP**: TS has, Rust missing |
-| `auto_compaction_end` | Y | N | **GAP**: TS has, Rust missing |
-| `auto_retry_start` | Y | N | **GAP**: TS has, Rust missing |
-| `auto_retry_end` | Y | N | **GAP**: TS has, Rust missing |
+| `auto_compaction_start` | Y | Y | Auto-compaction lifecycle start |
+| `auto_compaction_end` | Y | Y | Auto-compaction lifecycle end |
+| `auto_retry_start` | Y | Y | Auto-retry lifecycle start |
+| `auto_retry_end` | Y | Y | Auto-retry lifecycle end |
 
 ---
 
@@ -539,9 +540,9 @@
 | Event | TS Pi | Rust Pi | Notes |
 |-------|-------|---------|-------|
 | Agent events (streamed) | Y | Y | All agent events |
-| `extension_ui_request` | Y | ? | Extension UI requests |
-| `extension_ui_response` | Y | ? | Extension UI responses |
-| `extension_error` | N | ? | Rust-only (see bd-3clq3) |
+| `extension_ui_request` | Y | Y | Covered by `tests/e2e_rpc.rs` + `tests/json_mode_parity.rs` |
+| `extension_ui_response` | Y | Y | Covered by `tests/e2e_rpc.rs` (success + negative paths) |
+| `extension_error` | N | Y | Rust-only event emitted on extension dispatch/runtime failures |
 
 ---
 

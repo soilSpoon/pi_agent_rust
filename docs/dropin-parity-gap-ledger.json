@@ -146,7 +146,7 @@
         "docs/dropin-112-feature-inventory-matrix.md#section:11-rpc-events-responses",
         "docs/dropin-112-feature-inventory-matrix.md#section:15-extension-api-surface-ui"
       ],
-      "current_state": "extension_ui_request/response behavior and several UI methods are marked unverified",
+      "current_state": "tool execution event names and extension_ui_request/response round-trips are now validated by deterministic test evidence; parity closure tracked by bd-359pl",
       "user_impact": "Extension-driven UX flows can diverge or fail in JSON/RPC integrations.",
       "owner_issue_primary": "bd-359pl",
       "owner_issue_supporting": [
@@ -159,14 +159,11 @@
         "Verify command-path dispatch coverage alongside bd-38v5y."
       ],
       "verification_evidence": [
-        "Fixture coverage for extension_ui_request and extension_ui_response round-trips",
-        "Tool-event parity snapshots across TS and Rust",
-        "Negative-path tests for extension error framing"
+        "tests/e2e_rpc.rs: extension_ui_request/response round-trips, id/requestId handling, and negative-path coverage",
+        "tests/json_mode_parity.rs: tool_execution_start/update/end schema + event type assertions",
+        "legacy_pi_mono_code/pi-mono/packages/agent/src/types.ts: upstream tool_execution_* event contract"
       ],
-      "blocked_by": [
-        "bd-38v5y",
-        "bd-2my4b"
-      ]
+      "blocked_by": []
     },
     {
       "gap_id": "gap-cli-slash-command-surface",
