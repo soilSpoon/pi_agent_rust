@@ -48,6 +48,19 @@ For every failed suite entry in evidence artifacts:
 | `vcr` | Must preserve deterministic replay + schema-valid log/artifact records |
 | `e2e` | Must emit evidence/replay/failure-digest artifacts that satisfy the schema set above, and each workflow must map to one or more user-facing SLIs via `docs/perf_sli_matrix.json` |
 
+### Schema Evolution Policy
+
+`pi.parity.test_logging_contract.v1` uses additive, versioned evolution with strict fail-closed validation:
+
+- `pi.test.log.v2` is the current required log schema for new test output.
+- `pi.test.log.v1` remains readable only for historical/backfill validation and is rejected by `validate_jsonl_v2_only`.
+- `pi.test.artifact.v1` remains the canonical artifact-index schema until a successor is explicitly ratified.
+- New schema versions must ship with:
+  - validator updates in `tests/common/logging.rs`
+  - regression tests covering old/new acceptance and rejection boundaries
+  - runbook/policy updates in this document and `docs/qa-runbook.md`
+- Cross-run comparison tooling must use stable-field projection (schema/type/level/category/message/context) and scenario/component filtering to avoid false diffs from timing/correlation fields.
+
 ## Suites
 
 All tests belong to exactly one of three suites:

@@ -21,6 +21,7 @@ Use this runbook section to validate that the contract remains intact.
 | Suite taxonomy is explicit (`unit`/`vcr`/`e2e`) | `tests/suite_classification.toml` |
 | Test log schema remains `pi.test.log.v2` | `tests/common/logging.rs` validators |
 | Artifact index schema remains `pi.test.artifact.v1` | `tests/common/logging.rs` validators |
+| Schema evolution policy remains explicit and fail-closed | `docs/testing-policy.md` + `tests/common/logging.rs` v2-only validators |
 | Evidence contract schema remains `pi.qa.evidence_contract.v1` | `docs/evidence-contract-schema.json` + schema tests |
 | Failure digest taxonomy + replay metadata remain stable | `docs/evidence-contract-schema.json` |
 
@@ -33,6 +34,10 @@ cargo test --test validate_e2e_artifact_schema -- synthetic_evidence_contract --
 
 # Log/artifact JSONL schema validation checks
 cargo test --test e2e_artifact_retention_triage -- jsonl --nocapture
+
+# Cross-run scenario/component filtering + stable-field comparison helpers
+cargo test --test rpc_session_connector -- common::logging::tests::filter_log_records_by_scenario_and_component --nocapture
+cargo test --test rpc_session_connector -- common::logging::tests::compare_log_streams_by_filter_ignores_trace_and_timing --nocapture
 
 # Optional: full contract gate
 cargo test --test validate_e2e_artifact_schema -- --nocapture

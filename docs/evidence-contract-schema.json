@@ -301,6 +301,8 @@
         "realistic_replay_inputs",
         "required_metadata_fields",
         "evidence_labels",
+        "partition_weighting",
+        "partition_interpretation",
         "user_perceived_sli_catalog",
         "scenario_sli_matrix"
       ],
@@ -425,6 +427,73 @@
             }
           },
           "description": "Evidence class and confidence label vocabulary for benchmark claims."
+        },
+        "partition_weighting": {
+          "type": "object",
+          "required": ["matched-state", "realistic", "weights_sum_to"],
+          "additionalProperties": false,
+          "properties": {
+            "matched-state": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0
+            },
+            "realistic": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0
+            },
+            "weights_sum_to": {
+              "type": "number",
+              "const": 1.0
+            }
+          },
+          "description": "Machine-readable weighting policy for partition aggregation and prioritization."
+        },
+        "partition_interpretation": {
+          "type": "object",
+          "required": [
+            "primary_partition",
+            "secondary_partition",
+            "global_claim_requires_partitions",
+            "forbid_single_partition_conclusion",
+            "interpretation_notes"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "primary_partition": {
+              "type": "string",
+              "const": "realistic"
+            },
+            "secondary_partition": {
+              "type": "string",
+              "const": "matched-state"
+            },
+            "global_claim_requires_partitions": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "string",
+                "enum": ["matched-state", "realistic"]
+              }
+            },
+            "forbid_single_partition_conclusion": {
+              "type": "boolean",
+              "const": true
+            },
+            "interpretation_notes": {
+              "type": "object",
+              "required": ["matched-state", "realistic"],
+              "additionalProperties": false,
+              "properties": {
+                "matched-state": { "type": "string" },
+                "realistic": { "type": "string" }
+              }
+            }
+          },
+          "description": "Interpretation guardrails that prevent release conclusions from a single partition."
         },
         "user_perceived_sli_catalog": {
           "type": "array",
