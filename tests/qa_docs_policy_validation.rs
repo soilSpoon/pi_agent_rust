@@ -19,6 +19,7 @@
 #![allow(clippy::items_after_statements)]
 
 use serde_json::Value;
+use std::collections::HashSet;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -27,6 +28,7 @@ const NON_MOCK_RUBRIC_PATH: &str = "docs/non-mock-rubric.json";
 const QA_RUNBOOK_PATH: &str = "docs/qa-runbook.md";
 const FLAKE_TRIAGE_PATH: &str = "docs/flake-triage-policy.md";
 const SCENARIO_MATRIX_PATH: &str = "docs/e2e_scenario_matrix.json";
+const PERF_SLI_MATRIX_PATH: &str = "docs/perf_sli_matrix.json";
 const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 const SUITE_CLASSIFICATION_PATH: &str = "tests/suite_classification.toml";
 const TEST_DOUBLE_INVENTORY_PATH: &str = "docs/test_double_inventory.json";
@@ -686,6 +688,144 @@ fn scenario_matrix_suites_match_suite_classification() {
     }
 }
 
+#[test]
+fn scenario_matrix_rows_define_non_empty_sli_ids() {
+    let matrix = load_json(SCENARIO_MATRIX_PATH);
+    let rows = matrix["rows"].as_array().expect("rows array");
+
+    for row in rows {
+        let id = row["workflow_id"].as_str().unwrap_or("unknown");
+        let sli_ids = row["sli_ids"]
+            .as_array()
+            .unwrap_or_else(|| panic!("workflow {id} must define a sli_ids array"));
+        assert!(
+            !sli_ids.is_empty(),
+            "workflow {id} must include at least one SLI"
+        );
+        for sli_id in sli_ids {
+            let sli = sli_id.as_str().unwrap_or("");
+            assert!(
+                !sli.trim().is_empty(),
+                "workflow {id} contains an empty sli_id entry"
+            );
+        }
+    }
+}
+
+#[test]
+fn scenario_matrix_sli_ids_exist_in_perf_sli_catalog() {
+    let matrix = load_json(SCENARIO_MATRIX_PATH);
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+    let rows = matrix["rows"].as_array().expect("rows array");
+    let catalog = perf["sli_catalog"]
+        .as_array()
+        .expect("perf_sli_matrix sli_catalog array");
+
+    let known_ids: HashSet<String> = catalog
+        .iter()
+        .filter_map(|entry| entry["sli_id"].as_str().map(ToOwned::to_owned))
+        .collect();
+    assert!(
+        !known_ids.is_empty(),
+        "perf_sli_matrix sli_catalog must define at least one sli_id"
+    );
+
+    for row in rows {
+        let workflow_id = row["workflow_id"].as_str().unwrap_or("unknown");
+        let sli_ids = row["sli_ids"]
+            .as_array()
+            .unwrap_or_else(|| panic!("workflow {workflow_id} must define sli_ids"));
+        for sli_id in sli_ids {
+            let sli = sli_id.as_str().unwrap_or("");
+            assert!(
+                known_ids.contains(sli),
+                "workflow {workflow_id} references unknown SLI id '{sli}'"
+            );
+        }
+    }
+}
+
+#[test]
+fn perf_sli_catalog_entries_have_thresholds_and_user_guidance() {
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+    let catalog = perf["sli_catalog"]
+        .as_array()
+        .expect("perf_sli_matrix sli_catalog array");
+
+    for entry in catalog {
+        let sli_id = entry["sli_id"].as_str().unwrap_or("<unknown>");
+        let thresholds = &entry["thresholds"];
+        assert!(
+            thresholds["target"].is_number(),
+            "{sli_id} must define numeric thresholds.target"
+        );
+        assert!(
+            thresholds["warning"].is_number(),
+            "{sli_id} must define numeric thresholds.warning"
+        );
+        assert!(
+            thresholds["fail"].is_number(),
+            "{sli_id} must define numeric thresholds.fail"
+        );
+
+        let interpretation = &entry["user_interpretation"];
+        for key in ["target", "warning", "fail"] {
+            let value = interpretation[key].as_str().unwrap_or("");
+            assert!(
+                !value.trim().is_empty(),
+                "{sli_id} must define non-empty user_interpretation.{key}"
+            );
+        }
+    }
+}
+
+#[test]
+fn perf_sli_workflow_mapping_covers_scenario_matrix_workflows() {
+    let matrix = load_json(SCENARIO_MATRIX_PATH);
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+    let rows = matrix["rows"].as_array().expect("rows array");
+    let mappings = perf["workflow_sli_mapping"]
+        .as_array()
+        .expect("perf_sli_matrix workflow_sli_mapping array");
+
+    let mapped_workflows: HashSet<String> = mappings
+        .iter()
+        .filter_map(|entry| entry["workflow_id"].as_str().map(ToOwned::to_owned))
+        .collect();
+
+    for row in rows {
+        let workflow_id = row["workflow_id"].as_str().unwrap_or("unknown");
+        assert!(
+            mapped_workflows.contains(workflow_id),
+            "perf_sli_matrix workflow_sli_mapping missing scenario workflow {workflow_id}"
+        );
+    }
+}
+
+#[test]
+fn perf_sli_phase_validation_consumers_include_dependent_beads() {
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+    let consumers = perf["phase_validation_consumers"]
+        .as_array()
+        .expect("perf_sli_matrix phase_validation_consumers array");
+    let consumer_ids: HashSet<String> = consumers
+        .iter()
+        .filter_map(|entry| entry["issue_id"].as_str().map(ToOwned::to_owned))
+        .collect();
+
+    for required in [
+        "bd-3ar8v.1.5",
+        "bd-3ar8v.2.11",
+        "bd-3ar8v.3.11",
+        "bd-3ar8v.6.7",
+    ] {
+        assert!(
+            consumer_ids.contains(required),
+            "phase_validation_consumers must include dependent bead {required}"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Section 6: CI gate remediation guidance
 // ═══════════════════════════════════════════════════════════════════════════
@@ -912,6 +1052,18 @@ fn scenario_matrix_schema_is_versioned() {
     assert!(
         schema.starts_with("pi.e2e.scenario_matrix"),
         "matrix schema must be pi.e2e.scenario_matrix.*, got: {schema}"
+    );
+}
+
+#[test]
+fn perf_sli_matrix_schema_is_versioned() {
+    let matrix = load_json(PERF_SLI_MATRIX_PATH);
+    let schema = matrix["schema"]
+        .as_str()
+        .expect("perf_sli_matrix must have schema field");
+    assert!(
+        schema.starts_with("pi.perf.sli_ux_matrix"),
+        "perf_sli_matrix schema must be pi.perf.sli_ux_matrix.*, got: {schema}"
     );
 }
 
