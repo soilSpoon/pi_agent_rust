@@ -13,7 +13,7 @@ mod common;
 
 use common::TestHarness;
 use pi::agent::AgentEvent;
-use pi::extensions::ExtensionUiRequest;
+use pi::extensions::{ExtensionEventName, ExtensionUiRequest, extension_event_from_agent};
 use pi::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Message, StopReason, TextContent,
     ToolCall, Usage,
@@ -1188,7 +1188,7 @@ fn json_parity_extension_ui_select_schema() {
     harness
         .log()
         .info_ctx("json_parity", "extension_ui select schema ok", |ctx| {
-            ctx.push(("method".to_string(), "select".to_string()))
+            ctx.push(("method".to_string(), "select".to_string()));
         });
 }
 
@@ -1215,7 +1215,7 @@ fn json_parity_extension_ui_confirm_schema() {
     harness
         .log()
         .info_ctx("json_parity", "extension_ui confirm schema ok", |ctx| {
-            ctx.push(("method".to_string(), "confirm".to_string()))
+            ctx.push(("method".to_string(), "confirm".to_string()));
         });
 }
 
@@ -1242,7 +1242,7 @@ fn json_parity_extension_ui_input_schema() {
     harness
         .log()
         .info_ctx("json_parity", "extension_ui input schema ok", |ctx| {
-            ctx.push(("method".to_string(), "input".to_string()))
+            ctx.push(("method".to_string(), "input".to_string()));
         });
 }
 
@@ -1269,7 +1269,7 @@ fn json_parity_extension_ui_editor_schema() {
     harness
         .log()
         .info_ctx("json_parity", "extension_ui editor schema ok", |ctx| {
-            ctx.push(("method".to_string(), "editor".to_string()))
+            ctx.push(("method".to_string(), "editor".to_string()));
         });
 }
 
@@ -1311,7 +1311,7 @@ fn json_parity_extension_ui_notify_schema() {
     harness
         .log()
         .info_ctx("json_parity", "extension_ui notify schema ok", |ctx| {
-            ctx.push(("variants".to_string(), "3".to_string()))
+            ctx.push(("variants".to_string(), "3".to_string()));
         });
 }
 
@@ -1348,7 +1348,7 @@ fn json_parity_extension_ui_set_status_schema() {
     harness
         .log()
         .info_ctx("json_parity", "extension_ui setStatus schema ok", |ctx| {
-            ctx.push(("method".to_string(), "setStatus".to_string()))
+            ctx.push(("method".to_string(), "setStatus".to_string()));
         });
 }
 
@@ -1390,7 +1390,7 @@ fn json_parity_extension_ui_set_widget_schema() {
     harness
         .log()
         .info_ctx("json_parity", "extension_ui setWidget schema ok", |ctx| {
-            ctx.push(("method".to_string(), "setWidget".to_string()))
+            ctx.push(("method".to_string(), "setWidget".to_string()));
         });
 }
 
@@ -1412,7 +1412,7 @@ fn json_parity_extension_ui_set_title_schema() {
     harness
         .log()
         .info_ctx("json_parity", "extension_ui setTitle schema ok", |ctx| {
-            ctx.push(("method".to_string(), "setTitle".to_string()))
+            ctx.push(("method".to_string(), "setTitle".to_string()));
         });
 }
 
@@ -1513,7 +1513,7 @@ fn json_parity_extension_ui_all_methods_type_tag() {
     harness
         .log()
         .info_ctx("json_parity", "all 9 extension_ui methods ok", |ctx| {
-            ctx.push(("methods".to_string(), methods.len().to_string()))
+            ctx.push(("methods".to_string(), methods.len().to_string()));
         });
 }
 
@@ -1750,4 +1750,674 @@ fn json_parity_complete_lifecycle_with_extension_ui() {
     harness
         .log()
         .info_ctx("json_parity", "tool + extension_ui lifecycle ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 18. extension_event_from_agent mapping correctness (DROPIN-124)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn json_parity_extension_event_from_agent_mapping() {
+    let harness = TestHarness::new("json_parity_extension_event_from_agent_mapping");
+    let partial = Arc::new(test_assistant_message());
+
+    // Events that SHOULD be forwarded to extensions (10 of 15).
+    let forwarded: Vec<(AgentEvent, ExtensionEventName)> = vec![
+        (
+            AgentEvent::AgentStart {
+                session_id: "s".to_string(),
+            },
+            ExtensionEventName::AgentStart,
+        ),
+        (
+            AgentEvent::AgentEnd {
+                session_id: "s".to_string(),
+                messages: vec![],
+                error: None,
+            },
+            ExtensionEventName::AgentEnd,
+        ),
+        (
+            AgentEvent::TurnStart {
+                session_id: "s".to_string(),
+                turn_index: 0,
+                timestamp: 0,
+            },
+            ExtensionEventName::TurnStart,
+        ),
+        (
+            AgentEvent::TurnEnd {
+                session_id: "s".to_string(),
+                turn_index: 0,
+                message: test_user_message(),
+                tool_results: vec![],
+            },
+            ExtensionEventName::TurnEnd,
+        ),
+        (
+            AgentEvent::MessageStart {
+                message: test_user_message(),
+            },
+            ExtensionEventName::MessageStart,
+        ),
+        (
+            AgentEvent::MessageUpdate {
+                message: Message::Assistant(Arc::clone(&partial)),
+                assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "x".to_string(),
+                    partial: Arc::clone(&partial),
+                }),
+            },
+            ExtensionEventName::MessageUpdate,
+        ),
+        (
+            AgentEvent::MessageEnd {
+                message: test_user_message(),
+            },
+            ExtensionEventName::MessageEnd,
+        ),
+        (
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: "tc".to_string(),
+                tool_name: "read".to_string(),
+                args: json!({}),
+            },
+            ExtensionEventName::ToolExecutionStart,
+        ),
+        (
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "tc".to_string(),
+                tool_name: "bash".to_string(),
+                args: json!({}),
+                partial_result: test_tool_output(),
+            },
+            ExtensionEventName::ToolExecutionUpdate,
+        ),
+        (
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id: "tc".to_string(),
+                tool_name: "read".to_string(),
+                result: test_tool_output(),
+                is_error: false,
+            },
+            ExtensionEventName::ToolExecutionEnd,
+        ),
+    ];
+
+    for (event, expected_name) in &forwarded {
+        let result = extension_event_from_agent(event);
+        assert!(
+            result.is_some(),
+            "event {:?} should be forwarded to extensions",
+            event_to_json(event)["type"]
+        );
+        let (name, payload) = result.unwrap();
+        assert_eq!(
+            name,
+            *expected_name,
+            "extension event name mismatch for {:?}",
+            event_to_json(event)["type"]
+        );
+        assert!(
+            payload.is_some(),
+            "forwarded event should include serialized payload"
+        );
+    }
+
+    // Events that should NOT be forwarded to extensions (5 of 15).
+    let excluded: Vec<AgentEvent> = vec![
+        AgentEvent::AutoCompactionStart {
+            reason: "r".to_string(),
+        },
+        AgentEvent::AutoCompactionEnd {
+            result: None,
+            aborted: false,
+            will_retry: false,
+            error_message: None,
+        },
+        AgentEvent::AutoRetryStart {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 0,
+            error_message: "e".to_string(),
+        },
+        AgentEvent::AutoRetryEnd {
+            success: true,
+            attempt: 1,
+            final_error: None,
+        },
+        AgentEvent::ExtensionError {
+            extension_id: None,
+            event: "e".to_string(),
+            error: "err".to_string(),
+        },
+    ];
+
+    for event in &excluded {
+        let result = extension_event_from_agent(event);
+        assert!(
+            result.is_none(),
+            "event {:?} should NOT be forwarded to extensions",
+            event_to_json(event)["type"]
+        );
+    }
+
+    assert_eq!(
+        forwarded.len() + excluded.len(),
+        15,
+        "should cover all 15 AgentEvent variants"
+    );
+
+    harness.log().info_ctx(
+        "json_parity",
+        "extension_event_from_agent mapping ok",
+        |ctx| {
+            ctx.push(("forwarded".to_string(), forwarded.len().to_string()));
+            ctx.push(("excluded".to_string(), excluded.len().to_string()));
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 19. Extension event payload preserves camelCase fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_extension_event_payload_camel_case() {
+    let harness = TestHarness::new("json_parity_extension_event_payload_camel_case");
+
+    // Verify the serialized payload passed to extensions uses camelCase.
+    let event = AgentEvent::ToolExecutionStart {
+        tool_call_id: "tc-1".to_string(),
+        tool_name: "bash".to_string(),
+        args: json!({"command": "ls"}),
+    };
+
+    let (_, payload) = extension_event_from_agent(&event).expect("should be forwarded");
+    let payload = payload.expect("should have payload");
+
+    // The payload should use camelCase field names.
+    assert_eq!(payload["toolCallId"], "tc-1");
+    assert_eq!(payload["toolName"], "bash");
+    assert!(
+        payload.get("tool_call_id").is_none(),
+        "extension payload should use camelCase"
+    );
+    assert!(
+        payload.get("tool_name").is_none(),
+        "extension payload should use camelCase"
+    );
+
+    harness.log().info_ctx(
+        "json_parity",
+        "extension event payload camelCase ok",
+        |_| {},
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 20. Tool execution event with extension tool (non-builtin)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_tool_execution_extension_tool() {
+    let harness = TestHarness::new("json_parity_tool_execution_extension_tool");
+
+    // Extension tools have names prefixed with the extension ID.
+    let event = AgentEvent::ToolExecutionStart {
+        tool_call_id: "tc-ext-1".to_string(),
+        tool_name: "my-extension__custom_tool".to_string(),
+        args: json!({"input": "test data", "mode": "fast"}),
+    };
+    let json = event_to_json(&event);
+
+    assert_eq!(json["type"], "tool_execution_start");
+    assert_eq!(json["toolName"], "my-extension__custom_tool");
+    assert_eq!(json["args"]["input"], "test data");
+
+    // Extension tool end with error.
+    let event_end = AgentEvent::ToolExecutionEnd {
+        tool_call_id: "tc-ext-1".to_string(),
+        tool_name: "my-extension__custom_tool".to_string(),
+        result: ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("extension error"))],
+            details: None,
+            is_error: true,
+        },
+        is_error: true,
+    };
+    let json_end = event_to_json(&event_end);
+    assert_eq!(json_end["isError"], true);
+    assert_eq!(json_end["toolName"], "my-extension__custom_tool");
+
+    // Should still be forwarded to extensions.
+    let (name, _) = extension_event_from_agent(&event).expect("forwarded");
+    assert_eq!(name, ExtensionEventName::ToolExecutionStart);
+
+    harness
+        .log()
+        .info_ctx("json_parity", "extension tool execution events ok", |_| {});
+}
+
+// ============================================================================
+// DROPIN-124: Tool Lifecycle Event Payload Detail Tests (bd-359pl)
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// 21. Tool error events: isError at both top-level and result level
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_tool_error_consistency() {
+    let harness = TestHarness::new("json_parity_tool_error_consistency");
+    let event = AgentEvent::ToolExecutionEnd {
+        tool_call_id: "tc-err".to_string(),
+        tool_name: "bash".to_string(),
+        result: ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("command not found"))],
+            details: Some(json!({"exitCode": 127})),
+            is_error: true,
+        },
+        is_error: true,
+    };
+    let json = event_to_json(&event);
+    assert_eq!(json["isError"], true, "top-level isError");
+    assert_eq!(json["result"]["isError"], true, "result.isError");
+
+    harness
+        .log()
+        .info_ctx("json_parity", "tool error consistency ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 22. All 7 built-in tool names serialize correctly
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_all_builtin_tool_names() {
+    let harness = TestHarness::new("json_parity_all_builtin_tool_names");
+    for name in &["read", "write", "edit", "bash", "grep", "find", "ls"] {
+        let event = AgentEvent::ToolExecutionStart {
+            tool_call_id: format!("tc-{name}"),
+            tool_name: (*name).to_string(),
+            args: json!({}),
+        };
+        let json = event_to_json(&event);
+        assert_eq!(json["toolName"].as_str(), Some(*name));
+    }
+
+    harness
+        .log()
+        .info_ctx("json_parity", "all 7 built-in tool names ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 23. Tool result with details=None omits details correctly
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_tool_result_no_details() {
+    let harness = TestHarness::new("json_parity_tool_result_no_details");
+    let event = AgentEvent::ToolExecutionEnd {
+        tool_call_id: "tc-nd".to_string(),
+        tool_name: "write".to_string(),
+        result: ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("written"))],
+            details: None,
+            is_error: false,
+        },
+        is_error: false,
+    };
+    let json = event_to_json(&event);
+    // Pi-mono: write tool has details: undefined → null in JSON.
+    assert!(
+        json["result"]["details"].is_null(),
+        "details should be null when None"
+    );
+
+    harness
+        .log()
+        .info_ctx("json_parity", "tool result no details ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 24. ToolOutput content structure matches pi-mono TextContent
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_tool_output_content_structure() {
+    let harness = TestHarness::new("json_parity_tool_output_content_structure");
+    let output = ToolOutput {
+        content: vec![
+            ContentBlock::Text(TextContent::new("line 1")),
+            ContentBlock::Text(TextContent::new("line 2")),
+        ],
+        details: None,
+        is_error: false,
+    };
+    let json = serde_json::to_value(&output).expect("serialize");
+    let content = json["content"].as_array().expect("content is array");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "line 1");
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "line 2");
+
+    harness
+        .log()
+        .info_ctx("json_parity", "tool output content structure ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 25. Tool event args preserve arbitrary/complex JSON values
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_tool_args_preserve_arbitrary_json() {
+    let harness = TestHarness::new("json_parity_tool_args_preserve_arbitrary_json");
+    let complex_args = json!({
+        "path": "/home/user/src/main.rs",
+        "offset": 100,
+        "limit": 50,
+        "nested": {"a": [1, 2, 3]},
+        "unicode": "\u{65E5}\u{672C}\u{8A9E}"
+    });
+    let event = AgentEvent::ToolExecutionStart {
+        tool_call_id: "tc-cplx".to_string(),
+        tool_name: "read".to_string(),
+        args: complex_args.clone(),
+    };
+    let json = event_to_json(&event);
+    assert_eq!(json["args"], complex_args);
+
+    harness.log().info_ctx(
+        "json_parity",
+        "tool args preserve arbitrary JSON ok",
+        |_| {},
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 26. Extension event round-trip: direct serialize vs mapping
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_extension_event_round_trip() {
+    let harness = TestHarness::new("json_parity_extension_event_round_trip");
+    let event = AgentEvent::ToolExecutionStart {
+        tool_call_id: "tc-rt".to_string(),
+        tool_name: "edit".to_string(),
+        args: json!({"path": "/tmp/f.rs", "old_string": "foo", "new_string": "bar"}),
+    };
+
+    let direct = event_to_json(&event);
+    let (_, payload) = extension_event_from_agent(&event).unwrap();
+    let mapped = payload.unwrap();
+
+    assert_eq!(direct["type"], mapped["type"]);
+    assert_eq!(direct["toolCallId"], mapped["toolCallId"]);
+    assert_eq!(direct["toolName"], mapped["toolName"]);
+    assert_eq!(direct["args"], mapped["args"]);
+
+    harness
+        .log()
+        .info_ctx("json_parity", "extension event round-trip ok", |_| {});
+}
+
+// ============================================================================
+// DROPIN-124: Extension UI Response Parity Tests (bd-359pl)
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// 27. ExtensionUiResponse: value variant (select)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_ui_response_value_variant() {
+    let harness = TestHarness::new("json_parity_ui_response_value_variant");
+    let resp = pi::extensions::ExtensionUiResponse {
+        id: "sel-1".to_string(),
+        value: Some(json!("option_b")),
+        cancelled: false,
+    };
+    assert_eq!(resp.id, "sel-1");
+    assert_eq!(resp.value, Some(json!("option_b")));
+    assert!(!resp.cancelled);
+
+    harness
+        .log()
+        .info_ctx("json_parity", "ui response value variant ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 28. ExtensionUiResponse: confirmed variant
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_ui_response_confirmed_variant() {
+    let harness = TestHarness::new("json_parity_ui_response_confirmed_variant");
+
+    let confirmed = pi::extensions::ExtensionUiResponse {
+        id: "cfm-1".to_string(),
+        value: Some(json!(true)),
+        cancelled: false,
+    };
+    assert_eq!(confirmed.value, Some(json!(true)));
+    assert!(!confirmed.cancelled);
+
+    let denied = pi::extensions::ExtensionUiResponse {
+        id: "cfm-2".to_string(),
+        value: Some(json!(false)),
+        cancelled: false,
+    };
+    assert_eq!(denied.value, Some(json!(false)));
+
+    harness
+        .log()
+        .info_ctx("json_parity", "ui response confirmed variant ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 29. ExtensionUiResponse: cancelled variant
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_ui_response_cancelled_variant() {
+    let harness = TestHarness::new("json_parity_ui_response_cancelled_variant");
+    let resp = pi::extensions::ExtensionUiResponse {
+        id: "inp-1".to_string(),
+        value: None,
+        cancelled: true,
+    };
+    assert!(resp.cancelled);
+    assert!(resp.value.is_none());
+
+    harness
+        .log()
+        .info_ctx("json_parity", "ui response cancelled variant ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 30. ExtensionUiResponse: text input value
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_ui_response_text_value() {
+    let harness = TestHarness::new("json_parity_ui_response_text_value");
+    let input_resp = pi::extensions::ExtensionUiResponse {
+        id: "inp-1".to_string(),
+        value: Some(json!("user-typed-text")),
+        cancelled: false,
+    };
+    assert_eq!(input_resp.value, Some(json!("user-typed-text")));
+
+    let editor_resp = pi::extensions::ExtensionUiResponse {
+        id: "edt-1".to_string(),
+        value: Some(json!("edited prompt content")),
+        cancelled: false,
+    };
+    assert_eq!(editor_resp.value, Some(json!("edited prompt content")));
+
+    harness
+        .log()
+        .info_ctx("json_parity", "ui response text value ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 31. Extension event name Display matches pi-mono event hook strings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_extension_event_name_display() {
+    let harness = TestHarness::new("json_parity_extension_event_name_display");
+    let cases: Vec<(ExtensionEventName, &str)> = vec![
+        (ExtensionEventName::AgentStart, "agent_start"),
+        (ExtensionEventName::AgentEnd, "agent_end"),
+        (ExtensionEventName::TurnStart, "turn_start"),
+        (ExtensionEventName::TurnEnd, "turn_end"),
+        (ExtensionEventName::MessageStart, "message_start"),
+        (ExtensionEventName::MessageUpdate, "message_update"),
+        (ExtensionEventName::MessageEnd, "message_end"),
+        (
+            ExtensionEventName::ToolExecutionStart,
+            "tool_execution_start",
+        ),
+        (
+            ExtensionEventName::ToolExecutionUpdate,
+            "tool_execution_update",
+        ),
+        (ExtensionEventName::ToolExecutionEnd, "tool_execution_end"),
+        (ExtensionEventName::ToolCall, "tool_call"),
+        (ExtensionEventName::ToolResult, "tool_result"),
+    ];
+    for (name, expected) in &cases {
+        assert_eq!(name.to_string(), *expected, "Display for {name:?}");
+    }
+
+    harness
+        .log()
+        .info_ctx("json_parity", "extension event name Display ok", |ctx| {
+            ctx.push(("count".to_string(), cases.len().to_string()));
+        });
+}
+
+// ---------------------------------------------------------------------------
+// 32. Tool lifecycle with tool details containing rich data
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_tool_details_rich_data() {
+    let harness = TestHarness::new("json_parity_tool_details_rich_data");
+
+    // Bash tool details include exitCode, timing, etc.
+    let event = AgentEvent::ToolExecutionEnd {
+        tool_call_id: "tc-bash-det".to_string(),
+        tool_name: "bash".to_string(),
+        result: ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("output"))],
+            details: Some(json!({
+                "exitCode": 0,
+                "stdout": "hello\n",
+                "stderr": "",
+                "executionTimeMs": 42
+            })),
+            is_error: false,
+        },
+        is_error: false,
+    };
+    let json = event_to_json(&event);
+    let details = &json["result"]["details"];
+    assert_eq!(details["exitCode"], 0);
+    assert_eq!(details["stdout"], "hello\n");
+    assert_eq!(details["executionTimeMs"], 42);
+
+    // Read tool details include size, lineCount.
+    let event_read = AgentEvent::ToolExecutionEnd {
+        tool_call_id: "tc-read-det".to_string(),
+        tool_name: "read".to_string(),
+        result: ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("file contents"))],
+            details: Some(json!({
+                "size": 1024,
+                "lineCount": 50
+            })),
+            is_error: false,
+        },
+        is_error: false,
+    };
+    let json_read = event_to_json(&event_read);
+    assert_eq!(json_read["result"]["details"]["size"], 1024);
+    assert_eq!(json_read["result"]["details"]["lineCount"], 50);
+
+    harness
+        .log()
+        .info_ctx("json_parity", "tool details rich data ok", |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// 33. Complete tool lifecycle ordering matches pi-mono
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parity_tool_lifecycle_ordering() {
+    let harness = TestHarness::new("json_parity_tool_lifecycle_ordering");
+
+    // Pi-mono ordering: start → (optional updates) → end
+    let events = [
+        AgentEvent::ToolExecutionStart {
+            tool_call_id: "tc-life".to_string(),
+            tool_name: "bash".to_string(),
+            args: json!({"command": "sleep 1 && echo done"}),
+        },
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "tc-life".to_string(),
+            tool_name: "bash".to_string(),
+            args: json!({"command": "sleep 1 && echo done"}),
+            partial_result: ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(""))],
+                details: None,
+                is_error: false,
+            },
+        },
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc-life".to_string(),
+            tool_name: "bash".to_string(),
+            result: ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("done"))],
+                details: Some(json!({"exitCode": 0})),
+                is_error: false,
+            },
+            is_error: false,
+        },
+    ];
+
+    let jsons: Vec<Value> = events.iter().map(event_to_json).collect();
+    assert_eq!(jsons[0]["type"], "tool_execution_start");
+    assert_eq!(jsons[1]["type"], "tool_execution_update");
+    assert_eq!(jsons[2]["type"], "tool_execution_end");
+
+    // All share the same toolCallId
+    for j in &jsons {
+        assert_eq!(j["toolCallId"], "tc-life");
+        assert_eq!(j["toolName"], "bash");
+    }
+
+    // All map to extension events in the same order
+    for (event, expected) in events.iter().zip(
+        [
+            ExtensionEventName::ToolExecutionStart,
+            ExtensionEventName::ToolExecutionUpdate,
+            ExtensionEventName::ToolExecutionEnd,
+        ]
+        .iter(),
+    ) {
+        let (name, _) = extension_event_from_agent(event).unwrap();
+        assert_eq!(name, *expected);
+    }
+
+    harness
+        .log()
+        .info_ctx("json_parity", "tool lifecycle ordering ok", |_| {});
 }
