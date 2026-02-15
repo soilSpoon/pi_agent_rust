@@ -7677,6 +7677,24 @@ impl CommonHostcallOpcode {
         }
     }
 
+    const fn method(self) -> &'static str {
+        match self {
+            Self::ToolRead | Self::ToolWrite | Self::ToolEdit | Self::ToolBash => "tool",
+            Self::SessionGetName
+            | Self::SessionSetName
+            | Self::SessionGetModel
+            | Self::SessionSetModel
+            | Self::SessionGetThinkingLevel
+            | Self::SessionSetThinkingLevel
+            | Self::SessionSetLabel => "session",
+            Self::EventsGetActiveTools
+            | Self::EventsGetAllTools
+            | Self::EventsSetActiveTools
+            | Self::EventsEmit
+            | Self::EventsList => "events",
+        }
+    }
+
     const fn required_capability(self) -> &'static str {
         match self {
             Self::ToolRead => "read",
@@ -7694,6 +7712,46 @@ impl CommonHostcallOpcode {
             | Self::EventsSetActiveTools
             | Self::EventsEmit
             | Self::EventsList => "events",
+        }
+    }
+
+    const fn capability_class(self) -> &'static str {
+        match self {
+            Self::ToolRead | Self::ToolWrite | Self::ToolEdit => "filesystem",
+            Self::ToolBash => "execution",
+            Self::SessionGetName
+            | Self::SessionSetName
+            | Self::SessionGetModel
+            | Self::SessionSetModel
+            | Self::SessionGetThinkingLevel
+            | Self::SessionSetThinkingLevel
+            | Self::SessionSetLabel => "session",
+            Self::EventsGetActiveTools
+            | Self::EventsGetAllTools
+            | Self::EventsSetActiveTools
+            | Self::EventsEmit
+            | Self::EventsList => "events",
+        }
+    }
+
+    const fn lane_matrix_key(self) -> &'static str {
+        match self {
+            Self::ToolRead => "tool|tool.read|filesystem",
+            Self::ToolWrite => "tool|tool.write|filesystem",
+            Self::ToolEdit => "tool|tool.edit|filesystem",
+            Self::ToolBash => "tool|tool.bash|execution",
+            Self::SessionGetName => "session|session.get_name|session",
+            Self::SessionSetName => "session|session.set_name|session",
+            Self::SessionGetModel => "session|session.get_model|session",
+            Self::SessionSetModel => "session|session.set_model|session",
+            Self::SessionGetThinkingLevel => "session|session.get_thinking_level|session",
+            Self::SessionSetThinkingLevel => "session|session.set_thinking_level|session",
+            Self::SessionSetLabel => "session|session.set_label|session",
+            Self::EventsGetActiveTools => "events|events.get_active_tools|events",
+            Self::EventsGetAllTools => "events|events.get_all_tools|events",
+            Self::EventsSetActiveTools => "events|events.set_active_tools|events",
+            Self::EventsEmit => "events|events.emit|events",
+            Self::EventsList => "events|events.list|events",
         }
     }
 }
@@ -7730,6 +7788,7 @@ struct HostcallLaneDecision {
     reason: &'static str,
     opcode: Option<CommonHostcallOpcode>,
     capability_class: &'static str,
+    matrix_key: &'static str,
 }
 
 // ============================================================================
@@ -7975,9 +8034,17 @@ fn parse_opcode_from_context(call: &HostCallPayload) -> Result<Option<CommonHost
         ));
     };
 
-    if let Some(schema) = meta_obj.get("schema").and_then(Value::as_str)
-        && schema != HOSTCALL_OPCODE_SCHEMA_VERSION
-    {
+    let Some(schema) = meta_obj
+        .get("schema")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(Error::validation(
+            "host_call context.typed_opcode.schema is required",
+        ));
+    };
+    if schema != HOSTCALL_OPCODE_SCHEMA_VERSION {
         return Err(Error::validation(format!(
             "Unsupported host_call typed opcode schema: {schema}"
         )));
@@ -8050,6 +8117,7 @@ fn hostcall_capability_class_from_capability(capability: &str) -> &'static str {
     match capability {
         "read" | "write" => "filesystem",
         "exec" => "execution",
+        "env" => "environment",
         "http" => "network",
         "session" => "session",
         "events" => "events",
@@ -8061,28 +8129,74 @@ fn hostcall_capability_class_from_capability(capability: &str) -> &'static str {
 }
 
 fn hostcall_capability_class(call: &HostCallPayload) -> &'static str {
-    let capability = required_capability_for_host_call_static(call).unwrap_or("internal");
-    hostcall_capability_class_from_capability(capability)
+    let capability = call.capability.trim().to_ascii_lowercase();
+    hostcall_capability_class_from_capability(capability.as_str())
+}
+
+fn fallback_lane_matrix_key(
+    call: &HostCallPayload,
+    capability_class: &'static str,
+) -> &'static str {
+    let method = call.method.trim().to_ascii_lowercase();
+    match (method.as_str(), capability_class) {
+        ("tool", "tool") => "tool|fallback|tool",
+        ("tool", "filesystem") => "tool|fallback|filesystem",
+        ("tool", "execution") => "tool|fallback|execution",
+        ("fs", "filesystem") => "fs|fallback|filesystem",
+        ("exec", "execution") => "exec|fallback|execution",
+        ("env", "environment") => "env|fallback|environment",
+        ("http", "network") => "http|fallback|network",
+        ("session", "session") => "session|fallback|session",
+        ("events", "events") => "events|fallback|events",
+        ("ui", "ui") => "ui|fallback|ui",
+        ("log", "telemetry") => "log|fallback|telemetry",
+        _ => "unknown|fallback|unknown",
+    }
 }
 
 fn select_hostcall_lane(call: &HostCallPayload) -> Result<HostcallLaneDecision> {
-    let capability_class = hostcall_capability_class(call);
+    let declared_capability = call.capability.trim().to_ascii_lowercase();
+    if declared_capability.is_empty() {
+        return Err(Error::validation("Host call capability is empty"));
+    }
     match resolve_hostcall_opcode(call)? {
-        HostcallOpcodeResolution::FastPath { opcode, source } => Ok(HostcallLaneDecision {
-            lane: HostcallDispatchLane::Fast,
-            reason: match source {
-                HostcallOpcodeSource::ContextV1 => "typed_opcode_context_v1",
-                HostcallOpcodeSource::DerivedV1 => "typed_opcode_derived_v1",
-            },
-            opcode: Some(opcode),
-            capability_class,
-        }),
-        HostcallOpcodeResolution::Fallback { reason } => Ok(HostcallLaneDecision {
-            lane: HostcallDispatchLane::Compat,
-            reason,
-            opcode: None,
-            capability_class,
-        }),
+        HostcallOpcodeResolution::FastPath { opcode, source } => {
+            let required = opcode.required_capability();
+            if declared_capability != required {
+                return Err(Error::validation(format!(
+                    "Host call capability mismatch: declared {declared_capability}, required \
+                     {required}"
+                )));
+            }
+            Ok(HostcallLaneDecision {
+                lane: HostcallDispatchLane::Fast,
+                reason: match source {
+                    HostcallOpcodeSource::ContextV1 => "typed_opcode_context_v1",
+                    HostcallOpcodeSource::DerivedV1 => "typed_opcode_derived_v1",
+                },
+                opcode: Some(opcode),
+                capability_class: opcode.capability_class(),
+                matrix_key: opcode.lane_matrix_key(),
+            })
+        }
+        HostcallOpcodeResolution::Fallback { reason } => {
+            if let Some(required) = required_capability_for_host_call_static_legacy(call)
+                && declared_capability != required
+            {
+                return Err(Error::validation(format!(
+                    "Host call capability mismatch: declared {declared_capability}, required \
+                     {required}"
+                )));
+            }
+            let capability_class = hostcall_capability_class(call);
+            Ok(HostcallLaneDecision {
+                lane: HostcallDispatchLane::Compat,
+                reason,
+                opcode: None,
+                capability_class,
+                matrix_key: fallback_lane_matrix_key(call, capability_class),
+            })
+        }
     }
 }
 
@@ -14194,6 +14308,8 @@ async fn dispatch_shared_allowed(
         method = %call.method,
         lane = lane.lane.as_str(),
         decision_reason = lane.reason,
+        lane_matrix_key = lane.matrix_key,
+        lane_matrix_method = lane.opcode.map(CommonHostcallOpcode::method).unwrap_or("fallback"),
         capability_class = lane.capability_class,
         opcode = lane.opcode.map(CommonHostcallOpcode::code),
         opcode_schema = HOSTCALL_OPCODE_SCHEMA_VERSION,
@@ -14203,7 +14319,19 @@ async fn dispatch_shared_allowed(
 
     match lane.lane {
         HostcallDispatchLane::Fast => {
-            let opcode = lane.opcode.expect("fast lane must include opcode");
+            let Some(opcode) = lane.opcode else {
+                tracing::warn!(
+                    event = "host_call.lane_invalid_state",
+                    call_id = %call.call_id,
+                    extension_id = ?ctx.extension_id,
+                    method = %call.method,
+                    "Fast lane selected without opcode; rejecting call"
+                );
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "Invalid hostcall lane state: fast lane requires opcode".to_string(),
+                };
+            };
             dispatch_shared_allowed_fast(ctx, call, opcode).await
         }
         HostcallDispatchLane::Compat => dispatch_shared_allowed_legacy(ctx, call).await,
@@ -28383,6 +28511,31 @@ mod tests {
     }
 
     #[test]
+    fn validate_host_call_rejects_typed_opcode_without_schema() {
+        let payload = HostCallPayload {
+            call_id: "bad-opcode-no-schema".to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "read", "input": {} }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: Some(json!({
+                "typed_opcode": {
+                    "version": HOSTCALL_OPCODE_VERSION,
+                    "code": "tool.read"
+                }
+            })),
+        };
+
+        let err = validate_host_call(&payload).expect_err("missing schema must be rejected");
+        assert!(
+            err.to_string()
+                .contains("context.typed_opcode.schema is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn resolve_hostcall_opcode_fallback_for_unsupported_ops() {
         let payload = HostCallPayload {
             call_id: "fallback-op".to_string(),
@@ -28425,7 +28578,28 @@ mod tests {
         assert_eq!(lane.lane, HostcallDispatchLane::Fast);
         assert_eq!(lane.reason, "typed_opcode_context_v1");
         assert_eq!(lane.capability_class, "filesystem");
+        assert_eq!(lane.matrix_key, "tool|tool.read|filesystem");
         assert_eq!(lane.opcode, Some(CommonHostcallOpcode::ToolRead));
+    }
+
+    #[test]
+    fn select_hostcall_lane_fast_when_opcode_is_derived() {
+        let payload = HostCallPayload {
+            call_id: "lane-fast-derived".to_string(),
+            capability: "session".to_string(),
+            method: "session".to_string(),
+            params: json!({ "op": "get_name" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let lane = select_hostcall_lane(&payload).expect("lane decision");
+        assert_eq!(lane.lane, HostcallDispatchLane::Fast);
+        assert_eq!(lane.reason, "typed_opcode_derived_v1");
+        assert_eq!(lane.capability_class, "session");
+        assert_eq!(lane.matrix_key, "session|session.get_name|session");
+        assert_eq!(lane.opcode, Some(CommonHostcallOpcode::SessionGetName));
     }
 
     #[test]
@@ -28444,6 +28618,195 @@ mod tests {
         assert_eq!(lane.lane, HostcallDispatchLane::Compat);
         assert_eq!(lane.reason, "opcode_not_declared_or_not_supported");
         assert_eq!(lane.capability_class, "session");
+        assert_eq!(lane.matrix_key, "session|fallback|session");
+        assert!(lane.opcode.is_none());
+    }
+
+    #[test]
+    fn select_hostcall_lane_compat_for_env_hostcall() {
+        let payload = HostCallPayload {
+            call_id: "lane-env".to_string(),
+            capability: "env".to_string(),
+            method: "env".to_string(),
+            params: json!({ "name": "HOME" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let lane = select_hostcall_lane(&payload).expect("lane decision");
+        assert_eq!(lane.lane, HostcallDispatchLane::Compat);
+        assert_eq!(lane.reason, "opcode_not_declared_or_not_supported");
+        assert_eq!(lane.capability_class, "environment");
+        assert_eq!(lane.matrix_key, "env|fallback|environment");
+        assert!(lane.opcode.is_none());
+    }
+
+    #[test]
+    fn select_hostcall_lane_rejects_capability_mismatch_for_fast_opcode() {
+        let payload = HostCallPayload {
+            call_id: "lane-cap-mismatch".to_string(),
+            capability: "write".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "read", "input": {} }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let err = select_hostcall_lane(&payload).expect_err("capability mismatch must fail");
+        assert!(
+            err.to_string().contains("Host call capability mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hostcall_fast_lane_matrix_entries_are_consistent() {
+        let matrix = [
+            (
+                CommonHostcallOpcode::ToolRead,
+                "tool",
+                "tool.read",
+                "filesystem",
+                "tool|tool.read|filesystem",
+            ),
+            (
+                CommonHostcallOpcode::ToolWrite,
+                "tool",
+                "tool.write",
+                "filesystem",
+                "tool|tool.write|filesystem",
+            ),
+            (
+                CommonHostcallOpcode::ToolEdit,
+                "tool",
+                "tool.edit",
+                "filesystem",
+                "tool|tool.edit|filesystem",
+            ),
+            (
+                CommonHostcallOpcode::ToolBash,
+                "tool",
+                "tool.bash",
+                "execution",
+                "tool|tool.bash|execution",
+            ),
+            (
+                CommonHostcallOpcode::SessionGetName,
+                "session",
+                "session.get_name",
+                "session",
+                "session|session.get_name|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionSetName,
+                "session",
+                "session.set_name",
+                "session",
+                "session|session.set_name|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionGetModel,
+                "session",
+                "session.get_model",
+                "session",
+                "session|session.get_model|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionSetModel,
+                "session",
+                "session.set_model",
+                "session",
+                "session|session.set_model|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionGetThinkingLevel,
+                "session",
+                "session.get_thinking_level",
+                "session",
+                "session|session.get_thinking_level|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionSetThinkingLevel,
+                "session",
+                "session.set_thinking_level",
+                "session",
+                "session|session.set_thinking_level|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionSetLabel,
+                "session",
+                "session.set_label",
+                "session",
+                "session|session.set_label|session",
+            ),
+            (
+                CommonHostcallOpcode::EventsGetActiveTools,
+                "events",
+                "events.get_active_tools",
+                "events",
+                "events|events.get_active_tools|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsGetAllTools,
+                "events",
+                "events.get_all_tools",
+                "events",
+                "events|events.get_all_tools|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsSetActiveTools,
+                "events",
+                "events.set_active_tools",
+                "events",
+                "events|events.set_active_tools|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsEmit,
+                "events",
+                "events.emit",
+                "events",
+                "events|events.emit|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsList,
+                "events",
+                "events.list",
+                "events",
+                "events|events.list|events",
+            ),
+        ];
+
+        for (opcode, method, code, capability_class, matrix_key) in matrix {
+            assert_eq!(opcode.method(), method);
+            assert_eq!(opcode.code(), code);
+            assert_eq!(opcode.capability_class(), capability_class);
+            assert_eq!(opcode.lane_matrix_key(), matrix_key);
+            assert_eq!(
+                opcode.lane_matrix_key(),
+                format!("{method}|{code}|{capability_class}")
+            );
+        }
+    }
+
+    #[test]
+    fn select_hostcall_lane_compat_unknown_method_uses_unknown_matrix_key() {
+        let payload = HostCallPayload {
+            call_id: "lane-unknown".to_string(),
+            capability: "tool".to_string(),
+            method: "mystery".to_string(),
+            params: json!({}),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let lane = select_hostcall_lane(&payload).expect("lane decision");
+        assert_eq!(lane.lane, HostcallDispatchLane::Compat);
+        assert_eq!(lane.reason, "opcode_not_declared_or_not_supported");
+        assert_eq!(lane.capability_class, "tool");
+        assert_eq!(lane.matrix_key, "unknown|fallback|unknown");
         assert!(lane.opcode.is_none());
     }
 
