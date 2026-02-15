@@ -25178,13 +25178,8 @@ mod tests {
                 }
 
                 // Final state should reflect last update.
-                let name_out = dispatch_hostcall_session(
-                    "interleave",
-                    &manager,
-                    "get_name",
-                    json!({}),
-                )
-                .await;
+                let name_out =
+                    dispatch_hostcall_session("interleave", &manager, "get_name", json!({})).await;
                 if let HostcallOutcome::Success(value) = name_out {
                     assert_eq!(
                         value.as_str(),
@@ -25246,8 +25241,14 @@ mod tests {
                     dispatch_hostcall_session("real-session", &manager, "get_model", json!({}))
                         .await;
                 if let HostcallOutcome::Success(value) = get_model {
-                    assert_eq!(value.get("provider").and_then(Value::as_str), Some("prov-real"));
-                    assert_eq!(value.get("modelId").and_then(Value::as_str), Some("model-real"));
+                    assert_eq!(
+                        value.get("provider").and_then(Value::as_str),
+                        Some("prov-real")
+                    );
+                    assert_eq!(
+                        value.get("modelId").and_then(Value::as_str),
+                        Some("model-real")
+                    );
                 } else {
                     panic!("get_model should succeed, got: {get_model:?}");
                 }

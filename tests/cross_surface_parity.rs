@@ -3,9 +3,7 @@
 //! confirm drop-in replacement behavior.
 
 use pi::error::Error;
-use pi::model::{
-    AssistantMessage, ContentBlock, Message, TextContent, ToolCall, Usage,
-};
+use pi::model::{AssistantMessage, ContentBlock, Message, TextContent, ToolCall, Usage};
 use pi::session::Session;
 use serde_json::json;
 
@@ -89,8 +87,8 @@ mod exit_codes {
 
     #[test]
     fn json_errors_are_failure() {
-        let json_err = serde_json::from_str::<serde_json::Value>("{{bad}}")
-            .expect_err("should fail");
+        let json_err =
+            serde_json::from_str::<serde_json::Value>("{{bad}}").expect_err("should fail");
         let err: Error = json_err.into();
         assert_eq!(classify(err), "failure");
     }
@@ -101,13 +99,20 @@ mod exit_codes {
 // ============================================================================
 
 mod cli_combinations {
-    use pi::cli::Cli;
     use clap::Parser;
+    use pi::cli::Cli;
 
     #[test]
     fn print_mode_with_provider_and_model() {
         let cli = Cli::parse_from([
-            "pi", "-p", "--provider", "openai", "--model", "gpt-4o", "--thinking", "off",
+            "pi",
+            "-p",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o",
+            "--thinking",
+            "off",
         ]);
         assert!(cli.print);
         assert_eq!(cli.provider.as_deref(), Some("openai"));
@@ -118,7 +123,12 @@ mod cli_combinations {
     #[test]
     fn session_flags_are_mutually_parsed() {
         let cli = Cli::parse_from([
-            "pi", "-c", "--session", "/tmp/sess.jsonl", "--session-dir", "/tmp/sessions",
+            "pi",
+            "-c",
+            "--session",
+            "/tmp/sess.jsonl",
+            "--session-dir",
+            "/tmp/sessions",
         ]);
         assert!(cli.r#continue);
         assert_eq!(cli.session.as_deref(), Some("/tmp/sess.jsonl"));
@@ -160,9 +170,7 @@ mod cli_combinations {
 
     #[test]
     fn tools_subset_with_provider() {
-        let cli = Cli::parse_from([
-            "pi", "--tools", "read,bash", "--provider", "anthropic",
-        ]);
+        let cli = Cli::parse_from(["pi", "--tools", "read,bash", "--provider", "anthropic"]);
         assert_eq!(cli.tools, "read,bash");
         assert_eq!(cli.provider.as_deref(), Some("anthropic"));
     }
@@ -212,10 +220,7 @@ mod cli_combinations {
     #[test]
     fn list_models_with_pattern() {
         let cli = Cli::parse_from(["pi", "--list-models", "claude*"]);
-        assert_eq!(
-            cli.list_models.unwrap().as_deref(),
-            Some("claude*")
-        );
+        assert_eq!(cli.list_models.unwrap().as_deref(), Some("claude*"));
     }
 
     #[test]
@@ -236,10 +241,7 @@ mod cli_combinations {
             "Also be concise",
         ]);
         assert_eq!(cli.system_prompt.as_deref(), Some("Be helpful"));
-        assert_eq!(
-            cli.append_system_prompt.as_deref(),
-            Some("Also be concise")
-        );
+        assert_eq!(cli.append_system_prompt.as_deref(), Some("Also be concise"));
     }
 
     #[test]
@@ -256,18 +258,22 @@ mod cli_combinations {
 // ============================================================================
 
 mod env_precedence {
-    use pi::cli::Cli;
     use clap::Parser;
+    use pi::cli::Cli;
 
     /// Parse CLI with environment variables set.
     fn parse_with_env(args: &[&str], env_vars: &[(&str, &str)]) -> Cli {
         for (key, value) in env_vars {
             // SAFETY: test-only, single-threaded execution assumed
-            unsafe { std::env::set_var(key, value); }
+            unsafe {
+                std::env::set_var(key, value);
+            }
         }
         let result = Cli::try_parse_from(args);
         for (key, _) in env_vars {
-            unsafe { std::env::remove_var(key); }
+            unsafe {
+                std::env::remove_var(key);
+            }
         }
         result.expect("CLI parse should succeed")
     }
@@ -297,7 +303,10 @@ mod env_precedence {
     fn both_env_vars_together() {
         let cli = parse_with_env(
             &["pi"],
-            &[("PI_PROVIDER", "anthropic"), ("PI_MODEL", "claude-opus-4-5")],
+            &[
+                ("PI_PROVIDER", "anthropic"),
+                ("PI_MODEL", "claude-opus-4-5"),
+            ],
         );
         assert_eq!(cli.provider.as_deref(), Some("anthropic"));
         assert_eq!(cli.model.as_deref(), Some("claude-opus-4-5"));
@@ -406,10 +415,10 @@ mod session_invariants {
 
         let compaction_id = session.append_compaction(
             "summary of prior conversation".to_string(),
-            id1,         // first_kept_entry_id
-            150,         // tokens_before
-            None,        // details
-            None,        // from_hook
+            id1,  // first_kept_entry_id
+            150,  // tokens_before
+            None, // details
+            None, // from_hook
         );
 
         let entry = session.get_entry(&compaction_id);
@@ -419,10 +428,8 @@ mod session_invariants {
     #[test]
     fn model_change_entries_tracked() {
         let mut session = Session::in_memory();
-        let id = session.append_model_change(
-            "anthropic".to_string(),
-            "claude-opus-4-5".to_string(),
-        );
+        let id =
+            session.append_model_change("anthropic".to_string(), "claude-opus-4-5".to_string());
         let entry = session.get_entry(&id);
         assert!(entry.is_some(), "model change entry should exist");
     }
@@ -512,8 +519,14 @@ mod error_display {
         ];
         for err in errors {
             let display = err.to_string();
-            assert!(!display.is_empty(), "Error display should not be empty: {err:?}");
-            assert!(display.len() > 5, "Error display should be descriptive: {display}");
+            assert!(
+                !display.is_empty(),
+                "Error display should not be empty: {err:?}"
+            );
+            assert!(
+                display.len() > 5,
+                "Error display should be descriptive: {display}"
+            );
         }
     }
 }

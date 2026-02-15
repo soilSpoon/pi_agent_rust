@@ -596,8 +596,7 @@ fn json_parity_extension_error_schema() {
     };
     let json_no_id = event_to_json(&event_no_id);
     assert!(
-        json_no_id.get("extensionId").is_none()
-            || json_no_id["extensionId"].is_null(),
+        json_no_id.get("extensionId").is_none() || json_no_id["extensionId"].is_null(),
         "extensionId should be absent or null when None"
     );
 
@@ -667,12 +666,12 @@ fn json_parity_complete_lifecycle_ordering() {
 
     let expected_order = [
         "agent_start",
-        "message_start",   // user
-        "message_end",     // user
+        "message_start", // user
+        "message_end",   // user
         "turn_start",
-        "message_start",   // assistant
+        "message_start", // assistant
         "message_update",
-        "message_end",     // assistant
+        "message_end", // assistant
         "turn_end",
         "agent_end",
     ];
@@ -699,10 +698,7 @@ fn json_parity_complete_lifecycle_ordering() {
         .log()
         .info_ctx("json_parity", "lifecycle ordering ok", |ctx| {
             ctx.push(("events".to_string(), json_lines.len().to_string()));
-            ctx.push((
-                "order".to_string(),
-                expected_order.join(","),
-            ));
+            ctx.push(("order".to_string(), expected_order.join(",")));
         });
 }
 
@@ -967,7 +963,10 @@ fn json_parity_no_snake_case_leak() {
         .log()
         .info_ctx("json_parity", "no snake_case leak ok", |ctx| {
             ctx.push(("events_checked".to_string(), events.len().to_string()));
-            ctx.push(("banned_fields".to_string(), banned_snake_case.len().to_string()));
+            ctx.push((
+                "banned_fields".to_string(),
+                banned_snake_case.len().to_string(),
+            ));
         });
 }
 
@@ -988,9 +987,7 @@ fn json_parity_session_header_schema() {
         "id should be non-empty string"
     );
     assert!(
-        json["timestamp"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()),
+        json["timestamp"].as_str().is_some_and(|s| !s.is_empty()),
         "timestamp should be non-empty string"
     );
     assert!(
@@ -1188,11 +1185,11 @@ fn json_parity_extension_ui_select_schema() {
     // Payload fields are flattened — no nested "payload" key.
     assert!(event.get("payload").is_none(), "payload must be flattened");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui select schema ok",
-        |ctx| ctx.push(("method".to_string(), "select".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui select schema ok", |ctx| {
+            ctx.push(("method".to_string(), "select".to_string()))
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,11 +1212,11 @@ fn json_parity_extension_ui_confirm_schema() {
     assert_eq!(event["title"], "Allow exec?");
     assert_eq!(event["message"], "Extension wants to run commands");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui confirm schema ok",
-        |ctx| ctx.push(("method".to_string(), "confirm".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui confirm schema ok", |ctx| {
+            ctx.push(("method".to_string(), "confirm".to_string()))
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,11 +1239,11 @@ fn json_parity_extension_ui_input_schema() {
     assert_eq!(event["title"], "API Key");
     assert_eq!(event["placeholder"], "sk-ant-...");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui input schema ok",
-        |ctx| ctx.push(("method".to_string(), "input".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui input schema ok", |ctx| {
+            ctx.push(("method".to_string(), "input".to_string()))
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,11 +1266,11 @@ fn json_parity_extension_ui_editor_schema() {
     assert_eq!(event["title"], "Edit prompt");
     assert_eq!(event["prefill"], "Hello, world!");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui editor schema ok",
-        |ctx| ctx.push(("method".to_string(), "editor".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui editor schema ok", |ctx| {
+            ctx.push(("method".to_string(), "editor".to_string()))
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,11 +1308,11 @@ fn json_parity_extension_ui_notify_schema() {
     );
     assert_eq!(req_err.to_rpc_event()["notifyType"], "error");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui notify schema ok",
-        |ctx| ctx.push(("variants".to_string(), "3".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui notify schema ok", |ctx| {
+            ctx.push(("variants".to_string(), "3".to_string()))
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,11 +1345,11 @@ fn json_parity_extension_ui_set_status_schema() {
     assert_eq!(event_clear["statusKey"], "build");
     assert!(event_clear["statusText"].is_null());
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui setStatus schema ok",
-        |ctx| ctx.push(("method".to_string(), "setStatus".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui setStatus schema ok", |ctx| {
+            ctx.push(("method".to_string(), "setStatus".to_string()))
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1390,11 +1387,11 @@ fn json_parity_extension_ui_set_widget_schema() {
     assert_eq!(event_clear["widgetKey"], "metrics");
     assert!(event_clear["widgetLines"].is_null());
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui setWidget schema ok",
-        |ctx| ctx.push(("method".to_string(), "setWidget".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui setWidget schema ok", |ctx| {
+            ctx.push(("method".to_string(), "setWidget".to_string()))
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,11 +1401,7 @@ fn json_parity_extension_ui_set_widget_schema() {
 #[test]
 fn json_parity_extension_ui_set_title_schema() {
     let harness = TestHarness::new("json_parity_extension_ui_set_title_schema");
-    let req = ExtensionUiRequest::new(
-        "ttl-1",
-        "setTitle",
-        json!({"title": "My Agent Session"}),
-    );
+    let req = ExtensionUiRequest::new("ttl-1", "setTitle", json!({"title": "My Agent Session"}));
     let event = req.to_rpc_event();
 
     assert_eq!(event["type"], "extension_ui_request");
@@ -1416,11 +1409,11 @@ fn json_parity_extension_ui_set_title_schema() {
     assert_eq!(event["method"], "setTitle");
     assert_eq!(event["title"], "My Agent Session");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui setTitle schema ok",
-        |ctx| ctx.push(("method".to_string(), "setTitle".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui setTitle schema ok", |ctx| {
+            ctx.push(("method".to_string(), "setTitle".to_string()))
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,7 +1460,13 @@ fn json_parity_extension_ui_expects_response_classification() {
     }
 
     // Fire-and-forget methods (expects response = false).
-    for method in &["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"] {
+    for method in &[
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text",
+    ] {
         let req = ExtensionUiRequest::new("x", *method, json!({}));
         assert!(
             !req.expects_response(),
@@ -1490,8 +1489,15 @@ fn json_parity_extension_ui_expects_response_classification() {
 fn json_parity_extension_ui_all_methods_type_tag() {
     let harness = TestHarness::new("json_parity_extension_ui_all_methods_type_tag");
     let methods = [
-        "select", "confirm", "input", "editor",
-        "notify", "setStatus", "setWidget", "setTitle", "set_editor_text",
+        "select",
+        "confirm",
+        "input",
+        "editor",
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text",
     ];
 
     for method in &methods {
@@ -1504,11 +1510,11 @@ fn json_parity_extension_ui_all_methods_type_tag() {
         assert_eq!(event["method"], *method);
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "all 9 extension_ui methods ok",
-        |ctx| ctx.push(("methods".to_string(), methods.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "all 9 extension_ui methods ok", |ctx| {
+            ctx.push(("methods".to_string(), methods.len().to_string()))
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1538,11 +1544,9 @@ fn json_parity_extension_ui_payload_flattening() {
     let event_str = req_str.to_rpc_event();
     assert_eq!(event_str["payload"], "raw");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui payload flattening ok",
-        |_| {},
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui payload flattening ok", |_| {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,8 +1564,16 @@ fn json_parity_extension_ui_no_snake_case_leaks() {
         ExtensionUiRequest::new("r2", "confirm", json!({"title": "T", "message": "M"})),
         ExtensionUiRequest::new("r3", "input", json!({"title": "T", "placeholder": "P"})),
         ExtensionUiRequest::new("r4", "editor", json!({"title": "T", "prefill": "P"})),
-        ExtensionUiRequest::new("r5", "notify", json!({"message": "M", "notifyType": "info"})),
-        ExtensionUiRequest::new("r6", "setStatus", json!({"statusKey": "K", "statusText": "V"})),
+        ExtensionUiRequest::new(
+            "r5",
+            "notify",
+            json!({"message": "M", "notifyType": "info"}),
+        ),
+        ExtensionUiRequest::new(
+            "r6",
+            "setStatus",
+            json!({"statusKey": "K", "statusText": "V"}),
+        ),
         ExtensionUiRequest::new(
             "r7",
             "setWidget",
@@ -1658,11 +1670,9 @@ fn json_parity_extension_ui_timeout_field() {
     req.timeout_ms = Some(3000);
     assert_eq!(req.effective_timeout_ms(), Some(3000));
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui timeout field ok",
-        |_| {},
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui timeout field ok", |_| {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1686,16 +1696,16 @@ fn json_parity_extension_ui_select_rich_options() {
     let event = req.to_rpc_event();
 
     assert_eq!(event["method"], "select");
-    let options = event["options"].as_array().expect("options should be array");
+    let options = event["options"]
+        .as_array()
+        .expect("options should be array");
     assert_eq!(options.len(), 2);
     assert_eq!(options[0]["label"], "Anthropic");
     assert_eq!(options[0]["value"], "anthropic");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension_ui select rich options ok",
-        |_| {},
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension_ui select rich options ok", |_| {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1737,9 +1747,7 @@ fn json_parity_complete_lifecycle_with_extension_ui() {
     assert!(ui_req.get("toolCallId").is_none());
     assert!(ui_req.get("toolName").is_none());
 
-    harness.log().info_ctx(
-        "json_parity",
-        "tool + extension_ui lifecycle ok",
-        |_| {},
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "tool + extension_ui lifecycle ok", |_| {});
 }
