@@ -66,6 +66,12 @@ pub const EVIDENCE_CONTRACT_SCHEMA_V1: &str = "pi.qa.evidence_contract.v1";
 pub const FAILURE_DIGEST_SCHEMA_V1: &str = "pi.e2e.failure_digest.v1";
 /// Versioned parity test/logging contract identifier.
 pub const PARITY_TEST_LOGGING_CONTRACT_SCHEMA_V1: &str = "pi.parity.test_logging_contract.v1";
+/// Unified structured logging contract tying all schemas together (bd-3ar8v.1.7).
+pub const EVIDENCE_LOGGING_CONTRACT_SCHEMA_V1: &str = "pi.test.evidence_logging_contract.v1";
+/// Performance evidence record schema for PERF-3X beads (bd-3ar8v.1.7).
+pub const PERF_EVIDENCE_SCHEMA_V1: &str = "pi.perf.evidence.v1";
+/// Bead-to-test coverage link schema for coverage auditing (bd-3ar8v.1.7).
+pub const BEAD_COVERAGE_SCHEMA_V1: &str = "pi.perf.bead_coverage.v1";
 const TEST_LOG_SCHEMA: &str = TEST_LOG_SCHEMA_V2;
 const TEST_ARTIFACT_SCHEMA: &str = TEST_ARTIFACT_SCHEMA_V1;
 const PLACEHOLDER_TIMESTAMP: &str = "<TIMESTAMP>";
@@ -222,6 +228,124 @@ impl ArtifactEntry {
     pub fn format(&self) -> String {
         let elapsed = format_elapsed_ms(self.elapsed_ms);
         format!("[{elapsed}s] {} -> {}\n", self.name, self.path)
+    }
+}
+
+/// Performance evidence record linking a benchmark result to the unified contract (bd-3ar8v.1.7).
+///
+/// Each PERF-3X bead's test must emit at least one `PerfEvidenceRecord` proving it
+/// produced measurable results. Consumed by bd-3ar8v.6.11 (coverage audit) and
+/// bd-3ar8v.1.3 (`NO_DATA` → hard failure).
+#[derive(Debug, Clone, Serialize)]
+pub struct PerfEvidenceRecord {
+    /// Schema identifier (always `pi.perf.evidence.v1`).
+    pub schema: &'static str,
+    /// Bead ID this evidence is linked to.
+    pub bead_id: String,
+    /// Record type classification.
+    pub record_type: PerfRecordType,
+    /// Correlation ID for cross-schema linking.
+    pub correlation_id: String,
+    /// ISO-8601 timestamp when the evidence was captured.
+    pub timestamp: String,
+    /// Environment fingerprint for reproducibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_fingerprint: Option<BTreeMap<String, String>>,
+    /// Partition tag (matched-state or realistic).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition: Option<String>,
+    /// Scenario identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scenario_id: Option<String>,
+}
+
+/// Classification of performance evidence record types.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfRecordType {
+    /// Raw benchmark timing data.
+    BenchRun,
+    /// Budget threshold check result.
+    BudgetCheck,
+    /// Regression delta against baseline.
+    RegressionDelta,
+    /// Realistic workload throughput/latency.
+    WorkloadResult,
+    /// Cross-runtime comparison report.
+    ComparisonReport,
+}
+
+impl PerfEvidenceRecord {
+    /// Create a new perf evidence record for a bead.
+    pub fn new(bead_id: impl Into<String>, record_type: PerfRecordType) -> Self {
+        let now: DateTime<Utc> = SystemTime::now().into();
+        Self {
+            schema: PERF_EVIDENCE_SCHEMA_V1,
+            bead_id: bead_id.into(),
+            record_type,
+            correlation_id: generate_trace_id(),
+            timestamp: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            env_fingerprint: None,
+            partition: None,
+            scenario_id: None,
+        }
+    }
+
+    /// Serialize to a JSONL line.
+    pub fn to_jsonl_line(&self) -> String {
+        serde_json::to_string(self).expect("PerfEvidenceRecord serialization")
+    }
+}
+
+/// Bead-to-test coverage link for the coverage audit (bd-3ar8v.1.7 / bd-3ar8v.6.11).
+///
+/// Maps a bead to the test files and log artifacts that prove its implementation.
+#[derive(Debug, Clone, Serialize)]
+pub struct BeadCoverageLink {
+    /// Schema identifier (always `pi.perf.bead_coverage.v1`).
+    pub schema: &'static str,
+    /// Bead ID being linked.
+    pub bead_id: String,
+    /// Test source files providing evidence.
+    pub test_files: Vec<String>,
+    /// JSONL log artifact paths.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub log_artifacts: Vec<String>,
+    /// Evidence type classification.
+    pub evidence_type: EvidenceType,
+}
+
+/// Classification of evidence types for bead coverage.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceType {
+    Unit,
+    Vcr,
+    E2e,
+    Bench,
+    Regression,
+    DesignDoc,
+}
+
+impl BeadCoverageLink {
+    /// Create a new bead coverage link.
+    pub fn new(
+        bead_id: impl Into<String>,
+        test_files: Vec<String>,
+        evidence_type: EvidenceType,
+    ) -> Self {
+        Self {
+            schema: BEAD_COVERAGE_SCHEMA_V1,
+            bead_id: bead_id.into(),
+            test_files,
+            log_artifacts: Vec::new(),
+            evidence_type,
+        }
+    }
+
+    /// Serialize to a JSONL line.
+    pub fn to_jsonl_line(&self) -> String {
+        serde_json::to_string(self).expect("BeadCoverageLink serialization")
     }
 }
 
@@ -1325,6 +1449,94 @@ pub fn validate_jsonl(content: &str) -> Vec<JsonlValidationError> {
     errors
 }
 
+/// Filter `log` JSONL records by category and standard context keys.
+///
+/// This supports cross-run triage flows that need to isolate a
+/// scenario/component slice before comparing outputs.
+pub fn filter_log_records(
+    content: &str,
+    category: Option<&str>,
+    scenario_id: Option<&str>,
+    component: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut filtered = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) != Some("log") {
+            continue;
+        }
+
+        let category_matches = category
+            .map(|needle| obj.get("category").and_then(|v| v.as_str()) == Some(needle))
+            .unwrap_or(true);
+        let context = obj.get("context").and_then(|v| v.as_object());
+        let scenario_matches = scenario_id
+            .map(|needle| {
+                context
+                    .and_then(|ctx| ctx.get("scenario_id"))
+                    .and_then(|v| v.as_str())
+                    == Some(needle)
+            })
+            .unwrap_or(true);
+        let component_matches = component
+            .map(|needle| {
+                context
+                    .and_then(|ctx| ctx.get("component"))
+                    .and_then(|v| v.as_str())
+                    == Some(needle)
+            })
+            .unwrap_or(true);
+
+        if category_matches && scenario_matches && component_matches {
+            filtered.push(value);
+        }
+    }
+    filtered
+}
+
+fn comparable_log_record(record: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = record.as_object()?;
+    let mut stable = serde_json::Map::new();
+    for key in ["schema", "type", "level", "category", "message", "context"] {
+        if let Some(value) = obj.get(key) {
+            stable.insert(key.to_string(), value.clone());
+        }
+    }
+    Some(serde_json::Value::Object(stable))
+}
+
+/// Compare two JSONL streams after filtering and stable-field projection.
+///
+/// Volatile correlation/timing fields are ignored by comparing only:
+/// `schema`, `type`, `level`, `category`, `message`, and `context`.
+pub fn compare_log_streams_by_filter(
+    left: &str,
+    right: &str,
+    category: Option<&str>,
+    scenario_id: Option<&str>,
+    component: Option<&str>,
+) -> bool {
+    let left_records: Vec<_> = filter_log_records(left, category, scenario_id, component)
+        .iter()
+        .filter_map(comparable_log_record)
+        .collect();
+    let right_records: Vec<_> = filter_log_records(right, category, scenario_id, component)
+        .iter()
+        .filter_map(comparable_log_record)
+        .collect();
+    left_records == right_records
+}
+
 // ============================================================================
 // Artifact-Index Path Cross-Validation (DISC-019 / GAP-3)
 // ============================================================================
@@ -1845,6 +2057,77 @@ mod tests {
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].line, 1);
         assert_eq!(errors[1].line, 2);
+    }
+
+    #[test]
+    fn filter_log_records_by_scenario_and_component() {
+        let logger = TestLogger::new();
+        logger.info_ctx("action", "scenario-A write", |ctx| {
+            ctx.push(("scenario_id".into(), "scenario-A".into()));
+            ctx.push(("component".into(), "session".into()));
+        });
+        logger.info_ctx("action", "scenario-B write", |ctx| {
+            ctx.push(("scenario_id".into(), "scenario-B".into()));
+            ctx.push(("component".into(), "session".into()));
+        });
+        logger.info_ctx("verify", "scenario-A verify", |ctx| {
+            ctx.push(("scenario_id".into(), "scenario-A".into()));
+            ctx.push(("component".into(), "rpc".into()));
+        });
+
+        let jsonl = logger.dump_jsonl();
+        let filtered =
+            filter_log_records(&jsonl, Some("action"), Some("scenario-A"), Some("session"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["message"], "scenario-A write");
+    }
+
+    #[test]
+    fn compare_log_streams_by_filter_ignores_trace_and_timing() {
+        let left = TestLogger::new();
+        left.info_ctx("action", "persist queued message", |ctx| {
+            ctx.push(("scenario_id".into(), "persist-backlog".into()));
+            ctx.push(("component".into(), "session".into()));
+            ctx.push(("sli_id".into(), "sli.persist.backlog_depth".into()));
+        });
+
+        let right = TestLogger::new();
+        right.info_ctx("action", "persist queued message", |ctx| {
+            ctx.push(("scenario_id".into(), "persist-backlog".into()));
+            ctx.push(("component".into(), "session".into()));
+            ctx.push(("sli_id".into(), "sli.persist.backlog_depth".into()));
+        });
+
+        assert!(compare_log_streams_by_filter(
+            &left.dump_jsonl(),
+            &right.dump_jsonl(),
+            Some("action"),
+            Some("persist-backlog"),
+            Some("session"),
+        ));
+    }
+
+    #[test]
+    fn compare_log_streams_by_filter_detects_semantic_difference() {
+        let left = TestLogger::new();
+        left.info_ctx("action", "persist succeeded", |ctx| {
+            ctx.push(("scenario_id".into(), "persist-backlog".into()));
+            ctx.push(("component".into(), "session".into()));
+        });
+
+        let right = TestLogger::new();
+        right.info_ctx("action", "persist failed", |ctx| {
+            ctx.push(("scenario_id".into(), "persist-backlog".into()));
+            ctx.push(("component".into(), "session".into()));
+        });
+
+        assert!(!compare_log_streams_by_filter(
+            &left.dump_jsonl(),
+            &right.dump_jsonl(),
+            Some("action"),
+            Some("persist-backlog"),
+            Some("session"),
+        ));
     }
 
     // ====================================================================

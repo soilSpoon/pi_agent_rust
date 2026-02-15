@@ -164,6 +164,8 @@ const BENCH_PROTOCOL_SCHEMA: &str = "pi.bench.protocol.v1";
 const BENCH_PROTOCOL_VERSION: &str = "1.0.0";
 const PARTITION_MATCHED_STATE: &str = "matched-state";
 const PARTITION_REALISTIC: &str = "realistic";
+const PARTITION_WEIGHT_MATCHED_STATE: f64 = 0.3;
+const PARTITION_WEIGHT_REALISTIC: f64 = 0.7;
 const EVIDENCE_CLASS_MEASURED: &str = "measured";
 const EVIDENCE_CLASS_INFERRED: &str = "inferred";
 const CONFIDENCE_HIGH: &str = "high";
@@ -356,6 +358,21 @@ fn canonical_protocol_contract() -> Value {
             "evidence_class": [EVIDENCE_CLASS_MEASURED, EVIDENCE_CLASS_INFERRED],
             "confidence": [CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW],
         },
+        "partition_weighting": {
+            PARTITION_MATCHED_STATE: PARTITION_WEIGHT_MATCHED_STATE,
+            PARTITION_REALISTIC: PARTITION_WEIGHT_REALISTIC,
+            "weights_sum_to": 1.0,
+        },
+        "partition_interpretation": {
+            "primary_partition": PARTITION_REALISTIC,
+            "secondary_partition": PARTITION_MATCHED_STATE,
+            "global_claim_requires_partitions": [PARTITION_MATCHED_STATE, PARTITION_REALISTIC],
+            "forbid_single_partition_conclusion": true,
+            "interpretation_notes": {
+                PARTITION_MATCHED_STATE: "Use matched-state for controlled equivalence and attribution; do not generalize alone.",
+                PARTITION_REALISTIC: "Use realistic workloads as primary user-impact evidence and release-facing performance narrative.",
+            },
+        },
         "user_perceived_sli_catalog": user_perceived_sli_catalog,
         "scenario_sli_matrix": scenario_sli_matrix,
     })
@@ -457,7 +474,20 @@ fn validate_protocol_record(record: &Value) -> Result<(), String> {
         }
     }
 
+    let scenario_id = metadata
+        .get("scenario_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if scenario_id.trim().is_empty() {
+        return Err("scenario_metadata.scenario_id must be non-empty".to_string());
+    }
+
     if partition == PARTITION_REALISTIC {
+        if !scenario_id.starts_with("realistic/session_") {
+            return Err(format!(
+                "realistic partition requires scenario_id prefixed with realistic/session_: {scenario_id}"
+            ));
+        }
         let replay = metadata
             .get("replay_input")
             .and_then(Value::as_object)
@@ -469,6 +499,22 @@ fn validate_protocol_record(record: &Value) -> Result<(), String> {
         if !REALISTIC_SESSION_SIZES.contains(&size) {
             return Err(format!(
                 "unsupported realistic session_messages: {size} (expected one of {REALISTIC_SESSION_SIZES:?})"
+            ));
+        }
+    } else {
+        let matched_valid = [
+            "cold_start",
+            "warm_start",
+            "tool_call",
+            "event_dispatch",
+            "matched-state/cold_start",
+            "matched-state/warm_start",
+            "matched-state/tool_call",
+            "matched-state/event_dispatch",
+        ];
+        if !matched_valid.contains(&scenario_id) {
+            return Err(format!(
+                "matched-state partition requires canonical scenario_id, got: {scenario_id}"
             ));
         }
     }
@@ -531,6 +577,56 @@ fn protocol_contract_covers_realistic_and_matched_state_partitions() {
         .collect();
     assert!(partitions.contains(&PARTITION_MATCHED_STATE));
     assert!(partitions.contains(&PARTITION_REALISTIC));
+}
+
+#[test]
+fn protocol_contract_defines_partition_weighting_and_guardrails() {
+    let contract = canonical_protocol_contract();
+
+    let matched_weight = contract["partition_weighting"][PARTITION_MATCHED_STATE]
+        .as_f64()
+        .expect("matched-state weight");
+    let realistic_weight = contract["partition_weighting"][PARTITION_REALISTIC]
+        .as_f64()
+        .expect("realistic weight");
+    let weights_sum_to = contract["partition_weighting"]["weights_sum_to"]
+        .as_f64()
+        .expect("weights_sum_to");
+    assert_eq!(weights_sum_to, 1.0);
+    assert!(
+        ((matched_weight + realistic_weight) - weights_sum_to).abs() < f64::EPSILON,
+        "partition weights must sum to 1.0"
+    );
+    assert!(
+        realistic_weight > matched_weight,
+        "realistic partition should carry higher release-facing weight"
+    );
+
+    assert_eq!(
+        contract["partition_interpretation"]["primary_partition"].as_str(),
+        Some(PARTITION_REALISTIC)
+    );
+    assert_eq!(
+        contract["partition_interpretation"]["secondary_partition"].as_str(),
+        Some(PARTITION_MATCHED_STATE)
+    );
+    assert_eq!(
+        contract["partition_interpretation"]["forbid_single_partition_conclusion"].as_bool(),
+        Some(true)
+    );
+
+    let required_partitions =
+        contract["partition_interpretation"]["global_claim_requires_partitions"]
+            .as_array()
+            .expect("global_claim_requires_partitions array");
+    let required: HashSet<&str> = required_partitions
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        required.contains(PARTITION_MATCHED_STATE) && required.contains(PARTITION_REALISTIC),
+        "global claim rules must require both partitions"
+    );
 }
 
 #[test]
@@ -884,6 +980,22 @@ fn evidence_contract_schema_includes_benchmark_protocol_definition() {
         required_fields.contains(&"scenario_sli_matrix"),
         "benchmark protocol schema must require scenario_sli_matrix"
     );
+    assert!(
+        required_fields.contains(&"partition_weighting"),
+        "benchmark protocol schema must require partition_weighting"
+    );
+    assert!(
+        required_fields.contains(&"partition_interpretation"),
+        "benchmark protocol schema must require partition_interpretation"
+    );
+
+    assert_eq!(
+        benchmark_protocol["properties"]["partition_interpretation"]["properties"]
+            ["forbid_single_partition_conclusion"]["const"]
+            .as_bool(),
+        Some(true),
+        "schema must enforce no single-partition release conclusion"
+    );
 }
 
 #[test]
@@ -1196,6 +1308,12 @@ fn generate_schema_doc() {
     );
     md.push_str(
         "| `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |\n\n",
+    );
+    md.push_str(
+        "| `partition_weighting` | object | Machine-readable partition weights (`realistic` + `matched-state`) with explicit sum-to-one contract |\n",
+    );
+    md.push_str(
+        "| `partition_interpretation` | object | Primary/secondary partition roles and release guardrail forbidding single-partition conclusions |\n",
     );
     md.push_str(
         "| `user_perceived_sli_catalog` | object[] | Versioned user-facing SLI targets with UX interpretation guidance |\n",

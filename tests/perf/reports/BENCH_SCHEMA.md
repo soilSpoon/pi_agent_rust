@@ -78,6 +78,8 @@ Same structure as `pi.ext.rust_bench.v1` with:
 | `required_metadata_fields` | string[] | `runtime`, `build_profile`, `host`, `scenario_id`, `correlation_id` |
 | `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |
 
+| `partition_weighting` | object | Machine-readable partition weights (`realistic` + `matched-state`) with explicit sum-to-one contract |
+| `partition_interpretation` | object | Primary/secondary partition roles and release guardrail forbidding single-partition conclusions |
 | `user_perceived_sli_catalog` | object[] | Versioned user-facing SLI targets with UX interpretation guidance |
 | `scenario_sli_matrix` | object[] | Canonical mapping from benchmark scenarios to user-perceived SLIs and consuming validation beads |
 

@@ -91,10 +91,28 @@
         "scenario": "event_dispatch"
       }
     ],
+    "partition_interpretation": {
+      "forbid_single_partition_conclusion": true,
+      "global_claim_requires_partitions": [
+        "matched-state",
+        "realistic"
+      ],
+      "interpretation_notes": {
+        "matched-state": "Use matched-state for controlled equivalence and attribution; do not generalize alone.",
+        "realistic": "Use realistic workloads as primary user-impact evidence and release-facing performance narrative."
+      },
+      "primary_partition": "realistic",
+      "secondary_partition": "matched-state"
+    },
     "partition_tags": [
       "matched-state",
       "realistic"
     ],
+    "partition_weighting": {
+      "matched-state": 0.3,
+      "realistic": 0.7,
+      "weights_sum_to": 1.0
+    },
     "realistic_replay_inputs": [
       {
         "partition": "realistic",

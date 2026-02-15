@@ -729,6 +729,7 @@ fn scenario_matrix_sli_ids_exist_in_perf_sli_catalog() {
         !known_ids.is_empty(),
         "perf_sli_matrix sli_catalog must define at least one sli_id"
     );
+    let alias_map = perf["sli_aliases"].as_object().cloned().unwrap_or_default();
 
     for row in rows {
         let workflow_id = row["workflow_id"].as_str().unwrap_or("unknown");
@@ -737,9 +738,11 @@ fn scenario_matrix_sli_ids_exist_in_perf_sli_catalog() {
             .unwrap_or_else(|| panic!("workflow {workflow_id} must define sli_ids"));
         for sli_id in sli_ids {
             let sli = sli_id.as_str().unwrap_or("");
+            let alias_target = alias_map.get(sli).and_then(Value::as_str);
             assert!(
-                known_ids.contains(sli),
-                "workflow {workflow_id} references unknown SLI id '{sli}'"
+                known_ids.contains(sli)
+                    || alias_target.is_some_and(|target| known_ids.contains(target)),
+                "workflow {workflow_id} references unknown SLI id '{sli}' (and no valid alias target)"
             );
         }
     }
@@ -822,6 +825,505 @@ fn perf_sli_phase_validation_consumers_include_dependent_beads() {
         assert!(
             consumer_ids.contains(required),
             "phase_validation_consumers must include dependent bead {required}"
+        );
+    }
+}
+
+#[test]
+fn perf_sli_epistemology_contract_is_versioned_and_reference_linked() {
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+
+    let version = perf["contract_version"]
+        .as_str()
+        .expect("perf_sli_matrix contract_version must be present");
+    let segments: Vec<&str> = version.split('.').collect();
+    assert!(
+        segments.len() == 3 && segments.iter().all(|part| part.parse::<u64>().is_ok()),
+        "contract_version must be semantic version (x.y.z), got: {version}"
+    );
+
+    let refs = &perf["contract_references"];
+    let mut linked_ids = HashSet::new();
+    for key in [
+        "ci_blocking_beads",
+        "certification_beads",
+        "reporting_beads",
+    ] {
+        let entries = refs[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("contract_references.{key} must be an array"));
+        assert!(
+            !entries.is_empty(),
+            "contract_references.{key} must not be empty"
+        );
+        for entry in entries {
+            let issue_id = entry["issue_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("contract_references.{key} entries need issue_id"));
+            linked_ids.insert(issue_id.to_string());
+        }
+    }
+
+    for required in ["bd-3ar8v.1.2", "bd-3ar8v.1.12", "bd-3ar8v.6.5"] {
+        assert!(
+            linked_ids.contains(required),
+            "perf epistemology contract must reference critical CI/cert/report bead {required}"
+        );
+    }
+}
+
+#[test]
+fn perf_sli_workload_partition_contract_is_versioned_and_complete() {
+    let matrix = load_json(SCENARIO_MATRIX_PATH);
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+    let run_all = load_text("scripts/e2e/run_all.sh");
+    let partition_contract = &perf["workload_partition_contract"];
+
+    let schema = partition_contract["schema"]
+        .as_str()
+        .expect("workload_partition_contract.schema must be present");
+    assert!(
+        schema.starts_with("pi.perf.workload_partition_contract."),
+        "workload_partition_contract.schema must be versioned, got: {schema}"
+    );
+
+    let version = partition_contract["contract_version"]
+        .as_str()
+        .expect("workload_partition_contract.contract_version must be present");
+    let segments: Vec<&str> = version.split('.').collect();
+    assert!(
+        segments.len() == 3 && segments.iter().all(|part| part.parse::<u64>().is_ok()),
+        "workload_partition_contract.contract_version must be semantic version (x.y.z), got: {version}"
+    );
+    assert_eq!(
+        partition_contract["bead_id"].as_str(),
+        Some("bd-3ar8v.1.10"),
+        "workload_partition_contract must be tied to bd-3ar8v.1.10"
+    );
+
+    let tags: HashSet<String> = perf["benchmark_partitions"]["partition_tags"]
+        .as_array()
+        .expect("benchmark_partitions.partition_tags must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    let expected_tags: HashSet<String> = ["matched-state", "realistic"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+    assert_eq!(
+        tags, expected_tags,
+        "benchmark_partitions.partition_tags must be exactly [matched-state, realistic]"
+    );
+
+    let script_refs = partition_contract["benchmark_script_references"]
+        .as_array()
+        .expect("workload_partition_contract.benchmark_script_references must be an array");
+    assert!(
+        !script_refs.is_empty(),
+        "workload_partition_contract must reference benchmark scripts"
+    );
+    for entry in script_refs {
+        let path = entry["path"]
+            .as_str()
+            .expect("benchmark_script_references entries must include path");
+        assert!(
+            std::path::Path::new(path).exists(),
+            "referenced benchmark script must exist: {path}"
+        );
+    }
+    assert!(
+        run_all.contains("docs/perf_sli_matrix.json"),
+        "scripts/e2e/run_all.sh must reference docs/perf_sli_matrix.json"
+    );
+
+    let metadata_fields: HashSet<String> = partition_contract["required_result_metadata_fields"]
+        .as_array()
+        .expect("workload_partition_contract.required_result_metadata_fields must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    for field in [
+        "workflow_id",
+        "workflow_class",
+        "suite_ids",
+        "vcr_mode",
+        "scenario_owner",
+    ] {
+        assert!(
+            metadata_fields.contains(field),
+            "required_result_metadata_fields must include {field}"
+        );
+    }
+
+    let workflow_ids: HashSet<String> = matrix["rows"]
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .filter_map(|row| row["workflow_id"].as_str().map(ToOwned::to_owned))
+        .collect();
+    let scenario_partition_coverage = partition_contract["scenario_partition_coverage"]
+        .as_array()
+        .expect("workload_partition_contract.scenario_partition_coverage must be an array");
+    let mut covered_workflows = HashSet::new();
+    for row in scenario_partition_coverage {
+        let workflow_id = row["workflow_id"]
+            .as_str()
+            .expect("scenario_partition_coverage entries must include workflow_id");
+        assert!(
+            workflow_ids.contains(workflow_id),
+            "scenario_partition_coverage references unknown workflow_id {workflow_id}"
+        );
+        covered_workflows.insert(workflow_id.to_string());
+        let required_partitions: HashSet<String> = row["required_partitions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{workflow_id} must include required_partitions"))
+            .iter()
+            .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+            .collect();
+        assert_eq!(
+            required_partitions, expected_tags,
+            "workflow {workflow_id} must require both matched-state and realistic partitions"
+        );
+    }
+    assert_eq!(
+        covered_workflows, workflow_ids,
+        "workload_partition_contract.scenario_partition_coverage must cover every workflow"
+    );
+
+    let release_policy = &partition_contract["release_claim_policy"];
+    assert_eq!(
+        release_policy["forbidden_single_partition_claim"].as_bool(),
+        Some(true),
+        "release_claim_policy.forbidden_single_partition_claim must be true"
+    );
+    let required_for_global: HashSet<String> =
+        release_policy["global_conclusion_requires_partitions"]
+            .as_array()
+            .expect("release_claim_policy.global_conclusion_requires_partitions must be an array")
+            .iter()
+            .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+            .collect();
+    assert_eq!(
+        required_for_global, expected_tags,
+        "release_claim_policy must require both partition tags for global conclusions"
+    );
+
+    let weights = &partition_contract["weighting_policy"]["decision_weights"];
+    let matched_weight = weights["matched-state"]
+        .as_f64()
+        .expect("weighting_policy.decision_weights.matched-state must be numeric");
+    let realistic_weight = weights["realistic"]
+        .as_f64()
+        .expect("weighting_policy.decision_weights.realistic must be numeric");
+    assert!(
+        (matched_weight + realistic_weight - 1.0).abs() < 1e-9,
+        "weighting_policy decision weights must sum to 1.0"
+    );
+    assert!(
+        realistic_weight > matched_weight,
+        "realistic partition weight must be greater than matched-state weight"
+    );
+}
+
+#[test]
+fn perf_sli_metric_hierarchy_has_three_levels_without_overlap() {
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+    let hierarchy = &perf["metric_hierarchy"];
+
+    let primary = hierarchy["primary"]
+        .as_array()
+        .expect("metric_hierarchy.primary must be an array");
+    let secondary = hierarchy["secondary"]
+        .as_array()
+        .expect("metric_hierarchy.secondary must be an array");
+    let tertiary = hierarchy["tertiary"]
+        .as_array()
+        .expect("metric_hierarchy.tertiary must be an array");
+
+    assert!(
+        !primary.is_empty(),
+        "metric_hierarchy.primary must not be empty"
+    );
+    assert!(
+        !secondary.is_empty(),
+        "metric_hierarchy.secondary must not be empty"
+    );
+    assert!(
+        !tertiary.is_empty(),
+        "metric_hierarchy.tertiary must not be empty"
+    );
+
+    let mut seen = HashSet::new();
+    for (level, items) in [
+        ("primary", primary),
+        ("secondary", secondary),
+        ("tertiary", tertiary),
+    ] {
+        for item in items {
+            let metric = item
+                .as_str()
+                .unwrap_or_else(|| panic!("metric_hierarchy.{level} items must be strings"));
+            assert!(
+                seen.insert(metric.to_string()),
+                "metric_hierarchy has duplicate metric id across levels: {metric}"
+            );
+        }
+    }
+
+    let rules = hierarchy["interpretation_rules"]
+        .as_array()
+        .expect("metric_hierarchy.interpretation_rules must be an array");
+    assert!(
+        !rules.is_empty(),
+        "metric_hierarchy.interpretation_rules must define at least one rule"
+    );
+}
+
+#[test]
+fn perf_sli_catalog_entries_define_priority_and_mandatory_interpretation_notes() {
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+    let catalog = perf["sli_catalog"]
+        .as_array()
+        .expect("perf_sli_matrix sli_catalog array");
+
+    for entry in catalog {
+        let sli_id = entry["sli_id"].as_str().unwrap_or("<unknown>");
+        let priority = entry["priority_level"].as_str().unwrap_or("");
+        assert!(
+            ["primary", "secondary", "tertiary"].contains(&priority),
+            "{sli_id} must declare priority_level as primary/secondary/tertiary"
+        );
+
+        let notes = entry["mandatory_interpretation_notes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{sli_id} must define mandatory_interpretation_notes"));
+        assert!(
+            !notes.is_empty(),
+            "{sli_id} must include at least one mandatory_interpretation_note"
+        );
+        for (idx, note) in notes.iter().enumerate() {
+            let text = note
+                .as_str()
+                .unwrap_or_else(|| panic!("{sli_id} interpretation note {idx} must be a string"));
+            assert!(
+                !text.trim().is_empty(),
+                "{sli_id} interpretation note {idx} must be non-empty"
+            );
+        }
+    }
+}
+
+#[test]
+fn perf_sli_reporting_contract_requires_absolute_and_relative_metrics_for_all_workflows() {
+    let matrix = load_json(SCENARIO_MATRIX_PATH);
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+    let reporting = &perf["reporting_contract"];
+
+    let required_fields = reporting["required_metric_fields"]
+        .as_array()
+        .expect("reporting_contract.required_metric_fields must be an array");
+    let required_field_set: HashSet<String> = required_fields
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+
+    for field in [
+        "scenario_id",
+        "workload_partition",
+        "scenario_metadata",
+        "sli_id",
+        "evidence_class",
+        "confidence",
+        "absolute_value",
+        "rust_vs_node_ratio",
+        "rust_vs_bun_ratio",
+        "correlation_id",
+    ] {
+        assert!(
+            required_field_set.contains(field),
+            "reporting_contract.required_metric_fields missing {field}"
+        );
+    }
+
+    let workflow_ids: HashSet<String> = matrix["rows"]
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .filter_map(|row| row["workflow_id"].as_str().map(ToOwned::to_owned))
+        .collect();
+    let required_scenarios: HashSet<String> = reporting["required_scenarios"]
+        .as_array()
+        .expect("reporting_contract.required_scenarios must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+
+    assert_eq!(
+        required_scenarios, workflow_ids,
+        "reporting_contract.required_scenarios must exactly match e2e_scenario_matrix workflows"
+    );
+
+    let required_partition_tags: HashSet<String> = reporting["required_partition_tags"]
+        .as_array()
+        .expect("reporting_contract.required_partition_tags must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    let expected_partition_tags: HashSet<String> = ["matched-state", "realistic"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+    assert_eq!(
+        required_partition_tags, expected_partition_tags,
+        "reporting_contract.required_partition_tags must be exactly [matched-state, realistic]"
+    );
+
+    let required_metadata_fields: HashSet<String> = reporting["required_scenario_metadata_fields"]
+        .as_array()
+        .expect("reporting_contract.required_scenario_metadata_fields must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    for field in [
+        "workflow_id",
+        "workflow_class",
+        "suite_ids",
+        "vcr_mode",
+        "scenario_owner",
+    ] {
+        assert!(
+            required_metadata_fields.contains(field),
+            "reporting_contract.required_scenario_metadata_fields missing {field}"
+        );
+    }
+
+    let scenario_requirements = reporting["scenario_requirements"]
+        .as_array()
+        .expect("reporting_contract.scenario_requirements must be an array");
+    for row in scenario_requirements {
+        let workflow_id = row["workflow_id"]
+            .as_str()
+            .expect("scenario_requirements entries need workflow_id");
+        assert!(
+            workflow_ids.contains(workflow_id),
+            "scenario_requirements references unknown workflow_id {workflow_id}"
+        );
+        assert_eq!(
+            row["required_absolute_metrics"].as_bool(),
+            Some(true),
+            "workflow {workflow_id} must require absolute metrics"
+        );
+        let ratios = row["required_relative_ratios"]
+            .as_array()
+            .unwrap_or_else(|| panic!("workflow {workflow_id} requires required_relative_ratios"));
+        let ratio_set: HashSet<&str> = ratios.iter().filter_map(Value::as_str).collect();
+        for required_ratio in ["rust_vs_node_ratio", "rust_vs_bun_ratio"] {
+            assert!(
+                ratio_set.contains(required_ratio),
+                "workflow {workflow_id} must require {required_ratio}"
+            );
+        }
+    }
+
+    let scenario_partition_requirements = reporting["scenario_partition_requirements"]
+        .as_array()
+        .expect("reporting_contract.scenario_partition_requirements must be an array");
+    let mut covered_workflows = HashSet::new();
+    for row in scenario_partition_requirements {
+        let workflow_id = row["workflow_id"]
+            .as_str()
+            .expect("scenario_partition_requirements entries need workflow_id");
+        assert!(
+            workflow_ids.contains(workflow_id),
+            "scenario_partition_requirements references unknown workflow_id {workflow_id}"
+        );
+        covered_workflows.insert(workflow_id.to_string());
+        let required_partitions: HashSet<String> = row["required_partitions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("workflow {workflow_id} requires required_partitions"))
+            .iter()
+            .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+            .collect();
+        assert_eq!(
+            required_partitions, expected_partition_tags,
+            "workflow {workflow_id} must require matched-state and realistic partitions"
+        );
+    }
+    assert_eq!(
+        covered_workflows, workflow_ids,
+        "scenario_partition_requirements must cover every required workflow"
+    );
+}
+
+#[test]
+fn perf_sli_confidence_and_evidence_labels_are_machine_enforced() {
+    let perf = load_json(PERF_SLI_MATRIX_PATH);
+
+    let evidence_class: Vec<&str> = perf["evidence_labels"]["evidence_class"]
+        .as_array()
+        .expect("evidence_labels.evidence_class must be an array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        evidence_class,
+        vec!["measured", "inferred"],
+        "evidence_labels.evidence_class must be [measured, inferred]"
+    );
+
+    let confidence_labels: Vec<&str> = perf["evidence_labels"]["confidence"]
+        .as_array()
+        .expect("evidence_labels.confidence must be an array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        confidence_labels,
+        vec!["high", "medium", "low"],
+        "evidence_labels.confidence must be [high, medium, low]"
+    );
+
+    let ci = &perf["ci_enforcement"];
+    let required_result_fields: HashSet<String> = ci["required_result_fields"]
+        .as_array()
+        .expect("ci_enforcement.required_result_fields must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    for field in [
+        "evidence_class",
+        "confidence",
+        "absolute_value",
+        "rust_vs_node_ratio",
+        "rust_vs_bun_ratio",
+        "workload_partition",
+        "scenario_metadata",
+    ] {
+        assert!(
+            required_result_fields.contains(field),
+            "ci_enforcement.required_result_fields must include {field}"
+        );
+    }
+
+    let fail_closed: HashSet<String> = ci["fail_closed_conditions"]
+        .as_array()
+        .expect("ci_enforcement.fail_closed_conditions must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    for condition in [
+        "missing_absolute_or_relative_values",
+        "missing_workload_partition_tag",
+        "missing_scenario_metadata",
+        "invalid_evidence_class",
+        "invalid_confidence_label",
+        "microbench_only_claim",
+        "global_claim_missing_partition_coverage",
+    ] {
+        assert!(
+            fail_closed.contains(condition),
+            "ci_enforcement.fail_closed_conditions must include {condition}"
         );
     }
 }
@@ -1272,5 +1774,306 @@ fn all_doc_files_referenced_in_runbook_exist() {
             std::path::Path::new(path).exists(),
             "referenced doc must exist: {path}"
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Section: Unified Structured Logging Contract (bd-3ar8v.1.7)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const EVIDENCE_LOGGING_CONTRACT_PATH: &str = "docs/schema/test_evidence_logging_contract.json";
+const EVIDENCE_LOGGING_INSTANCE_PATH: &str = "docs/schema/test_evidence_logging_instance.json";
+
+#[test]
+fn evidence_logging_contract_schema_exists_and_is_valid_json() {
+    let schema = load_json(EVIDENCE_LOGGING_CONTRACT_PATH);
+    assert_eq!(
+        schema["$id"], "pi.test.evidence_logging_contract.v1",
+        "contract schema must have correct $id"
+    );
+    assert_eq!(
+        schema["version"], "1.0.0",
+        "contract schema must be versioned"
+    );
+}
+
+#[test]
+fn evidence_logging_contract_defines_all_required_sections() {
+    let schema = load_json(EVIDENCE_LOGGING_CONTRACT_PATH);
+    let required = schema["required"]
+        .as_array()
+        .expect("must have required array");
+    let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+    for section in &[
+        "schema_registry",
+        "suite_requirements",
+        "correlation_model",
+        "perf_evidence_contract",
+        "bead_coverage_contract",
+    ] {
+        assert!(
+            required_strs.contains(section),
+            "contract must require section: {section}"
+        );
+    }
+}
+
+#[test]
+fn evidence_logging_instance_exists_and_has_schema_registry() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let schemas = instance["schema_registry"]["schemas"]
+        .as_array()
+        .expect("instance must have schema_registry.schemas array");
+    assert!(
+        schemas.len() >= 10,
+        "registry must contain at least 10 schemas, found {}",
+        schemas.len()
+    );
+}
+
+#[test]
+fn evidence_logging_instance_schema_registry_contains_all_canonical_schemas() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let schemas = instance["schema_registry"]["schemas"]
+        .as_array()
+        .expect("schemas array");
+    let schema_ids: HashSet<&str> = schemas
+        .iter()
+        .filter_map(|s| s["schema_id"].as_str())
+        .collect();
+
+    let required_schemas = [
+        "pi.test.log.v2",
+        "pi.test.artifact.v1",
+        "pi.qa.evidence_contract.v1",
+        "pi.e2e.failure_digest.v1",
+        "pi.parity.test_logging_contract.v1",
+        "pi.ext.rust_bench.v1",
+        "pi.perf.budget.v1",
+        "pi.bench.protocol.v1",
+        "pi.perf.sli_ux_matrix.v1",
+        "pi.test.transcript.v1",
+    ];
+    for schema_id in &required_schemas {
+        assert!(
+            schema_ids.contains(schema_id),
+            "registry must contain schema: {schema_id}"
+        );
+    }
+}
+
+#[test]
+fn evidence_logging_instance_has_schema_relationships() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let relationships = instance["schema_registry"]["schema_relationships"]
+        .as_array()
+        .expect("must have schema_relationships array");
+    assert!(
+        relationships.len() >= 5,
+        "must have at least 5 schema relationships, found {}",
+        relationships.len()
+    );
+    // Verify evidence contract references test log schema
+    let has_evidence_to_log = relationships.iter().any(|r| {
+        r["from_schema"] == "pi.qa.evidence_contract.v1" && r["to_schema"] == "pi.test.log.v2"
+    });
+    assert!(
+        has_evidence_to_log,
+        "must have evidence_contract -> test_log relationship"
+    );
+}
+
+#[test]
+fn evidence_logging_instance_suite_requirements_cover_all_suites() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let suites = instance["suite_requirements"]
+        .as_object()
+        .expect("must have suite_requirements object");
+    for suite in &["unit", "vcr", "e2e", "perf_bench", "perf_regression"] {
+        assert!(
+            suites.contains_key(*suite),
+            "suite_requirements must define: {suite}"
+        );
+        let req = &suites[*suite];
+        assert!(
+            req["required_schemas"].as_array().is_some(),
+            "{suite} must have required_schemas"
+        );
+        assert!(
+            req["evidence_level"].as_str().is_some(),
+            "{suite} must have evidence_level"
+        );
+    }
+}
+
+#[test]
+fn evidence_logging_instance_e2e_suite_requires_forensic_evidence() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let e2e = &instance["suite_requirements"]["e2e"];
+    assert_eq!(
+        e2e["evidence_level"], "forensic",
+        "e2e suite must require forensic evidence level"
+    );
+    assert_eq!(
+        e2e["correlation_required"], true,
+        "e2e suite must require correlation"
+    );
+    assert_eq!(
+        e2e["artifact_checksums_required"], true,
+        "e2e suite must require artifact checksums"
+    );
+}
+
+#[test]
+fn evidence_logging_instance_correlation_model_has_four_levels() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let levels = instance["correlation_model"]["levels"]
+        .as_array()
+        .expect("must have correlation levels");
+    assert_eq!(
+        levels.len(),
+        4,
+        "correlation model must have exactly 4 levels (ci_run, suite, test, operation)"
+    );
+    let scopes: Vec<&str> = levels.iter().filter_map(|l| l["scope"].as_str()).collect();
+    assert!(scopes.contains(&"ci_run"));
+    assert!(scopes.contains(&"suite"));
+    assert!(scopes.contains(&"test"));
+    assert!(scopes.contains(&"operation"));
+}
+
+#[test]
+fn evidence_logging_instance_join_keys_are_complete() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let keys = instance["correlation_model"]["join_keys"]
+        .as_object()
+        .expect("must have join_keys object");
+    for key in &[
+        "ci_run_to_evidence",
+        "evidence_to_suite",
+        "suite_to_log",
+        "log_to_span",
+        "bench_to_evidence",
+    ] {
+        assert!(keys.contains_key(*key), "join_keys must define: {key}");
+    }
+}
+
+#[test]
+fn evidence_logging_instance_cross_domain_paths_exist() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let paths = instance["correlation_model"]["cross_domain_paths"]
+        .as_array()
+        .expect("must have cross_domain_paths");
+    assert!(
+        paths.len() >= 3,
+        "must have at least 3 cross-domain forensic paths"
+    );
+    let names: Vec<&str> = paths.iter().filter_map(|p| p["name"].as_str()).collect();
+    assert!(
+        names.contains(&"bead_to_evidence"),
+        "must define bead_to_evidence path"
+    );
+    assert!(
+        names.contains(&"failure_to_replay"),
+        "must define failure_to_replay path"
+    );
+    assert!(
+        names.contains(&"perf_claim_to_measurements"),
+        "must define perf_claim_to_measurements path"
+    );
+}
+
+#[test]
+fn evidence_logging_instance_perf_evidence_contract_is_complete() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let perf = &instance["perf_evidence_contract"];
+    assert_eq!(
+        perf["schema"], "pi.perf.evidence.v1",
+        "perf evidence must use pi.perf.evidence.v1 schema"
+    );
+    // Must define required record types
+    let record_types = perf["required_record_types"]
+        .as_array()
+        .expect("must have required_record_types");
+    assert!(
+        record_types.len() >= 4,
+        "must define at least 4 record types"
+    );
+    // Must define env fingerprint fields
+    let env_fields = perf["env_fingerprint_fields"]
+        .as_array()
+        .expect("must have env_fingerprint_fields");
+    assert!(
+        env_fields.len() >= 5,
+        "must require at least 5 env fingerprint fields"
+    );
+    // Must define no_data policy as hard_fail
+    assert_eq!(
+        perf["no_data_policy"]["action"], "hard_fail",
+        "NO_DATA must be treated as hard failure"
+    );
+}
+
+#[test]
+fn evidence_logging_instance_bead_coverage_contract_is_complete() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let coverage = &instance["bead_coverage_contract"];
+    assert_eq!(
+        coverage["schema"], "pi.perf.bead_coverage.v1",
+        "bead coverage must use pi.perf.bead_coverage.v1 schema"
+    );
+    // Must define coverage policy
+    let policy = &coverage["coverage_policy"];
+    assert_eq!(
+        policy["min_evidence_per_bead"], 1,
+        "every bead must have at least 1 evidence link"
+    );
+    // Must define allowed evidence types
+    let types = policy["allowed_evidence_types"]
+        .as_array()
+        .expect("must have allowed_evidence_types");
+    assert!(types.len() >= 4, "must allow at least 4 evidence types");
+}
+
+#[test]
+fn evidence_logging_instance_schema_source_files_exist() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let schemas = instance["schema_registry"]["schemas"]
+        .as_array()
+        .expect("schemas array");
+    for schema in schemas {
+        let schema_id = schema["schema_id"].as_str().unwrap_or("unknown");
+        let sources = schema["source_files"]
+            .as_array()
+            .unwrap_or_else(|| panic!("schema {schema_id} must have source_files"));
+        for src in sources {
+            let path = src.as_str().unwrap();
+            assert!(
+                std::path::Path::new(path).exists(),
+                "source file for {schema_id} must exist: {path}"
+            );
+        }
+    }
+}
+
+#[test]
+fn evidence_logging_contract_perf_statistical_fields_include_required_percentiles() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let percentiles =
+        instance["perf_evidence_contract"]["statistical_fields"]["required_percentiles"]
+            .as_array()
+            .expect("must have required_percentiles");
+    let p_strs: Vec<&str> = percentiles.iter().filter_map(|v| v.as_str()).collect();
+    for p in &["p50", "p95", "p99"] {
+        assert!(p_strs.contains(p), "required_percentiles must include {p}");
+    }
+    let aggregates =
+        instance["perf_evidence_contract"]["statistical_fields"]["required_aggregates"]
+            .as_array()
+            .expect("must have required_aggregates");
+    let a_strs: Vec<&str> = aggregates.iter().filter_map(|v| v.as_str()).collect();
+    for a in &["min", "max", "mean", "count"] {
+        assert!(a_strs.contains(a), "required_aggregates must include {a}");
     }
 }
