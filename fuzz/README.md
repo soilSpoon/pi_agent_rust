@@ -66,6 +66,33 @@ for t in \
   done
 ```
 
+## Coverage Dashboard (`bd-1akey`)
+
+Use `fuzz/generate-coverage.sh` for local coverage snapshots and trend tracking.
+The script runs `cargo fuzz coverage` per target, extracts llvm-cov percentages
+when available, and writes machine-readable report artifacts.
+
+```bash
+# Single target coverage snapshot
+./fuzz/generate-coverage.sh --target=fuzz_sse_parser --runs=0 --require-rch
+
+# Multiple targets with a small additional run budget
+./fuzz/generate-coverage.sh --target=fuzz_sse_parser --target=fuzz_provider_event --runs=25 --require-rch
+```
+
+Generated artifacts (default paths):
+- `fuzz/reports/fuzz_coverage_*.json` (schema: `pi.fuzz.coverage_report.v1`)
+- `fuzz/reports/fuzz_coverage_history.jsonl` append-only trend history
+- `fuzz/reports/fuzz_coverage_*_llvm_summary.json` per-target llvm summary export
+- `fuzz/reports/fuzz_coverage_*.log` run log
+
+Coverage report fields include per-target line/function/region percentages and
+target status, suitable for CI ingestion and historical trend analysis.
+
+CI also runs a dedicated dashboard job in `.github/workflows/fuzz.yml`
+(`fuzz-coverage-dashboard`) that emits Markdown plus JSON artifacts with line
+and branch coverage breakdowns.
+
 ## Phase 1 Validation Suite (`bd-26ecm`)
 
 Use the P1 validator to run the curated Phase 1 proptest matrix and emit a

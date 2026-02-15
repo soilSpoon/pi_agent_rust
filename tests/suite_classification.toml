@@ -29,6 +29,8 @@ files = [
     "e2e_artifact_retention_triage",
     "e2e_replay_bundle_validation",
     "error_types",
+    "fuzz_regression",
+    "fuzz_regression_generated",
     "extension_scoring",
     "extensions_auth_error_coverage",
     "mock_spec_schema",

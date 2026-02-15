@@ -19,9 +19,11 @@ Before migration, pin these artifacts as your source of truth:
 - Surface inventory: `docs/dropin-feature-inventory-matrix.json`
 - Gap ledger: `docs/dropin-parity-gap-ledger.json`
 - Certification gates: `docs/dropin-certification-contract.json`
-- Current parity status: `docs/parity-certification.json`
+- Certification verdict artifact (strict claim gate): `docs/dropin-certification-verdict.json`
+- Current parity status snapshot (informational): `docs/parity-certification.json`
 
 If your required workflow maps to an open `critical`/`high` gap in `docs/dropin-parity-gap-ledger.json`, treat migration as blocked until that gap is closed or explicitly waived for your environment.
+If `docs/dropin-certification-verdict.json` is missing or not `overall_verdict = CERTIFIED`, treat strict drop-in replacement messaging as blocked.
 
 ## Migration Outcomes
 
@@ -205,6 +207,7 @@ Before promoting to production, capture and store:
 Recommended gate policy:
 - Block rollout if any required surface fails.
 - Block rollout if an unresolved `critical` parity gap affects your workflow.
+- Block strict drop-in replacement messaging unless `docs/dropin-certification-verdict.json` exists and reports `overall_verdict = CERTIFIED`.
 - Require sign-off that references the artifact set used for the decision.
 
 ## Rollback Plan
@@ -219,7 +222,7 @@ If compatibility fails in canary or production:
 ## Fast Checklist
 
 ```text
-[ ] Baseline/gap/certification artifacts reviewed
+[ ] Baseline/gap/certification artifacts reviewed (including drop-in verdict)
 [ ] Required surfaces identified
 [ ] Install strategy selected (canonical vs canary)
 [ ] Config + credential migration completed
@@ -236,6 +239,7 @@ If compatibility fails in canary or production:
 - `docs/dropin-feature-inventory-matrix.json`
 - `docs/dropin-parity-gap-ledger.json`
 - `docs/dropin-certification-contract.json`
+- `docs/dropin-certification-verdict.json`
 - `docs/parity-certification.json`
 - `docs/rpc.md`
 - `docs/session.md`
