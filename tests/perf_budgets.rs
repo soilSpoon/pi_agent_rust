@@ -94,7 +94,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p99 per-call latency",
         unit: "us",
         threshold: 200.0,
-        methodology: "pijs_workload: 2000 iterations x 1 tool call, release build",
+        methodology: "pijs_workload: 2000 iterations x 1 tool call, perf profile",
         ci_enforced: true,
     },
     Budget {
@@ -103,7 +103,7 @@ const BUDGETS: &[Budget] = &[
         metric: "minimum calls/sec",
         unit: "calls/sec",
         threshold: 5000.0, // Must exceed 5k calls/sec
-        methodology: "pijs_workload: 2000 iterations x 10 tool calls, release build",
+        methodology: "pijs_workload: 2000 iterations x 10 tool calls, perf profile",
         ci_enforced: true,
     },
     // ── Event Dispatch ───────────────────────────────────────────────────
@@ -252,8 +252,7 @@ fn check_budget(budget: &Budget) -> BudgetResult {
 }
 
 fn read_pijs_workload_latency(root: &Path) -> (Option<f64>, String) {
-    let path = root.join("target/perf/pijs_workload.jsonl");
-    let events = read_jsonl_file(&path);
+    let (events, source) = read_pijs_workload_events(root);
     for event in &events {
         if event
             .get("tool_calls_per_iteration")
@@ -261,7 +260,7 @@ fn read_pijs_workload_latency(root: &Path) -> (Option<f64>, String) {
             == Some(1)
         {
             if let Some(us) = event.get("per_call_us").and_then(Value::as_f64) {
-                return (Some(us), "target/perf/pijs_workload.jsonl".to_string());
+                return (Some(us), source);
             }
         }
     }
@@ -269,8 +268,7 @@ fn read_pijs_workload_latency(root: &Path) -> (Option<f64>, String) {
 }
 
 fn read_pijs_workload_throughput(root: &Path) -> (Option<f64>, String) {
-    let path = root.join("target/perf/pijs_workload.jsonl");
-    let events = read_jsonl_file(&path);
+    let (events, source) = read_pijs_workload_events(root);
     for event in &events {
         if event
             .get("tool_calls_per_iteration")
@@ -278,11 +276,31 @@ fn read_pijs_workload_throughput(root: &Path) -> (Option<f64>, String) {
             == Some(10)
         {
             if let Some(cps) = event.get("calls_per_sec").and_then(Value::as_f64) {
-                return (Some(cps), "target/perf/pijs_workload.jsonl".to_string());
+                return (Some(cps), source);
             }
         }
     }
     (None, "no pijs_workload data".to_string())
+}
+
+fn read_pijs_workload_events(root: &Path) -> (Vec<Value>, String) {
+    for relative_path in pijs_workload_candidate_paths() {
+        let full_path = root.join(relative_path);
+        let events = read_jsonl_file(&full_path);
+        if !events.is_empty() {
+            return (events, relative_path.to_string());
+        }
+    }
+    (Vec::new(), "no pijs_workload data".to_string())
+}
+
+const fn pijs_workload_candidate_paths() -> &'static [&'static str] {
+    &[
+        "target/perf/perf/pijs_workload_perf.jsonl",
+        "target/perf/release/pijs_workload_release.jsonl",
+        "target/perf/debug/pijs_workload_debug.jsonl",
+        "target/perf/pijs_workload.jsonl",
+    ]
 }
 
 fn read_criterion_load_time(root: &Path, ext: &str) -> (Option<f64>, String) {
@@ -621,6 +639,56 @@ fn check_tool_call_throughput_budget() {
             budget.threshold
         );
     }
+}
+
+#[test]
+fn pijs_workload_profile_field_is_present_when_data_exists() {
+    let root = project_root();
+    let (events, source) = read_pijs_workload_events(&root);
+    if events.is_empty() {
+        eprintln!("[budget] No pijs_workload data — skipping profile field check");
+        return;
+    }
+
+    for event in &events {
+        let profile = event
+            .get("build_profile")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            !profile.trim().is_empty(),
+            "pijs_workload event missing non-empty build_profile in {source}: {event}"
+        );
+    }
+}
+
+#[test]
+fn pijs_workload_reader_prefers_profile_labeled_artifact_path() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let profile_dir = tmp.path().join("target/perf/perf");
+    std::fs::create_dir_all(&profile_dir).expect("create profile perf dir");
+    let path = profile_dir.join("pijs_workload_perf.jsonl");
+    let payload = json!({
+        "schema": "pi.perf.workload.v1",
+        "tool": "pijs_workload",
+        "scenario": "tool_call_roundtrip",
+        "iterations": 200,
+        "tool_calls_per_iteration": 1,
+        "total_calls": 200,
+        "elapsed_ms": 10,
+        "per_call_us": 50.0,
+        "calls_per_sec": 20000.0,
+        "build_profile": "perf"
+    });
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&payload).unwrap_or_default()),
+    )
+    .expect("write pijs workload profile artifact");
+
+    let (latency, source) = read_pijs_workload_latency(tmp.path());
+    assert_eq!(latency, Some(50.0));
+    assert_eq!(source, "target/perf/perf/pijs_workload_perf.jsonl");
 }
 
 #[test]

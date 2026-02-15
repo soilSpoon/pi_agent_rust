@@ -85,9 +85,11 @@ pub mod scheduler;
 pub mod sdk;
 pub mod session;
 pub mod session_index;
+pub mod session_metrics;
 pub mod session_picker;
 #[cfg(feature = "sqlite-sessions")]
 pub mod session_sqlite;
+pub mod session_store_v2;
 pub mod sse;
 pub mod terminal_images;
 pub mod theme;

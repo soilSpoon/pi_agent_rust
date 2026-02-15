@@ -1221,12 +1221,19 @@ impl Tool for ReadTool {
 
         // Clamp end_line to avoid huge allocations if the range is much larger than what we'll display.
         // We add 1 to the limit so that if there are more lines, truncate_head detects it.
-        let display_limit = DEFAULT_MAX_LINES.saturating_add(1);
+        //
+        // If user provided an explicit limit, respect it (up to byte limits) by using it as the base
+        // for clamping. Otherwise use the default truncation limit.
+        let max_lines_for_truncation = input
+            .limit
+            .and_then(|l| usize::try_from(l).ok())
+            .unwrap_or(DEFAULT_MAX_LINES);
+        let display_limit = max_lines_for_truncation.saturating_add(1);
         let clamped_end_line = end_line.min(start_line.saturating_add(display_limit));
 
         // Format lines with line numbers (cat -n style)
         // Format: "     N→content" where N is right-aligned
-        let max_line_num = end_line;
+        let max_line_num = clamped_end_line;
         let line_num_width = max_line_num.to_string().len().max(5);
 
         // Iterate lines lazily
@@ -1253,7 +1260,11 @@ impl Tool for ReadTool {
             let _ = write!(selected_content, "{line_num:>line_num_width$}→{line}");
         }
 
-        let mut truncation = truncate_head(selected_content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let mut truncation = truncate_head(
+            selected_content,
+            max_lines_for_truncation,
+            DEFAULT_MAX_BYTES,
+        );
         // `selected_content` may be clamped to keep allocations bounded, but truncation details should
         // still report the full file line count so consumers can reason about "how much is left".
         truncation.total_lines = total_file_lines;
@@ -3485,18 +3496,28 @@ async fn ingest_bash_chunk(chunk: &[u8], state: &mut BashOutputState) -> Result<
         let id_full = Uuid::new_v4().simple().to_string();
         let id = &id_full[..16];
         let path = std::env::temp_dir().join(format!("pi-bash-{id}.log"));
-        let mut file = asupersync::fs::File::create(&path)
-            .await
-            .map_err(|e| Error::tool("bash", e.to_string()))?;
-
-        #[cfg(unix)]
+        // Create the file synchronously with restricted permissions to avoid
+        // a race condition where the file is world-readable before we fix it.
         {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = std::fs::Permissions::from_mode(0o600);
-            file.set_permissions(permissions).await.map_err(|e| {
-                Error::tool("bash", format!("Failed to set temp file permissions: {e}"))
-            })?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            let _ = options
+                .open(&path)
+                .map_err(|e| Error::tool("bash", format!("Failed to create temp file: {e}")))?;
         }
+
+        let mut file = asupersync::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .map_err(|e| Error::tool("bash", format!("Failed to open temp file: {e}")))?;
 
         // Write buffered chunks to file first so it contains output from the beginning.
         for existing in &state.chunks {
@@ -4006,6 +4027,39 @@ mod tests {
             let msg = err.unwrap_err().to_string();
             assert!(msg.contains("beyond end of file"));
         });
+    }
+
+    #[test]
+    fn test_map_normalized_with_trailing_whitespace() {
+        // "A   \nB" -> "A\nB" (normalized strips trailing spaces)
+        let content = "A   \nB";
+
+        // Find "A" (norm idx 0)
+        let (start, len) = map_normalized_range_to_original(content, 0, 1);
+        assert_eq!(start, 0);
+        assert_eq!(len, 1);
+        assert_eq!(&content[start..start + len], "A");
+
+        // Find "\n" (norm idx 1)
+        // Original: "A" (0) + "   " (1,2,3) + "\n" (4)
+        // map_normalized_range_to_original logic:
+        // Line 1: "A   ". trimmed len 1 ("A").
+        // "A" (0): norm 0 matches. match_start=0. norm 1.
+        // loop ends. orig_idx -> 4.
+        // has_newline: true.
+        // norm 1 matches? Yes. match_start = orig_idx(4).
+        // norm 2. orig_idx 5.
+        // The test above asserted start=4.
+        let (start, len) = map_normalized_range_to_original(content, 1, 1);
+        assert_eq!(start, 4);
+        assert_eq!(len, 1);
+        assert_eq!(&content[start..start + len], "\n");
+
+        // Find "B" (norm idx 2)
+        let (start, len) = map_normalized_range_to_original(content, 2, 1);
+        assert_eq!(start, 5);
+        assert_eq!(len, 1);
+        assert_eq!(&content[start..start + len], "B");
     }
 
     #[test]

@@ -37,8 +37,139 @@
       "field": "config_hash"
     }
   ],
+  "protocol_contract": {
+    "evidence_labels": {
+      "confidence": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "evidence_class": [
+        "measured",
+        "inferred"
+      ]
+    },
+    "matched_state_scenarios": [
+      {
+        "replay_input": {
+          "extension_fixture_set": [
+            "hello",
+            "pirate",
+            "diff"
+          ],
+          "runs": 5
+        },
+        "scenario": "cold_start"
+      },
+      {
+        "replay_input": {
+          "extension_fixture_set": [
+            "hello",
+            "pirate",
+            "diff"
+          ],
+          "runs": 5
+        },
+        "scenario": "warm_start"
+      },
+      {
+        "replay_input": {
+          "extension_fixture_set": [
+            "hello",
+            "pirate",
+            "diff"
+          ],
+          "iterations": 500
+        },
+        "scenario": "tool_call"
+      },
+      {
+        "replay_input": {
+          "event_name": "before_agent_start",
+          "iterations": 500
+        },
+        "scenario": "event_dispatch"
+      }
+    ],
+    "partition_tags": [
+      "matched-state",
+      "realistic"
+    ],
+    "realistic_replay_inputs": [
+      {
+        "partition": "realistic",
+        "replay_input": {
+          "mode": "replay",
+          "seed": 7,
+          "transcript_fixture": "tests/artifacts/perf/session_100000.jsonl"
+        },
+        "scenario_id": "realistic/session_100000",
+        "session_messages": 100000
+      },
+      {
+        "partition": "realistic",
+        "replay_input": {
+          "mode": "replay",
+          "seed": 7,
+          "transcript_fixture": "tests/artifacts/perf/session_200000.jsonl"
+        },
+        "scenario_id": "realistic/session_200000",
+        "session_messages": 200000
+      },
+      {
+        "partition": "realistic",
+        "replay_input": {
+          "mode": "replay",
+          "seed": 7,
+          "transcript_fixture": "tests/artifacts/perf/session_500000.jsonl"
+        },
+        "scenario_id": "realistic/session_500000",
+        "session_messages": 500000
+      },
+      {
+        "partition": "realistic",
+        "replay_input": {
+          "mode": "replay",
+          "seed": 7,
+          "transcript_fixture": "tests/artifacts/perf/session_1000000.jsonl"
+        },
+        "scenario_id": "realistic/session_1000000",
+        "session_messages": 1000000
+      },
+      {
+        "partition": "realistic",
+        "replay_input": {
+          "mode": "replay",
+          "seed": 7,
+          "transcript_fixture": "tests/artifacts/perf/session_5000000.jsonl"
+        },
+        "scenario_id": "realistic/session_5000000",
+        "session_messages": 5000000
+      }
+    ],
+    "realistic_session_sizes": [
+      100000,
+      200000,
+      500000,
+      1000000,
+      5000000
+    ],
+    "required_metadata_fields": [
+      "runtime",
+      "build_profile",
+      "host",
+      "scenario_id",
+      "correlation_id"
+    ],
+    "schema": "pi.bench.protocol.v1",
+    "version": "1.0.0"
+  },
   "schema": "pi.bench.schema_registry.v1",
   "schemas": [
+    {
+      "description": "Canonical benchmark protocol contract (partitions, datasets, metadata, replay inputs)",
+      "name": "pi.bench.protocol.v1"
+    },
     {
       "description": "Rust QuickJS extension benchmark event (load, tool call, event hook)",
       "name": "pi.ext.rust_bench.v1"

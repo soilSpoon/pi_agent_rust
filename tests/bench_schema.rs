@@ -10,6 +10,7 @@
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::doc_markdown,
+    clippy::too_many_lines,
     dead_code
 )]
 
@@ -99,6 +100,10 @@ pub struct BudgetEvent {
 /// Known JSONL schemas with version and description.
 const SCHEMAS: &[(&str, &str)] = &[
     (
+        "pi.bench.protocol.v1",
+        "Canonical benchmark protocol contract (partitions, datasets, metadata, replay inputs)",
+    ),
+    (
         "pi.ext.rust_bench.v1",
         "Rust QuickJS extension benchmark event (load, tool call, event hook)",
     ),
@@ -154,6 +159,17 @@ const ENV_FINGERPRINT_FIELDS: &[(&str, &str)] = &[
     ("config_hash", "SHA-256 of env fields for dedup"),
 ];
 
+const BENCH_PROTOCOL_SCHEMA: &str = "pi.bench.protocol.v1";
+const BENCH_PROTOCOL_VERSION: &str = "1.0.0";
+const PARTITION_MATCHED_STATE: &str = "matched-state";
+const PARTITION_REALISTIC: &str = "realistic";
+const EVIDENCE_CLASS_MEASURED: &str = "measured";
+const EVIDENCE_CLASS_INFERRED: &str = "inferred";
+const CONFIDENCE_HIGH: &str = "high";
+const CONFIDENCE_MEDIUM: &str = "medium";
+const CONFIDENCE_LOW: &str = "low";
+const REALISTIC_SESSION_SIZES: &[u64] = &[100_000, 200_000, 500_000, 1_000_000, 5_000_000];
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn project_root() -> PathBuf {
@@ -179,6 +195,176 @@ fn has_required_fields(record: &Value, fields: &[&str]) -> Vec<String> {
         }
     }
     missing
+}
+
+fn canonical_protocol_contract() -> Value {
+    let realistic_replay_inputs = REALISTIC_SESSION_SIZES
+        .iter()
+        .map(|messages| {
+            json!({
+                "scenario_id": format!("realistic/session_{messages}"),
+                "partition": PARTITION_REALISTIC,
+                "session_messages": messages,
+                "replay_input": {
+                    "transcript_fixture": format!("tests/artifacts/perf/session_{messages}.jsonl"),
+                    "seed": 7,
+                    "mode": "replay",
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "schema": BENCH_PROTOCOL_SCHEMA,
+        "version": BENCH_PROTOCOL_VERSION,
+        "partition_tags": [PARTITION_MATCHED_STATE, PARTITION_REALISTIC],
+        "realistic_session_sizes": REALISTIC_SESSION_SIZES,
+        "matched_state_scenarios": [
+            {
+                "scenario": "cold_start",
+                "replay_input": { "runs": 5, "extension_fixture_set": ["hello", "pirate", "diff"] },
+            },
+            {
+                "scenario": "warm_start",
+                "replay_input": { "runs": 5, "extension_fixture_set": ["hello", "pirate", "diff"] },
+            },
+            {
+                "scenario": "tool_call",
+                "replay_input": { "iterations": 500, "extension_fixture_set": ["hello", "pirate", "diff"] },
+            },
+            {
+                "scenario": "event_dispatch",
+                "replay_input": { "iterations": 500, "event_name": "before_agent_start" },
+            },
+        ],
+        "realistic_replay_inputs": realistic_replay_inputs,
+        "required_metadata_fields": [
+            "runtime",
+            "build_profile",
+            "host",
+            "scenario_id",
+            "correlation_id",
+        ],
+        "evidence_labels": {
+            "evidence_class": [EVIDENCE_CLASS_MEASURED, EVIDENCE_CLASS_INFERRED],
+            "confidence": [CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW],
+        },
+    })
+}
+
+fn validate_protocol_record(record: &Value) -> Result<(), String> {
+    let required = [
+        "protocol_schema",
+        "protocol_version",
+        "partition",
+        "evidence_class",
+        "confidence",
+        "correlation_id",
+        "scenario_metadata",
+    ];
+    let missing = has_required_fields(record, &required);
+    if !missing.is_empty() {
+        return Err(format!("missing required fields: {missing:?}"));
+    }
+
+    let protocol_schema = record
+        .get("protocol_schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if protocol_schema != BENCH_PROTOCOL_SCHEMA {
+        return Err(format!("unexpected protocol_schema: {protocol_schema}"));
+    }
+
+    let protocol_version = record
+        .get("protocol_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if protocol_version != BENCH_PROTOCOL_VERSION {
+        return Err(format!("unexpected protocol_version: {protocol_version}"));
+    }
+
+    let partition = record
+        .get("partition")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(partition, PARTITION_MATCHED_STATE | PARTITION_REALISTIC) {
+        return Err(format!("invalid partition: {partition}"));
+    }
+
+    let evidence_class = record
+        .get("evidence_class")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        evidence_class,
+        EVIDENCE_CLASS_MEASURED | EVIDENCE_CLASS_INFERRED
+    ) {
+        return Err(format!("invalid evidence_class: {evidence_class}"));
+    }
+
+    let confidence = record
+        .get("confidence")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        confidence,
+        CONFIDENCE_HIGH | CONFIDENCE_MEDIUM | CONFIDENCE_LOW
+    ) {
+        return Err(format!("invalid confidence: {confidence}"));
+    }
+
+    let correlation_id = record
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if correlation_id.trim().is_empty() {
+        return Err("correlation_id must be non-empty".to_string());
+    }
+
+    let metadata = record
+        .get("scenario_metadata")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "scenario_metadata must be an object".to_string())?;
+
+    for key in &[
+        "runtime",
+        "build_profile",
+        "host",
+        "scenario_id",
+        "replay_input",
+    ] {
+        if !metadata.contains_key(*key) {
+            return Err(format!("scenario_metadata missing {key}"));
+        }
+    }
+
+    let host = metadata
+        .get("host")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "scenario_metadata.host must be an object".to_string())?;
+    for key in &["os", "arch", "cpu_model", "cpu_cores"] {
+        if !host.contains_key(*key) {
+            return Err(format!("scenario_metadata.host missing {key}"));
+        }
+    }
+
+    if partition == PARTITION_REALISTIC {
+        let replay = metadata
+            .get("replay_input")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "realistic partition requires object replay_input".to_string())?;
+        let size = replay
+            .get("session_messages")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "realistic replay_input requires session_messages".to_string())?;
+        if !REALISTIC_SESSION_SIZES.contains(&size) {
+            return Err(format!(
+                "unsupported realistic session_messages: {size} (expected one of {REALISTIC_SESSION_SIZES:?})"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -217,7 +403,318 @@ fn env_fingerprint_fields_documented() {
 }
 
 #[test]
+fn protocol_contract_covers_realistic_and_matched_state_partitions() {
+    let contract = canonical_protocol_contract();
+    assert_eq!(
+        contract.get("schema").and_then(Value::as_str),
+        Some(BENCH_PROTOCOL_SCHEMA)
+    );
+    assert_eq!(
+        contract.get("version").and_then(Value::as_str),
+        Some(BENCH_PROTOCOL_VERSION)
+    );
+
+    let partitions: Vec<&str> = contract["partition_tags"]
+        .as_array()
+        .expect("partition_tags array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(partitions.contains(&PARTITION_MATCHED_STATE));
+    assert!(partitions.contains(&PARTITION_REALISTIC));
+}
+
+#[test]
+fn protocol_contract_contains_realistic_size_matrix() {
+    let contract = canonical_protocol_contract();
+    let sizes: Vec<u64> = contract["realistic_session_sizes"]
+        .as_array()
+        .expect("realistic_session_sizes array")
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+    assert_eq!(
+        sizes, REALISTIC_SESSION_SIZES,
+        "realistic session sizes must match canonical 100k/200k/500k/1M/5M matrix"
+    );
+
+    let replay_inputs = contract["realistic_replay_inputs"]
+        .as_array()
+        .expect("realistic_replay_inputs array");
+    assert_eq!(
+        replay_inputs.len(),
+        REALISTIC_SESSION_SIZES.len(),
+        "realistic replay inputs must cover each canonical size"
+    );
+    for expected_size in REALISTIC_SESSION_SIZES {
+        assert!(
+            replay_inputs.iter().any(|entry| {
+                entry.get("session_messages").and_then(Value::as_u64) == Some(*expected_size)
+            }),
+            "missing realistic replay input for size {expected_size}"
+        );
+    }
+}
+
+#[test]
+fn protocol_contract_contains_matched_state_replay_inputs() {
+    let contract = canonical_protocol_contract();
+    let scenarios = contract["matched_state_scenarios"]
+        .as_array()
+        .expect("matched_state_scenarios array");
+    for expected in &["cold_start", "warm_start", "tool_call", "event_dispatch"] {
+        let entry = scenarios
+            .iter()
+            .find(|scenario| scenario.get("scenario").and_then(Value::as_str) == Some(*expected));
+        assert!(entry.is_some(), "missing matched-state scenario {expected}");
+        assert!(
+            entry
+                .and_then(|v| v.get("replay_input"))
+                .is_some_and(Value::is_object),
+            "matched-state scenario {expected} must include replay_input object"
+        );
+    }
+}
+
+#[test]
+fn protocol_contract_labels_evidence_and_confidence() {
+    let contract = canonical_protocol_contract();
+    let evidence_classes: Vec<&str> = contract["evidence_labels"]["evidence_class"]
+        .as_array()
+        .expect("evidence_class labels")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        evidence_classes,
+        vec![EVIDENCE_CLASS_MEASURED, EVIDENCE_CLASS_INFERRED]
+    );
+
+    let confidence_labels: Vec<&str> = contract["evidence_labels"]["confidence"]
+        .as_array()
+        .expect("confidence labels")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        confidence_labels,
+        vec![CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW]
+    );
+}
+
+#[test]
+fn protocol_record_validator_accepts_golden_fixture() {
+    let golden = json!({
+        "schema": "pi.ext.rust_bench.v1",
+        "runtime": "pi_agent_rust",
+        "scenario": "tool_call",
+        "extension": "hello",
+        "protocol_schema": BENCH_PROTOCOL_SCHEMA,
+        "protocol_version": BENCH_PROTOCOL_VERSION,
+        "partition": PARTITION_REALISTIC,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": CONFIDENCE_HIGH,
+        "correlation_id": "0123456789abcdef0123456789abcdef",
+        "scenario_metadata": {
+            "runtime": "pi_agent_rust",
+            "build_profile": "release",
+            "host": {
+                "os": "linux",
+                "arch": "x86_64",
+                "cpu_model": "test-cpu",
+                "cpu_cores": 8,
+            },
+            "scenario_id": "realistic/session_100000",
+            "replay_input": {
+                "session_messages": 100_000,
+                "fixture": "tests/artifacts/perf/session_100000.jsonl",
+            },
+        },
+    });
+    assert!(
+        validate_protocol_record(&golden).is_ok(),
+        "golden protocol fixture should pass validation"
+    );
+}
+
+#[test]
+fn protocol_record_validator_rejects_missing_correlation_id() {
+    let malformed = json!({
+        "schema": "pi.ext.rust_bench.v1",
+        "runtime": "pi_agent_rust",
+        "scenario": "cold_start",
+        "extension": "hello",
+        "protocol_schema": BENCH_PROTOCOL_SCHEMA,
+        "protocol_version": BENCH_PROTOCOL_VERSION,
+        "partition": PARTITION_MATCHED_STATE,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": CONFIDENCE_HIGH,
+        "scenario_metadata": {
+            "runtime": "pi_agent_rust",
+            "build_profile": "release",
+            "host": {
+                "os": "linux",
+                "arch": "x86_64",
+                "cpu_model": "test-cpu",
+                "cpu_cores": 8,
+            },
+            "scenario_id": "matched-state/cold_start",
+            "replay_input": { "runs": 5 },
+        },
+    });
+
+    let err = validate_protocol_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("correlation_id"),
+        "expected correlation_id failure, got: {err}"
+    );
+}
+
+#[test]
+fn protocol_record_validator_rejects_invalid_partition_or_size() {
+    let bad_partition = json!({
+        "schema": "pi.ext.rust_bench.v1",
+        "runtime": "pi_agent_rust",
+        "scenario": "tool_call",
+        "extension": "hello",
+        "protocol_schema": BENCH_PROTOCOL_SCHEMA,
+        "protocol_version": BENCH_PROTOCOL_VERSION,
+        "partition": "invalid-partition",
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": CONFIDENCE_HIGH,
+        "correlation_id": "abc",
+        "scenario_metadata": {
+            "runtime": "pi_agent_rust",
+            "build_profile": "release",
+            "host": {
+                "os": "linux",
+                "arch": "x86_64",
+                "cpu_model": "test-cpu",
+                "cpu_cores": 8,
+            },
+            "scenario_id": "invalid/thing",
+            "replay_input": { "runs": 5 },
+        },
+    });
+    assert!(
+        validate_protocol_record(&bad_partition).is_err(),
+        "invalid partition fixture must fail"
+    );
+
+    let bad_size = json!({
+        "schema": "pi.ext.rust_bench.v1",
+        "runtime": "pi_agent_rust",
+        "scenario": "tool_call",
+        "extension": "hello",
+        "protocol_schema": BENCH_PROTOCOL_SCHEMA,
+        "protocol_version": BENCH_PROTOCOL_VERSION,
+        "partition": PARTITION_REALISTIC,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": CONFIDENCE_HIGH,
+        "correlation_id": "abc",
+        "scenario_metadata": {
+            "runtime": "pi_agent_rust",
+            "build_profile": "release",
+            "host": {
+                "os": "linux",
+                "arch": "x86_64",
+                "cpu_model": "test-cpu",
+                "cpu_cores": 8,
+            },
+            "scenario_id": "realistic/session_bad",
+            "replay_input": { "session_messages": 42 },
+        },
+    });
+    assert!(
+        validate_protocol_record(&bad_size).is_err(),
+        "realistic scenario with unsupported size must fail"
+    );
+}
+
+#[test]
+fn evidence_contract_schema_includes_benchmark_protocol_definition() {
+    let schema_path = project_root().join("docs/evidence-contract-schema.json");
+    let content = std::fs::read_to_string(&schema_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", schema_path.display()));
+    let parsed: Value = serde_json::from_str(&content).expect("valid evidence contract JSON");
+    let benchmark_protocol = parsed["definitions"]["benchmark_protocol"]
+        .as_object()
+        .expect("definitions.benchmark_protocol object must exist");
+
+    assert_eq!(
+        benchmark_protocol["properties"]["schema"]["const"]
+            .as_str()
+            .unwrap_or_default(),
+        BENCH_PROTOCOL_SCHEMA
+    );
+
+    let partition_values: Vec<&str> =
+        benchmark_protocol["properties"]["partition_tags"]["items"]["enum"]
+            .as_array()
+            .expect("partition enum array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+    assert!(partition_values.contains(&PARTITION_MATCHED_STATE));
+    assert!(partition_values.contains(&PARTITION_REALISTIC));
+
+    let size_values: Vec<u64> =
+        benchmark_protocol["properties"]["realistic_session_sizes"]["items"]["enum"]
+            .as_array()
+            .expect("realistic session size enum array")
+            .iter()
+            .filter_map(Value::as_u64)
+            .collect();
+    assert_eq!(size_values, REALISTIC_SESSION_SIZES);
+}
+
+#[test]
+fn protocol_is_referenced_by_benchmark_and_conformance_harnesses() {
+    let refs = vec![
+        ("tests/bench_scenario_runner.rs", BENCH_PROTOCOL_SCHEMA),
+        ("tests/perf_bench_harness.rs", "pi.ext.rust_bench.v1"),
+        ("tests/ext_bench_harness.rs", "pi.ext.rust_bench.v1"),
+        ("tests/perf_comparison.rs", "pi.ext.perf_comparison.v1"),
+        ("tests/ext_conformance_scenarios.rs", "conformance"),
+    ];
+
+    for (rel_path, marker) in refs {
+        let abs = project_root().join(rel_path);
+        let text = std::fs::read_to_string(&abs)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", abs.display()));
+        assert!(
+            text.contains(marker),
+            "{rel_path} must reference marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn validate_rust_bench_schema() {
+    let root = project_root();
+    let events = read_jsonl_file(&root.join("target/perf/scenario_runner.jsonl"));
+    if events.is_empty() {
+        eprintln!("[schema] No scenario_runner.jsonl data — skipping");
+        return;
+    }
+
+    for event in &events {
+        let missing = has_required_fields(event, RUST_BENCH_REQUIRED);
+        assert!(
+            missing.is_empty(),
+            "rust bench event missing required fields: {missing:?}"
+        );
+        assert_eq!(
+            event.get("schema").and_then(Value::as_str),
+            Some("pi.ext.rust_bench.v1"),
+            "rust bench should use pi.ext.rust_bench.v1 schema"
+        );
+    }
+    eprintln!("[schema] Validated {} rust bench events", events.len());
+}
+
+#[test]
+fn validate_workload_schema() {
     let root = project_root();
     let events = read_jsonl_file(&root.join("target/perf/pijs_workload.jsonl"));
     if events.is_empty() {
@@ -313,6 +810,26 @@ fn validate_conformance_events_schema() {
         );
     }
     eprintln!("[schema] Validated {} conformance events", events.len());
+}
+
+#[test]
+fn validate_scenario_runner_protocol_contract() {
+    let root = project_root();
+    let events = read_jsonl_file(&root.join("target/perf/scenario_runner.jsonl"));
+    if events.is_empty() {
+        eprintln!("[schema] No scenario_runner.jsonl data — skipping");
+        return;
+    }
+
+    for (index, event) in events.iter().enumerate() {
+        if let Err(err) = validate_protocol_record(event) {
+            panic!("scenario_runner record {index} violates protocol contract: {err}");
+        }
+    }
+    eprintln!(
+        "[schema] Validated benchmark protocol contract on {} scenario_runner records",
+        events.len()
+    );
 }
 
 #[test]
@@ -442,6 +959,54 @@ fn generate_schema_doc() {
     }
     md.push('\n');
 
+    let protocol_contract = canonical_protocol_contract();
+
+    md.push_str("### `pi.bench.protocol.v1`\n\n");
+    md.push_str("| Field | Type | Description |\n");
+    md.push_str("|---|---|---|\n");
+    md.push_str("| `schema` | string | Always `\"pi.bench.protocol.v1\"` |\n");
+    md.push_str("| `version` | string | Protocol version used by all benchmark harnesses |\n");
+    md.push_str("| `partition_tags` | string[] | Must include `matched-state` and `realistic` |\n");
+    md.push_str(
+        "| `realistic_session_sizes` | integer[] | Canonical matrix: 100k, 200k, 500k, 1M, 5M |\n",
+    );
+    md.push_str(
+        "| `matched_state_scenarios` | object[] | `cold_start`, `warm_start`, `tool_call`, `event_dispatch` with replay inputs |\n",
+    );
+    md.push_str(
+        "| `required_metadata_fields` | string[] | `runtime`, `build_profile`, `host`, `scenario_id`, `correlation_id` |\n",
+    );
+    md.push_str(
+        "| `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |\n\n",
+    );
+
+    md.push_str("## Protocol Matrix\n\n");
+    md.push_str("| Partition | Scenario ID | Replay Input |\n");
+    md.push_str("|---|---|---|\n");
+    for scenario in protocol_contract["matched_state_scenarios"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+    {
+        let scenario_name = scenario["scenario"].as_str().unwrap_or("unknown");
+        let replay = scenario["replay_input"].to_string();
+        let _ = writeln!(
+            md,
+            "| `{PARTITION_MATCHED_STATE}` | `{scenario_name}` | `{replay}` |"
+        );
+    }
+    for scenario in protocol_contract["realistic_replay_inputs"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+    {
+        let scenario_id = scenario["scenario_id"].as_str().unwrap_or("unknown");
+        let replay = scenario["replay_input"].to_string();
+        let _ = writeln!(
+            md,
+            "| `{PARTITION_REALISTIC}` | `{scenario_id}` | `{replay}` |"
+        );
+    }
+    md.push('\n');
+
     // Determinism notes
     md.push_str("## Determinism Requirements\n\n");
     md.push_str(
@@ -462,6 +1027,7 @@ fn generate_schema_doc() {
             "name": name,
             "description": desc,
         })).collect::<Vec<_>>(),
+        "protocol_contract": canonical_protocol_contract(),
         "env_fingerprint_fields": ENV_FINGERPRINT_FIELDS.iter().map(|(name, desc)| json!({
             "field": name,
             "description": desc,

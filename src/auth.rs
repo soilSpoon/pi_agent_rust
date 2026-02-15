@@ -2,8 +2,10 @@
 //!
 //! Auth file: ~/.pi/agent/auth.json
 
+use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::provider_metadata::{canonical_provider_id, provider_auth_env_keys};
+use asupersync::channel::oneshot;
 use base64::Engine as _;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
@@ -145,27 +147,17 @@ impl AuthStorage {
 
     /// Load auth.json asynchronously (creates empty if missing).
     pub async fn load_async(path: PathBuf) -> Result<Self> {
-        let entries = if path.exists() {
-            let file = File::open(&path).map_err(|e| Error::auth(format!("auth.json: {e}")))?;
-            let mut locked = lock_file_async(file, Duration::from_secs(30)).await?;
-            let mut content = String::new();
-            locked.as_file_mut().read_to_string(&mut content)?;
-            let parsed: AuthFile = match serde_json::from_str(&content) {
-                Ok(file) => file,
-                Err(e) => {
-                    tracing::warn!(
-                        event = "pi.auth.parse_error",
-                        error = %e,
-                        "auth.json is corrupted; starting with empty credentials"
-                    );
-                    AuthFile::default()
-                }
-            };
-            parsed.entries
-        } else {
-            HashMap::new()
-        };
-        Ok(Self { path, entries })
+        let (tx, rx) = oneshot::channel();
+        std::thread::spawn(move || {
+            let res = Self::load(path);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
+        });
+
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
+            .await
+            .map_err(|_| Error::auth("Load task cancelled".to_string()))?
     }
 
     /// Persist auth.json (atomic write + permissions).
@@ -205,37 +197,19 @@ impl AuthStorage {
 
     /// Persist auth.json asynchronously.
     pub async fn save_async(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let (tx, rx) = oneshot::channel();
+        let this = self.clone();
 
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)?;
-        let mut locked = lock_file_async(file, Duration::from_secs(30)).await?;
+        std::thread::spawn(move || {
+            let res = this.save();
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
+        });
 
-        let data = serde_json::to_string_pretty(&AuthFile {
-            entries: self.entries.clone(),
-        })?;
-
-        // Write to the locked file handle
-        let f = locked.as_file_mut();
-        f.seek(SeekFrom::Start(0))?;
-        f.set_len(0)?;
-        f.write_all(data.as_bytes())?;
-        f.flush()?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&self.path, perms)?;
-        }
-
-        Ok(())
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
+            .await
+            .map_err(|_| Error::auth("Save task cancelled".to_string()))?
     }
 
     /// Get raw credential.
@@ -1923,35 +1897,6 @@ fn lock_file(file: File, timeout: Duration) -> Result<LockedFile> {
         let jitter = u64::from(start.elapsed().subsec_nanos()) % (sleep_ms / 2 + 1);
         let delay = sleep_ms / 2 + jitter;
         std::thread::sleep(Duration::from_millis(delay));
-        attempt = attempt.saturating_add(1);
-    }
-}
-
-async fn lock_file_async(file: File, timeout: Duration) -> Result<LockedFile> {
-    let start = Instant::now();
-    let mut attempt: u32 = 0;
-    loop {
-        match FileExt::try_lock_exclusive(&file) {
-            Ok(true) => return Ok(LockedFile { file }),
-            Ok(false) => {} // Lock held by another process, retry
-            Err(e) => {
-                return Err(Error::auth(format!("Failed to lock auth file: {e}")));
-            }
-        }
-
-        if start.elapsed() >= timeout {
-            return Err(Error::auth("Timed out waiting for auth lock".to_string()));
-        }
-
-        let base_ms: u64 = 10;
-        let cap_ms: u64 = 500;
-        let sleep_ms = base_ms
-            .checked_shl(attempt.min(5))
-            .unwrap_or(cap_ms)
-            .min(cap_ms);
-        let jitter = u64::from(start.elapsed().subsec_nanos()) % (sleep_ms / 2 + 1);
-        let delay = sleep_ms / 2 + jitter;
-        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(delay)).await;
         attempt = attempt.saturating_add(1);
     }
 }

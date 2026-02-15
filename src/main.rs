@@ -9,6 +9,12 @@
 // Allow dead code and unused async during scaffolding phase - remove once implementation is complete
 #![allow(dead_code, clippy::unused_async)]
 
+// Gap H: jemalloc allocator for 10-20% improvement on allocation-heavy paths.
+// Enable with `--features jemalloc` (e.g. perf benchmarks).
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -21,7 +27,7 @@ use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::Mutex;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
-use clap::Parser;
+use clap::error::ErrorKind;
 use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::app::StartupError;
 use pi::auth::{AuthCredential, AuthStorage};
@@ -67,20 +73,42 @@ fn main() {
     }
 }
 
+fn parse_cli_args(raw_args: Vec<String>) -> Result<Option<(cli::Cli, Vec<cli::ExtensionCliFlag>)>> {
+    match cli::parse_with_extension_flags(raw_args) {
+        Ok(parsed) => Ok(Some((parsed.cli, parsed.extension_flags))),
+        Err(err) => {
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                err.print()?;
+                return Ok(None);
+            }
+            Err(anyhow::Error::new(err))
+        }
+    }
+}
+
+fn parse_cli_from_env() -> Result<Option<(cli::Cli, Vec<cli::ExtensionCliFlag>)>> {
+    parse_cli_args(std::env::args().collect())
+}
+
 #[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
     // Parse CLI arguments
-    let cli = cli::Cli::parse();
-
-    // Early-validate theme file paths so invalid paths error before --version.
-    // Named themes (without .json, /, ~) are validated later after resource loading.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
+    let Some((cli, extension_flags)) = parse_cli_from_env()? else {
+        return Ok(());
+    };
 
     if cli.version {
         print_version();
         return Ok(());
     }
+
+    // Early-validate theme file paths so invalid paths error before --version.
+    // Named themes (without .json, /, ~) are validated later after resource loading.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
 
     // Ultra-fast paths that don't need tracing or the async runtime.
     if let Some(command) = &cli.command {
@@ -193,7 +221,7 @@ fn main_impl() -> Result<()> {
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let handle = runtime.handle();
     let runtime_handle = handle.clone();
-    let join = handle.spawn(Box::pin(run(cli, runtime_handle)));
+    let join = handle.spawn(Box::pin(run(cli, extension_flags, runtime_handle)));
     runtime.block_on(join)
 }
 
@@ -244,6 +272,143 @@ fn validate_theme_path_spec(theme_spec: Option<&str>, cwd: &Path) -> Result<()> 
             pi::theme::Theme::resolve_spec(theme_spec, cwd).map_err(anyhow::Error::new)?;
         }
     }
+    Ok(())
+}
+
+fn parse_bool_flag_value(flag_name: &str, raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(pi::error::Error::validation(format!(
+            "Invalid boolean value for extension flag --{flag_name}: \"{raw}\". Use one of: true,false,1,0,yes,no,on,off."
+        ))
+        .into()),
+    }
+}
+
+fn coerce_extension_flag_value(
+    flag: &cli::ExtensionCliFlag,
+    declared_type: &str,
+) -> Result<serde_json::Value> {
+    match declared_type.trim().to_ascii_lowercase().as_str() {
+        "bool" | "boolean" => {
+            if let Some(raw) = flag.value.as_deref() {
+                Ok(Value::Bool(parse_bool_flag_value(&flag.name, raw)?))
+            } else {
+                Ok(Value::Bool(true))
+            }
+        }
+        "number" | "int" | "integer" | "float" => {
+            let Some(raw) = flag.value.as_deref() else {
+                return Err(pi::error::Error::validation(format!(
+                    "Extension flag --{} requires a numeric value.",
+                    flag.name
+                ))
+                .into());
+            };
+            if let Ok(parsed) = raw.parse::<i64>() {
+                return Ok(Value::Number(parsed.into()));
+            }
+            let parsed = raw.parse::<f64>().map_err(|_| {
+                pi::error::Error::validation(format!(
+                    "Invalid numeric value for extension flag --{}: \"{}\"",
+                    flag.name, raw
+                ))
+            })?;
+            let Some(number) = serde_json::Number::from_f64(parsed) else {
+                return Err(pi::error::Error::validation(format!(
+                    "Numeric value for extension flag --{} is not finite: \"{}\"",
+                    flag.name, raw
+                ))
+                .into());
+            };
+            Ok(Value::Number(number))
+        }
+        _ => {
+            let Some(raw) = flag.value.as_deref() else {
+                return Err(pi::error::Error::validation(format!(
+                    "Extension flag --{} requires a value.",
+                    flag.name
+                ))
+                .into());
+            };
+            Ok(Value::String(raw.to_string()))
+        }
+    }
+}
+
+async fn apply_extension_cli_flags(
+    manager: &pi::extensions::ExtensionManager,
+    extension_flags: &[cli::ExtensionCliFlag],
+) -> Result<()> {
+    if extension_flags.is_empty() {
+        return Ok(());
+    }
+
+    let registered = manager.list_flags();
+    let known_names: std::collections::BTreeSet<String> = registered
+        .iter()
+        .filter_map(|flag| flag.get("name").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect();
+
+    for cli_flag in extension_flags {
+        let matches = registered
+            .iter()
+            .filter(|flag| {
+                flag.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&cli_flag.name))
+            })
+            .collect::<Vec<_>>();
+
+        if matches.is_empty() {
+            let known = if known_names.is_empty() {
+                "(none)".to_string()
+            } else {
+                known_names
+                    .iter()
+                    .map(|name| format!("--{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(pi::error::Error::validation(format!(
+                "Unknown extension flag --{}. Registered extension flags: {known}",
+                cli_flag.name
+            ))
+            .into());
+        }
+
+        for spec in matches {
+            let Some(extension_id) = spec.get("extension_id").and_then(Value::as_str) else {
+                return Err(pi::error::Error::validation(format!(
+                    "Extension flag --{} cannot be set because extension metadata is missing extension_id.",
+                    cli_flag.name
+                ))
+                .into());
+            };
+            if extension_id.trim().is_empty() {
+                return Err(pi::error::Error::validation(format!(
+                    "Extension flag --{} cannot be set because extension_id is empty.",
+                    cli_flag.name
+                ))
+                .into());
+            }
+            let registered_name = spec.get("name").and_then(Value::as_str).ok_or_else(|| {
+                pi::error::Error::validation(format!(
+                    "Extension flag --{} is missing name metadata.",
+                    cli_flag.name
+                ))
+            })?;
+            let flag_type = spec.get("type").and_then(Value::as_str).unwrap_or("string");
+            let value = coerce_extension_flag_value(cli_flag, flag_type)?;
+            manager
+                .set_flag_value(extension_id, registered_name, value)
+                .await
+                .map_err(anyhow::Error::new)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -487,7 +652,11 @@ fn print_resolved_repair_policy(resolved: &pi::config::ResolvedRepairPolicy) -> 
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
+async fn run(
+    mut cli: cli::Cli,
+    extension_flags: Vec<cli::ExtensionCliFlag>,
+    runtime_handle: RuntimeHandle,
+) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     if let Some(command) = cli.command.take() {
@@ -772,6 +941,17 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
             .await
             .map_err(anyhow::Error::new)?;
 
+        if !extension_flags.is_empty() {
+            if let Some(region) = &agent_session.extensions {
+                apply_extension_cli_flags(region.manager(), &extension_flags).await?;
+            } else {
+                return Err(pi::error::Error::validation(
+                    "Extension flags were provided, but extensions are not active in this session.",
+                )
+                .into());
+            }
+        }
+
         // Merge extension-registered providers into the model registry.
         if let Some(region) = &agent_session.extensions {
             let ext_entries = region.manager().extension_model_entries();
@@ -806,6 +986,16 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
                 }
             }
         }
+    } else if !extension_flags.is_empty() {
+        let rendered = extension_flags
+            .iter()
+            .map(pi::cli::ExtensionCliFlag::display_name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(pi::error::Error::validation(format!(
+            "Extension flags were provided ({rendered}), but no extensions are loaded. Add extensions via --extension or remove the flags."
+        ))
+        .into());
     }
 
     agent_session.set_model_registry(model_registry.clone());
@@ -3237,6 +3427,61 @@ mod tests {
     fn exit_code_classifier_defaults_to_general_failure() {
         let runtime_err = anyhow::Error::new(pi::error::Error::auth("missing key"));
         assert_eq!(exit_code_for_error(&runtime_err), EXIT_CODE_FAILURE);
+    }
+
+    #[test]
+    fn parse_cli_args_extracts_extension_flags() {
+        let parsed = parse_cli_args(vec![
+            "pi".to_string(),
+            "--model".to_string(),
+            "gpt-4o".to_string(),
+            "--plan".to_string(),
+            "ship-it".to_string(),
+            "--dry-run".to_string(),
+            "--print".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse args")
+        .expect("parsed cli payload");
+
+        assert_eq!(parsed.0.model.as_deref(), Some("gpt-4o"));
+        assert!(parsed.0.print);
+        assert_eq!(parsed.1.len(), 2);
+        assert_eq!(parsed.1[0].name, "plan");
+        assert_eq!(parsed.1[0].value.as_deref(), Some("ship-it"));
+        assert_eq!(parsed.1[1].name, "dry-run");
+        assert!(parsed.1[1].value.is_none());
+    }
+
+    #[test]
+    fn parse_cli_args_keeps_subcommand_validation() {
+        let result = parse_cli_args(vec![
+            "pi".to_string(),
+            "install".to_string(),
+            "--bogus".to_string(),
+            "pkg".to_string(),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn coerce_extension_flag_bool_defaults_to_true_without_value() {
+        let flag = cli::ExtensionCliFlag {
+            name: "dry-run".to_string(),
+            value: None,
+        };
+        let value = coerce_extension_flag_value(&flag, "bool").expect("coerce bool");
+        assert_eq!(value, Value::Bool(true));
+    }
+
+    #[test]
+    fn coerce_extension_flag_rejects_invalid_bool_text() {
+        let flag = cli::ExtensionCliFlag {
+            name: "dry-run".to_string(),
+            value: Some("maybe".to_string()),
+        };
+        let err = coerce_extension_flag_value(&flag, "bool").expect_err("invalid bool should fail");
+        assert!(err.to_string().contains("Invalid boolean value"));
     }
 
     #[test]

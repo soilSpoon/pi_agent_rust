@@ -65,6 +65,20 @@ jobs:
             ${{ runner.os }}-cargo-bench-
             ${{ runner.os }}-cargo-
 
+      - name: Standardize benchmark environment
+        run: |
+          set -euxo pipefail
+          # Apply benchmark-optimal OS settings (best-effort, some may fail in containers)
+          sudo scripts/bench_env_setup.sh apply || echo "::warning::Could not fully apply bench env (expected in containers)"
+          # Emit environment fingerprint for artifact tracking
+          mkdir -p target/perf
+          scripts/bench_env_setup.sh fingerprint | tee target/perf/bench_env_fingerprint.json || true
+          # Validate and report
+          echo "## Benchmark Environment" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          scripts/bench_env_setup.sh validate 2>&1 | sed 's/\x1b\[[0-9;]*m//g' >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
       - name: Build release binary
         run: cargo build --release
 
@@ -98,9 +112,10 @@ jobs:
       - name: Generate PiJS workload perf data (JSONL)
         run: |
           set -euxo pipefail
-          mkdir -p target/perf
-          cargo run --release --bin pijs_workload -- --iterations 2000 --tool-calls 1 > target/perf/pijs_workload.jsonl
-          cargo run --release --bin pijs_workload -- --iterations 2000 --tool-calls 10 >> target/perf/pijs_workload.jsonl
+          PERF_PROFILE=perf
+          mkdir -p "target/perf/${PERF_PROFILE}"
+          PI_BENCH_BUILD_PROFILE="${PERF_PROFILE}" cargo run --profile "${PERF_PROFILE}" --bin pijs_workload -- --iterations 2000 --tool-calls 1 > "target/perf/${PERF_PROFILE}/pijs_workload_${PERF_PROFILE}.jsonl"
+          PI_BENCH_BUILD_PROFILE="${PERF_PROFILE}" cargo run --profile "${PERF_PROFILE}" --bin pijs_workload -- --iterations 2000 --tool-calls 10 >> "target/perf/${PERF_PROFILE}/pijs_workload_${PERF_PROFILE}.jsonl"
 
       - name: Generate benchmark summary
         run: |
@@ -145,12 +160,18 @@ jobs:
       - name: Perf budget gate
         run: cargo test --test perf_budgets -- --nocapture
 
+      - name: Restore benchmark environment
+        if: always()
+        run: sudo scripts/bench_env_setup.sh restore || true
+
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results-${{ github.sha }}
-          path: pi_agent_rust/target/criterion/
+          path: |
+            pi_agent_rust/target/criterion/
+            pi_agent_rust/target/perf/
           retention-days: 30
 
   # Compare with main branch baseline (only on PRs)

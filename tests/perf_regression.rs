@@ -121,12 +121,7 @@ fn collect_fingerprint() -> EnvFingerprint {
     let mem_total_mb = system.total_memory() / (1024 * 1024);
     let os = System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
     let arch = std::env::consts::ARCH.to_string();
-    let build_profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    }
-    .to_string();
+    let build_profile = detect_build_profile();
     let git_commit = option_env!("VERGEN_GIT_SHA")
         .unwrap_or("unknown")
         .to_string();
@@ -146,6 +141,58 @@ fn collect_fingerprint() -> EnvFingerprint {
         git_commit,
         config_hash,
     }
+}
+
+fn detect_build_profile() -> String {
+    if let Ok(value) = std::env::var("PI_BENCH_BUILD_PROFILE") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    if let Ok(path) = std::env::current_exe() {
+        if let Some(profile) = profile_from_target_path(&path) {
+            return profile;
+        }
+    }
+
+    if cfg!(debug_assertions) {
+        "debug".to_string()
+    } else {
+        "release".to_string()
+    }
+}
+
+fn profile_from_target_path(path: &Path) -> Option<String> {
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+
+    let target_idx = components
+        .iter()
+        .rposition(|component| component == "target")?;
+    let tail = components.get(target_idx + 1..)?;
+    if tail.len() < 2 {
+        return None;
+    }
+
+    let profile_idx = if tail.len() >= 3 && tail[tail.len() - 2] == "deps" {
+        tail.len().checked_sub(3)?
+    } else {
+        tail.len().checked_sub(2)?
+    };
+
+    let candidate = tail.get(profile_idx)?.trim();
+    if !candidate.is_empty() {
+        return Some(candidate.to_string());
+    }
+
+    None
 }
 
 fn sha256_short(input: &str) -> String {

@@ -18,66 +18,20 @@
 //! - Idle memory: <50MB RSS
 //! - Binary size (release): <20MB
 
+#[path = "bench_env.rs"]
+mod bench_env;
+
 use std::env;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use sha2::{Digest, Sha256};
 use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 
-// ============================================================================
-// Environment Banner
-// ============================================================================
-
-fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-fn print_system_banner_once() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let mut system = System::new();
-        system.refresh_cpu_all();
-        system.refresh_memory();
-
-        let cpu_brand = system
-            .cpus()
-            .first()
-            .map_or_else(|| "unknown".to_string(), |cpu| cpu.brand().to_string());
-
-        let config = format!(
-            "pkg={} git_sha={} build_ts={}",
-            env!("CARGO_PKG_VERSION"),
-            option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
-            option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or(""),
-        );
-        let config_hash = sha256_hex(&config);
-
-        eprintln!(
-            "[bench-env] os={} arch={} cpu=\"{}\" cores={} mem_total_mb={} config_hash={}",
-            System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string()),
-            std::env::consts::ARCH,
-            cpu_brand,
-            system.cpus().len(),
-            system.total_memory() / 1024 / 1024,
-            config_hash
-        );
-    });
-}
-
 fn criterion_config() -> Criterion {
-    print_system_banner_once();
-    #[cfg(test)]
-    run_resolution_regression_checks();
-    Criterion::default()
-        .sample_size(20) // Fewer samples for process spawn benchmarks
-        .measurement_time(Duration::from_secs(10))
+    bench_env::criterion_config_system()
 }
 
 // ============================================================================
@@ -166,6 +120,7 @@ fn find_profile_binary(root: &Path, profile: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn run_resolution_regression_checks() {
     use std::path::{Path, PathBuf};
 

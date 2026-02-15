@@ -58,6 +58,9 @@ pub struct Config {
     /// Session persistence backend: `jsonl` (default) or `sqlite` (requires `sqlite-sessions`).
     #[serde(alias = "sessionStore", alias = "sessionBackend")]
     pub session_store: Option<String>,
+    /// Session durability mode: `strict`, `balanced` (default), or `throughput`.
+    #[serde(alias = "sessionDurability")]
+    pub session_durability: Option<String>,
 
     // Compaction
     pub compaction: Option<CompactionSettings>,
@@ -458,6 +461,7 @@ impl Config {
                 .or(base.autocomplete_max_visible),
             session_picker_input: other.session_picker_input.or(base.session_picker_input),
             session_store: other.session_store.or(base.session_store),
+            session_durability: other.session_durability.or(base.session_durability),
 
             // Compaction
             compaction: merge_compaction(base.compaction, other.compaction),
@@ -1730,7 +1734,8 @@ mod tests {
                 "doubleEscapeAction": "quit",
                 "editorPaddingX": 5,
                 "autocompleteMaxVisible": 15,
-                "sessionPickerInput": 2
+                "sessionPickerInput": 2,
+                "sessionDurability": "throughput"
             }"#,
         );
 
@@ -1743,6 +1748,7 @@ mod tests {
         assert_eq!(config.editor_padding_x, Some(5));
         assert_eq!(config.autocomplete_max_visible, Some(15));
         assert_eq!(config.session_picker_input, Some(2));
+        assert_eq!(config.session_durability.as_deref(), Some("throughput"));
     }
 
     #[test]

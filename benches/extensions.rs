@@ -4,10 +4,13 @@
 //! - `cargo bench --bench extensions`
 //! - `cargo bench ext_policy`
 
+#[path = "bench_env.rs"]
+mod bench_env;
+
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -19,14 +22,6 @@ use pi::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeC
 use pi::scheduler::HostcallOutcome;
 use pi::tools::ToolRegistry;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use sysinfo::System;
-
-fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
 
 const BENCH_TOOL_SETUP: &str = r#"
 __pi_begin_extension("ext.bench", { name: "Bench" });
@@ -52,41 +47,8 @@ if (!globalThis.__bench_done) {
 }
 "#;
 
-fn print_bench_banner_once() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let mut system = System::new();
-        system.refresh_cpu_all();
-        system.refresh_memory();
-
-        let cpu_brand = system
-            .cpus()
-            .first()
-            .map_or_else(|| "unknown".to_string(), |cpu| cpu.brand().to_string());
-
-        let config = format!(
-            "pkg={} git_sha={} build_ts={}",
-            env!("CARGO_PKG_VERSION"),
-            option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
-            option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or(""),
-        );
-        let config_hash = sha256_hex(&config);
-
-        eprintln!(
-            "[bench-env] os={} arch={} cpu=\"{}\" cores={} mem_kb={} config_hash={}",
-            System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string()),
-            std::env::consts::ARCH,
-            cpu_brand,
-            system.cpus().len(),
-            system.total_memory(),
-            config_hash
-        );
-    });
-}
-
 fn criterion_config() -> Criterion {
-    print_bench_banner_once();
-    Criterion::default()
+    bench_env::criterion_config()
 }
 
 fn artifact_single_file_entry(name: &str) -> PathBuf {
@@ -730,6 +692,482 @@ fn bench_hostcall_params_hash(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================================
+// Phase 3 profiling: Hostcall bridge roundtrip decomposition (bd-3ar8v.4.1)
+// ============================================================================
+
+/// Measure `hostcall_request_to_payload` conversion overhead for various
+/// hostcall kinds and payload sizes.
+fn bench_hostcall_request_to_payload(c: &mut Criterion) {
+    use pi::extensions::hostcall_request_to_payload;
+
+    let tool_small = HostcallRequest {
+        call_id: "call-1".to_string(),
+        kind: HostcallKind::Tool {
+            name: "read".to_string(),
+        },
+        payload: json!({"path": "README.md"}),
+        trace_id: 1,
+        extension_id: Some("ext.bench".to_string()),
+    };
+
+    let session_op = HostcallRequest {
+        call_id: "call-2".to_string(),
+        kind: HostcallKind::Session {
+            op: "get_state".to_string(),
+        },
+        payload: json!({}),
+        trace_id: 2,
+        extension_id: Some("ext.bench".to_string()),
+    };
+
+    let events_op = HostcallRequest {
+        call_id: "call-3".to_string(),
+        kind: HostcallKind::Events {
+            op: "getActiveTools".to_string(),
+        },
+        payload: json!({}),
+        trace_id: 3,
+        extension_id: Some("ext.bench".to_string()),
+    };
+
+    // Large payload: 64 keys with 64-char values
+    let mut large_input = serde_json::Map::new();
+    for idx in 0..64 {
+        large_input.insert(format!("k{idx:02}"), Value::String("x".repeat(64)));
+    }
+    let tool_large = HostcallRequest {
+        call_id: "call-4".to_string(),
+        kind: HostcallKind::Tool {
+            name: "read".to_string(),
+        },
+        payload: Value::Object(large_input),
+        trace_id: 4,
+        extension_id: Some("ext.bench".to_string()),
+    };
+
+    let mut group = c.benchmark_group("ext_request_to_payload");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("tool_small", |b| {
+        b.iter(|| black_box(hostcall_request_to_payload(black_box(&tool_small))));
+    });
+    group.bench_function("tool_large_64k", |b| {
+        b.iter(|| black_box(hostcall_request_to_payload(black_box(&tool_large))));
+    });
+    group.bench_function("session_get_state", |b| {
+        b.iter(|| black_box(hostcall_request_to_payload(black_box(&session_op))));
+    });
+    group.bench_function("events_get_active_tools", |b| {
+        b.iter(|| black_box(hostcall_request_to_payload(black_box(&events_op))));
+    });
+    group.finish();
+}
+
+/// Measure `host_result_to_outcome` and `outcome_to_host_result` conversion
+/// overhead (the Rust↔JS result bridge).
+fn bench_hostcall_outcome_conversion(c: &mut Criterion) {
+    use pi::extensions::{host_result_to_outcome, outcome_to_host_result};
+    use pi::scheduler::HostcallOutcome;
+
+    let success_small = HostcallOutcome::Success(json!({"ok": true}));
+    let success_large = HostcallOutcome::Success(json!({
+        "content": "x".repeat(8192),
+        "metadata": {"lines": 200, "bytes": 8192}
+    }));
+    let error = HostcallOutcome::Error {
+        code: "denied".to_string(),
+        message: "Policy denied access".to_string(),
+    };
+    let stream_chunk = HostcallOutcome::StreamChunk {
+        sequence: 42,
+        chunk: json!({"data": "partial response"}),
+        is_final: false,
+    };
+
+    let mut group = c.benchmark_group("ext_outcome_conversion");
+    group.throughput(Throughput::Elements(1));
+
+    // outcome → host_result
+    group.bench_function("to_host_result/success_small", |b| {
+        b.iter(|| black_box(outcome_to_host_result("call-1", black_box(&success_small))));
+    });
+    group.bench_function("to_host_result/success_large", |b| {
+        b.iter(|| black_box(outcome_to_host_result("call-1", black_box(&success_large))));
+    });
+    group.bench_function("to_host_result/error", |b| {
+        b.iter(|| black_box(outcome_to_host_result("call-1", black_box(&error))));
+    });
+    group.bench_function("to_host_result/stream_chunk", |b| {
+        b.iter(|| black_box(outcome_to_host_result("call-1", black_box(&stream_chunk))));
+    });
+
+    // host_result → outcome
+    let result_success = outcome_to_host_result("call-1", &success_small);
+    let result_error = outcome_to_host_result("call-1", &error);
+    let result_stream = outcome_to_host_result("call-1", &stream_chunk);
+
+    group.bench_function("to_outcome/success", |b| {
+        b.iter(|| black_box(host_result_to_outcome(black_box(result_success.clone()))));
+    });
+    group.bench_function("to_outcome/error", |b| {
+        b.iter(|| black_box(host_result_to_outcome(black_box(result_error.clone()))));
+    });
+    group.bench_function("to_outcome/stream_chunk", |b| {
+        b.iter(|| black_box(host_result_to_outcome(black_box(result_stream.clone()))));
+    });
+
+    group.finish();
+}
+
+/// Measure the full `dispatch_host_call_shared` roundtrip for session ops,
+/// which are the most common lightweight hostcalls.
+fn bench_dispatch_shared_session(c: &mut Criterion) {
+    use pi::connectors::http::{HttpConnector, HttpConnectorConfig};
+    use pi::extensions::{
+        ExtensionManager, ExtensionPolicy, HostCallContext, HostCallPayload,
+        dispatch_host_call_shared,
+    };
+
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let http = Arc::new(HttpConnector::new(HttpConnectorConfig::default()));
+    let policy = ExtensionPolicy::default();
+
+    let manager = ExtensionManager::new();
+    let session: Arc<dyn pi::extensions::ExtensionSession + Send + Sync> = Arc::new(BenchSession);
+    manager.set_session(session);
+
+    let calls: Vec<(&str, HostCallPayload)> = vec![
+        (
+            "get_state",
+            HostCallPayload {
+                call_id: "call-1".to_string(),
+                capability: "session".to_string(),
+                method: "session".to_string(),
+                params: json!({"op": "get_state"}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "get_name",
+            HostCallPayload {
+                call_id: "call-2".to_string(),
+                capability: "session".to_string(),
+                method: "session".to_string(),
+                params: json!({"op": "get_name"}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "set_name",
+            HostCallPayload {
+                call_id: "call-3".to_string(),
+                capability: "session".to_string(),
+                method: "session".to_string(),
+                params: json!({"op": "set_name", "name": "bench-session"}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "get_model",
+            HostCallPayload {
+                call_id: "call-4".to_string(),
+                capability: "session".to_string(),
+                method: "session".to_string(),
+                params: json!({"op": "get_model"}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+    ];
+
+    let mut group = c.benchmark_group("ext_dispatch_shared_session");
+    group.throughput(Throughput::Elements(1));
+
+    for (name, call) in &calls {
+        let ctx = HostCallContext {
+            runtime_name: "bench",
+            extension_id: Some("ext.bench"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager.clone()),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+        let call = call.clone();
+        group.bench_function(BenchmarkId::new("roundtrip", name), move |b| {
+            b.iter(|| {
+                block_on(dispatch_host_call_shared(
+                    black_box(&ctx),
+                    black_box(call.clone()),
+                ))
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Measure the full `dispatch_host_call_shared` roundtrip for events ops.
+fn bench_dispatch_shared_events(c: &mut Criterion) {
+    use pi::connectors::http::{HttpConnector, HttpConnectorConfig};
+    use pi::extensions::{
+        ExtensionManager, ExtensionPolicy, HostCallContext, HostCallPayload,
+        dispatch_host_call_shared,
+    };
+
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let http = Arc::new(HttpConnector::new(HttpConnectorConfig::default()));
+    let policy = ExtensionPolicy::default();
+
+    let manager = ExtensionManager::new();
+
+    let calls: Vec<(&str, HostCallPayload)> = vec![
+        (
+            "getActiveTools",
+            HostCallPayload {
+                call_id: "call-e1".to_string(),
+                capability: "events".to_string(),
+                method: "events".to_string(),
+                params: json!({"op": "getActiveTools"}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "getAllTools",
+            HostCallPayload {
+                call_id: "call-e2".to_string(),
+                capability: "events".to_string(),
+                method: "events".to_string(),
+                params: json!({"op": "getAllTools"}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+        (
+            "emit",
+            HostCallPayload {
+                call_id: "call-e3".to_string(),
+                capability: "events".to_string(),
+                method: "events".to_string(),
+                params: json!({"op": "emit", "event": "test_event", "data": {"key": "value"}}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            },
+        ),
+    ];
+
+    let mut group = c.benchmark_group("ext_dispatch_shared_events");
+    group.throughput(Throughput::Elements(1));
+
+    for (name, call) in &calls {
+        let ctx = HostCallContext {
+            runtime_name: "bench",
+            extension_id: Some("ext.bench"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager.clone()),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+        let call = call.clone();
+        group.bench_function(BenchmarkId::new("roundtrip", name), move |b| {
+            b.iter(|| {
+                block_on(dispatch_host_call_shared(
+                    black_box(&ctx),
+                    black_box(call.clone()),
+                ))
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Measure the JS↔Rust serialization bridge overhead by roundtripping
+/// payloads through hostcall requests.
+///
+/// Each hostcall crosses the JS→JSON boundary on entry (`js_to_json` in the
+/// native function) and JSON→JS on return (`json_to_js` in `deliver_completion`).
+/// We measure this indirectly via the `complete_hostcall` + `tick` path with
+/// varying payload sizes.
+fn bench_js_serde_bridge(c: &mut Criterion) {
+    // Set up a PiJsRuntime with the tool-calling shim installed.
+    let rt = block_on(PiJsRuntime::new()).unwrap();
+    block_on(rt.eval(BENCH_TOOL_SETUP)).expect("register bench tool");
+
+    let payloads: Vec<(&str, Value)> = vec![
+        ("null", Value::Null),
+        ("bool", json!(true)),
+        ("int", json!(42)),
+        ("string_short", json!("hello")),
+        ("string_1kb", json!("x".repeat(1024))),
+        ("object_small", json!({"name": "read", "path": "README.md"})),
+        ("object_medium", {
+            let mut obj = serde_json::Map::new();
+            for i in 0..16 {
+                obj.insert(format!("key_{i:02}"), json!(format!("value_{i}")));
+            }
+            Value::Object(obj)
+        }),
+        ("object_large", {
+            let mut obj = serde_json::Map::new();
+            for i in 0..64 {
+                obj.insert(format!("key_{i:02}"), json!("x".repeat(64)));
+            }
+            Value::Object(obj)
+        }),
+        ("array_10", json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
+        (
+            "nested_deep",
+            json!({
+                "a": {"b": {"c": {"d": {"e": {"f": "deep_value"}}}}}
+            }),
+        ),
+    ];
+
+    // Measure the complete_hostcall + tick path which exercises json_to_js
+    // (converting the outcome Value back to JS) and drain_jobs (resolving
+    // the Promise). This is the return-path serialization hot path.
+    let mut group = c.benchmark_group("ext_serde_bridge_roundtrip");
+    group.throughput(Throughput::Elements(1));
+
+    for (name, payload) in &payloads {
+        let payload = payload.clone();
+        group.bench_function(*name, |b| {
+            b.iter(|| {
+                block_on(async {
+                    // Trigger a tool call from JS to generate a hostcall request.
+                    rt.eval(BENCH_TOOL_CALL).await.expect("eval tool call");
+                    let mut requests = rt.drain_hostcall_requests();
+                    let request = requests.pop_front().expect("hostcall request");
+                    // Complete with the test payload — this exercises json_to_js.
+                    rt.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Success(black_box(payload.clone())),
+                    );
+                    rt.tick().await.expect("tick");
+                });
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Measure policy evaluation in the full shared-dispatch context including
+/// quota check and runtime risk evaluation overhead.
+fn bench_dispatch_overhead_breakdown(c: &mut Criterion) {
+    use pi::connectors::http::{HttpConnector, HttpConnectorConfig};
+    use pi::extensions::{
+        ExtensionManager, ExtensionPolicy, ExtensionPolicyMode, HostCallContext, HostCallPayload,
+        dispatch_host_call_shared,
+    };
+
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let http = Arc::new(HttpConnector::new(HttpConnectorConfig::default()));
+
+    let policies = vec![
+        ("default", ExtensionPolicy::default()),
+        (
+            "strict",
+            ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                ..ExtensionPolicy::default()
+            },
+        ),
+        (
+            "permissive",
+            ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            },
+        ),
+    ];
+
+    // A simple session read call that will be allowed through policy.
+    let call = HostCallPayload {
+        call_id: "call-overhead".to_string(),
+        capability: "session".to_string(),
+        method: "session".to_string(),
+        params: json!({"op": "get_state"}),
+        timeout_ms: None,
+        cancel_token: None,
+        context: None,
+    };
+
+    let mut group = c.benchmark_group("ext_dispatch_overhead");
+    group.throughput(Throughput::Elements(1));
+
+    // Without manager (minimal overhead path)
+    for (policy_name, policy) in &policies {
+        let ctx = HostCallContext {
+            runtime_name: "bench",
+            extension_id: Some("ext.bench"),
+            tools: &tools,
+            http: &http,
+            manager: None,
+            policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+        let call = call.clone();
+        group.bench_function(BenchmarkId::new("no_manager", *policy_name), move |b| {
+            b.iter(|| {
+                block_on(dispatch_host_call_shared(
+                    black_box(&ctx),
+                    black_box(call.clone()),
+                ))
+            });
+        });
+    }
+
+    // With manager (full overhead: quota + risk eval)
+    let manager = ExtensionManager::new();
+    let session: Arc<dyn pi::extensions::ExtensionSession + Send + Sync> = Arc::new(BenchSession);
+    manager.set_session(session);
+
+    for (policy_name, policy) in &policies {
+        let ctx = HostCallContext {
+            runtime_name: "bench",
+            extension_id: Some("ext.bench"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager.clone()),
+            policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+        let call = call.clone();
+        group.bench_function(BenchmarkId::new("with_manager", *policy_name), move |b| {
+            b.iter(|| {
+                block_on(dispatch_host_call_shared(
+                    black_box(&ctx),
+                    black_box(call.clone()),
+                ))
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = criterion_config();
@@ -743,6 +1181,12 @@ criterion_group!(
         bench_extension_tool_call_roundtrip,
         bench_extension_event_hook_dispatch,
         bench_js_runtime,
-        bench_hostcall_params_hash
+        bench_hostcall_params_hash,
+        bench_hostcall_request_to_payload,
+        bench_hostcall_outcome_conversion,
+        bench_dispatch_shared_session,
+        bench_dispatch_shared_events,
+        bench_js_serde_bridge,
+        bench_dispatch_overhead_breakdown
 );
 criterion_main!(benches);

@@ -8,6 +8,9 @@
 //! - `truncate_tail_10k_lines`: <1ms
 //! - `sse_parse_100_events`: <100μs
 
+#[path = "bench_env.rs"]
+mod bench_env;
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::StreamExt as _;
 use std::fmt::Write as _;
@@ -278,13 +281,15 @@ fn bench_streaming_arc(c: &mut Criterion) {
 // Criterion Groups
 // ============================================================================
 
-criterion_group!(
-    benches,
-    bench_truncate_head,
-    bench_truncate_tail,
-    bench_truncate_no_truncation,
-    bench_sse_parsing,
-    bench_sse_stream,
-    bench_streaming_arc,
-);
+criterion_group! {
+    name = benches;
+    config = bench_env::criterion_config();
+    targets =
+        bench_truncate_head,
+        bench_truncate_tail,
+        bench_truncate_no_truncation,
+        bench_sse_parsing,
+        bench_sse_stream,
+        bench_streaming_arc,
+}
 criterion_main!(benches);

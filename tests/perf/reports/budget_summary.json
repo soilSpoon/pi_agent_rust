@@ -48,7 +48,7 @@
     {
       "category": "tool_call",
       "ci_enforced": true,
-      "methodology": "pijs_workload: 2000 iterations x 1 tool call, release build",
+      "methodology": "pijs_workload: 2000 iterations x 1 tool call, perf profile",
       "metric": "p99 per-call latency",
       "name": "tool_call_latency_p99",
       "threshold": 200.0,
@@ -57,7 +57,7 @@
     {
       "category": "tool_call",
       "ci_enforced": true,
-      "methodology": "pijs_workload: 2000 iterations x 10 tool calls, release build",
+      "methodology": "pijs_workload: 2000 iterations x 10 tool calls, perf profile",
       "metric": "minimum calls/sec",
       "name": "tool_call_throughput_min",
       "threshold": 5000.0,
@@ -119,12 +119,12 @@
     }
   ],
   "ci_enforced": 8,
-  "ci_fail": 0,
-  "ci_with_data": 1,
-  "fail": 0,
-  "generated_at": "2026-02-12T17:02:12.568748440+00:00",
-  "no_data": 9,
-  "pass": 4,
+  "ci_fail": 1,
+  "ci_with_data": 5,
+  "fail": 1,
+  "generated_at": "2026-02-15T18:20:27.682689268+00:00",
+  "no_data": 4,
+  "pass": 8,
   "schema": "pi.perf.budget_summary.v1",
   "total_budgets": 13
 }

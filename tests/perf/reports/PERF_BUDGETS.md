@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-12T17:02:12Z
+> Generated: 2026-02-15T18:20:27Z
 
 ## Summary
 
@@ -8,11 +8,11 @@
 |---|---|
 | Total budgets | 13 |
 | CI-enforced | 8 |
-| CI-enforced with data | 1 |
-| CI-enforced FAIL | 0 |
-| PASS | 4 |
-| FAIL | 0 |
-| No data | 9 |
+| CI-enforced with data | 5 |
+| CI-enforced FAIL | 1 |
+| PASS | 8 |
+| FAIL | 1 |
+| No data | 4 |
 
 ## Startup
 
@@ -25,8 +25,8 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `ext_cold_load_simple_p95` | p95 cold load time | 5 ms | - | NO_DATA | Yes |
-| `ext_cold_load_complex_p95` | p95 cold load time | 50 ms | - | NO_DATA | No |
+| `ext_cold_load_simple_p95` | p95 cold load time | 5 ms | 1.0 | PASS | Yes |
+| `ext_cold_load_complex_p95` | p95 cold load time | 50 ms | 0.8 | PASS | No |
 | `ext_load_60_total` | total load time (60 official extensions) | 10000 ms | 6198.0 | PASS | No |
 
 ## Tool_call
@@ -40,32 +40,32 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 36 | PASS | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 46 | PASS | No |
 
 ## Policy
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `policy_eval_p99` | p99 evaluation time | 500 ns | - | NO_DATA | Yes |
+| `policy_eval_p99` | p99 evaluation time | 500 ns | 115 | PASS | Yes |
 
 ## Memory
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `idle_memory_rss` | RSS at idle | 50 MB | 4.2 | PASS | Yes |
+| `idle_memory_rss` | RSS at idle | 50 MB | 4.6 | PASS | Yes |
 | `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | 0.0 | PASS | No |
 
 ## Binary
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `binary_size_release` | release binary size | 20 MB | - | NO_DATA | Yes |
+| `binary_size_release` | release binary size | 20 MB | 20.9 | FAIL | Yes |
 
 ## Protocol
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `protocol_parse_p99` | p99 parse+validate time | 50 us | - | NO_DATA | Yes |
+| `protocol_parse_p99` | p99 parse+validate time | 50 us | 6 | PASS | Yes |
 
 ## Measurement Methodology
 
@@ -74,8 +74,8 @@
 - **`ext_cold_load_simple_p95`**: criterion: load_init_cold for simple single-file extensions (10 samples)
 - **`ext_cold_load_complex_p95`**: criterion: load_init_cold for multi-registration extensions (10 samples)
 - **`ext_load_60_total`**: conformance runner: sequential load of all 60 official extensions
-- **`tool_call_latency_p99`**: pijs_workload: 2000 iterations x 1 tool call, release build
-- **`tool_call_throughput_min`**: pijs_workload: 2000 iterations x 10 tool calls, release build
+- **`tool_call_latency_p99`**: pijs_workload: 2000 iterations x 1 tool call, perf profile
+- **`tool_call_throughput_min`**: pijs_workload: 2000 iterations x 10 tool calls, perf profile
 - **`event_dispatch_p99`**: criterion: event_hook dispatch for before_agent_start (100 samples)
 - **`policy_eval_p99`**: criterion: ext_policy/evaluate with various modes and capabilities
 - **`idle_memory_rss`**: sysinfo: measure RSS after startup, before any user input

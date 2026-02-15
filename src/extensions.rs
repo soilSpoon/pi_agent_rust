@@ -67,62 +67,203 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
-fn hostcall_params_hash(method: &str, params: &Value) -> String {
-    fn canonicalize_json(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => {
-                let mut keys = map.keys().cloned().collect::<Vec<_>>();
-                keys.sort();
-                let mut out = serde_json::Map::new();
-                for key in keys {
-                    if let Some(value) = map.get(&key) {
-                        out.insert(key, canonicalize_json(value));
-                    }
+/// Write JSON with sorted object keys directly into `out`, avoiding an
+/// intermediate `serde_json::Value` tree.  Produces output identical to
+/// `serde_json::to_string(&canonicalize_json(value))`.
+fn write_canonical_json(value: &Value, out: &mut String) {
+    use std::fmt::Write as _;
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Value::String(s) => {
+            write_json_escaped_str(s, out);
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
                 }
-                Value::Object(out)
+                write_canonical_json(item, out);
             }
-            Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
-            other => other.clone(),
+            out.push(']');
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            let mut first = true;
+            for key in keys {
+                if let Some(v) = map.get(key) {
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    write_json_escaped_str(key, out);
+                    out.push(':');
+                    write_canonical_json(v, out);
+                }
+            }
+            out.push('}');
         }
     }
+}
 
-    let canonical = canonicalize_json(&json!({ "method": method, "params": params }));
-    let encoded = serde_json::to_string(&canonical).expect("serialize canonical hostcall params");
+/// Write a JSON-escaped string (with quotes) to `out`.  Uses a fast path for
+/// ASCII strings that need no escaping (common for object keys and method
+/// names), falling back to `serde_json::to_string` only when necessary.
+fn write_json_escaped_str(s: &str, out: &mut String) {
+    // Fast path: pure ASCII with no chars that require JSON escaping.
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.reserve(s.len() + 2);
+        out.push('"');
+        out.push_str(s);
+        out.push('"');
+    } else {
+        let escaped = serde_json::to_string(s).expect("string serialization");
+        out.push_str(&escaped);
+    }
+}
+
+/// Feed canonical JSON with sorted object keys directly into a SHA-256 hasher,
+/// bypassing the intermediate `String` buffer entirely.
+pub(crate) fn hash_canonical_json(value: &Value, hasher: &mut sha2::Sha256) {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+    match value {
+        Value::Null => hasher.update(b"null"),
+        Value::Bool(b) => hasher.update(if *b { &b"true"[..] } else { &b"false"[..] }),
+        Value::Number(n) => {
+            // Numbers are short — write to a small stack buffer.
+            let mut buf = String::with_capacity(24);
+            let _ = write!(buf, "{n}");
+            hasher.update(buf.as_bytes());
+        }
+        Value::String(s) => {
+            hash_json_escaped_str(s, hasher);
+        }
+        Value::Array(items) => {
+            hasher.update(b"[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    hasher.update(b",");
+                }
+                hash_canonical_json(item, hasher);
+            }
+            hasher.update(b"]");
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            hasher.update(b"{");
+            let mut first = true;
+            for key in keys {
+                if let Some(v) = map.get(key) {
+                    if !first {
+                        hasher.update(b",");
+                    }
+                    first = false;
+                    hash_json_escaped_str(key, hasher);
+                    hasher.update(b":");
+                    hash_canonical_json(v, hasher);
+                }
+            }
+            hasher.update(b"}");
+        }
+    }
+}
+
+/// Feed a JSON-escaped string (with quotes) directly into a SHA-256 hasher.
+pub(crate) fn hash_json_escaped_str(s: &str, hasher: &mut sha2::Sha256) {
+    use sha2::Digest as _;
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        hasher.update(b"\"");
+        hasher.update(s.as_bytes());
+        hasher.update(b"\"");
+    } else {
+        let escaped = serde_json::to_string(s).expect("string serialization");
+        hasher.update(escaped.as_bytes());
+    }
+}
+
+/// Convert a SHA-256 digest to a lowercase hex string using a lookup table.
+pub(crate) fn sha256_to_hex(digest: &[u8]) -> String {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for &b in digest {
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 0x0f)]));
+    }
+    out
+}
+
+pub(crate) fn hostcall_params_hash(method: &str, params: &Value) -> String {
+    use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
-    hasher.update(encoded.as_bytes());
-    format!("{:x}", hasher.finalize())
+    // {"method": ..., "params": ...} — keys already sorted alphabetically.
+    hasher.update(br#"{"method":"#);
+    hash_json_escaped_str(method, &mut hasher);
+    hasher.update(br#","params":"#);
+    hash_canonical_json(params, &mut hasher);
+    hasher.update(b"}");
+    sha256_to_hex(hasher.finalize().as_slice())
+}
+
+/// Feed the *shape* of a JSON value into the hasher, replacing leaves with
+/// type tags ("string", "number", etc.) without allocating an intermediate
+/// `Value` tree.
+fn hash_canonical_shape(value: &Value, hasher: &mut sha2::Sha256) {
+    use sha2::Digest as _;
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            hasher.update(b"{");
+            let mut first = true;
+            for key in keys {
+                if let Some(v) = map.get(key) {
+                    if !first {
+                        hasher.update(b",");
+                    }
+                    first = false;
+                    hash_json_escaped_str(key, hasher);
+                    hasher.update(b":");
+                    hash_canonical_shape(v, hasher);
+                }
+            }
+            hasher.update(b"}");
+        }
+        Value::Array(items) => {
+            hasher.update(b"[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    hasher.update(b",");
+                }
+                hash_canonical_shape(item, hasher);
+            }
+            hasher.update(b"]");
+        }
+        Value::String(_) => hasher.update(br#""string""#),
+        Value::Number(_) => hasher.update(br#""number""#),
+        Value::Bool(_) => hasher.update(br#""bool""#),
+        Value::Null => hasher.update(br#""null""#),
+    }
 }
 
 fn hostcall_params_shape_hash(method: &str, params: &Value) -> String {
-    fn shape_only(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => {
-                let mut keys = map.keys().cloned().collect::<Vec<_>>();
-                keys.sort();
-                let mut out = serde_json::Map::new();
-                for key in keys {
-                    if let Some(value) = map.get(&key) {
-                        out.insert(key, shape_only(value));
-                    }
-                }
-                Value::Object(out)
-            }
-            Value::Array(items) => Value::Array(items.iter().map(shape_only).collect()),
-            Value::String(_) => Value::String("string".to_string()),
-            Value::Number(_) => Value::String("number".to_string()),
-            Value::Bool(_) => Value::String("bool".to_string()),
-            Value::Null => Value::String("null".to_string()),
-        }
-    }
-
-    let canonical = json!({
-        "method": method,
-        "params_shape": shape_only(params),
-    });
-    let encoded = serde_json::to_string(&canonical).unwrap_or_default();
+    use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
-    hasher.update(encoded.as_bytes());
-    format!("{:x}", hasher.finalize())
+    // Canonical form: {"method": ..., "params_shape": shape_only(params)}
+    // Keys "method" and "params_shape" are already alphabetically sorted.
+    hasher.update(br#"{"method":"#);
+    hash_json_escaped_str(method, &mut hasher);
+    hasher.update(br#","params_shape":"#);
+    hash_canonical_shape(params, &mut hasher);
+    hasher.update(b"}");
+    sha256_to_hex(hasher.finalize().as_slice())
 }
 
 pub const PROTOCOL_VERSION: &str = "1.0";
@@ -1164,8 +1305,8 @@ fn strip_js_comments(line: &str, in_block_comment: &mut bool) -> String {
         }
 
         match ch {
-            '/' if matches!(chars.peek(), Some('/')) => break,
-            '/' if matches!(chars.peek(), Some('*')) => {
+            '/' if matches!(chars.peek(), Some(&'/')) => break,
+            '/' if matches!(chars.peek(), Some(&'*')) => {
                 chars.next();
                 *in_block_comment = true;
             }
@@ -1975,11 +2116,7 @@ fn check_extension_quota(
         state.hostcall_timestamps_ms.pop_front();
     }
 
-    // 2. Record this call.
-    state.hostcall_timestamps_ms.push_back(now_ms);
-    state.hostcalls_total += 1;
-
-    // 3. Per-second burst check.
+    // 2. Per-second burst check.
     if let Some(max_per_sec) = config.max_hostcalls_per_second {
         let horizon_1s = now_ms.saturating_sub(1_000);
         let count_1s = state
@@ -1988,26 +2125,26 @@ fn check_extension_quota(
             .rev()
             .take_while(|&&ts| ts >= horizon_1s)
             .count();
-        if count_1s > max_per_sec as usize {
+        if count_1s >= max_per_sec as usize {
             return QuotaCheckResult::Exceeded {
                 reason: format!("hostcall rate {count_1s}/s exceeds limit {max_per_sec}/s"),
             };
         }
     }
 
-    // 4. Per-minute rate check.
+    // 3. Per-minute rate check.
     if let Some(max_per_min) = config.max_hostcalls_per_minute {
         let count_60s = state.hostcall_timestamps_ms.len();
-        if count_60s > max_per_min as usize {
+        if count_60s >= max_per_min as usize {
             return QuotaCheckResult::Exceeded {
                 reason: format!("hostcall rate {count_60s}/60s exceeds limit {max_per_min}/60s"),
             };
         }
     }
 
-    // 5. Total hostcall budget.
+    // 4. Total hostcall budget.
     if let Some(max_total) = config.max_hostcalls_total {
-        if state.hostcalls_total > max_total {
+        if state.hostcalls_total >= max_total {
             return QuotaCheckResult::Exceeded {
                 reason: format!(
                     "total hostcalls {} exceeds limit {max_total}",
@@ -2017,7 +2154,7 @@ fn check_extension_quota(
         }
     }
 
-    // 6. Subprocess fan-out (only relevant for exec capability).
+    // 5. Subprocess fan-out (only relevant for exec capability).
     if capability == "exec" {
         if let Some(max_sub) = config.max_subprocesses {
             if state.active_subprocesses >= max_sub {
@@ -2031,7 +2168,7 @@ fn check_extension_quota(
         }
     }
 
-    // 7. HTTP request budget.
+    // 6. HTTP request budget.
     if capability == "http" {
         if let Some(max_http) = config.max_http_requests {
             if state.http_requests_total >= max_http {
@@ -2042,11 +2179,10 @@ fn check_extension_quota(
                     ),
                 };
             }
-            state.http_requests_total += 1;
         }
     }
 
-    // 8. Write bytes budget (tracked externally via record_write_bytes).
+    // 7. Write bytes budget (tracked externally via record_write_bytes).
     if capability == "write" {
         if let Some(max_wb) = config.max_write_bytes {
             if state.write_bytes_total >= max_wb {
@@ -2058,6 +2194,13 @@ fn check_extension_quota(
                 };
             }
         }
+    }
+
+    // All checks passed; record usage.
+    state.hostcall_timestamps_ms.push_back(now_ms);
+    state.hostcalls_total += 1;
+    if capability == "http" {
+        state.http_requests_total += 1;
     }
 
     QuotaCheckResult::Allowed
@@ -4629,11 +4772,12 @@ fn runtime_risk_base_score(capability: &str, method: &str, policy_reason: &str) 
     runtime_risk_clamp01(capability_score + method_bonus + policy_bonus)
 }
 
-fn runtime_hostcall_policy_profile(mode: ExtensionPolicyMode) -> String {
+/// Gap D3: returns `&'static str` — avoids one heap allocation per hostcall.
+const fn runtime_hostcall_policy_profile(mode: ExtensionPolicyMode) -> &'static str {
     match mode {
-        ExtensionPolicyMode::Strict => "strict".to_string(),
-        ExtensionPolicyMode::Prompt => "balanced".to_string(),
-        ExtensionPolicyMode::Permissive => "permissive".to_string(),
+        ExtensionPolicyMode::Strict => "strict",
+        ExtensionPolicyMode::Prompt => "balanced",
+        ExtensionPolicyMode::Permissive => "permissive",
     }
 }
 
@@ -4726,47 +4870,49 @@ fn runtime_hostcall_is_private_ip(host: &str) -> Option<bool> {
     })
 }
 
-fn runtime_hostcall_resource_target_class(method: &str, params: &Value) -> String {
+/// Gap D3: returns `&'static str` — all branches are known static strings,
+/// eliminating one heap allocation per hostcall.
+fn runtime_hostcall_resource_target_class(method: &str, params: &Value) -> &'static str {
     match method {
         "http" => {
             let Some(url_raw) = params.get("url").and_then(Value::as_str) else {
-                return "network.unknown".to_string();
+                return "network.unknown";
             };
             let parsed = Url::parse(url_raw).ok();
             let Some(url) = parsed else {
-                return "network.unknown".to_string();
+                return "network.unknown";
             };
             let Some(host) = url.host_str() else {
-                return "network.unknown".to_string();
+                return "network.unknown";
             };
             if host.eq_ignore_ascii_case("localhost") {
-                return "network.loopback".to_string();
+                return "network.loopback";
             }
             if let Some(is_private) = runtime_hostcall_is_private_ip(host) {
                 if is_private {
-                    return "network.private".to_string();
+                    return "network.private";
                 }
-                return "network.public".to_string();
+                return "network.public";
             }
-            "network.public".to_string()
+            "network.public"
         }
-        "exec" => "subprocess.exec".to_string(),
+        "exec" => "subprocess.exec",
         "tool" => {
             let tool_name = params
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             match tool_name {
-                "read" | "write" | "edit" | "grep" | "find" | "ls" => "filesystem.tool".to_string(),
-                "bash" => "subprocess.tool".to_string(),
-                _ => "tool.unknown".to_string(),
+                "read" | "write" | "edit" | "grep" | "find" | "ls" => "filesystem.tool",
+                "bash" => "subprocess.tool",
+                _ => "tool.unknown",
             }
         }
-        "session" => "session.state".to_string(),
-        "ui" => "ui.interaction".to_string(),
-        "events" => "event.bus".to_string(),
-        "log" => "telemetry.log".to_string(),
-        _ => "unknown".to_string(),
+        "session" => "session.state",
+        "ui" => "ui.interaction",
+        "events" => "event.bus",
+        "log" => "telemetry.log",
+        _ => "unknown",
     }
 }
 
@@ -6546,9 +6692,7 @@ impl ExtensionPolicy {
     }
 }
 
-pub(crate) fn required_capability_for_host_call_static(
-    call: &HostCallPayload,
-) -> Option<&'static str> {
+fn required_capability_for_host_call_static_legacy(call: &HostCallPayload) -> Option<&'static str> {
     let method = call.method.trim();
     if method.is_empty() {
         return None;
@@ -6608,6 +6752,15 @@ pub(crate) fn required_capability_for_host_call_static(
     } else {
         None
     }
+}
+
+pub(crate) fn required_capability_for_host_call_static(
+    call: &HostCallPayload,
+) -> Option<&'static str> {
+    if let Ok(HostcallOpcodeResolution::FastPath { opcode, .. }) = resolve_hostcall_opcode(call) {
+        return Some(opcode.required_capability());
+    }
+    required_capability_for_host_call_static_legacy(call)
 }
 
 pub fn required_capability_for_host_call(call: &HostCallPayload) -> Option<String> {
@@ -7472,6 +7625,113 @@ pub struct HostResultPayload {
     pub chunk: Option<HostStreamChunk>,
 }
 
+pub const HOSTCALL_OPCODE_SCHEMA_VERSION: &str = "pi.ext.hostcall_opcode.v1";
+pub const HOSTCALL_OPCODE_VERSION: u16 = 1;
+const HOSTCALL_OPCODE_CONTEXT_KEY: &str = "typed_opcode";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostcallOpcodeSource {
+    ContextV1,
+    DerivedV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommonHostcallOpcode {
+    ToolRead,
+    ToolWrite,
+    ToolEdit,
+    ToolBash,
+    SessionGetName,
+    SessionSetName,
+    SessionGetModel,
+    SessionSetModel,
+    SessionGetThinkingLevel,
+    SessionSetThinkingLevel,
+    SessionSetLabel,
+    EventsGetActiveTools,
+    EventsGetAllTools,
+    EventsSetActiveTools,
+    EventsEmit,
+    EventsList,
+}
+
+impl CommonHostcallOpcode {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::ToolRead => "tool.read",
+            Self::ToolWrite => "tool.write",
+            Self::ToolEdit => "tool.edit",
+            Self::ToolBash => "tool.bash",
+            Self::SessionGetName => "session.get_name",
+            Self::SessionSetName => "session.set_name",
+            Self::SessionGetModel => "session.get_model",
+            Self::SessionSetModel => "session.set_model",
+            Self::SessionGetThinkingLevel => "session.get_thinking_level",
+            Self::SessionSetThinkingLevel => "session.set_thinking_level",
+            Self::SessionSetLabel => "session.set_label",
+            Self::EventsGetActiveTools => "events.get_active_tools",
+            Self::EventsGetAllTools => "events.get_all_tools",
+            Self::EventsSetActiveTools => "events.set_active_tools",
+            Self::EventsEmit => "events.emit",
+            Self::EventsList => "events.list",
+        }
+    }
+
+    const fn required_capability(self) -> &'static str {
+        match self {
+            Self::ToolRead => "read",
+            Self::ToolWrite | Self::ToolEdit => "write",
+            Self::ToolBash => "exec",
+            Self::SessionGetName
+            | Self::SessionSetName
+            | Self::SessionGetModel
+            | Self::SessionSetModel
+            | Self::SessionGetThinkingLevel
+            | Self::SessionSetThinkingLevel
+            | Self::SessionSetLabel => "session",
+            Self::EventsGetActiveTools
+            | Self::EventsGetAllTools
+            | Self::EventsSetActiveTools
+            | Self::EventsEmit
+            | Self::EventsList => "events",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostcallOpcodeResolution {
+    FastPath {
+        opcode: CommonHostcallOpcode,
+        source: HostcallOpcodeSource,
+    },
+    Fallback {
+        reason: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostcallDispatchLane {
+    Fast,
+    Compat,
+}
+
+impl HostcallDispatchLane {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Compat => "compat",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostcallLaneDecision {
+    lane: HostcallDispatchLane,
+    reason: &'static str,
+    opcode: Option<CommonHostcallOpcode>,
+    capability_class: &'static str,
+}
+
 // ============================================================================
 // Shared Hostcall Dispatch (bd-1uy.1.3)
 // ============================================================================
@@ -7511,6 +7771,7 @@ pub fn hostcall_request_to_payload(request: &HostcallRequest) -> HostCallPayload
     let capability = request.required_capability();
     let params = request.params_for_hash();
     let timeout_ms = js_hostcall_timeout_ms(request);
+    let context = hostcall_opcode_context_for_params(&method, &params);
 
     HostCallPayload {
         call_id: request.call_id.clone(),
@@ -7519,7 +7780,7 @@ pub fn hostcall_request_to_payload(request: &HostcallRequest) -> HostCallPayload
         params,
         timeout_ms,
         cancel_token: None,
-        context: None,
+        context,
     }
 }
 
@@ -7609,6 +7870,240 @@ const fn host_call_error_code_str(code: HostCallErrorCode) -> &'static str {
         HostCallErrorCode::Io => "io",
         HostCallErrorCode::InvalidRequest => "invalid_request",
         HostCallErrorCode::Internal => "internal",
+    }
+}
+
+fn normalize_opcode_token(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn hostcall_param_op(params: &Value) -> Option<&str> {
+    params
+        .get("op")
+        .or_else(|| params.get("method"))
+        .or_else(|| params.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_common_hostcall_opcode_code(code: &str) -> Option<CommonHostcallOpcode> {
+    match code.trim() {
+        "tool.read" => Some(CommonHostcallOpcode::ToolRead),
+        "tool.write" => Some(CommonHostcallOpcode::ToolWrite),
+        "tool.edit" => Some(CommonHostcallOpcode::ToolEdit),
+        "tool.bash" => Some(CommonHostcallOpcode::ToolBash),
+        "session.get_name" => Some(CommonHostcallOpcode::SessionGetName),
+        "session.set_name" => Some(CommonHostcallOpcode::SessionSetName),
+        "session.get_model" => Some(CommonHostcallOpcode::SessionGetModel),
+        "session.set_model" => Some(CommonHostcallOpcode::SessionSetModel),
+        "session.get_thinking_level" => Some(CommonHostcallOpcode::SessionGetThinkingLevel),
+        "session.set_thinking_level" => Some(CommonHostcallOpcode::SessionSetThinkingLevel),
+        "session.set_label" => Some(CommonHostcallOpcode::SessionSetLabel),
+        "events.get_active_tools" => Some(CommonHostcallOpcode::EventsGetActiveTools),
+        "events.get_all_tools" => Some(CommonHostcallOpcode::EventsGetAllTools),
+        "events.set_active_tools" => Some(CommonHostcallOpcode::EventsSetActiveTools),
+        "events.emit" => Some(CommonHostcallOpcode::EventsEmit),
+        "events.list" => Some(CommonHostcallOpcode::EventsList),
+        _ => None,
+    }
+}
+
+fn derive_common_hostcall_opcode(method: &str, params: &Value) -> Option<CommonHostcallOpcode> {
+    match normalize_opcode_token(method).as_str() {
+        "tool" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(normalize_opcode_token)?;
+            match name.as_str() {
+                "read" => Some(CommonHostcallOpcode::ToolRead),
+                "write" => Some(CommonHostcallOpcode::ToolWrite),
+                "edit" => Some(CommonHostcallOpcode::ToolEdit),
+                "bash" => Some(CommonHostcallOpcode::ToolBash),
+                _ => None,
+            }
+        }
+        "session" => {
+            let op = hostcall_param_op(params).map(normalize_opcode_token)?;
+            match op.as_str() {
+                "getname" => Some(CommonHostcallOpcode::SessionGetName),
+                "setname" => Some(CommonHostcallOpcode::SessionSetName),
+                "getmodel" => Some(CommonHostcallOpcode::SessionGetModel),
+                "setmodel" => Some(CommonHostcallOpcode::SessionSetModel),
+                "getthinkinglevel" => Some(CommonHostcallOpcode::SessionGetThinkingLevel),
+                "setthinkinglevel" => Some(CommonHostcallOpcode::SessionSetThinkingLevel),
+                "setlabel" => Some(CommonHostcallOpcode::SessionSetLabel),
+                _ => None,
+            }
+        }
+        "events" => {
+            let op = hostcall_param_op(params).map(normalize_opcode_token)?;
+            match op.as_str() {
+                "getactivetools" => Some(CommonHostcallOpcode::EventsGetActiveTools),
+                "getalltools" => Some(CommonHostcallOpcode::EventsGetAllTools),
+                "setactivetools" => Some(CommonHostcallOpcode::EventsSetActiveTools),
+                "emit" => Some(CommonHostcallOpcode::EventsEmit),
+                "list" => Some(CommonHostcallOpcode::EventsList),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_opcode_from_context(call: &HostCallPayload) -> Result<Option<CommonHostcallOpcode>> {
+    let Some(context) = call.context.as_ref() else {
+        return Ok(None);
+    };
+    let Some(context_obj) = context.as_object() else {
+        return Err(Error::validation(
+            "host_call context must be an object when typed opcode metadata is provided",
+        ));
+    };
+    let Some(opcode_meta) = context_obj.get(HOSTCALL_OPCODE_CONTEXT_KEY) else {
+        return Ok(None);
+    };
+    let Some(meta_obj) = opcode_meta.as_object() else {
+        return Err(Error::validation(
+            "host_call context.typed_opcode must be an object",
+        ));
+    };
+
+    if let Some(schema) = meta_obj.get("schema").and_then(Value::as_str)
+        && schema != HOSTCALL_OPCODE_SCHEMA_VERSION
+    {
+        return Err(Error::validation(format!(
+            "Unsupported host_call typed opcode schema: {schema}"
+        )));
+    }
+
+    let Some(version) = meta_obj.get("version").and_then(Value::as_u64) else {
+        return Err(Error::validation(
+            "host_call context.typed_opcode.version is required",
+        ));
+    };
+    if version != u64::from(HOSTCALL_OPCODE_VERSION) {
+        return Err(Error::validation(format!(
+            "Unsupported host_call typed opcode version: {version}"
+        )));
+    }
+
+    let Some(code) = meta_obj
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(Error::validation(
+            "host_call context.typed_opcode.code is required",
+        ));
+    };
+    let Some(opcode) = parse_common_hostcall_opcode_code(code) else {
+        return Err(Error::validation(format!(
+            "Unknown host_call typed opcode code: {code}"
+        )));
+    };
+    Ok(Some(opcode))
+}
+
+fn resolve_hostcall_opcode(call: &HostCallPayload) -> Result<HostcallOpcodeResolution> {
+    if let Some(opcode) = parse_opcode_from_context(call)? {
+        let Some(derived) = derive_common_hostcall_opcode(&call.method, &call.params) else {
+            return Err(Error::validation(format!(
+                "host_call typed opcode '{}' is not compatible with method '{}'",
+                opcode.code(),
+                call.method
+            )));
+        };
+        if derived != opcode {
+            return Err(Error::validation(format!(
+                "host_call typed opcode '{}' does not match payload-derived opcode '{}'",
+                opcode.code(),
+                derived.code()
+            )));
+        }
+        return Ok(HostcallOpcodeResolution::FastPath {
+            opcode,
+            source: HostcallOpcodeSource::ContextV1,
+        });
+    }
+
+    if let Some(opcode) = derive_common_hostcall_opcode(&call.method, &call.params) {
+        return Ok(HostcallOpcodeResolution::FastPath {
+            opcode,
+            source: HostcallOpcodeSource::DerivedV1,
+        });
+    }
+
+    Ok(HostcallOpcodeResolution::Fallback {
+        reason: "opcode_not_declared_or_not_supported",
+    })
+}
+
+fn hostcall_capability_class_from_capability(capability: &str) -> &'static str {
+    match capability {
+        "read" | "write" => "filesystem",
+        "exec" => "execution",
+        "http" => "network",
+        "session" => "session",
+        "events" => "events",
+        "ui" => "ui",
+        "log" => "telemetry",
+        "tool" => "tool",
+        _ => "unknown",
+    }
+}
+
+fn hostcall_capability_class(call: &HostCallPayload) -> &'static str {
+    let capability = required_capability_for_host_call_static(call).unwrap_or("internal");
+    hostcall_capability_class_from_capability(capability)
+}
+
+fn select_hostcall_lane(call: &HostCallPayload) -> Result<HostcallLaneDecision> {
+    let capability_class = hostcall_capability_class(call);
+    match resolve_hostcall_opcode(call)? {
+        HostcallOpcodeResolution::FastPath { opcode, source } => Ok(HostcallLaneDecision {
+            lane: HostcallDispatchLane::Fast,
+            reason: match source {
+                HostcallOpcodeSource::ContextV1 => "typed_opcode_context_v1",
+                HostcallOpcodeSource::DerivedV1 => "typed_opcode_derived_v1",
+            },
+            opcode: Some(opcode),
+            capability_class,
+        }),
+        HostcallOpcodeResolution::Fallback { reason } => Ok(HostcallLaneDecision {
+            lane: HostcallDispatchLane::Compat,
+            reason,
+            opcode: None,
+            capability_class,
+        }),
+    }
+}
+
+fn hostcall_opcode_context_for_params(method: &str, params: &Value) -> Option<Value> {
+    let opcode = derive_common_hostcall_opcode(method, params)?;
+    Some(json!({
+        HOSTCALL_OPCODE_CONTEXT_KEY: {
+            "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+            "version": HOSTCALL_OPCODE_VERSION,
+            "code": opcode.code(),
+        }
+    }))
+}
+
+fn params_without_key(params: &Value, key: &str) -> Value {
+    if let Value::Object(map) = params {
+        let mut out = map.clone();
+        out.remove(key);
+        Value::Object(out)
+    } else {
+        Value::Null
     }
 }
 
@@ -8143,12 +8638,17 @@ fn validate_host_call(payload: &HostCallPayload) -> Result<()> {
         return Err(Error::validation("Host call method is empty"));
     }
 
-    let required = required_capability_for_host_call_static(payload).ok_or_else(|| {
-        Error::validation(format!(
-            "Unknown or invalid host call method: {}",
-            payload.method
-        ))
-    })?;
+    let required = match resolve_hostcall_opcode(payload)? {
+        HostcallOpcodeResolution::FastPath { opcode, .. } => opcode.required_capability(),
+        HostcallOpcodeResolution::Fallback { .. } => {
+            required_capability_for_host_call_static_legacy(payload).ok_or_else(|| {
+                Error::validation(format!(
+                    "Unknown or invalid host call method: {}",
+                    payload.method
+                ))
+            })?
+        }
+    };
 
     if declared_capability != required {
         return Err(Error::validation(format!(
@@ -11220,7 +11720,7 @@ impl JsExtensionRuntimeHandle {
 
     #[allow(clippy::too_many_lines)]
     async fn start_inner(
-        config: PiJsRuntimeConfig,
+        mut config: PiJsRuntimeConfig,
         tools: Arc<ToolRegistry>,
         manager: ExtensionManager,
         interceptor: Option<Arc<dyn HostcallInterceptor>>,
@@ -11229,11 +11729,17 @@ impl JsExtensionRuntimeHandle {
         let (tx, rx) = mpsc::channel(32);
         let (init_tx, init_rx) = oneshot::channel();
         let (exit_tx, exit_rx) = oneshot::channel();
+        let policy = policy.unwrap_or_default();
+
+        if !policy.deny_caps.contains(&"env".to_string()) {
+            config.deny_env = false;
+        }
+
         let host = JsRuntimeHost {
             tools,
             manager_ref: Arc::downgrade(&manager.inner),
             http: Arc::new(HttpConnector::with_defaults()),
-            policy: policy.unwrap_or_default(),
+            policy,
             interceptor,
         };
 
@@ -13134,6 +13640,16 @@ pub async fn dispatch_host_call_shared(
     call: HostCallPayload,
 ) -> HostResultPayload {
     if let Err(err) = validate_host_call(&call) {
+        tracing::warn!(
+            event = "host_call.validation_reject",
+            runtime = ctx.runtime_name,
+            call_id = %call.call_id,
+            extension_id = ?ctx.extension_id,
+            capability = %call.capability,
+            method = %call.method,
+            reason = %err,
+            "Hostcall rejected during validation"
+        );
         return outcome_to_host_result(
             &call.call_id,
             &HostcallOutcome::Error {
@@ -13254,9 +13770,9 @@ pub async fn dispatch_host_call_shared(
                 &params_hash,
                 RuntimeRiskCallMetadata {
                     args_shape_hash: &args_shape_hash,
-                    resource_target_class: &resource_target_class,
+                    resource_target_class,
                     timeout_ms: call.timeout_ms,
-                    policy_profile: &policy_profile,
+                    policy_profile,
                 },
                 &reason,
             );
@@ -13650,6 +14166,263 @@ async fn resolve_shared_policy_prompt(
 /// expected by the type-specific dispatch functions.
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn dispatch_shared_allowed(
+    ctx: &HostCallContext<'_>,
+    call: &HostCallPayload,
+) -> HostcallOutcome {
+    let lane = match select_hostcall_lane(call) {
+        Ok(lane) => lane,
+        Err(err) => {
+            tracing::warn!(
+                event = "host_call.opcode.reject",
+                call_id = %call.call_id,
+                extension_id = ?ctx.extension_id,
+                method = %call.method,
+                reason = %err,
+                "Rejecting hostcall due to invalid typed opcode metadata"
+            );
+            return HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message: err.to_string(),
+            };
+        }
+    };
+
+    tracing::debug!(
+        event = "host_call.lane_decision",
+        call_id = %call.call_id,
+        extension_id = ?ctx.extension_id,
+        method = %call.method,
+        lane = lane.lane.as_str(),
+        decision_reason = lane.reason,
+        capability_class = lane.capability_class,
+        opcode = lane.opcode.map(CommonHostcallOpcode::code),
+        opcode_schema = HOSTCALL_OPCODE_SCHEMA_VERSION,
+        opcode_version = HOSTCALL_OPCODE_VERSION,
+        "Selected hostcall dispatch lane"
+    );
+
+    match lane.lane {
+        HostcallDispatchLane::Fast => {
+            let opcode = lane.opcode.expect("fast lane must include opcode");
+            dispatch_shared_allowed_fast(ctx, call, opcode).await
+        }
+        HostcallDispatchLane::Compat => dispatch_shared_allowed_legacy(ctx, call).await,
+    }
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+async fn dispatch_shared_allowed_fast(
+    ctx: &HostCallContext<'_>,
+    call: &HostCallPayload,
+    opcode: CommonHostcallOpcode,
+) -> HostcallOutcome {
+    match opcode {
+        CommonHostcallOpcode::ToolRead => {
+            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
+            dispatch_hostcall_tool(ctx.tools, &call.call_id, "read", input).await
+        }
+        CommonHostcallOpcode::ToolWrite => {
+            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
+            dispatch_hostcall_tool(ctx.tools, &call.call_id, "write", input).await
+        }
+        CommonHostcallOpcode::ToolEdit => {
+            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
+            dispatch_hostcall_tool(ctx.tools, &call.call_id, "edit", input).await
+        }
+        CommonHostcallOpcode::ToolBash => {
+            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
+            dispatch_hostcall_tool(ctx.tools, &call.call_id, "bash", input).await
+        }
+        CommonHostcallOpcode::SessionGetName => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "get_name",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionSetName => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "set_name",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionGetModel => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "get_model",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionSetModel => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "set_model",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionGetThinkingLevel => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "get_thinking_level",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionSetThinkingLevel => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "set_thinking_level",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionSetLabel => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "set_label",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsGetActiveTools => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "get_active_tools",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsGetAllTools => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "get_all_tools",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsSetActiveTools => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "set_active_tools",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsEmit => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "emit",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsList => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "list",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+async fn dispatch_shared_allowed_legacy(
     ctx: &HostCallContext<'_>,
     call: &HostCallPayload,
 ) -> HostcallOutcome {
@@ -14171,6 +14944,7 @@ async fn dispatch_hostcall_exec(
             });
 
             let mut sequence = 0_u64;
+            let call_id_owned = call_id.to_string();
             loop {
                 if !runtime.is_hostcall_pending(call_id) {
                     cancel.store(true, AtomicOrdering::SeqCst);
@@ -14182,22 +14956,26 @@ async fn dispatch_hostcall_exec(
 
                 match rx.recv_timeout(Duration::from_millis(25)) {
                     Ok(ExecStreamFrame::Stdout(chunk)) => {
+                        let mut m = serde_json::Map::with_capacity(1);
+                        m.insert("stdout".into(), Value::String(chunk));
                         runtime.complete_hostcall(
-                            call_id.to_string(),
+                            call_id_owned.clone(),
                             HostcallOutcome::StreamChunk {
                                 sequence,
-                                chunk: json!({ "stdout": chunk }),
+                                chunk: Value::Object(m),
                                 is_final: false,
                             },
                         );
                         sequence = sequence.saturating_add(1);
                     }
                     Ok(ExecStreamFrame::Stderr(chunk)) => {
+                        let mut m = serde_json::Map::with_capacity(1);
+                        m.insert("stderr".into(), Value::String(chunk));
                         runtime.complete_hostcall(
-                            call_id.to_string(),
+                            call_id_owned.clone(),
                             HostcallOutcome::StreamChunk {
                                 sequence,
-                                chunk: json!({ "stderr": chunk }),
+                                chunk: Value::Object(m),
                                 is_final: false,
                             },
                         );
@@ -27484,6 +28262,16 @@ mod tests {
             payload.params,
             json!({ "name": "read", "input": { "path": "test.txt" } })
         );
+        assert_eq!(
+            payload.context,
+            Some(json!({
+                "typed_opcode": {
+                    "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+                    "version": HOSTCALL_OPCODE_VERSION,
+                    "code": "tool.read"
+                }
+            }))
+        );
     }
 
     #[test]
@@ -27507,6 +28295,10 @@ mod tests {
             Some("ls")
         );
         assert!(payload.params.get("args").is_some());
+        assert!(
+            payload.context.is_none(),
+            "exec is currently routed through legacy dispatcher path"
+        );
     }
 
     #[test]
@@ -27532,6 +28324,152 @@ mod tests {
         assert_eq!(
             payload.params.get("key").and_then(Value::as_str),
             Some("value")
+        );
+        assert!(
+            payload.context.is_none(),
+            "unsupported session ops should omit typed opcode context and use fallback"
+        );
+    }
+
+    #[test]
+    fn hostcall_request_to_payload_session_get_name_emits_typed_opcode_context() {
+        let request = HostcallRequest {
+            call_id: "call-session-name".to_string(),
+            kind: HostcallKind::Session {
+                op: "get_name".to_string(),
+            },
+            payload: json!({}),
+            trace_id: 7,
+            extension_id: None,
+        };
+
+        let payload = hostcall_request_to_payload(&request);
+        assert_eq!(
+            payload.context,
+            Some(json!({
+                "typed_opcode": {
+                    "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+                    "version": HOSTCALL_OPCODE_VERSION,
+                    "code": "session.get_name"
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn validate_host_call_rejects_malformed_typed_opcode_context() {
+        let payload = HostCallPayload {
+            call_id: "bad-opcode-context".to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "read", "input": {} }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: Some(json!({
+                "typed_opcode": {
+                    "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+                    "version": HOSTCALL_OPCODE_VERSION,
+                    "code": "tool.unknown"
+                }
+            })),
+        };
+
+        let err = validate_host_call(&payload).expect_err("unknown opcode code must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Unknown host_call typed opcode code"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_hostcall_opcode_fallback_for_unsupported_ops() {
+        let payload = HostCallPayload {
+            call_id: "fallback-op".to_string(),
+            capability: "session".to_string(),
+            method: "session".to_string(),
+            params: json!({ "op": "append_entry", "customType": "metric", "data": {} }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let resolution = resolve_hostcall_opcode(&payload).expect("opcode resolution");
+        assert!(matches!(
+            resolution,
+            HostcallOpcodeResolution::Fallback {
+                reason: "opcode_not_declared_or_not_supported"
+            }
+        ));
+    }
+
+    #[test]
+    fn select_hostcall_lane_fast_for_typed_tool_opcode() {
+        let payload = HostCallPayload {
+            call_id: "lane-fast".to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "read", "input": {} }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: Some(json!({
+                "typed_opcode": {
+                    "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+                    "version": HOSTCALL_OPCODE_VERSION,
+                    "code": "tool.read"
+                }
+            })),
+        };
+
+        let lane = select_hostcall_lane(&payload).expect("lane decision");
+        assert_eq!(lane.lane, HostcallDispatchLane::Fast);
+        assert_eq!(lane.reason, "typed_opcode_context_v1");
+        assert_eq!(lane.capability_class, "filesystem");
+        assert_eq!(lane.opcode, Some(CommonHostcallOpcode::ToolRead));
+    }
+
+    #[test]
+    fn select_hostcall_lane_compat_for_untyped_session_op() {
+        let payload = HostCallPayload {
+            call_id: "lane-compat".to_string(),
+            capability: "session".to_string(),
+            method: "session".to_string(),
+            params: json!({ "op": "append_entry", "customType": "x", "data": {} }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        let lane = select_hostcall_lane(&payload).expect("lane decision");
+        assert_eq!(lane.lane, HostcallDispatchLane::Compat);
+        assert_eq!(lane.reason, "opcode_not_declared_or_not_supported");
+        assert_eq!(lane.capability_class, "session");
+        assert!(lane.opcode.is_none());
+    }
+
+    #[test]
+    fn select_hostcall_lane_rejects_mismatched_typed_opcode() {
+        let payload = HostCallPayload {
+            call_id: "lane-bad".to_string(),
+            capability: "session".to_string(),
+            method: "session".to_string(),
+            params: json!({ "op": "set_name", "name": "x" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: Some(json!({
+                "typed_opcode": {
+                    "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+                    "version": HOSTCALL_OPCODE_VERSION,
+                    "code": "session.get_name"
+                }
+            })),
+        };
+
+        let err = select_hostcall_lane(&payload).expect_err("mismatch must fail");
+        assert!(
+            err.to_string()
+                .contains("does not match payload-derived opcode"),
+            "unexpected error: {err}"
         );
     }
 

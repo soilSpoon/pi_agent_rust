@@ -1,12 +1,13 @@
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::session::{SessionEntry, SessionHeader};
+use crate::session_metrics;
 use asupersync::Outcome;
 use asupersync::database::{SqliteConnection, SqliteError, SqliteRow, SqliteValue};
 use std::path::Path;
 
 const INIT_SQL: &str = r"
-PRAGMA journal_mode = DELETE;
+PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 
@@ -49,14 +50,12 @@ fn row_get_str<'a>(row: &'a SqliteRow, column: &str) -> Result<&'a str> {
         .map_err(|err| Error::session(format!("SQLite row read failed: {err}")))
 }
 
-fn compute_message_count_and_name(
-    entries: &[std::sync::Arc<SessionEntry>],
-) -> (u64, Option<String>) {
+fn compute_message_count_and_name(entries: &[SessionEntry]) -> (u64, Option<String>) {
     let mut message_count = 0u64;
     let mut name = None;
 
     for entry in entries {
-        match &**entry {
+        match entry {
             SessionEntry::Message(_) => message_count += 1,
             SessionEntry::SessionInfo(info) => {
                 if info.name.is_some() {
@@ -70,9 +69,10 @@ fn compute_message_count_and_name(
     (message_count, name)
 }
 
-pub async fn load_session(
-    path: &Path,
-) -> Result<(SessionHeader, Vec<std::sync::Arc<SessionEntry>>)> {
+pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>)> {
+    let metrics = session_metrics::global();
+    let _timer = metrics.start_timer(&metrics.sqlite_load);
+
     if !path.exists() {
         return Err(Error::SessionNotFound {
             path: path.display().to_string(),
@@ -105,13 +105,16 @@ pub async fn load_session(
     for row in entry_rows {
         let json = row_get_str(&row, "json")?;
         let entry: SessionEntry = serde_json::from_str(json)?;
-        entries.push(std::sync::Arc::new(entry));
+        entries.push(entry);
     }
 
     Ok((header, entries))
 }
 
 pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
+    let metrics = session_metrics::global();
+    let _timer = metrics.start_timer(&metrics.sqlite_load_meta);
+
     if !path.exists() {
         return Err(Error::SessionNotFound {
             path: path.display().to_string(),
@@ -168,15 +171,10 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
         for row in entry_rows {
             let json = row_get_str(&row, "json")?;
             let entry: SessionEntry = serde_json::from_str(json)?;
-            entries.push(std::sync::Arc::new(entry));
+            entries.push(entry);
         }
 
-        let (message_count, fallback_name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (message_count, fallback_name) = compute_message_count_and_name(&entries);
         if name.is_none() {
             name = fallback_name;
         }
@@ -190,6 +188,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::model::UserContent;
@@ -230,12 +229,7 @@ mod tests {
     #[test]
     fn compute_counts_messages_only() {
         let entries = vec![message_entry(), message_entry(), message_entry()];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 3);
         assert!(name.is_none());
     }
@@ -247,12 +241,7 @@ mod tests {
             session_info_entry(Some("My Session".to_string())),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 2);
         assert_eq!(name, Some("My Session".to_string()));
     }
@@ -264,12 +253,7 @@ mod tests {
             session_info_entry(None),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 1);
         // The second SessionInfo has name=None, so it doesn't overwrite.
         assert_eq!(name, Some("First".to_string()));
@@ -281,12 +265,7 @@ mod tests {
             session_info_entry(Some("First".to_string())),
             session_info_entry(Some("Second".to_string())),
         ];
-        let (_, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (_, name) = compute_message_count_and_name(&entries);
         assert_eq!(name, Some("Second".to_string()));
     }
 
@@ -304,12 +283,7 @@ mod tests {
             }),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 2);
         assert!(name.is_none());
     }
@@ -325,12 +299,7 @@ mod tests {
                 label: Some("important".to_string()),
             }),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 1);
         assert!(name.is_none());
     }
@@ -346,12 +315,7 @@ mod tests {
             }),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 1);
         assert!(name.is_none());
     }
@@ -372,12 +336,7 @@ mod tests {
             message_entry(),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 3);
         assert!(name.is_none());
     }
@@ -414,12 +373,7 @@ mod tests {
             }),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 3);
         assert_eq!(name, Some("Named".to_string()));
     }
@@ -501,9 +455,7 @@ mod tests {
 
     #[test]
     fn compute_counts_large_message_set() {
-        let entries: Vec<std::sync::Arc<SessionEntry>> = (0..1000)
-            .map(|_| std::sync::Arc::new(message_entry()))
-            .collect();
+        let entries: Vec<SessionEntry> = (0..1000).map(|_| message_entry()).collect();
         let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 1000);
         assert!(name.is_none());
@@ -519,12 +471,7 @@ mod tests {
             message_entry(),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 3);
         assert_eq!(name, Some("Early Name".to_string()));
     }
@@ -544,12 +491,7 @@ mod tests {
                 from_hook: None,
             }),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 1);
         assert!(name.is_none());
     }
@@ -566,12 +508,7 @@ mod tests {
             }),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(
-            &entries
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect::<Vec<_>>(),
-        );
+        let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 1);
         assert!(name.is_none());
     }
@@ -580,8 +517,11 @@ mod tests {
 pub async fn save_session(
     path: &Path,
     header: &SessionHeader,
-    entries: &[std::sync::Arc<SessionEntry>],
+    entries: &[SessionEntry],
 ) -> Result<()> {
+    let metrics = session_metrics::global();
+    let _save_timer = metrics.start_timer(&metrics.sqlite_save);
+
     if let Some(parent) = path.parent() {
         asupersync::fs::create_dir_all(parent).await?;
     }
@@ -605,7 +545,20 @@ pub async fn save_session(
             .await,
     )?;
 
+    // Serialize header + entries and track serialization time + bytes.
+    let serialize_timer = metrics.start_timer(&metrics.sqlite_serialize);
     let header_json = serde_json::to_string(header)?;
+    let mut total_json_bytes = header_json.len() as u64;
+
+    let mut entry_jsons = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let json = serde_json::to_string(entry)?;
+        total_json_bytes += json.len() as u64;
+        entry_jsons.push(json);
+    }
+    serialize_timer.finish();
+    metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
+
     map_outcome(
         tx.execute(
             cx.cx(),
@@ -618,8 +571,7 @@ pub async fn save_session(
         .await,
     )?;
 
-    for (idx, entry) in entries.iter().enumerate() {
-        let json = serde_json::to_string(&**entry)?;
+    for (idx, json) in entry_jsons.into_iter().enumerate() {
         map_outcome(
             tx.execute(
                 cx.cx(),
@@ -653,6 +605,92 @@ pub async fn save_session(
                 &[
                     SqliteValue::Text("name".to_string()),
                     SqliteValue::Text(name),
+                ],
+            )
+            .await,
+        )?;
+    }
+
+    map_outcome(tx.commit(cx.cx()).await)?;
+    Ok(())
+}
+
+/// Incrementally append new entries to an existing SQLite session database.
+///
+/// Only the entries in `new_entries` (starting at 1-based sequence `start_seq`)
+/// are inserted. The header row is left unchanged, while the `message_count`
+/// and `name` meta rows are upserted to reflect the current totals.
+///
+/// This avoids the DELETE+reinsert cost of [`save_session`] for the common
+/// case where a few entries are appended between saves.
+pub async fn append_entries(
+    path: &Path,
+    new_entries: &[SessionEntry],
+    start_seq: usize,
+    message_count: u64,
+    session_name: Option<&str>,
+) -> Result<()> {
+    let metrics = session_metrics::global();
+    let _timer = metrics.start_timer(&metrics.sqlite_append);
+
+    let cx = AgentCx::for_request();
+    let conn = map_outcome(SqliteConnection::open(cx.cx(), path).await)?;
+
+    // Ensure WAL mode is active (no-op if already set).
+    map_outcome(
+        conn.execute_batch(cx.cx(), "PRAGMA journal_mode = WAL")
+            .await,
+    )?;
+
+    let tx = map_outcome(conn.begin_immediate(cx.cx()).await)?;
+
+    // Serialize and insert only the new entries.
+    let serialize_timer = metrics.start_timer(&metrics.sqlite_serialize);
+    let mut total_json_bytes = 0u64;
+    let mut entry_jsons = Vec::with_capacity(new_entries.len());
+    for entry in new_entries {
+        let json = serde_json::to_string(entry)?;
+        total_json_bytes += json.len() as u64;
+        entry_jsons.push(json);
+    }
+    serialize_timer.finish();
+    metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
+
+    for (i, json) in entry_jsons.into_iter().enumerate() {
+        let seq = start_seq + i + 1; // 1-based
+        map_outcome(
+            tx.execute(
+                cx.cx(),
+                "INSERT INTO pi_session_entries (seq,json) VALUES (?1,?2)",
+                &[
+                    SqliteValue::Integer(i64::try_from(seq).unwrap_or(i64::MAX)),
+                    SqliteValue::Text(json),
+                ],
+            )
+            .await,
+        )?;
+    }
+
+    // Upsert meta counters (INSERT OR REPLACE).
+    map_outcome(
+        tx.execute(
+            cx.cx(),
+            "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
+            &[
+                SqliteValue::Text("message_count".to_string()),
+                SqliteValue::Text(message_count.to_string()),
+            ],
+        )
+        .await,
+    )?;
+    if let Some(name) = session_name {
+        map_outcome(
+            tx.execute(
+                cx.cx(),
+                "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
+                &[
+                    SqliteValue::Text("name".to_string()),
+                    SqliteValue::Text(name.to_string()),
                 ],
             )
             .await,

@@ -208,8 +208,14 @@ impl ModelRegistry {
         self.models
             .iter()
             .find(|m| {
-                (m.model.provider.eq_ignore_ascii_case(provider)
-                    || m.model.provider.eq_ignore_ascii_case(canonical_provider))
+                let model_provider = m.model.provider.as_str();
+                let model_provider_canonical =
+                    canonical_provider_id(model_provider).unwrap_or(model_provider);
+                let provider_matches = model_provider.eq_ignore_ascii_case(provider)
+                    || model_provider.eq_ignore_ascii_case(canonical_provider)
+                    || model_provider_canonical.eq_ignore_ascii_case(provider)
+                    || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
+                provider_matches
                     && lookup_ids
                         .iter()
                         .any(|lookup_id| m.model.id.eq_ignore_ascii_case(lookup_id))
@@ -391,6 +397,7 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
 #[allow(clippy::too_many_lines)]
 fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config: &ModelsConfig) {
     for (provider_id, provider_cfg) in &config.providers {
+        let provider_id_str = provider_id.as_str();
         let routing_defaults = provider_routing_defaults(provider_id);
         let default_api = routing_defaults.map_or("openai-completions", |defaults| defaults.api);
         let provider_api = provider_cfg.api.as_deref().unwrap_or(default_api);
@@ -406,7 +413,15 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
         });
 
         let provider_headers = resolve_headers(provider_cfg.headers.as_ref());
-        let canonical_provider = canonical_provider_id(provider_id).unwrap_or(provider_id.as_str());
+        let canonical_provider = canonical_provider_id(provider_id).unwrap_or(provider_id_str);
+        let provider_matches = |candidate_provider: &str| {
+            let candidate_canonical =
+                canonical_provider_id(candidate_provider).unwrap_or(candidate_provider);
+            candidate_provider.eq_ignore_ascii_case(provider_id_str)
+                || candidate_provider.eq_ignore_ascii_case(canonical_provider)
+                || candidate_canonical.eq_ignore_ascii_case(provider_id_str)
+                || candidate_canonical.eq_ignore_ascii_case(canonical_provider)
+        };
         let provider_key = provider_cfg
             .api_key
             .as_deref()
@@ -435,7 +450,7 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
         if is_override {
             for entry in models
                 .iter_mut()
-                .filter(|m| m.model.provider == *provider_id)
+                .filter(|m| provider_matches(&m.model.provider))
             {
                 // Only override base_url and api if explicitly set in models.json.
                 // Otherwise keep the built-in defaults (e.g. anthropic's /v1/messages URL).
@@ -462,7 +477,7 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
         }
 
         // Remove built-in provider models if fully overridden
-        models.retain(|m| m.model.provider != *provider_id);
+        models.retain(|m| !provider_matches(&m.model.provider));
 
         let mut normalized_provider_ids = HashSet::new();
         for model_cfg in provider_cfg.models.clone().unwrap_or_default() {
@@ -2100,6 +2115,119 @@ mod tests {
             .collect();
         assert_eq!(anthropic_after.len(), 1);
         assert_eq!(anthropic_after[0].model.id, "custom-claude");
+    }
+
+    #[test]
+    fn apply_custom_models_alias_replaces_canonical_built_ins_when_models_specified() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = built_in_models(&auth);
+        let google_before = models
+            .iter()
+            .filter(|m| m.model.provider == "google")
+            .count();
+        assert!(google_before > 0);
+
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "gemini".to_string(),
+                ProviderConfig {
+                    models: Some(vec![ModelConfig {
+                        id: "gemini-custom".to_string(),
+                        name: Some("Gemini Custom".to_string()),
+                        ..ModelConfig::default()
+                    }]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config);
+
+        assert!(
+            !models.iter().any(|m| m.model.provider == "google"),
+            "canonical google built-ins should be replaced when alias config provides explicit models"
+        );
+        let gemini_models: Vec<_> = models
+            .iter()
+            .filter(|m| m.model.provider == "gemini")
+            .collect();
+        assert_eq!(gemini_models.len(), 1);
+        assert_eq!(gemini_models[0].model.id, "gemini-custom");
+    }
+
+    #[test]
+    fn apply_custom_models_alias_override_without_models_updates_canonical_provider_models() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = built_in_models(&auth);
+        let google_before = models
+            .iter()
+            .filter(|m| m.model.provider == "google")
+            .count();
+        assert!(google_before > 0);
+
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "gemini".to_string(),
+                ProviderConfig {
+                    base_url: Some("https://proxy.example/v1".to_string()),
+                    api: Some("google-generative-ai".to_string()),
+                    auth_header: Some(true),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config);
+
+        let google_after: Vec<_> = models
+            .iter()
+            .filter(|m| m.model.provider == "google")
+            .collect();
+        assert_eq!(google_after.len(), google_before);
+        assert!(
+            google_after
+                .iter()
+                .all(|m| m.model.base_url == "https://proxy.example/v1")
+        );
+        assert!(
+            google_after
+                .iter()
+                .all(|m| m.model.api == "google-generative-ai")
+        );
+        assert!(google_after.iter().all(|m| m.auth_header));
+    }
+
+    #[test]
+    fn model_registry_find_canonical_provider_matches_alias_backed_custom_model() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = Vec::new();
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "gemini".to_string(),
+                ProviderConfig {
+                    models: Some(vec![ModelConfig {
+                        id: "gemini-custom-find".to_string(),
+                        ..ModelConfig::default()
+                    }]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config);
+        let registry = ModelRegistry {
+            models,
+            error: None,
+        };
+
+        assert!(
+            registry.find("gemini", "gemini-custom-find").is_some(),
+            "alias lookup should resolve"
+        );
+        assert!(
+            registry.find("google", "gemini-custom-find").is_some(),
+            "canonical provider lookup should also match alias-backed model"
+        );
     }
 
     // ─── OAuthConfig ─────────────────────────────────────────────────

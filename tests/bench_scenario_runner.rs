@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -36,6 +36,11 @@ use sysinfo::System;
 /// Extensions to benchmark (name, artifact dir name).
 /// Must be >=3 per bd-m5jp acceptance criteria.
 const BENCH_EXTENSIONS: &[&str] = &["hello", "pirate", "diff"];
+const BENCH_PROTOCOL_SCHEMA: &str = "pi.bench.protocol.v1";
+const BENCH_PROTOCOL_VERSION: &str = "1.0.0";
+const PARTITION_MATCHED_STATE: &str = "matched-state";
+const EVIDENCE_CLASS_MEASURED: &str = "measured";
+const CONFIDENCE_HIGH: &str = "high";
 
 /// Iterations for cold/warm start scenarios.
 const LOAD_RUNS: usize = 5;
@@ -89,6 +94,43 @@ fn env_fingerprint() -> Value {
         "git_commit": git_commit,
         "features": [],
         "config_hash": config_hash,
+    })
+}
+
+fn new_run_correlation_id(env: &Value) -> String {
+    let config_hash = env
+        .get("config_hash")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let raw = format!("{config_hash}|{now_nanos}|{}", std::process::id());
+    let full = sha256_hex(&raw);
+    full.chars().take(32).collect()
+}
+
+fn scenario_replay_input(record: &serde_json::Map<String, Value>) -> Value {
+    record
+        .get("runs")
+        .and_then(Value::as_u64)
+        .map(|runs| json!({ "runs": runs }))
+        .or_else(|| {
+            record
+                .get("iterations")
+                .and_then(Value::as_u64)
+                .map(|iterations| json!({ "iterations": iterations }))
+        })
+        .unwrap_or_else(|| json!({}))
+}
+
+fn host_metadata_from_env(env: &Value) -> Value {
+    json!({
+        "os": env.get("os").cloned().unwrap_or(Value::Null),
+        "arch": env.get("arch").cloned().unwrap_or(Value::Null),
+        "cpu_model": env.get("cpu_model").cloned().unwrap_or(Value::Null),
+        "cpu_cores": env.get("cpu_cores").cloned().unwrap_or(Value::Null),
+        "mem_total_mb": env.get("mem_total_mb").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -445,6 +487,7 @@ fn run_all_scenarios() -> Result<Vec<Value>> {
     let cwd = project_root();
     let js_cwd = cwd.display().to_string();
     let env = env_fingerprint();
+    let run_correlation_id = new_run_correlation_id(&env);
 
     let mut records: Vec<Value> = Vec::new();
 
@@ -459,21 +502,21 @@ fn run_all_scenarios() -> Result<Vec<Value>> {
 
         eprintln!("[bench] {ext_name}: cold_start ({LOAD_RUNS} runs)");
         let cold = block_on(scenario_cold_start(&spec, &js_cwd, LOAD_RUNS))?;
-        records.push(attach_env(cold, &env));
+        records.push(attach_contract(cold, &env, &run_correlation_id));
 
         eprintln!("[bench] {ext_name}: warm_start ({LOAD_RUNS} runs)");
         let warm = block_on(scenario_warm_start(&spec, &js_cwd, LOAD_RUNS))?;
-        records.push(attach_env(warm, &env));
+        records.push(attach_contract(warm, &env, &run_correlation_id));
 
         eprintln!("[bench] {ext_name}: tool_call ({DISPATCH_ITERATIONS} iters)");
         match block_on(scenario_tool_call(&spec, &js_cwd, DISPATCH_ITERATIONS)) {
-            Ok(tc) => records.push(attach_env(tc, &env)),
+            Ok(tc) => records.push(attach_contract(tc, &env, &run_correlation_id)),
             Err(e) => eprintln!("[warn] {ext_name}: tool_call failed: {e}"),
         }
 
         eprintln!("[bench] {ext_name}: event_dispatch ({DISPATCH_ITERATIONS} iters)");
         match block_on(scenario_event_dispatch(&spec, &js_cwd, DISPATCH_ITERATIONS)) {
-            Ok(ed) => records.push(attach_env(ed, &env)),
+            Ok(ed) => records.push(attach_contract(ed, &env, &run_correlation_id)),
             Err(e) => eprintln!("[warn] {ext_name}: event_dispatch failed: {e}"),
         }
     }
@@ -481,9 +524,67 @@ fn run_all_scenarios() -> Result<Vec<Value>> {
     Ok(records)
 }
 
-fn attach_env(mut record: Value, env: &Value) -> Value {
+fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> Value {
     if let Value::Object(ref mut map) = record {
+        let extension = map
+            .get("extension")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let scenario = map
+            .get("scenario")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let runtime = map
+            .get("runtime")
+            .cloned()
+            .unwrap_or_else(|| Value::String("unknown".to_string()));
+        let scenario_correlation =
+            sha256_hex(&format!("{run_correlation_id}|{extension}|{scenario}"));
+        let scenario_correlation: String = scenario_correlation.chars().take(32).collect();
+
+        let replay_input = scenario_replay_input(map);
+        let build_profile = env
+            .get("build_profile")
+            .cloned()
+            .unwrap_or_else(|| Value::String("unknown".to_string()));
+
         map.insert("env".to_string(), env.clone());
+        map.insert(
+            "protocol_schema".to_string(),
+            Value::String(BENCH_PROTOCOL_SCHEMA.to_string()),
+        );
+        map.insert(
+            "protocol_version".to_string(),
+            Value::String(BENCH_PROTOCOL_VERSION.to_string()),
+        );
+        map.insert(
+            "partition".to_string(),
+            Value::String(PARTITION_MATCHED_STATE.to_string()),
+        );
+        map.insert(
+            "evidence_class".to_string(),
+            Value::String(EVIDENCE_CLASS_MEASURED.to_string()),
+        );
+        map.insert(
+            "confidence".to_string(),
+            Value::String(CONFIDENCE_HIGH.to_string()),
+        );
+        map.insert(
+            "correlation_id".to_string(),
+            Value::String(scenario_correlation),
+        );
+        map.insert(
+            "scenario_metadata".to_string(),
+            json!({
+                "runtime": runtime,
+                "build_profile": build_profile,
+                "host": host_metadata_from_env(env),
+                "scenario_id": format!("{PARTITION_MATCHED_STATE}/{scenario}"),
+                "replay_input": replay_input,
+            }),
+        );
     }
     record
 }
@@ -593,6 +694,57 @@ fn scenario_output_has_stable_structure() {
         assert!(obj.contains_key("scenario"), "missing scenario");
         assert!(obj.contains_key("extension"), "missing extension");
         assert!(obj.contains_key("env"), "missing env");
+        assert!(
+            obj.contains_key("protocol_schema"),
+            "missing protocol_schema"
+        );
+        assert!(
+            obj.contains_key("protocol_version"),
+            "missing protocol_version"
+        );
+        assert!(obj.contains_key("partition"), "missing partition");
+        assert!(obj.contains_key("evidence_class"), "missing evidence_class");
+        assert!(obj.contains_key("confidence"), "missing confidence");
+        assert!(obj.contains_key("correlation_id"), "missing correlation_id");
+        assert!(
+            obj.contains_key("scenario_metadata"),
+            "missing scenario_metadata"
+        );
+
+        assert_eq!(
+            obj.get("protocol_schema").and_then(Value::as_str),
+            Some(BENCH_PROTOCOL_SCHEMA),
+            "unexpected protocol_schema",
+        );
+        assert_eq!(
+            obj.get("protocol_version").and_then(Value::as_str),
+            Some(BENCH_PROTOCOL_VERSION),
+            "unexpected protocol_version",
+        );
+        assert_eq!(
+            obj.get("partition").and_then(Value::as_str),
+            Some(PARTITION_MATCHED_STATE),
+            "unexpected partition",
+        );
+        assert_eq!(
+            obj.get("evidence_class").and_then(Value::as_str),
+            Some(EVIDENCE_CLASS_MEASURED),
+            "unexpected evidence_class",
+        );
+        assert_eq!(
+            obj.get("confidence").and_then(Value::as_str),
+            Some(CONFIDENCE_HIGH),
+            "unexpected confidence",
+        );
+
+        let correlation_id = obj
+            .get("correlation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            !correlation_id.is_empty(),
+            "correlation_id must be non-empty"
+        );
 
         // Env fingerprint has required fields
         let env = obj.get("env").unwrap();
@@ -607,6 +759,23 @@ fn scenario_output_has_stable_structure() {
             "config_hash",
         ] {
             assert!(env.get(field).is_some(), "env missing field: {field}");
+        }
+
+        let metadata = obj
+            .get("scenario_metadata")
+            .and_then(Value::as_object)
+            .expect("scenario_metadata must be object");
+        for field in &[
+            "runtime",
+            "build_profile",
+            "host",
+            "scenario_id",
+            "replay_input",
+        ] {
+            assert!(
+                metadata.contains_key(*field),
+                "scenario_metadata missing field: {field}"
+            );
         }
     }
 }

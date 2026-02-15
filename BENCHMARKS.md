@@ -119,19 +119,32 @@ sse_parsing/parse/1000  time:   [495.54 µs 495.96 µs 496.40 µs]
 
 ```
 benches/
+├── bench_env.rs      # Shared environment validation and fingerprinting
 ├── tools.rs          # Core operation benchmarks
 │   ├── truncation    # Text truncation (head/tail)
-│   └── sse_parsing   # SSE event parsing
+│   ├── sse_parsing   # SSE event parsing
+│   ├── sse_stream    # Streaming SSE parsing at various chunk sizes
+│   └── streaming_clone  # Arc<AssistantMessage> vs deep clone
 ├── extensions.rs     # Connector dispatch + policy / protocol parsing
 │   ├── ext_policy
 │   ├── ext_required_capability
 │   ├── ext_dispatch
-│   └── ext_protocol
-│   └── ext_js_runtime     # QuickJS cold/warm start + no-op eval
-└── system.rs         # System-level benchmarks (process spawn)
-    ├── startup       # Startup time (version, help, list_models)
-    ├── memory        # RSS memory measurement
-    └── binary        # Binary size tracking
+│   ├── ext_protocol
+│   ├── ext_js_runtime     # QuickJS cold/warm start + no-op eval
+│   ├── hostcall_*         # Hostcall conversion, hashing, dispatch
+│   └── js_serde_bridge    # JS↔Rust serialization roundtrip
+├── system.rs         # System-level benchmarks (process spawn)
+│   ├── startup       # Startup time (version, help, list_models)
+│   ├── memory        # RSS memory measurement
+│   └── binary        # Binary size tracking
+├── tui_perf.rs       # TUI rendering benchmarks (PERF-8)
+│   ├── build_conversation_content
+│   ├── view          # Full TUI render
+│   ├── viewport_operations
+│   └── markdown_rendering
+└── session_save.rs   # Session clone benchmarks
+scripts/
+└── bench_env_setup.sh  # OS-level benchmark environment standardization
 ```
 
 ## Adding New Benchmarks
@@ -210,9 +223,9 @@ jobs:
       - name: Generate PiJS workload perf data (JSONL)
         run: |
           set -euxo pipefail
-          mkdir -p target/perf
-          cargo run --release --bin pijs_workload -- --iterations 2000 --tool-calls 1 > target/perf/pijs_workload.jsonl
-          cargo run --release --bin pijs_workload -- --iterations 2000 --tool-calls 10 >> target/perf/pijs_workload.jsonl
+          mkdir -p target/perf/perf
+          PI_BENCH_BUILD_PROFILE=perf cargo run --profile perf --bin pijs_workload -- --iterations 2000 --tool-calls 1 > target/perf/perf/pijs_workload_perf.jsonl
+          PI_BENCH_BUILD_PROFILE=perf cargo run --profile perf --bin pijs_workload -- --iterations 2000 --tool-calls 10 >> target/perf/perf/pijs_workload_perf.jsonl
 
       - name: Perf budget gate
         run: cargo test --test perf_budgets -- --nocapture
@@ -248,6 +261,62 @@ System benchmarks spawn real processes, so variance is higher than micro-benchma
 - **CI runners**: Expect 2-3x variance vs local machines; focus on relative changes
 - **Percentiles**: Report p95/p99 for budgets, not just mean
 
+### Environment Standardization (bd-3ar8v.5.4)
+
+All benchmark suites use a shared environment module (`benches/bench_env.rs`) that:
+
+1. **Validates** the execution environment at startup (CPU governor, turbo boost, ASLR, THP)
+2. **Fingerprints** every run with OS, CPU, cores, memory, governor, turbo, ASLR, THP, and config hash
+3. **Computes a noise score** (0 = optimal) and warns when conditions are suboptimal
+
+The `scripts/bench_env_setup.sh` script standardizes the OS for low-variance results:
+
+```bash
+# Check current environment suitability
+./scripts/bench_env_setup.sh validate
+
+# Apply optimal settings (requires root)
+sudo ./scripts/bench_env_setup.sh apply
+
+# Run benchmarks with CPU affinity and priority
+./scripts/bench_env_setup.sh run cargo bench
+
+# Emit JSON fingerprint for artifact tracking
+./scripts/bench_env_setup.sh fingerprint
+
+# Restore original settings
+sudo ./scripts/bench_env_setup.sh restore
+```
+
+**What it controls:**
+
+| Setting | Optimal | Why |
+|---------|---------|-----|
+| CPU governor | `performance` | Fixed frequency eliminates DVFS variance |
+| Turbo boost | disabled | Prevents thermal-dependent frequency shifts |
+| ASLR | disabled | Reproducible memory layouts |
+| THP | `never` | Avoids latency spikes from page coalescing |
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BENCH_CORES` | `0,1` | CPU cores for `taskset` affinity |
+| `BENCH_GOVERNOR` | `performance` | CPU frequency governor to set |
+| `BENCH_NICE` | `-20` | Nice priority for bench processes |
+
+**Noise score interpretation:**
+
+| Score | Meaning |
+|-------|---------|
+| 0 | Optimal — all settings applied |
+| 1-2 | Minor — THP or ASLR not ideal |
+| 3-5 | Moderate — governor or turbo not controlled |
+| 6-7 | High — multiple sources of variance |
+
+CI applies environment setup automatically before benchmarks. The `[bench-env]` banner
+in benchmark stderr output includes the noise score for every run.
+
 ## Profiling Tips
 
 ### bd-1pb: Profile-Driven Optimization Loop
@@ -274,8 +343,8 @@ scripts/bench_extension_workloads.sh
 Commands:
 
 ```bash
-hyperfine --warmup 3 --runs 10 'target/release/pijs_workload --iterations 200 --tool-calls 1'
-hyperfine --warmup 3 --runs 10 'target/release/pijs_workload --iterations 200 --tool-calls 10'
+hyperfine --warmup 3 --runs 10 'target/perf/pijs_workload --iterations 200 --tool-calls 1'
+hyperfine --warmup 3 --runs 10 'target/perf/pijs_workload --iterations 200 --tool-calls 10'
 ```
 
 Summary (times in ms):
@@ -288,16 +357,16 @@ Summary (times in ms):
 JSONL logs (hyperfine + workload):
 
 ```jsonl
-{"tool":"hyperfine","scenario":"pijs_workload_200x1","command":"target/release/pijs_workload --iterations 200 --tool-calls 1","mean_ms":16.96,"stddev_ms":0.98,"min_ms":15.78,"max_ms":19.00}
-{"tool":"hyperfine","scenario":"pijs_workload_200x10","command":"target/release/pijs_workload --iterations 200 --tool-calls 10","mean_ms":97.09,"stddev_ms":4.27,"min_ms":93.08,"max_ms":105.57}
-{"tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":1,"total_calls":200,"elapsed_ms":8,"per_call_us":44,"calls_per_sec":22716}
-{"tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":87,"per_call_us":43,"calls_per_sec":22883}
+{"tool":"hyperfine","scenario":"pijs_workload_200x1","command":"target/perf/pijs_workload --iterations 200 --tool-calls 1","mean_ms":16.96,"stddev_ms":0.98,"min_ms":15.78,"max_ms":19.00}
+{"tool":"hyperfine","scenario":"pijs_workload_200x10","command":"target/perf/pijs_workload --iterations 200 --tool-calls 10","mean_ms":97.09,"stddev_ms":4.27,"min_ms":93.08,"max_ms":105.57}
+{"schema":"pi.perf.workload.v1","tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":1,"total_calls":200,"elapsed_ms":8,"per_call_us":44,"calls_per_sec":22716,"build_profile":"perf"}
+{"schema":"pi.perf.workload.v1","tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":87,"per_call_us":43,"calls_per_sec":22883,"build_profile":"perf"}
 ```
 
 Raw artifacts (local):
-- `target/perf/hyperfine_pijs_workload_200x1.json`
-- `target/perf/hyperfine_pijs_workload_200x10.json`
-- `target/perf/pijs_workload.jsonl`
+- `target/perf/perf/hyperfine_pijs_workload_200x1_perf.json`
+- `target/perf/perf/hyperfine_pijs_workload_200x10_perf.json`
+- `target/perf/perf/pijs_workload_perf.jsonl`
 
 #### 2) Profile
 

@@ -6,6 +6,7 @@
 
 | Schema | Description |
 |---|---|
+| `pi.bench.protocol.v1` | Canonical benchmark protocol contract (partitions, datasets, metadata, replay inputs) |
 | `pi.ext.rust_bench.v1` | Rust QuickJS extension benchmark event (load, tool call, event hook) |
 | `pi.ext.legacy_bench.v1` | Legacy pi-mono (Node.js) extension benchmark event |
 | `pi.perf.workload.v1` | PiJS workload harness output (tool call throughput) |
@@ -64,6 +65,32 @@ Same structure as `pi.ext.rust_bench.v1` with:
 | `elapsed_ms` | number | Total elapsed milliseconds |
 | `per_call_us` | number | Per-call latency in microseconds |
 | `calls_per_sec` | number | Throughput (calls per second) |
+
+### `pi.bench.protocol.v1`
+
+| Field | Type | Description |
+|---|---|---|
+| `schema` | string | Always `"pi.bench.protocol.v1"` |
+| `version` | string | Protocol version used by all benchmark harnesses |
+| `partition_tags` | string[] | Must include `matched-state` and `realistic` |
+| `realistic_session_sizes` | integer[] | Canonical matrix: 100k, 200k, 500k, 1M, 5M |
+| `matched_state_scenarios` | object[] | `cold_start`, `warm_start`, `tool_call`, `event_dispatch` with replay inputs |
+| `required_metadata_fields` | string[] | `runtime`, `build_profile`, `host`, `scenario_id`, `correlation_id` |
+| `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |
+
+## Protocol Matrix
+
+| Partition | Scenario ID | Replay Input |
+|---|---|---|
+| `matched-state` | `cold_start` | `{"extension_fixture_set":["hello","pirate","diff"],"runs":5}` |
+| `matched-state` | `warm_start` | `{"extension_fixture_set":["hello","pirate","diff"],"runs":5}` |
+| `matched-state` | `tool_call` | `{"extension_fixture_set":["hello","pirate","diff"],"iterations":500}` |
+| `matched-state` | `event_dispatch` | `{"event_name":"before_agent_start","iterations":500}` |
+| `realistic` | `realistic/session_100000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_100000.jsonl"}` |
+| `realistic` | `realistic/session_200000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_200000.jsonl"}` |
+| `realistic` | `realistic/session_500000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_500000.jsonl"}` |
+| `realistic` | `realistic/session_1000000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_1000000.jsonl"}` |
+| `realistic` | `realistic/session_5000000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_5000000.jsonl"}` |
 
 ## Determinism Requirements
 

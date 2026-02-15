@@ -1,3 +1,6 @@
+#[path = "bench_env.rs"]
+mod bench_env;
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use pi::model::UserContent;
 use pi::session::{Session, SessionMessage};
@@ -29,5 +32,9 @@ fn bench_session_clone(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_session_clone);
+criterion_group! {
+    name = benches;
+    config = bench_env::criterion_config();
+    targets = bench_session_clone,
+}
 criterion_main!(benches);

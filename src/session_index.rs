@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader};
+use crate::session_metrics;
 use fs4::fs_std::FileExt;
 use serde::Deserialize;
 use sqlmodel_core::Value;
@@ -79,6 +80,8 @@ impl SessionIndex {
     }
 
     fn upsert_meta(&self, meta: SessionMeta) -> Result<()> {
+        let metrics = session_metrics::global();
+        let _timer = metrics.start_timer(&metrics.index_upsert);
         self.with_lock(|conn| {
             init_schema(conn)?;
             let message_count = sqlite_i64_from_u64("message_count", meta.message_count)?;
@@ -116,6 +119,8 @@ impl SessionIndex {
     }
 
     pub fn list_sessions(&self, cwd: Option<&str>) -> Result<Vec<SessionMeta>> {
+        let metrics = session_metrics::global();
+        let _timer = metrics.start_timer(&metrics.index_list);
         self.with_lock(|conn| {
             init_schema(conn)?;
 
@@ -159,6 +164,8 @@ impl SessionIndex {
     }
 
     pub fn reindex_all(&self) -> Result<()> {
+        let metrics = session_metrics::global();
+        let _timer = metrics.start_timer(&metrics.index_reindex);
         let sessions_root = self.sessions_root();
         if !sessions_root.exists() {
             return Ok(());
@@ -235,6 +242,8 @@ impl SessionIndex {
         if let Some(parent) = self.db_path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let metrics = session_metrics::global();
+        let lock_timer = metrics.start_timer(&metrics.index_lock);
         let lock_file = File::options()
             .read(true)
             .write(true)
@@ -242,6 +251,7 @@ impl SessionIndex {
             .truncate(false)
             .open(&self.lock_path)?;
         let _lock = lock_file_guard(&lock_file, Duration::from_secs(5))?;
+        lock_timer.finish();
 
         let config = SqliteConfig::file(self.db_path.to_string_lossy())
             .flags(OpenFlags::create_read_write())

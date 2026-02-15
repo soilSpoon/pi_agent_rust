@@ -213,37 +213,9 @@ pub struct ExtensionToolDef {
     pub parameters: serde_json::Value,
 }
 
-fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut keys = map.keys().cloned().collect::<Vec<_>>();
-            keys.sort();
-            let mut out = serde_json::Map::new();
-            for key in keys {
-                if let Some(value) = map.get(&key) {
-                    out.insert(key, canonicalize_json(value));
-                }
-            }
-            serde_json::Value::Object(out)
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(canonicalize_json).collect())
-        }
-        other => other.clone(),
-    }
-}
-
-fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
-    hex_lower(digest.as_slice())
-}
-
+/// Delegates to the canonical streaming implementation in `extensions.rs`.
 fn hostcall_params_hash(method: &str, params: &serde_json::Value) -> String {
-    let canonical = canonicalize_json(&serde_json::json!({ "method": method, "params": params }));
-    let json = serde_json::to_string(&canonical).expect("serialize canonical hostcall params");
-    sha256_hex(&json)
+    crate::extensions::hostcall_params_hash(method, params)
 }
 
 fn canonical_exec_params(cmd: &str, payload: &serde_json::Value) -> serde_json::Value {
@@ -365,7 +337,8 @@ pub(crate) fn json_to_js<'js>(
             },
             |i| Ok(Value::new_int(ctx.clone(), i)),
         ),
-        serde_json::Value::String(s) => s.clone().into_js(ctx),
+        // Gap D4: avoid cloning the String — pass &str directly to QuickJS.
+        serde_json::Value::String(s) => s.as_str().into_js(ctx),
         serde_json::Value::Array(arr) => {
             let js_arr = rquickjs::Array::new(ctx.clone())?;
             for (i, v) in arr.iter().enumerate() {
@@ -4370,6 +4343,9 @@ pub struct PiJsRuntimeConfig {
     /// Security default is `false` so extensions cannot bypass capability/risk
     /// mediation through direct synchronous subprocess execution.
     pub allow_unsafe_sync_exec: bool,
+    /// Explicitly deny environment variable access regardless of `is_env_var_allowed` blocklist.
+    /// Used to enforce `ExtensionPolicy` with `deny_caps=[\"env\"]` for synchronous `pi.env` access.
+    pub deny_env: bool,
 }
 
 impl PiJsRuntimeConfig {
@@ -4388,6 +4364,7 @@ impl Default for PiJsRuntimeConfig {
             limits: PiJsRuntimeLimits::default(),
             repair_mode: RepairMode::default(),
             allow_unsafe_sync_exec: false,
+            deny_env: true,
         }
     }
 }
@@ -11837,6 +11814,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let process_cwd = self.config.cwd.clone();
         let process_args = self.config.args.clone();
         let env = self.config.env.clone();
+        let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
         let repair_events = Arc::clone(&self.repair_events);
         let allow_unsafe_sync_exec = self.config.allow_unsafe_sync_exec;
@@ -12259,6 +12237,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let env = env.clone();
                         move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
+                            if deny_env {
+                                tracing::debug!(event = "pijs.env.get.denied", key = %key, "env capability denied");
+                                return Ok(None);
+                            }
                             if let Some(value) = compat_env_fallback_value(&key, &env) {
                                 tracing::debug!(
                                     event = "pijs.env.get.compat",
@@ -14618,11 +14600,19 @@ function __pi_crypto_bytes_to_array(raw) {
         return Array.from(new Uint8Array(raw), (value) => Number(value) & 0xff);
     }
     if (typeof raw === 'string') {
-        // Vec<u8> arrives as a hex string (2 chars per byte) via rquickjs.
-        const out = [];
-        for (let i = 0; i + 1 < raw.length; i += 2) {
-            out.push(parseInt(raw.slice(i, i + 2), 16));
+        // Depending on bridge coercion, bytes may arrive as:
+        // 1) hex text (2 chars per byte), or 2) latin1-style binary string.
+        const isHex = raw.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(raw);
+        if (isHex) {
+            const out = [];
+            for (let i = 0; i + 1 < raw.length; i += 2) {
+                const byte = Number.parseInt(raw.slice(i, i + 2), 16);
+                out.push(Number.isFinite(byte) ? (byte & 0xff) : 0);
+            }
+            return out;
         }
+        const out = new Array(raw.length);
+        for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i) & 0xff;
         return out;
     }
     if (typeof raw.length === 'number') {
@@ -16841,11 +16831,9 @@ export default ConfigLoader;
             let params = request.params_for_hash();
             let js_hash = request.params_hash();
 
-            let canonical = canonicalize_json(
-                &serde_json::json!({ "method": request.method(), "params": params }),
-            );
-            let encoded = serde_json::to_string(&canonical).expect("serialize canonical request");
-            let wasm_contract_hash = sha256_hex(&encoded);
+            // Validate streaming hash matches the reference implementation.
+            let wasm_contract_hash =
+                crate::extensions::hostcall_params_hash(request.method(), &params);
 
             assert_eq!(
                 js_hash, wasm_contract_hash,
@@ -17209,6 +17197,7 @@ export default ConfigLoader;
                 limits: PiJsRuntimeLimits::default(),
                 repair_mode: RepairMode::default(),
                 allow_unsafe_sync_exec: false,
+                deny_env: false,
             };
             let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
                 .await
@@ -17266,6 +17255,7 @@ export default ConfigLoader;
                 limits: PiJsRuntimeLimits::default(),
                 repair_mode: RepairMode::default(),
                 allow_unsafe_sync_exec: false,
+                deny_env: false,
             };
             let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
                 .await
@@ -19088,6 +19078,34 @@ export default ConfigLoader;
     }
 
     #[test]
+    fn pijs_web_crypto_get_random_values_smoke() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    const bytes = new Uint8Array(32);
+                    crypto.getRandomValues(bytes);
+                    globalThis.cryptoRng = {
+                        len: bytes.length,
+                        inRange: Array.from(bytes).every((n) => Number.isInteger(n) && n >= 0 && n <= 255),
+                    };
+                    ",
+                )
+                .await
+                .expect("eval web crypto getRandomValues");
+
+            let r = get_global_json(&runtime, "cryptoRng").await;
+            assert_eq!(r["len"], serde_json::json!(32));
+            assert_eq!(r["inRange"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
     fn pijs_buffer_global_operations() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
@@ -19191,6 +19209,7 @@ export default ConfigLoader;
                 limits: PiJsRuntimeLimits::default(),
                 repair_mode: RepairMode::default(),
                 allow_unsafe_sync_exec: false,
+                deny_env: false,
             };
             let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
                 .await
@@ -19265,6 +19284,7 @@ export default ConfigLoader;
                 limits: PiJsRuntimeLimits::default(),
                 repair_mode: RepairMode::default(),
                 allow_unsafe_sync_exec: false,
+                deny_env: false,
             };
             let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
                 .await

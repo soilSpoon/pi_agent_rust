@@ -206,6 +206,39 @@ fn root_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn find_first_existing(root: &Path, candidates: &[&str]) -> PathBuf {
+    for candidate in candidates {
+        let path = root.join(candidate);
+        if path.exists() {
+            return path;
+        }
+    }
+
+    root.join(candidates[0])
+}
+
+fn rust_workload_path(root: &Path) -> PathBuf {
+    find_first_existing(
+        root,
+        &[
+            "target/perf/perf/pijs_workload_perf.jsonl",
+            "target/perf/release/pijs_workload_release.jsonl",
+            "target/perf/debug/pijs_workload_debug.jsonl",
+            "target/perf/pijs_workload.jsonl",
+        ],
+    )
+}
+
+fn hyperfine_path(root: &Path, tool_calls: u32) -> PathBuf {
+    let scenario = format!("200x{tool_calls}");
+    let perf = format!("target/perf/perf/hyperfine_pijs_workload_{scenario}_perf.json");
+    let release = format!("target/perf/release/hyperfine_pijs_workload_{scenario}_release.json");
+    let debug = format!("target/perf/debug/hyperfine_pijs_workload_{scenario}_debug.json");
+    let legacy = format!("target/perf/hyperfine_pijs_workload_{scenario}.json");
+
+    find_first_existing(root, &[&perf, &release, &debug, &legacy])
+}
+
 fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -716,7 +749,8 @@ fn test_read_legacy_bench() {
 
 #[test]
 fn test_read_rust_workload() {
-    let path = root_dir().join("target/perf/pijs_workload.jsonl");
+    let root = root_dir();
+    let path = rust_workload_path(&root);
     if !path.exists() {
         eprintln!(
             "Skipping: Rust workload data not found at {}",
@@ -780,16 +814,14 @@ fn generate_perf_comparison() {
     // Ingest all data sources.
     let legacy: Vec<LegacyBench> =
         read_jsonl(&root.join("target/perf/legacy_extension_workloads.jsonl"));
-    let rust_workloads: Vec<RustWorkload> =
-        read_jsonl(&root.join("target/perf/pijs_workload.jsonl"));
+    let rust_workload_path = rust_workload_path(&root);
+    let rust_workloads: Vec<RustWorkload> = read_jsonl(&rust_workload_path);
     let load_bench: Option<LoadTimeBenchmark> =
         read_json(&root.join("tests/ext_conformance/reports/load_time_benchmark.json"));
     let stress: Option<StressTriage> =
         read_json(&root.join("tests/perf/reports/stress_triage.json"));
-    let hyperfine_1: Option<HyperfineResult> =
-        read_json(&root.join("target/perf/hyperfine_pijs_workload_200x1.json"));
-    let hyperfine_10: Option<HyperfineResult> =
-        read_json(&root.join("target/perf/hyperfine_pijs_workload_200x10.json"));
+    let hyperfine_1: Option<HyperfineResult> = read_json(&hyperfine_path(&root, 1));
+    let hyperfine_10: Option<HyperfineResult> = read_json(&hyperfine_path(&root, 10));
 
     // Build comparison.
     let rows = build_comparison_rows(

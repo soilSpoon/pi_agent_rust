@@ -25,7 +25,7 @@ use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Current session file format version.
 pub const SESSION_VERSION: u8 = 3;
@@ -42,6 +42,7 @@ impl ExtensionSession for SessionHandle {
             return serde_json::json!({
                 "model": null,
                 "thinkingLevel": "off",
+                "durabilityMode": "balanced",
                 "isStreaming": false,
                 "isCompacting": false,
                 "steeringMode": "one-at-a-time",
@@ -67,9 +68,12 @@ impl ExtensionSession for SessionHandle {
             .iter()
             .filter(|entry| matches!(entry, SessionEntry::Message(_)))
             .count();
+        let pending_message_count = session.autosave_metrics().pending_mutations;
+        let durability_mode = session.autosave_durability_mode().as_str();
         serde_json::json!({
             "model": null,
             "thinkingLevel": thinking_level,
+            "durabilityMode": durability_mode,
             "isStreaming": false,
             "isCompacting": false,
             "steeringMode": "one-at-a-time",
@@ -79,7 +83,7 @@ impl ExtensionSession for SessionHandle {
             "sessionName": session_name,
             "autoCompactionEnabled": false,
             "messageCount": message_count,
-            "pendingMessageCount": 0,
+            "pendingMessageCount": pending_message_count,
         })
     }
 
@@ -139,9 +143,6 @@ impl ExtensionSession for SessionHandle {
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.set_name(&name);
-        if session.path.is_some() {
-            session.save().await?;
-        }
         Ok(())
     }
 
@@ -153,9 +154,6 @@ impl ExtensionSession for SessionHandle {
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.append_message(message);
-        if session.path.is_some() {
-            session.save().await?;
-        }
         Ok(())
     }
 
@@ -170,9 +168,6 @@ impl ExtensionSession for SessionHandle {
             return Err(Error::validation("customType must not be empty"));
         }
         session.append_custom_entry(custom_type, data);
-        if session.path.is_some() {
-            session.save().await?;
-        }
         Ok(())
     }
 
@@ -185,9 +180,6 @@ impl ExtensionSession for SessionHandle {
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.append_model_change(provider.clone(), model_id.clone());
         session.set_model_header(Some(provider), Some(model_id), None);
-        if session.path.is_some() {
-            session.save().await?;
-        }
         Ok(())
     }
 
@@ -211,9 +203,6 @@ impl ExtensionSession for SessionHandle {
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.append_thinking_level_change(level.clone());
         session.set_model_header(None, None, Some(level));
-        if session.path.is_some() {
-            session.save().await?;
-        }
         Ok(())
     }
 
@@ -236,9 +225,6 @@ impl ExtensionSession for SessionHandle {
             return Err(Error::validation(format!(
                 "target entry '{target_id}' not found in session"
             )));
-        }
-        if session.path.is_some() {
-            session.save().await?;
         }
         Ok(())
     }
@@ -312,6 +298,224 @@ impl SessionStoreKind {
     }
 }
 
+/// Default upper bound for queued autosave mutations before backpressure coalescing kicks in.
+const DEFAULT_AUTOSAVE_MAX_PENDING_MUTATIONS: usize = 256;
+
+fn autosave_max_pending_mutations() -> usize {
+    std::env::var("PI_SESSION_AUTOSAVE_MAX_PENDING")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AUTOSAVE_MAX_PENDING_MUTATIONS)
+}
+
+/// Default number of incremental appends before forcing a full checkpoint rewrite.
+const DEFAULT_COMPACTION_CHECKPOINT_INTERVAL: u64 = 50;
+
+fn compaction_checkpoint_interval() -> u64 {
+    std::env::var("PI_SESSION_COMPACTION_INTERVAL")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_COMPACTION_CHECKPOINT_INTERVAL)
+}
+
+/// Durability mode for write-behind autosave behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutosaveDurabilityMode {
+    Strict,
+    Balanced,
+    Throughput,
+}
+
+impl AutosaveDurabilityMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "strict" => Some(Self::Strict),
+            "balanced" => Some(Self::Balanced),
+            "throughput" => Some(Self::Throughput),
+            _ => None,
+        }
+    }
+
+    fn from_env() -> Self {
+        std::env::var("PI_SESSION_DURABILITY_MODE")
+            .ok()
+            .as_deref()
+            .and_then(Self::parse)
+            .unwrap_or(Self::Balanced)
+    }
+
+    const fn should_flush_on_shutdown(self) -> bool {
+        matches!(self, Self::Strict | Self::Balanced)
+    }
+
+    const fn best_effort_on_shutdown(self) -> bool {
+        matches!(self, Self::Balanced)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Balanced => "balanced",
+            Self::Throughput => "throughput",
+        }
+    }
+}
+
+fn resolve_autosave_durability_mode(
+    cli_mode: Option<&str>,
+    config_mode: Option<&str>,
+    env_mode: Option<&str>,
+) -> AutosaveDurabilityMode {
+    cli_mode
+        .and_then(AutosaveDurabilityMode::parse)
+        .or_else(|| config_mode.and_then(AutosaveDurabilityMode::parse))
+        .or_else(|| env_mode.and_then(AutosaveDurabilityMode::parse))
+        .unwrap_or(AutosaveDurabilityMode::Balanced)
+}
+
+/// Autosave flush trigger used for observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutosaveFlushTrigger {
+    Manual,
+    Periodic,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutosaveMutationKind {
+    Message,
+    Metadata,
+    Label,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutosaveFlushTicket {
+    batch_size: usize,
+    started_at: Instant,
+    trigger: AutosaveFlushTrigger,
+}
+
+/// Snapshot of autosave queue state and lifecycle counters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AutosaveQueueMetrics {
+    pub pending_mutations: usize,
+    pub max_pending_mutations: usize,
+    pub coalesced_mutations: u64,
+    pub backpressure_events: u64,
+    pub flush_started: u64,
+    pub flush_succeeded: u64,
+    pub flush_failed: u64,
+    pub last_flush_batch_size: usize,
+    pub last_flush_duration_ms: Option<u64>,
+    pub last_flush_trigger: Option<AutosaveFlushTrigger>,
+}
+
+#[derive(Debug, Clone)]
+struct AutosaveQueue {
+    pending_mutations: usize,
+    max_pending_mutations: usize,
+    coalesced_mutations: u64,
+    backpressure_events: u64,
+    flush_started: u64,
+    flush_succeeded: u64,
+    flush_failed: u64,
+    last_flush_batch_size: usize,
+    last_flush_duration_ms: Option<u64>,
+    last_flush_trigger: Option<AutosaveFlushTrigger>,
+}
+
+impl AutosaveQueue {
+    fn new() -> Self {
+        Self {
+            pending_mutations: 0,
+            max_pending_mutations: autosave_max_pending_mutations(),
+            coalesced_mutations: 0,
+            backpressure_events: 0,
+            flush_started: 0,
+            flush_succeeded: 0,
+            flush_failed: 0,
+            last_flush_batch_size: 0,
+            last_flush_duration_ms: None,
+            last_flush_trigger: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limit(max_pending_mutations: usize) -> Self {
+        let mut queue = Self::new();
+        queue.max_pending_mutations = max_pending_mutations.max(1);
+        queue
+    }
+
+    const fn metrics(&self) -> AutosaveQueueMetrics {
+        AutosaveQueueMetrics {
+            pending_mutations: self.pending_mutations,
+            max_pending_mutations: self.max_pending_mutations,
+            coalesced_mutations: self.coalesced_mutations,
+            backpressure_events: self.backpressure_events,
+            flush_started: self.flush_started,
+            flush_succeeded: self.flush_succeeded,
+            flush_failed: self.flush_failed,
+            last_flush_batch_size: self.last_flush_batch_size,
+            last_flush_duration_ms: self.last_flush_duration_ms,
+            last_flush_trigger: self.last_flush_trigger,
+        }
+    }
+
+    const fn enqueue_mutation(&mut self, _kind: AutosaveMutationKind) {
+        if self.pending_mutations == 0 {
+            self.pending_mutations = 1;
+            return;
+        }
+        self.coalesced_mutations = self.coalesced_mutations.saturating_add(1);
+        if self.pending_mutations < self.max_pending_mutations {
+            self.pending_mutations += 1;
+        } else {
+            self.backpressure_events = self.backpressure_events.saturating_add(1);
+        }
+    }
+
+    fn begin_flush(&mut self, trigger: AutosaveFlushTrigger) -> Option<AutosaveFlushTicket> {
+        if self.pending_mutations == 0 {
+            return None;
+        }
+        let batch_size = self.pending_mutations;
+        self.pending_mutations = 0;
+        self.flush_started = self.flush_started.saturating_add(1);
+        self.last_flush_batch_size = batch_size;
+        self.last_flush_trigger = Some(trigger);
+        Some(AutosaveFlushTicket {
+            batch_size,
+            started_at: Instant::now(),
+            trigger,
+        })
+    }
+
+    fn finish_flush(&mut self, ticket: AutosaveFlushTicket, success: bool) {
+        let elapsed = ticket.started_at.elapsed().as_millis();
+        let elapsed = u64::try_from(elapsed.min(u128::from(u64::MAX)))
+            .expect("elapsed milliseconds clamped to u64::MAX");
+        self.last_flush_duration_ms = Some(elapsed);
+        self.last_flush_trigger = Some(ticket.trigger);
+        if success {
+            self.flush_succeeded = self.flush_succeeded.saturating_add(1);
+            return;
+        }
+
+        self.flush_failed = self.flush_failed.saturating_add(1);
+        let restored = ticket.batch_size.min(self.max_pending_mutations);
+        self.pending_mutations = self.pending_mutations.saturating_add(restored);
+        let dropped = ticket.batch_size.saturating_sub(restored);
+        if dropped > 0 {
+            let dropped = dropped as u64;
+            self.backpressure_events = self.backpressure_events.saturating_add(dropped);
+            self.coalesced_mutations = self.coalesced_mutations.saturating_add(dropped);
+        }
+    }
+}
+
 // ============================================================================
 // Session
 // ============================================================================
@@ -332,6 +536,30 @@ pub struct Session {
     store_kind: SessionStoreKind,
     /// Cached entry IDs for O(1) uniqueness checks when appending.
     entry_ids: HashSet<String>,
+
+    // -- Performance caches (Gaps A/B/C) --
+    /// True when all entries form a linear chain (no branching).
+    /// When true, `entries_for_current_path()` returns all entries without
+    /// building a parent map — the 99% fast path.
+    is_linear: bool,
+    /// Map from entry ID to index in `self.entries` for O(1) lookup.
+    entry_index: HashMap<String, usize>,
+    /// Incrementally maintained message count (avoids O(n) scan on save).
+    cached_message_count: u64,
+    /// Most recent session name from `SessionInfo` entries.
+    cached_name: Option<String>,
+    /// Write-behind autosave queue state and lifecycle counters.
+    autosave_queue: AutosaveQueue,
+    /// Current durability policy for shutdown final flush behavior.
+    autosave_durability: AutosaveDurabilityMode,
+
+    // -- Incremental append state --
+    /// Number of entries already persisted to disk (high-water mark).
+    persisted_entry_count: usize,
+    /// True when header was modified since last save (forces full rewrite).
+    header_dirty: bool,
+    /// Incremental appends since last full rewrite (checkpoint counter).
+    appends_since_checkpoint: u64,
 }
 
 /// Result of planning a `/fork` operation from a specific user message.
@@ -410,12 +638,21 @@ impl Session {
     /// Create a new session from CLI args and config.
     pub async fn new(cli: &Cli, config: &Config) -> Result<Self> {
         let session_dir = cli.session_dir.as_ref().map(PathBuf::from);
+        let durability_mode = resolve_autosave_durability_mode(
+            cli.session_durability.as_deref(),
+            config.session_durability.as_deref(),
+            std::env::var("PI_SESSION_DURABILITY_MODE").ok().as_deref(),
+        );
         if cli.no_session {
-            return Ok(Self::in_memory());
+            let mut session = Self::in_memory();
+            session.set_autosave_durability_mode(durability_mode);
+            return Ok(session);
         }
 
         if let Some(path) = &cli.session {
-            return Self::open(path).await;
+            let mut session = Self::open(path).await?;
+            session.set_autosave_durability_mode(durability_mode);
+            return Ok(session);
         }
 
         if cli.resume {
@@ -423,22 +660,28 @@ impl Session {
                 .session_picker_input
                 .filter(|value| *value > 0)
                 .map(|value| value.to_string());
-            return Box::pin(Self::resume_with_picker(
+            let mut session = Box::pin(Self::resume_with_picker(
                 session_dir.as_deref(),
                 config,
                 picker_input_override,
             ))
-            .await;
+            .await?;
+            session.set_autosave_durability_mode(durability_mode);
+            return Ok(session);
         }
 
         if cli.r#continue {
-            return Self::continue_recent_in_dir(session_dir.as_deref(), config).await;
+            let mut session = Self::continue_recent_in_dir(session_dir.as_deref(), config).await?;
+            session.set_autosave_durability_mode(durability_mode);
+            return Ok(session);
         }
 
         let store_kind = SessionStoreKind::from_config(config);
+        let mut session = Self::create_with_dir_and_store(session_dir, store_kind);
+        session.set_autosave_durability_mode(durability_mode);
 
         // Create a new session
-        Ok(Self::create_with_dir_and_store(session_dir, store_kind))
+        Ok(session)
     }
 
     /// Resume a session by prompting the user to select from recent sessions.
@@ -475,7 +718,7 @@ impl Session {
             })
             .unwrap_or_default();
 
-        let scanned = scan_sessions_on_disk(&project_session_dir).await?;
+        let scanned = scan_sessions_on_disk(&project_session_dir, entries.clone()).await?;
         let mut by_path: HashMap<PathBuf, SessionPickEntry> = HashMap::new();
         for entry in entries.into_iter().chain(scanned.into_iter()) {
             by_path
@@ -600,6 +843,15 @@ impl Session {
             session_dir: None,
             store_kind: SessionStoreKind::Jsonl,
             entry_ids: HashSet::new(),
+            is_linear: true,
+            entry_index: HashMap::new(),
+            cached_message_count: 0,
+            cached_name: None,
+            autosave_queue: AutosaveQueue::new(),
+            autosave_durability: AutosaveDurabilityMode::from_env(),
+            persisted_entry_count: 0,
+            header_dirty: false,
+            appends_since_checkpoint: 0,
         }
     }
 
@@ -626,6 +878,15 @@ impl Session {
             session_dir,
             store_kind,
             entry_ids: HashSet::new(),
+            is_linear: true,
+            entry_index: HashMap::new(),
+            cached_message_count: 0,
+            cached_name: None,
+            autosave_queue: AutosaveQueue::new(),
+            autosave_durability: AutosaveDurabilityMode::from_env(),
+            persisted_entry_count: 0,
+            header_dirty: false,
+            appends_since_checkpoint: 0,
         }
     }
 
@@ -670,89 +931,7 @@ impl Session {
         let (tx, rx) = oneshot::channel();
 
         thread::spawn(move || {
-            let res = (|| -> Result<(Self, SessionOpenDiagnostics)> {
-                let file =
-                    std::fs::File::open(&path_buf).map_err(|e| crate::Error::Io(Box::new(e)))?;
-                // Opening large JSONL sessions is a sequential line scan; using a
-                // larger buffer reduces read syscall overhead.
-                let reader = BufReader::with_capacity(1 << 20, file);
-                let mut lines = reader.lines();
-
-                // Parse header (first line)
-                let header_line = lines
-                    .next()
-                    .ok_or_else(|| crate::Error::session("Empty session file"))?
-                    .map_err(|e| crate::Error::session(format!("Failed to read header: {e}")))?;
-
-                let header: SessionHeader = serde_json::from_str(&header_line)
-                    .map_err(|e| crate::Error::session(format!("Invalid header: {e}")))?;
-
-                // Parse entries
-                let mut entries = Vec::new();
-                let mut diagnostics = SessionOpenDiagnostics::default();
-
-                for (line_num, line_res) in lines.enumerate() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
-                                line_number: line_num + 2,
-                                error: format!("I/O read error: {e}"),
-                            });
-                            continue;
-                        }
-                    };
-
-                    match serde_json::from_str::<SessionEntry>(&line) {
-                        Ok(entry) => entries.push(entry),
-                        Err(e) => {
-                            diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
-                                line_number: line_num + 2, // +2 for 1-based indexing and header line
-                                error: e.to_string(),
-                            });
-                        }
-                    }
-                }
-
-                ensure_entry_ids(&mut entries);
-
-                let existing_ids: HashSet<String> = entries
-                    .iter()
-                    .filter_map(|entry| entry.base_id().cloned())
-                    .collect();
-                for entry in &entries {
-                    let Some(entry_id) = entry.base_id() else {
-                        continue;
-                    };
-                    let Some(parent_id) = entry.base().parent_id.as_ref() else {
-                        continue;
-                    };
-                    if !existing_ids.contains(parent_id) {
-                        diagnostics
-                            .orphaned_parent_links
-                            .push(SessionOpenOrphanedParentLink {
-                                entry_id: entry_id.clone(),
-                                missing_parent_id: parent_id.clone(),
-                            });
-                    }
-                }
-
-                let leaf_id = entries.iter().rev().find_map(|e| e.base_id().cloned());
-
-                Ok((
-                    Self {
-                        header,
-                        entries,
-                        path: Some(path_buf),
-                        leaf_id,
-                        session_dir: None,
-                        store_kind: SessionStoreKind::Jsonl,
-                        entry_ids: existing_ids,
-                    },
-                    diagnostics,
-                ))
-            })();
-
+            let res = open_jsonl_blocking(path_buf);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
@@ -766,18 +945,26 @@ impl Session {
     #[cfg(feature = "sqlite-sessions")]
     async fn open_sqlite(path: &Path) -> Result<Self> {
         let (header, mut entries) = crate::session_sqlite::load_session(path).await?;
-        ensure_entry_ids(&mut entries);
-        let entry_ids = entry_id_set(&entries);
-        let leaf_id = entries.iter().rev().find_map(|e| e.base_id().cloned());
+        let finalized = finalize_loaded_entries(&mut entries);
+        let entry_count = entries.len();
 
         Ok(Self {
             header,
             entries,
             path: Some(path.to_path_buf()),
-            leaf_id,
+            leaf_id: finalized.leaf_id,
             session_dir: None,
             store_kind: SessionStoreKind::Sqlite,
-            entry_ids,
+            entry_ids: finalized.entry_ids,
+            is_linear: finalized.is_linear,
+            entry_index: finalized.entry_index,
+            cached_message_count: finalized.message_count,
+            cached_name: finalized.name,
+            autosave_queue: AutosaveQueue::new(),
+            autosave_durability: AutosaveDurabilityMode::from_env(),
+            persisted_entry_count: entry_count,
+            header_dirty: false,
+            appends_since_checkpoint: 0,
         })
     }
 
@@ -819,7 +1006,7 @@ impl Session {
                 .unwrap_or_default();
         }
 
-        let scanned = scan_sessions_on_disk(&project_session_dir).await?;
+        let scanned = scan_sessions_on_disk(&project_session_dir, indexed_sessions.clone()).await?;
 
         let mut by_path: HashMap<PathBuf, SessionPickEntry> = HashMap::new();
         for entry in indexed_sessions.into_iter().chain(scanned.into_iter()) {
@@ -856,10 +1043,93 @@ impl Session {
     }
 
     /// Save the session to disk.
-    #[allow(clippy::too_many_lines)]
     pub async fn save(&mut self) -> Result<()> {
-        ensure_entry_ids(&mut self.entries);
-        self.entry_ids = entry_id_set(&self.entries);
+        let ticket = self
+            .autosave_queue
+            .begin_flush(AutosaveFlushTrigger::Manual);
+        let result = self.save_inner().await;
+        if let Some(ticket) = ticket {
+            self.autosave_queue.finish_flush(ticket, result.is_ok());
+        }
+        result
+    }
+
+    /// Flush queued autosave mutations using the requested trigger.
+    ///
+    /// This is the write-behind entry point: no-op when there are no pending
+    /// mutations, and one persistence operation for all coalesced mutations when
+    /// pending work exists.
+    pub async fn flush_autosave(&mut self, trigger: AutosaveFlushTrigger) -> Result<()> {
+        let Some(ticket) = self.autosave_queue.begin_flush(trigger) else {
+            return Ok(());
+        };
+        let result = self.save_inner().await;
+        self.autosave_queue.finish_flush(ticket, result.is_ok());
+        result
+    }
+
+    /// Final shutdown flush respecting the configured durability mode.
+    pub async fn flush_autosave_on_shutdown(&mut self) -> Result<()> {
+        if !self.autosave_durability.should_flush_on_shutdown() {
+            return Ok(());
+        }
+        let result = self.flush_autosave(AutosaveFlushTrigger::Shutdown).await;
+        if result.is_err() && self.autosave_durability.best_effort_on_shutdown() {
+            if let Err(err) = &result {
+                tracing::warn!(error = %err, "best-effort autosave flush failed during shutdown");
+            }
+            return Ok(());
+        }
+        result
+    }
+
+    /// Current autosave queue and lifecycle counters for observability.
+    pub const fn autosave_metrics(&self) -> AutosaveQueueMetrics {
+        self.autosave_queue.metrics()
+    }
+
+    pub const fn autosave_durability_mode(&self) -> AutosaveDurabilityMode {
+        self.autosave_durability
+    }
+
+    pub const fn set_autosave_durability_mode(&mut self, mode: AutosaveDurabilityMode) {
+        self.autosave_durability = mode;
+    }
+
+    #[cfg(test)]
+    fn set_autosave_queue_limit_for_test(&mut self, max_pending_mutations: usize) {
+        self.autosave_queue = AutosaveQueue::with_limit(max_pending_mutations);
+    }
+
+    #[cfg(test)]
+    const fn set_autosave_durability_for_test(&mut self, mode: AutosaveDurabilityMode) {
+        self.autosave_durability = mode;
+    }
+
+    /// Returns `true` when a full rewrite is required instead of incremental append.
+    fn should_full_rewrite(&self) -> bool {
+        // First save — no file exists yet.
+        if self.persisted_entry_count == 0 {
+            return true;
+        }
+        // Header was modified since last save.
+        if self.header_dirty {
+            return true;
+        }
+        // Periodic checkpoint to clean up accumulated partial writes.
+        if self.appends_since_checkpoint >= compaction_checkpoint_interval() {
+            return true;
+        }
+        // Any new entry is a Compaction (dead entries before marker need rewriting).
+        self.entries[self.persisted_entry_count..]
+            .iter()
+            .any(|e| matches!(e, SessionEntry::Compaction(_)))
+    }
+
+    /// Save the session to disk.
+    #[allow(clippy::too_many_lines)]
+    async fn save_inner(&mut self) -> Result<()> {
+        self.ensure_entry_ids();
 
         let store_kind = match self
             .path
@@ -927,96 +1197,178 @@ impl Session {
 
         match store_kind {
             SessionStoreKind::Jsonl => {
-                type JsonlSaveResult = std::result::Result<
-                    (Vec<SessionEntry>, u64, Option<String>),
-                    (Error, Vec<SessionEntry>),
-                >;
-                let (tx, rx) = oneshot::channel::<JsonlSaveResult>();
-
-                let header_snapshot = self.header.clone();
                 let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
-                let entries_to_save = std::mem::take(&mut self.entries);
+                // Gap C: use incrementally maintained stats instead of O(n) scan.
+                let message_count = self.cached_message_count;
+                let session_name = self.cached_name.clone();
 
-                thread::spawn(move || {
-                    let entries = entries_to_save;
-                    let res = || -> Result<(u64, Option<String>)> {
-                        let parent = path_clone.parent().unwrap_or_else(|| Path::new("."));
-                        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
-                        {
-                            // Full-session rewrites are large JSONL streams; a larger buffer
-                            // reduces write syscall churn on slower disks.
-                            let mut writer =
-                                std::io::BufWriter::with_capacity(1 << 20, temp_file.as_file());
+                if self.should_full_rewrite() {
+                    // === Full rewrite path (first save, header change, compaction, checkpoint) ===
+                    type JsonlSaveResult =
+                        std::result::Result<Vec<SessionEntry>, (Error, Vec<SessionEntry>)>;
+                    let (tx, rx) = oneshot::channel::<JsonlSaveResult>();
 
-                            // Write header
-                            serde_json::to_writer(&mut writer, &header_snapshot)?;
-                            writer.write_all(b"\n")?;
+                    let header_snapshot = self.header.clone();
+                    let entries_to_save = std::mem::take(&mut self.entries);
 
-                            // Write entries
-                            for entry in &entries {
-                                serde_json::to_writer(&mut writer, entry)?;
+                    let path_for_thread = path_clone.clone();
+                    thread::spawn(move || {
+                        let entries = entries_to_save;
+                        let res = || -> Result<()> {
+                            let parent = path_for_thread.parent().unwrap_or_else(|| Path::new("."));
+                            let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+                            {
+                                let mut writer =
+                                    std::io::BufWriter::with_capacity(1 << 20, temp_file.as_file());
+                                serde_json::to_writer(&mut writer, &header_snapshot)?;
                                 writer.write_all(b"\n")?;
+                                for entry in &entries {
+                                    serde_json::to_writer(&mut writer, entry)?;
+                                    writer.write_all(b"\n")?;
+                                }
+                                writer.flush()?;
                             }
+                            temp_file
+                                .persist(&path_for_thread)
+                                .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
 
-                            writer.flush()?;
-                        }
-                        temp_file
-                            .persist(&path_clone)
-                            .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
+                            if let Err(err) = SessionIndex::for_sessions_root(&sessions_root)
+                                .index_session_snapshot(
+                                    &path_for_thread,
+                                    &header_snapshot,
+                                    message_count,
+                                    session_name,
+                                )
+                            {
+                                tracing::warn!("Failed to update session index: {err}");
+                            }
+                            Ok(())
+                        }();
+                        let cx = AgentCx::for_request();
+                        let _ = tx.send(
+                            cx.cx(),
+                            match res {
+                                Ok(()) => Ok(entries),
+                                Err(err) => Err((err, entries)),
+                            },
+                        );
+                    });
 
-                        let (message_count, name) = session_entry_stats(&entries);
-                        if let Err(err) = SessionIndex::for_sessions_root(&sessions_root)
-                            .index_session_snapshot(
-                                &path_clone,
-                                &header_snapshot,
-                                message_count,
-                                name.clone(),
-                            )
-                        {
-                            tracing::warn!("Failed to update session index: {err}");
-                        }
-                        Ok((message_count, name))
-                    }();
                     let cx = AgentCx::for_request();
-                    let _ = tx.send(
-                        cx.cx(),
-                        match res {
-                            Ok((message_count, name)) => Ok((entries, message_count, name)),
-                            Err(err) => Err((err, entries)),
-                        },
-                    );
-                });
+                    let result = rx
+                        .recv(cx.cx())
+                        .await
+                        .map_err(|_| crate::Error::session("Save task cancelled"))?;
 
-                let cx = AgentCx::for_request();
-                let result = rx
-                    .recv(cx.cx())
-                    .await
-                    .map_err(|_| crate::Error::session("Save task cancelled"))?;
+                    match result {
+                        Ok(entries) => {
+                            self.entries = entries;
+                            self.rebuild_all_caches();
+                            self.persisted_entry_count = self.entries.len();
+                            self.header_dirty = false;
+                            self.appends_since_checkpoint = 0;
+                            Ok(())
+                        }
+                        Err((err, entries)) => {
+                            self.entries = entries;
+                            self.rebuild_all_caches();
+                            Err(err)
+                        }
+                    }?;
+                } else {
+                    // === Incremental append path ===
+                    let new_start = self.persisted_entry_count;
+                    if new_start < self.entries.len() {
+                        // Pre-serialize new entries on the main thread (typically 1-3 entries).
+                        let mut serialized_bytes = Vec::new();
+                        for entry in &self.entries[new_start..] {
+                            let mut line = serde_json::to_vec(entry)?;
+                            line.push(b'\n');
+                            serialized_bytes.push(line);
+                        }
+                        let new_count = self.entries.len();
 
-                match result {
-                    Ok((entries, _message_count, _name)) => {
-                        self.entries = entries;
-                        self.entry_ids = entry_id_set(&self.entries);
-                        Ok(())
+                        let (tx, rx) = oneshot::channel::<Result<()>>();
+                        let header_snapshot = self.header.clone();
+
+                        let path_for_thread = path_clone.clone();
+                        thread::spawn(move || {
+                            let res = || -> Result<()> {
+                                let file = std::fs::OpenOptions::new()
+                                    .append(true)
+                                    .open(&path_for_thread)
+                                    .map_err(|e| crate::Error::Io(Box::new(e)))?;
+                                let mut writer = std::io::BufWriter::new(file);
+                                for chunk in &serialized_bytes {
+                                    writer.write_all(chunk)?;
+                                }
+                                writer.flush()?;
+
+                                if let Err(err) = SessionIndex::for_sessions_root(&sessions_root)
+                                    .index_session_snapshot(
+                                        &path_for_thread,
+                                        &header_snapshot,
+                                        message_count,
+                                        session_name,
+                                    )
+                                {
+                                    tracing::warn!("Failed to update session index: {err}");
+                                }
+                                Ok(())
+                            }();
+                            let cx = AgentCx::for_request();
+                            let _ = tx.send(cx.cx(), res);
+                        });
+
+                        let cx = AgentCx::for_request();
+                        let result = rx
+                            .recv(cx.cx())
+                            .await
+                            .map_err(|_| crate::Error::session("Append task cancelled"))?;
+
+                        if result.is_ok() {
+                            self.persisted_entry_count = new_count;
+                            self.appends_since_checkpoint += 1;
+                        }
+                        result?;
                     }
-                    Err((err, entries)) => {
-                        self.entries = entries;
-                        self.entry_ids = entry_id_set(&self.entries);
-                        Err(err)
-                    }
-                }?;
+                    // No new entries → no-op, nothing to write.
+                }
             }
             #[cfg(feature = "sqlite-sessions")]
             SessionStoreKind::Sqlite => {
-                // Async save must run on the runtime to access capabilities (AgentCx).
-                crate::session_sqlite::save_session(&path_clone, &self.header, &self.entries)
-                    .await?;
+                let message_count = self.cached_message_count;
+                let session_name = self.cached_name.clone();
+
+                if self.should_full_rewrite() {
+                    // === Full rewrite path (first save, header change, compaction, checkpoint) ===
+                    crate::session_sqlite::save_session(&path_clone, &self.header, &self.entries)
+                        .await?;
+                    self.persisted_entry_count = self.entries.len();
+                    self.header_dirty = false;
+                    self.appends_since_checkpoint = 0;
+                } else {
+                    // === Incremental append path ===
+                    let new_start = self.persisted_entry_count;
+                    if new_start < self.entries.len() {
+                        crate::session_sqlite::append_entries(
+                            &path_clone,
+                            &self.entries[new_start..],
+                            new_start,
+                            message_count,
+                            session_name.as_deref(),
+                        )
+                        .await?;
+                        self.persisted_entry_count = self.entries.len();
+                        self.appends_since_checkpoint += 1;
+                    }
+                    // No new entries → no-op, nothing to write.
+                }
 
                 // Offload blocking index update to a thread.
                 let session_dir = session_dir_clone;
                 let header_snapshot = self.header.clone();
                 let path_snapshot = path_clone.clone();
-                let (message_count, name) = session_entry_stats(&self.entries);
                 thread::spawn(move || {
                     let sessions_root = session_dir.unwrap_or_else(Config::sessions_dir);
                     if let Err(err) = SessionIndex::for_sessions_root(&sessions_root)
@@ -1024,17 +1376,19 @@ impl Session {
                             &path_snapshot,
                             &header_snapshot,
                             message_count,
-                            name.clone(),
+                            session_name,
                         )
                     {
                         tracing::warn!("Failed to update session index: {err}");
                     }
                 });
-
-                Ok(())?;
             }
         }
         Ok(())
+    }
+
+    const fn enqueue_autosave_mutation(&mut self, kind: AutosaveMutationKind) {
+        self.autosave_queue.enqueue_mutation(kind);
     }
 
     /// Append a session message entry.
@@ -1044,7 +1398,10 @@ impl Session {
         let entry = SessionEntry::Message(MessageEntry { base, message });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.cached_message_count += 1;
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Message);
         id
     }
 
@@ -1063,7 +1420,9 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
 
@@ -1076,17 +1435,24 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
 
     pub fn append_session_info(&mut self, name: Option<String>) -> String {
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        if name.is_some() {
+            self.cached_name.clone_from(&name);
+        }
         let entry = SessionEntry::SessionInfo(SessionInfoEntry { base, name });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
 
@@ -1105,7 +1471,9 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
 
@@ -1135,22 +1503,19 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.cached_message_count += 1;
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Message);
         id
     }
 
-    /// Get the current session name from the most recent SessionInfo entry.
+    /// Get the current session name from the cached value (Gap C).
     pub fn get_name(&self) -> Option<String> {
-        self.entries.iter().rev().find_map(|entry| {
-            if let SessionEntry::SessionInfo(info) = entry {
-                info.name.clone()
-            } else {
-                None
-            }
-        })
+        self.cached_name.clone()
     }
 
-    /// Set the session name by appending a SessionInfo entry.
+    /// Set the session name by appending a `SessionInfo` entry.
     pub fn set_name(&mut self, name: &str) -> String {
         self.append_session_info(Some(name.to_string()))
     }
@@ -1175,7 +1540,9 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
 
@@ -1197,13 +1564,32 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
 
     pub fn ensure_entry_ids(&mut self) {
         ensure_entry_ids(&mut self.entries);
-        self.entry_ids = entry_id_set(&self.entries);
+        self.rebuild_all_caches();
+    }
+
+    /// Rebuild all derived caches from `self.entries`.
+    ///
+    /// Called after bulk mutations (save round-trip, ensure_entry_ids) where
+    /// incremental maintenance is impractical.
+    fn rebuild_all_caches(&mut self) {
+        let finalized = finalize_loaded_entries(&mut self.entries);
+        self.entry_ids = finalized.entry_ids;
+        self.entry_index = finalized.entry_index;
+        self.cached_message_count = finalized.message_count;
+        self.cached_name = finalized.name;
+        // is_linear requires BOTH: no branching in the entry tree AND the
+        // current leaf_id pointing at the last entry.  If the user navigated
+        // to a mid-chain entry before saving, the leaf differs from the tip
+        // and the fast path would return wrong results.
+        self.is_linear = finalized.is_linear && self.leaf_id == finalized.leaf_id;
     }
 
     /// Convert session entries to model messages (for provider context).
@@ -1316,6 +1702,7 @@ impl Session {
         model_id: Option<String>,
         thinking_level: Option<String>,
     ) {
+        let changed = provider.is_some() || model_id.is_some() || thinking_level.is_some();
         if provider.is_some() {
             self.header.provider = provider;
         }
@@ -1325,10 +1712,16 @@ impl Session {
         if thinking_level.is_some() {
             self.header.thinking_level = thinking_level;
         }
+        if changed {
+            self.header_dirty = true;
+            self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        }
     }
 
     pub fn set_branched_from(&mut self, path: Option<String>) {
         self.header.parent_session = path;
+        self.header_dirty = true;
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
     }
 
     /// Plan a `/fork` from a user message entry ID.
@@ -1480,11 +1873,18 @@ impl Session {
     /// Navigate to a specific entry, making it the current leaf.
     /// Returns true if the entry exists.
     pub fn navigate_to(&mut self, entry_id: &str) -> bool {
-        let exists = self
-            .entries
-            .iter()
-            .any(|e| e.base_id().is_some_and(|id| id == entry_id));
+        // Gap B: O(1) existence check via entry_index.
+        let exists = self.entry_index.contains_key(entry_id);
         if exists {
+            // Gap A: navigating away from the tip breaks linearity.
+            let is_tip = self
+                .entries
+                .last()
+                .and_then(|e| e.base_id())
+                .is_some_and(|id| id == entry_id);
+            if !is_tip {
+                self.is_linear = false;
+            }
             self.leaf_id = Some(entry_id.to_string());
             true
         } else {
@@ -1499,6 +1899,7 @@ impl Session {
     /// re-editing the first user message.
     pub fn reset_leaf(&mut self) {
         self.leaf_id = None;
+        self.is_linear = false;
     }
 
     /// Create a new branch starting from a specific entry.
@@ -1508,25 +1909,35 @@ impl Session {
         self.navigate_to(entry_id)
     }
 
-    /// Get the entry at a specific ID.
+    /// Get the entry at a specific ID (Gap B: O(1) via `entry_index`).
     pub fn get_entry(&self, entry_id: &str) -> Option<&SessionEntry> {
-        self.entries
-            .iter()
-            .find(|e| e.base_id().is_some_and(|id| id == entry_id))
+        self.entry_index
+            .get(entry_id)
+            .and_then(|&idx| self.entries.get(idx))
     }
 
-    /// Get the entry at a specific ID (mutable).
+    /// Get the entry at a specific ID, mutable (Gap B: O(1) via `entry_index`).
     pub fn get_entry_mut(&mut self, entry_id: &str) -> Option<&mut SessionEntry> {
-        self.entries
-            .iter_mut()
-            .find(|e| e.base_id().is_some_and(|id| id == entry_id))
+        self.entry_index
+            .get(entry_id)
+            .copied()
+            .and_then(|idx| self.entries.get_mut(idx))
     }
 
     /// Entries along the current leaf path, in chronological order.
+    ///
+    /// Gap A: when `is_linear` is true (the 99% case — no branching has
+    /// occurred), this returns all entries directly without building a
+    /// parent map or tracing the path.
     pub fn entries_for_current_path(&self) -> Vec<&SessionEntry> {
         let Some(leaf_id) = &self.leaf_id else {
             return Vec::new();
         };
+
+        // Fast path: linear session — all entries are on the current path.
+        if self.is_linear {
+            return self.entries.iter().collect();
+        }
 
         let path = self.get_path_to_entry(leaf_id);
         let path_set: HashSet<&str> = path.iter().map(String::as_str).collect();
@@ -1804,7 +2215,9 @@ impl Session {
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Label);
         Some(id)
     }
 }
@@ -1843,6 +2256,7 @@ struct SessionPickEntry {
     message_count: u64,
     name: Option<String>,
     last_modified_ms: i64,
+    size_bytes: u64,
 }
 
 impl SessionPickEntry {
@@ -1858,11 +2272,23 @@ impl SessionPickEntry {
             message_count: meta.message_count,
             name: meta.name,
             last_modified_ms: meta.last_modified_ms,
+            size_bytes: meta.size_bytes,
         })
     }
 }
 
-async fn scan_sessions_on_disk(project_session_dir: &Path) -> Result<Vec<SessionPickEntry>> {
+const fn can_reuse_known_entry(
+    known_entry: &SessionPickEntry,
+    disk_ms: i64,
+    disk_size: u64,
+) -> bool {
+    known_entry.last_modified_ms == disk_ms && known_entry.size_bytes == disk_size
+}
+
+async fn scan_sessions_on_disk(
+    project_session_dir: &Path,
+    known: Vec<SessionPickEntry>,
+) -> Result<Vec<SessionPickEntry>> {
     let path_buf = project_session_dir.to_path_buf();
     let (tx, rx) = oneshot::channel();
 
@@ -1873,11 +2299,36 @@ async fn scan_sessions_on_disk(project_session_dir: &Path) -> Result<Vec<Session
                 let mut entries = Vec::new();
                 let dir_entries = std::fs::read_dir(&path_buf)
                     .map_err(|e| Error::session(format!("Failed to read sessions: {e}")))?;
+
+                let known_map: HashMap<PathBuf, SessionPickEntry> =
+                    known.into_iter().map(|e| (e.path.clone(), e)).collect();
+
                 for entry in dir_entries {
                     let entry =
                         entry.map_err(|e| Error::session(format!("Read dir entry: {e}")))?;
                     let path = entry.path();
                     if is_session_file_path(&path) {
+                        // Optimization: if we already have this file indexed and both mtime and
+                        // size match, reuse indexed metadata to avoid a full parse.
+                        if let Ok(metadata) = std::fs::metadata(&path) {
+                            let disk_size = metadata.len();
+                            if let Ok(modified) = metadata.modified() {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let disk_ms = modified
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis()
+                                    as i64;
+
+                                if let Some(known_entry) = known_map.get(&path) {
+                                    if can_reuse_known_entry(known_entry, disk_ms, disk_size) {
+                                        entries.push(known_entry.clone());
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
                         if let Ok(meta) = load_session_meta(&path) {
                             entries.push(meta);
                         }
@@ -1956,9 +2407,10 @@ fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
         }
     }
 
-    let modified = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| Error::session(format!("Failed to stat session: {e}")))?;
+    let size_bytes = metadata.len();
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     #[allow(clippy::cast_possible_truncation)]
     let last_modified_ms = modified
         .duration_since(UNIX_EPOCH)
@@ -1972,6 +2424,7 @@ fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
         message_count,
         name,
         last_modified_ms,
+        size_bytes,
     })
 }
 
@@ -1982,9 +2435,10 @@ fn load_session_meta_sqlite(path: &Path) -> Result<SessionPickEntry> {
     })?;
     let header = meta.header;
 
-    let modified = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| Error::session(format!("Failed to stat session: {e}")))?;
+    let size_bytes = metadata.len();
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     #[allow(clippy::cast_possible_truncation)]
     let last_modified_ms = modified
         .duration_since(UNIX_EPOCH)
@@ -1998,6 +2452,7 @@ fn load_session_meta_sqlite(path: &Path) -> Result<SessionPickEntry> {
         message_count: meta.message_count,
         name: meta.name,
         last_modified_ms,
+        size_bytes,
     })
 }
 
@@ -2640,6 +3095,226 @@ fn session_entry_stats(entries: &[SessionEntry]) -> (u64, Option<String>) {
     (message_count, name)
 }
 
+/// Minimum entry count to activate parallel deserialization (Gap E).
+const PARALLEL_THRESHOLD: usize = 512;
+
+/// Parse a JSONL session file on the current (blocking) thread.
+///
+/// Combines Gap E (parallel deserialization) and Gap F (single-pass
+/// finalization) for the fastest possible open path.
+#[allow(clippy::too_many_lines)]
+fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnostics)> {
+    type ChunkResult = (Vec<SessionEntry>, Vec<SessionOpenSkippedEntry>);
+
+    // Read the entire file into memory for parallel parsing (Gap E).
+    let contents = std::fs::read_to_string(&path_buf).map_err(|e| crate::Error::Io(Box::new(e)))?;
+    let all_lines: Vec<&str> = contents.lines().collect();
+
+    if all_lines.is_empty() {
+        return Err(crate::Error::session("Empty session file"));
+    }
+
+    // Parse header (first line)
+    let header: SessionHeader = serde_json::from_str(all_lines[0])
+        .map_err(|e| crate::Error::session(format!("Invalid header: {e}")))?;
+
+    let entry_lines = &all_lines[1..];
+    let mut diagnostics = SessionOpenDiagnostics::default();
+
+    // Gap E: parallel deserialization for large sessions.
+    // Below the threshold, sequential is faster (no thread overhead).
+    let num_threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+
+    let mut entries: Vec<SessionEntry> =
+        if entry_lines.len() >= PARALLEL_THRESHOLD && num_threads > 1 {
+            let chunk_size = (entry_lines.len() / num_threads).max(64);
+
+            let chunk_results: Vec<ChunkResult> = std::thread::scope(|s| {
+                entry_lines
+                    .chunks(chunk_size)
+                    .enumerate()
+                    .map(|(chunk_idx, chunk)| {
+                        let base_offset = chunk_idx * chunk_size;
+                        s.spawn(move || {
+                            let mut ok = Vec::with_capacity(chunk.len());
+                            let mut skip = Vec::new();
+                            for (j, line) in chunk.iter().enumerate() {
+                                match serde_json::from_str::<SessionEntry>(line) {
+                                    Ok(entry) => ok.push(entry),
+                                    Err(e) => {
+                                        skip.push(SessionOpenSkippedEntry {
+                                            line_number: base_offset + j + 2,
+                                            error: e.to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                            (ok, skip)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect()
+            });
+
+            let total: usize = chunk_results.iter().map(|(v, _)| v.len()).sum();
+            let mut merged = Vec::with_capacity(total);
+            for (chunk_entries, chunk_skipped) in chunk_results {
+                merged.extend(chunk_entries);
+                diagnostics.skipped_entries.extend(chunk_skipped);
+            }
+            merged
+        } else {
+            // Sequential path for small files.
+            let mut entries = Vec::with_capacity(entry_lines.len());
+            for (i, line) in entry_lines.iter().enumerate() {
+                match serde_json::from_str::<SessionEntry>(line) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => {
+                        diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
+                            line_number: i + 2,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            }
+            entries
+        };
+
+    // --- Single-pass load finalization (Gap F) ---
+    let finalized = finalize_loaded_entries(&mut entries);
+    for orphan in &finalized.orphans {
+        diagnostics
+            .orphaned_parent_links
+            .push(SessionOpenOrphanedParentLink {
+                entry_id: orphan.0.clone(),
+                missing_parent_id: orphan.1.clone(),
+            });
+    }
+
+    let entry_count = entries.len();
+
+    Ok((
+        Session {
+            header,
+            entries,
+            path: Some(path_buf),
+            leaf_id: finalized.leaf_id,
+            session_dir: None,
+            store_kind: SessionStoreKind::Jsonl,
+            entry_ids: finalized.entry_ids,
+            is_linear: finalized.is_linear,
+            entry_index: finalized.entry_index,
+            cached_message_count: finalized.message_count,
+            cached_name: finalized.name,
+            autosave_queue: AutosaveQueue::new(),
+            autosave_durability: AutosaveDurabilityMode::from_env(),
+            persisted_entry_count: entry_count,
+            header_dirty: false,
+            appends_since_checkpoint: 0,
+        },
+        diagnostics,
+    ))
+}
+
+/// Result of single-pass load finalization (Gap F).
+///
+/// Replaces the previous multi-pass approach (`ensure_entry_ids` +
+/// `entry_id_set` + orphan detection + stats) with a single O(n) scan
+/// that produces all required caches at once.
+struct LoadFinalization {
+    leaf_id: Option<String>,
+    entry_ids: HashSet<String>,
+    entry_index: HashMap<String, usize>,
+    message_count: u64,
+    name: Option<String>,
+    is_linear: bool,
+    orphans: Vec<(String, String)>,
+}
+
+/// Single-pass finalization of loaded entries.
+///
+/// 1. Assigns IDs to entries missing them (`ensure_entry_ids` work).
+/// 2. Builds `entry_ids` set and `entry_index` map.
+/// 3. Detects orphaned parent links.
+/// 4. Computes `session_entry_stats` (message count + name).
+/// 5. Determines `is_linear` (no branching, leaf == last entry).
+fn finalize_loaded_entries(entries: &mut [SessionEntry]) -> LoadFinalization {
+    // First pass: assign missing IDs (same logic as `ensure_entry_ids`).
+    let mut entry_ids: HashSet<String> = entries
+        .iter()
+        .filter_map(|e| e.base_id().cloned())
+        .collect();
+    for entry in entries.iter_mut() {
+        if entry.base().id.is_none() {
+            let id = generate_entry_id(&entry_ids);
+            entry.base_mut().id = Some(id.clone());
+            entry_ids.insert(id);
+        }
+    }
+
+    // Second (main) pass: build all caches in one scan.
+    let mut entry_index = HashMap::with_capacity(entries.len());
+    let mut message_count = 0u64;
+    let mut name: Option<String> = None;
+    let mut leaf_id: Option<String> = None;
+    let mut orphans = Vec::new();
+    // Track parent_ids seen as children's parent to detect branching.
+    let mut parent_id_child_count: HashMap<Option<&str>, u32> = HashMap::new();
+    let mut has_branching = false;
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(id) = entry.base_id() else {
+            continue;
+        };
+        entry_index.insert(id.clone(), idx);
+        leaf_id = Some(id.clone());
+
+        // Orphan detection.
+        if let Some(parent_id) = entry.base().parent_id.as_ref() {
+            if !entry_ids.contains(parent_id) {
+                orphans.push((id.clone(), parent_id.clone()));
+            }
+        }
+
+        // Branch detection: if any parent_id has >1 child, it's branched.
+        if !has_branching {
+            let parent_key = entry.base().parent_id.as_deref();
+            let count = parent_id_child_count.entry(parent_key).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                has_branching = true;
+            }
+        }
+
+        // Stats.
+        match entry {
+            SessionEntry::Message(_) => message_count += 1,
+            SessionEntry::SessionInfo(info) => {
+                if info.name.is_some() {
+                    name.clone_from(&info.name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // is_linear: no branching AND the leaf is the last entry's ID
+    // (i.e., we're at the tip of a single chain).
+    let is_linear = !has_branching;
+
+    LoadFinalization {
+        leaf_id,
+        entry_ids,
+        entry_index,
+        message_count,
+        name,
+        is_linear,
+        orphans,
+    }
+}
+
 fn parse_env_bool(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -2682,6 +3357,7 @@ mod tests {
     use super::*;
     use crate::model::{Cost, StopReason, Usage};
     use asupersync::runtime::RuntimeBuilder;
+    use clap::Parser;
     use std::future::Future;
 
     fn make_test_message(text: &str) -> SessionMessage {
@@ -2696,6 +3372,214 @@ mod tests {
             .build()
             .expect("build runtime");
         runtime.block_on(future)
+    }
+
+    #[test]
+    fn test_session_handle_mutations_defer_persistence_side_effects() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.set_autosave_durability_for_test(AutosaveDurabilityMode::Throughput);
+        // Point at a directory path so an eager save would fail with an IO error.
+        session.path = Some(temp_dir.path().to_path_buf());
+        let handle = SessionHandle(Arc::new(Mutex::new(session)));
+
+        run_async(async { handle.set_name("deferred-save".to_string()).await })
+            .expect("set_name should not trigger immediate save");
+        run_async(async { handle.append_message(make_test_message("hello")).await })
+            .expect("append_message should not trigger immediate save");
+        run_async(async {
+            handle
+                .append_custom_entry(
+                    "marker".to_string(),
+                    Some(serde_json::json!({ "value": 42 })),
+                )
+                .await
+        })
+        .expect("append_custom_entry should not trigger immediate save");
+        run_async(async {
+            handle
+                .set_model("prov".to_string(), "model".to_string())
+                .await
+        })
+        .expect("set_model should not trigger immediate save");
+        run_async(async { handle.set_thinking_level("high".to_string()).await })
+            .expect("set_thinking_level should not trigger immediate save");
+
+        let branch = run_async(async { handle.get_branch().await });
+        let message_id = branch
+            .iter()
+            .find_map(|entry| {
+                if entry.get("type").and_then(Value::as_str) == Some("message") {
+                    entry
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                } else {
+                    None
+                }
+            })
+            .expect("message entry id in branch");
+        run_async(async {
+            handle
+                .set_label(message_id, Some("hot-path".to_string()))
+                .await
+        })
+        .expect("set_label should not trigger immediate save");
+
+        let state = run_async(async { handle.get_state().await });
+        assert_eq!(
+            state.get("sessionName").and_then(Value::as_str),
+            Some("deferred-save")
+        );
+        assert_eq!(
+            state.get("thinkingLevel").and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            state.get("durabilityMode").and_then(Value::as_str),
+            Some("throughput")
+        );
+        assert_eq!(state.get("messageCount").and_then(Value::as_u64), Some(1));
+
+        let (provider, model_id) = run_async(async { handle.get_model().await });
+        assert_eq!(provider.as_deref(), Some("prov"));
+        assert_eq!(model_id.as_deref(), Some("model"));
+    }
+
+    #[test]
+    fn test_autosave_queue_coalesces_mutations_per_flush() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.path = Some(temp_dir.path().join("autosave-coalesce.jsonl"));
+
+        session.append_message(make_test_message("one"));
+        session.append_custom_entry("marker".to_string(), None);
+        session.append_message(make_test_message("two"));
+
+        let before = session.autosave_metrics();
+        assert_eq!(before.pending_mutations, 3);
+        assert!(before.coalesced_mutations >= 2);
+        assert_eq!(before.flush_succeeded, 0);
+
+        run_async(async { session.flush_autosave(AutosaveFlushTrigger::Periodic).await })
+            .expect("periodic flush");
+
+        let after = session.autosave_metrics();
+        assert_eq!(after.pending_mutations, 0);
+        assert_eq!(after.flush_started, 1);
+        assert_eq!(after.flush_succeeded, 1);
+        assert_eq!(after.last_flush_batch_size, 3);
+        assert_eq!(
+            after.last_flush_trigger,
+            Some(AutosaveFlushTrigger::Periodic)
+        );
+    }
+
+    #[test]
+    fn test_autosave_queue_backpressure_is_bounded() {
+        let mut session = Session::create();
+        session.set_autosave_queue_limit_for_test(2);
+
+        for i in 0..5 {
+            session.append_message(make_test_message(&format!("message-{i}")));
+        }
+
+        let metrics = session.autosave_metrics();
+        assert_eq!(metrics.max_pending_mutations, 2);
+        assert_eq!(metrics.pending_mutations, 2);
+        assert_eq!(metrics.backpressure_events, 3);
+        assert!(metrics.coalesced_mutations >= 4);
+    }
+
+    #[test]
+    fn test_autosave_shutdown_flush_semantics_follow_durability_mode() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let mut strict = Session::create();
+        // Point at a directory path so strict shutdown flush attempts fail.
+        strict.path = Some(temp_dir.path().to_path_buf());
+        strict.set_autosave_durability_for_test(AutosaveDurabilityMode::Strict);
+        strict.append_message(make_test_message("strict"));
+
+        run_async(async { strict.flush_autosave_on_shutdown().await })
+            .expect_err("strict mode should propagate shutdown flush failure");
+        let strict_metrics = strict.autosave_metrics();
+        assert_eq!(strict_metrics.flush_failed, 1);
+        assert!(strict_metrics.pending_mutations > 0);
+
+        let mut throughput = Session::create();
+        throughput.path = Some(temp_dir.path().to_path_buf());
+        throughput.set_autosave_durability_for_test(AutosaveDurabilityMode::Throughput);
+        throughput.append_message(make_test_message("throughput"));
+
+        run_async(async { throughput.flush_autosave_on_shutdown().await })
+            .expect("throughput mode skips shutdown flush");
+        let throughput_metrics = throughput.autosave_metrics();
+        assert_eq!(throughput_metrics.flush_started, 0);
+        assert_eq!(throughput_metrics.pending_mutations, 1);
+    }
+
+    #[test]
+    fn test_session_new_prefers_cli_durability_mode_over_config() {
+        let cli =
+            crate::cli::Cli::parse_from(["pi", "--no-session", "--session-durability", "strict"]);
+        let config: Config =
+            serde_json::from_str(r#"{ "sessionDurability": "throughput" }"#).expect("config parse");
+        let session =
+            run_async(async { Session::new(&cli, &config).await }).expect("create session");
+        assert_eq!(
+            session.autosave_durability_mode(),
+            AutosaveDurabilityMode::Strict
+        );
+    }
+
+    #[test]
+    fn test_session_new_uses_config_durability_mode_when_cli_unset() {
+        let cli = crate::cli::Cli::parse_from(["pi", "--no-session"]);
+        let config: Config =
+            serde_json::from_str(r#"{ "sessionDurability": "throughput" }"#).expect("config parse");
+        let session =
+            run_async(async { Session::new(&cli, &config).await }).expect("create session");
+        assert_eq!(
+            session.autosave_durability_mode(),
+            AutosaveDurabilityMode::Throughput
+        );
+    }
+
+    #[test]
+    fn test_resolve_autosave_durability_mode_precedence() {
+        assert_eq!(
+            resolve_autosave_durability_mode(Some("strict"), Some("throughput"), Some("balanced")),
+            AutosaveDurabilityMode::Strict
+        );
+        assert_eq!(
+            resolve_autosave_durability_mode(None, Some("throughput"), Some("strict")),
+            AutosaveDurabilityMode::Throughput
+        );
+        assert_eq!(
+            resolve_autosave_durability_mode(None, None, Some("strict")),
+            AutosaveDurabilityMode::Strict
+        );
+        assert_eq!(
+            resolve_autosave_durability_mode(None, None, None),
+            AutosaveDurabilityMode::Balanced
+        );
+    }
+
+    #[test]
+    fn test_resolve_autosave_durability_mode_ignores_invalid_values() {
+        assert_eq!(
+            resolve_autosave_durability_mode(Some("bad"), Some("throughput"), Some("strict")),
+            AutosaveDurabilityMode::Throughput
+        );
+        assert_eq!(
+            resolve_autosave_durability_mode(None, Some("bad"), Some("strict")),
+            AutosaveDurabilityMode::Strict
+        );
+        assert_eq!(
+            resolve_autosave_durability_mode(None, None, Some("bad")),
+            AutosaveDurabilityMode::Balanced
+        );
     }
 
     #[test]
@@ -4314,6 +5198,62 @@ mod tests {
         assert_eq!(path.extension().unwrap(), "jsonl");
     }
 
+    #[test]
+    fn test_can_reuse_known_entry_requires_matching_mtime_and_size() {
+        let known_entry = SessionPickEntry {
+            path: PathBuf::from("session.jsonl"),
+            id: "session-id".to_string(),
+            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+            message_count: 4,
+            name: Some("cached".to_string()),
+            last_modified_ms: 1234,
+            size_bytes: 4096,
+        };
+
+        assert!(can_reuse_known_entry(&known_entry, 1234, 4096));
+        assert!(!can_reuse_known_entry(&known_entry, 1235, 4096));
+        assert!(!can_reuse_known_entry(&known_entry, 1234, 4097));
+    }
+
+    #[test]
+    fn test_scan_sessions_on_disk_ignores_stale_known_entry_when_size_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("first"));
+        session.append_message(make_test_message("second"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().expect("session path");
+        let metadata = std::fs::metadata(&path).expect("session metadata");
+        let disk_size = metadata.len();
+        #[allow(clippy::cast_possible_truncation)]
+        let disk_ms = metadata
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let stale_known_entry = SessionPickEntry {
+            path: path.clone(),
+            id: session.header.id.clone(),
+            timestamp: session.header.timestamp.clone(),
+            message_count: 999,
+            name: Some("stale".to_string()),
+            last_modified_ms: disk_ms,
+            size_bytes: disk_size.saturating_add(1),
+        };
+
+        let session_dir = path.parent().expect("session parent").to_path_buf();
+        let scanned =
+            run_async(async { scan_sessions_on_disk(&session_dir, vec![stale_known_entry]).await })
+                .expect("scan sessions");
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].path, path);
+        assert_eq!(scanned[0].message_count, 2);
+        assert_eq!(scanned[0].size_bytes, disk_size);
+    }
+
     // ======================================================================
     // All entries corrupted (only header valid)
     // ======================================================================
@@ -5297,5 +6237,238 @@ mod tests {
 
             assert_eq!(session.entries.len(), 2, "both entries should be loaded");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Incremental append tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_incremental_append_writes_only_new_entries() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        // First save: full rewrite (persisted_entry_count == 0).
+        session.append_message(make_test_message("msg A"));
+        session.append_message(make_test_message("msg B"));
+        run_async(async { session.save().await }).unwrap();
+
+        assert_eq!(session.persisted_entry_count, 2);
+        assert_eq!(session.appends_since_checkpoint, 0);
+
+        let path = session.path.clone().unwrap();
+        let lines_after_first = std::fs::read_to_string(&path).unwrap().lines().count();
+        // 1 header + 2 entries = 3 lines
+        assert_eq!(lines_after_first, 3);
+
+        // Add more entries and save again (incremental append).
+        session.append_message(make_test_message("msg C"));
+        run_async(async { session.save().await }).unwrap();
+
+        assert_eq!(session.persisted_entry_count, 3);
+        assert_eq!(session.appends_since_checkpoint, 1);
+
+        let lines_after_second = std::fs::read_to_string(&path).unwrap().lines().count();
+        // 1 header + 3 entries = 4 lines
+        assert_eq!(lines_after_second, 4);
+    }
+
+    #[test]
+    fn test_header_change_forces_full_rewrite() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        run_async(async { session.save().await }).unwrap();
+        assert_eq!(session.persisted_entry_count, 1);
+        assert!(!session.header_dirty);
+
+        // Modify header.
+        session.set_model_header(Some("new-provider".to_string()), None, None);
+        assert!(session.header_dirty);
+
+        session.append_message(make_test_message("msg B"));
+        run_async(async { session.save().await }).unwrap();
+
+        // Full rewrite resets all counters.
+        assert_eq!(session.persisted_entry_count, 2);
+        assert!(!session.header_dirty);
+        assert_eq!(session.appends_since_checkpoint, 0);
+
+        // Verify header on disk has the new provider.
+        let path = session.path.clone().unwrap();
+        let first_line = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let header: serde_json::Value = serde_json::from_str(&first_line).unwrap();
+        assert_eq!(header["provider"], "new-provider");
+    }
+
+    #[test]
+    fn test_compaction_entry_forces_full_rewrite() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        let id_a = session.append_message(make_test_message("msg A"));
+        run_async(async { session.save().await }).unwrap();
+        assert_eq!(session.persisted_entry_count, 1);
+
+        // Append a compaction entry — should force full rewrite.
+        session.append_compaction("summary".to_string(), id_a, 100, None, None);
+        session.append_message(make_test_message("msg B"));
+
+        run_async(async { session.save().await }).unwrap();
+
+        // Full rewrite: counters reset.
+        assert_eq!(session.persisted_entry_count, 3);
+        assert_eq!(session.appends_since_checkpoint, 0);
+    }
+
+    #[test]
+    fn test_checkpoint_interval_forces_full_rewrite() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        // First save (full rewrite).
+        session.append_message(make_test_message("initial"));
+        run_async(async { session.save().await }).unwrap();
+
+        // Simulate many incremental appends by setting the counter near threshold.
+        let interval = compaction_checkpoint_interval();
+        session.appends_since_checkpoint = interval;
+
+        // Next save should trigger full rewrite due to checkpoint.
+        session.append_message(make_test_message("triggers checkpoint"));
+        run_async(async { session.save().await }).unwrap();
+
+        // Full rewrite resets counters.
+        assert_eq!(session.appends_since_checkpoint, 0);
+        assert_eq!(session.persisted_entry_count, 2);
+    }
+
+    #[test]
+    fn test_incremental_append_load_round_trip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        // First save.
+        session.append_message(make_test_message("msg A"));
+        session.append_message(make_test_message("msg B"));
+        run_async(async { session.save().await }).unwrap();
+
+        // Incremental append.
+        session.append_message(make_test_message("msg C"));
+        run_async(async { session.save().await }).unwrap();
+
+        let path = session.path.clone().unwrap();
+
+        // Reload and verify all entries present.
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.entries.len(), 3);
+        // Verify the entry content by checking that we have messages A, B, C.
+        let texts: Vec<&str> = loaded
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionEntry::Message(m) => match &m.message {
+                    SessionMessage::User {
+                        content: UserContent::Text(t),
+                        ..
+                    } => Some(t.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["msg A", "msg B", "msg C"]);
+    }
+
+    #[test]
+    fn test_persisted_entry_count_set_on_open() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        session.append_message(make_test_message("msg B"));
+        session.append_message(make_test_message("msg C"));
+        run_async(async { session.save().await }).unwrap();
+
+        let path = session.path.clone().unwrap();
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.persisted_entry_count, 3);
+        assert!(!loaded.header_dirty);
+        assert_eq!(loaded.appends_since_checkpoint, 0);
+    }
+
+    #[test]
+    fn test_no_new_entries_is_noop() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        run_async(async { session.save().await }).unwrap();
+
+        let path = session.path.clone().unwrap();
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Sleep briefly to ensure mtime would change if file was written.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Save again with no changes.
+        run_async(async { session.save().await }).unwrap();
+
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "file should not be modified on no-op save"
+        );
+        assert_eq!(session.persisted_entry_count, 1);
+    }
+
+    #[test]
+    fn test_incremental_append_caches_stay_valid() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        run_async(async { session.save().await }).unwrap();
+
+        // After full rewrite, caches rebuilt.
+        assert_eq!(session.entry_index.len(), 1);
+
+        // Incremental append: add more entries.
+        let id_b = session.append_message(make_test_message("msg B"));
+        let id_c = session.append_message(make_test_message("msg C"));
+        run_async(async { session.save().await }).unwrap();
+
+        // Caches should still be valid (not rebuilt, but maintained incrementally).
+        assert_eq!(session.entry_index.len(), 3);
+        assert!(session.entry_index.contains_key(&id_b));
+        assert!(session.entry_index.contains_key(&id_c));
+        assert_eq!(session.cached_message_count, 3);
+    }
+
+    #[test]
+    fn test_set_branched_from_marks_header_dirty() {
+        let mut session = Session::create();
+        assert!(!session.header_dirty);
+
+        session.set_branched_from(Some("/some/path".to_string()));
+        assert!(session.header_dirty);
     }
 }

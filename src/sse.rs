@@ -1329,6 +1329,4 @@ data: {"type":"message_stop"}
             );
         }
     }
-
 }
-

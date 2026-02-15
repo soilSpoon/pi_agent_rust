@@ -591,7 +591,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         use std::io::{BufRead as _, Read as _};
         use std::process::{Command, Stdio};
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-        use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+        use std::sync::mpsc::{self, SyncSender};
 
         enum ExecStreamFrame {
             Stdout(String),
@@ -794,7 +794,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     };
                 }
 
-                match rx.recv_timeout(Duration::from_millis(25)) {
+                match rx.try_recv() {
                     Ok(ExecStreamFrame::Stdout(chunk)) => {
                         self.runtime.complete_hostcall(
                             call_id.to_string(),
@@ -833,8 +833,10 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                             message,
                         };
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => {
+                    Err(mpsc::TryRecvError::Empty) => {
+                        sleep(wall_now(), Duration::from_millis(25)).await;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
                         return HostcallOutcome::Error {
                             code: "internal".to_string(),
                             message: "exec stream channel closed".to_string(),

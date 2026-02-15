@@ -64,6 +64,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "append-system-prompt"
         | "session"
         | "session-dir"
+        | "session-durability"
         | "mode"
         | "tools"
         | "extension"
@@ -95,47 +96,47 @@ fn is_known_short_flag(token: &str) -> bool {
         .all(|ch| matches!(ch, 'v' | 'c' | 'r' | 'p' | 'e'))
 }
 
+fn is_negative_numeric_token(token: &str) -> bool {
+    if !token.starts_with('-') || token == "-" || token.starts_with("--") {
+        return false;
+    }
+    token.parse::<i64>().is_ok() || token.parse::<f64>().is_ok()
+}
+
+#[allow(clippy::too_many_lines)] // Argument normalization needs single-pass stateful parsing.
 fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<ExtensionCliFlag>) {
     if raw_args.is_empty() {
         return (vec!["pi".to_string()], Vec::new());
     }
-
     let mut filtered = Vec::with_capacity(raw_args.len());
     filtered.push(raw_args[0].clone());
-
     let mut extracted = Vec::new();
     let mut expecting_value = false;
     let mut in_subcommand = false;
     let mut in_message_args = false;
-
     let mut index = 1usize;
     while index < raw_args.len() {
         let token = &raw_args[index];
-
         if token == "--" {
             filtered.extend(raw_args[index..].iter().cloned());
             break;
         }
-
         if expecting_value {
             filtered.push(token.clone());
             expecting_value = false;
             index += 1;
             continue;
         }
-
         if in_subcommand || in_message_args {
             filtered.push(token.clone());
             index += 1;
             continue;
         }
-
         if token.starts_with("--") && token.len() > 2 {
             let without_prefix = &token[2..];
             let (name, has_inline_value) = without_prefix
                 .split_once('=')
                 .map_or((without_prefix, false), |(name, _)| (name, true));
-
             if let Some(spec) = known_long_option(name) {
                 filtered.push(token.clone());
                 if spec.takes_value && !has_inline_value && !spec.optional_value {
@@ -149,30 +150,30 @@ fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<Extensio
                 index += 1;
                 continue;
             }
-
             let (name, inline_value) = without_prefix
                 .split_once('=')
                 .map_or((without_prefix, None), |(name, value)| {
                     (name, Some(value.to_string()))
                 });
-
             if name.is_empty() {
                 filtered.push(token.clone());
                 index += 1;
                 continue;
             }
-
             let mut value = inline_value;
             if value.is_none() {
                 let next = raw_args.get(index + 1);
                 if let Some(next) = next {
-                    if next != "--" && (!next.starts_with('-') || next == "-") {
+                    if next != "--"
+                        && (!next.starts_with('-')
+                            || next == "-"
+                            || is_negative_numeric_token(next))
+                    {
                         value = Some(next.clone());
                         index += 1;
                     }
                 }
             }
-
             extracted.push(ExtensionCliFlag {
                 name: name.to_string(),
                 value,
@@ -180,26 +181,22 @@ fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<Extensio
             index += 1;
             continue;
         }
-
         if token == "-e" {
             filtered.push(token.clone());
             expecting_value = true;
             index += 1;
             continue;
         }
-
         if is_known_short_flag(token) {
             filtered.push(token.clone());
             index += 1;
             continue;
         }
-
         if token.starts_with('-') {
             filtered.push(token.clone());
             index += 1;
             continue;
         }
-
         if ROOT_SUBCOMMANDS.contains(&token.as_str()) {
             in_subcommand = true;
         } else {
@@ -208,7 +205,6 @@ fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<Extensio
         filtered.push(token.clone());
         index += 1;
     }
-
     (filtered, extracted)
 }
 
@@ -314,6 +310,13 @@ pub struct Cli {
     /// Don't save session (ephemeral)
     #[arg(long)]
     pub no_session: bool,
+
+    /// Session durability mode: strict, balanced, or throughput
+    #[arg(
+        long,
+        value_parser = ["strict", "balanced", "throughput"]
+    )]
+    pub session_durability: Option<String>,
 
     /// Skip startup migrations for legacy config/session/layout paths
     #[arg(long)]
@@ -497,6 +500,12 @@ mod tests {
     fn parse_no_session() {
         let cli = Cli::parse_from(["pi", "--no-session"]);
         assert!(cli.no_session);
+    }
+
+    #[test]
+    fn parse_session_durability() {
+        let cli = Cli::parse_from(["pi", "--session-durability", "throughput"]);
+        assert_eq!(cli.session_durability.as_deref(), Some("throughput"));
     }
 
     #[test]
@@ -909,6 +918,56 @@ mod tests {
         assert_eq!(parsed.extension_flags.len(), 1);
         assert_eq!(parsed.extension_flags[0].name, "dry-run");
         assert!(parsed.extension_flags[0].value.is_none());
+    }
+
+    #[test]
+    fn extension_flag_accepts_negative_integer_value() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--temperature".to_string(),
+            "-1".to_string(),
+            "--print".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse negative integer value");
+
+        assert!(parsed.cli.print);
+        assert_eq!(parsed.extension_flags.len(), 1);
+        assert_eq!(parsed.extension_flags[0].name, "temperature");
+        assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("-1"));
+    }
+
+    #[test]
+    fn extension_flag_accepts_negative_float_value() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--temperature".to_string(),
+            "-0.25".to_string(),
+            "--print".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse negative float value");
+
+        assert!(parsed.cli.print);
+        assert_eq!(parsed.extension_flags.len(), 1);
+        assert_eq!(parsed.extension_flags[0].name, "temperature");
+        assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("-0.25"));
+    }
+
+    #[test]
+    fn parse_with_extension_flags_recognizes_session_durability_as_builtin() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--session-durability".to_string(),
+            "throughput".to_string(),
+            "--print".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse with session durability");
+
+        assert_eq!(parsed.cli.session_durability.as_deref(), Some("throughput"));
+        assert!(parsed.extension_flags.is_empty());
+        assert!(parsed.cli.print);
     }
 
     #[test]

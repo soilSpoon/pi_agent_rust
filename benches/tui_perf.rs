@@ -9,6 +9,9 @@
     clippy::suboptimal_flops
 )]
 
+#[path = "bench_env.rs"]
+mod bench_env;
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -414,12 +417,14 @@ fn bench_markdown_rendering(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_build_conversation_content,
-    bench_view,
-    bench_message_generation,
-    bench_viewport_operations,
-    bench_markdown_rendering,
-);
+criterion_group! {
+    name = benches;
+    config = bench_env::criterion_config();
+    targets =
+        bench_build_conversation_content,
+        bench_view,
+        bench_message_generation,
+        bench_viewport_operations,
+        bench_markdown_rendering,
+}
 criterion_main!(benches);

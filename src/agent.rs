@@ -33,7 +33,7 @@ use crate::model::{
 };
 use crate::models::{ModelEntry, ModelRegistry};
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
-use crate::session::{Session, SessionHandle};
+use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
 use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
 use asupersync::sync::{Mutex, Notify};
 use async_trait::async_trait;
@@ -716,9 +716,23 @@ impl Agent {
                     return Ok(abort_message);
                 }
 
-                let assistant_message = self
+                let assistant_message = match self
                     .stream_assistant_response(&on_event, abort.clone())
-                    .await?;
+                    .await
+                {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        let agent_end_event = AgentEvent::AgentEnd {
+                            session_id: session_id.clone(),
+                            messages: new_messages.clone(),
+                            error: Some(err.to_string()),
+                        };
+                        on_event(agent_end_event.clone());
+                        self.dispatch_extension_lifecycle_event(&agent_end_event)
+                            .await;
+                        return Err(err);
+                    }
+                };
                 last_assistant = Some(assistant_message.clone());
 
                 let assistant_event_message = Message::assistant(assistant_message.clone());
@@ -785,14 +799,28 @@ impl Agent {
                         return Ok(stop_message);
                     }
 
-                    let outcome = self
+                    let outcome = match self
                         .execute_tool_calls(
                             &tool_calls,
                             &on_event,
                             &mut new_messages,
                             abort.clone(),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            let agent_end_event = AgentEvent::AgentEnd {
+                                session_id: session_id.clone(),
+                                messages: new_messages.clone(),
+                                error: Some(err.to_string()),
+                            };
+                            on_event(agent_end_event.clone());
+                            self.dispatch_extension_lifecycle_event(&agent_end_event)
+                                .await;
+                            return Err(err);
+                        }
+                    };
                     tool_results = outcome.tool_results;
                     steering_after_tools = outcome.steering_messages;
                 }
@@ -4156,7 +4184,9 @@ impl AgentSession {
                     );
 
                     if self.save_enabled {
-                        session.save().await?;
+                        session
+                            .flush_autosave(AutosaveFlushTrigger::Periodic)
+                            .await?;
                     }
 
                     on_event(AgentEvent::AutoCompactionEnd {
@@ -4362,7 +4392,9 @@ impl AgentSession {
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.save().await?;
+            session
+                .flush_autosave(AutosaveFlushTrigger::Periodic)
+                .await?;
         }
         Ok(())
     }
@@ -4377,7 +4409,9 @@ impl AgentSession {
             .lock(cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
-        session.save().await?;
+        session
+            .flush_autosave(AutosaveFlushTrigger::Periodic)
+            .await?;
         Ok(())
     }
 
@@ -4569,7 +4603,7 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
             if self.save_enabled {
-                session.save().await?;
+                session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
             }
         }
 
@@ -4637,7 +4671,7 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
             if self.save_enabled {
-                session.save().await?;
+                session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
             }
         }
 
@@ -4666,7 +4700,9 @@ impl AgentSession {
                 session.append_model_message(message);
             }
             if self.save_enabled {
-                session.save().await?;
+                session
+                    .flush_autosave(AutosaveFlushTrigger::Periodic)
+                    .await?;
             }
         }
         Ok(())
