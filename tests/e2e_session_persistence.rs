@@ -24,10 +24,10 @@ use pi::model::{
 use pi::provider::{Context, Provider, StreamOptions};
 #[cfg(unix)]
 use pi::session::encode_cwd;
-use pi::session::{Session, SessionEntry, SessionMessage};
+use pi::session::{Session, SessionEntry, SessionMessage, SessionStoreKind};
 use pi::tools::ToolRegistry;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -391,6 +391,28 @@ async fn current_messages(session: &Arc<asupersync::sync::Mutex<Session>>) -> Ve
     guard.to_messages_for_current_path()
 }
 
+fn user_texts_in_order(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => match &user.content {
+                UserContent::Text(text) => Some(text.clone()),
+                UserContent::Blocks(_) => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_no_duplicate_user_texts(user_texts: &[String], context: &str) {
+    let unique: HashSet<&String> = user_texts.iter().collect();
+    assert_eq!(
+        unique.len(),
+        user_texts.len(),
+        "duplicate user text detected in {context}"
+    );
+}
+
 #[test]
 fn create_and_save() {
     let test_name = "e2e_session_create_and_save";
@@ -704,6 +726,209 @@ fn multi_turn_persistence() {
             "expected persisted tool result entries"
         );
     });
+    write_jsonl_artifacts(&harness, test_name);
+}
+
+#[test]
+fn jsonl_fault_injection_flush_windows_preserve_integrity() {
+    let test_name = "e2e_jsonl_fault_injection_flush_windows";
+    let harness = TestHarness::new(test_name);
+    harness.section("jsonl_fault_injection");
+
+    run_async_test(async {
+        let cwd = harness.temp_dir().to_path_buf();
+        let mut session = Session::create_with_dir_and_store(Some(cwd), SessionStoreKind::Jsonl);
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("jsonl-base".to_string()),
+            timestamp: Some(0),
+        });
+        session.save().await.expect("save baseline jsonl session");
+        let stable_path = session.path.clone().expect("jsonl session path");
+        harness.record_artifact("jsonl-fault-initial-session", &stable_path);
+
+        // Pre-flush crash window: pending mutation should not corrupt persisted state.
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("jsonl-preflush-pending".to_string()),
+            timestamp: Some(0),
+        });
+        drop(session);
+
+        let reopened_pre = Session::open(stable_path.to_string_lossy().as_ref())
+            .await
+            .expect("reopen after pre-flush crash simulation");
+        let pre_texts = user_texts_in_order(&reopened_pre.to_messages_for_current_path());
+        assert_eq!(pre_texts, vec!["jsonl-base".to_string()]);
+        assert_no_duplicate_user_texts(&pre_texts, "jsonl pre-flush window");
+
+        // Mid-flush crash window: force a flush error by pointing path at a directory.
+        let mut mid = reopened_pre;
+        mid.append_message(SessionMessage::User {
+            content: UserContent::Text("jsonl-midflush-pending".to_string()),
+            timestamp: Some(0),
+        });
+        let fault_path = harness.create_dir("jsonl-midflush-fault-path");
+        mid.path = Some(fault_path.clone());
+        let flush_err = mid.save().await.expect_err("mid-flush save should fail");
+        harness
+            .log()
+            .info_ctx("fault", "jsonl mid-flush failure", |ctx| {
+                ctx.push(("fault_path".into(), fault_path.display().to_string()));
+                ctx.push(("error".into(), flush_err.to_string()));
+            });
+
+        // Simulate process crash/restart after failed flush.
+        drop(mid);
+        let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
+            .await
+            .expect("reopen after mid-flush crash simulation");
+        let mid_texts = user_texts_in_order(&reopened_mid.to_messages_for_current_path());
+        assert_eq!(mid_texts, vec!["jsonl-base".to_string()]);
+        assert_no_duplicate_user_texts(&mid_texts, "jsonl mid-flush window");
+
+        // Post-flush crash window: persisted mutation survives exactly once.
+        let mut post = reopened_mid;
+        post.append_message(SessionMessage::User {
+            content: UserContent::Text("jsonl-postflush-persisted".to_string()),
+            timestamp: Some(0),
+        });
+        post.save().await.expect("post-flush save should succeed");
+        drop(post);
+
+        let reopened_post = Session::open(stable_path.to_string_lossy().as_ref())
+            .await
+            .expect("reopen after post-flush crash simulation");
+        let post_texts = user_texts_in_order(&reopened_post.to_messages_for_current_path());
+        assert_eq!(
+            post_texts,
+            vec![
+                "jsonl-base".to_string(),
+                "jsonl-postflush-persisted".to_string()
+            ],
+            "jsonl post-crash ordering mismatch"
+        );
+        assert_no_duplicate_user_texts(&post_texts, "jsonl post-flush window");
+
+        let summary_path = harness.temp_path("jsonl-fault-window-summary.json");
+        std::fs::write(
+            &summary_path,
+            serde_json::to_string_pretty(&json!({
+                "scenario": "jsonl_fault_windows",
+                "windows": {
+                    "pre_flush": pre_texts,
+                    "mid_flush": mid_texts,
+                    "post_flush": post_texts
+                }
+            }))
+            .expect("serialize jsonl fault summary"),
+        )
+        .expect("write jsonl fault summary");
+        harness.record_artifact("jsonl-fault-window-summary.json", &summary_path);
+    });
+
+    write_jsonl_artifacts(&harness, test_name);
+}
+
+#[cfg(feature = "sqlite-sessions")]
+#[test]
+fn sqlite_fault_injection_flush_windows_preserve_integrity() {
+    let test_name = "e2e_sqlite_fault_injection_flush_windows";
+    let harness = TestHarness::new(test_name);
+    harness.section("sqlite_fault_injection");
+
+    run_async_test(async {
+        let cwd = harness.temp_dir().to_path_buf();
+        let mut session = Session::create_with_dir_and_store(Some(cwd), SessionStoreKind::Sqlite);
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("sqlite-base".to_string()),
+            timestamp: Some(0),
+        });
+        session.save().await.expect("save baseline sqlite session");
+        let stable_path = session.path.clone().expect("sqlite session path");
+        harness.record_artifact("sqlite-fault-initial-session", &stable_path);
+
+        // Pre-flush crash window.
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("sqlite-preflush-pending".to_string()),
+            timestamp: Some(0),
+        });
+        drop(session);
+
+        let reopened_pre = Session::open(stable_path.to_string_lossy().as_ref())
+            .await
+            .expect("reopen sqlite after pre-flush crash simulation");
+        let pre_texts = user_texts_in_order(&reopened_pre.to_messages_for_current_path());
+        assert_eq!(pre_texts, vec!["sqlite-base".to_string()]);
+        assert_no_duplicate_user_texts(&pre_texts, "sqlite pre-flush window");
+
+        // Mid-flush crash window.
+        let mut mid = reopened_pre;
+        mid.append_message(SessionMessage::User {
+            content: UserContent::Text("sqlite-midflush-pending".to_string()),
+            timestamp: Some(0),
+        });
+        let fault_path = harness.create_dir("sqlite-midflush-fault-path");
+        mid.path = Some(fault_path.clone());
+        let flush_err = mid
+            .save()
+            .await
+            .expect_err("sqlite mid-flush save should fail");
+        harness
+            .log()
+            .info_ctx("fault", "sqlite mid-flush failure", |ctx| {
+                ctx.push(("fault_path".into(), fault_path.display().to_string()));
+                ctx.push(("error".into(), flush_err.to_string()));
+            });
+
+        drop(mid);
+        let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
+            .await
+            .expect("reopen sqlite after mid-flush crash simulation");
+        let mid_texts = user_texts_in_order(&reopened_mid.to_messages_for_current_path());
+        assert_eq!(mid_texts, vec!["sqlite-base".to_string()]);
+        assert_no_duplicate_user_texts(&mid_texts, "sqlite mid-flush window");
+
+        // Post-flush crash window.
+        let mut post = reopened_mid;
+        post.append_message(SessionMessage::User {
+            content: UserContent::Text("sqlite-postflush-persisted".to_string()),
+            timestamp: Some(0),
+        });
+        post.save()
+            .await
+            .expect("sqlite post-flush save should succeed");
+        drop(post);
+
+        let reopened_post = Session::open(stable_path.to_string_lossy().as_ref())
+            .await
+            .expect("reopen sqlite after post-flush crash simulation");
+        let post_texts = user_texts_in_order(&reopened_post.to_messages_for_current_path());
+        assert_eq!(
+            post_texts,
+            vec![
+                "sqlite-base".to_string(),
+                "sqlite-postflush-persisted".to_string()
+            ],
+            "sqlite post-crash ordering mismatch"
+        );
+        assert_no_duplicate_user_texts(&post_texts, "sqlite post-flush window");
+
+        let summary_path = harness.temp_path("sqlite-fault-window-summary.json");
+        std::fs::write(
+            &summary_path,
+            serde_json::to_string_pretty(&json!({
+                "scenario": "sqlite_fault_windows",
+                "windows": {
+                    "pre_flush": pre_texts,
+                    "mid_flush": mid_texts,
+                    "post_flush": post_texts
+                }
+            }))
+            .expect("serialize sqlite fault summary"),
+        )
+        .expect("write sqlite fault summary");
+        harness.record_artifact("sqlite-fault-window-summary.json", &summary_path);
+    });
+
     write_jsonl_artifacts(&harness, test_name);
 }
 

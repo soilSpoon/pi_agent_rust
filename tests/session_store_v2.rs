@@ -1,7 +1,11 @@
 #![forbid(unsafe_code)]
 
 use pi::PiResult;
-use pi::session_store_v2::{MigrationEvent, MigrationVerification, SessionStoreV2};
+use pi::session::{CustomEntry, EntryBase, MigrationState, SessionEntry};
+use pi::session_store_v2::{
+    MigrationEvent, MigrationVerification, SessionStoreV2, frame_to_session_entry,
+    session_entry_to_frame_args,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -184,23 +188,12 @@ fn bootstrap_fails_if_index_points_to_missing_segment() -> PiResult<()> {
 
 // ── O(index+tail) resume path tests ──────────────────────────────────
 
-use pi::session::{CustomEntry, EntryBase, SessionEntry, SessionInfoEntry};
-use pi::session_store_v2::{frame_to_session_entry, session_entry_to_frame_args};
-
 /// Helper: build a `SessionEntry::Custom` with the given id and parent.
 fn make_custom_entry(id: &str, parent_id: Option<&str>) -> SessionEntry {
     SessionEntry::Custom(CustomEntry {
         base: EntryBase::new(parent_id.map(String::from), id.to_string()),
         custom_type: "test".to_string(),
         data: Some(json!({"id": id})),
-    })
-}
-
-/// Helper: build a `SessionEntry::SessionInfo` with an optional name.
-fn make_session_info_entry(id: &str, parent_id: Option<&str>, name: Option<&str>) -> SessionEntry {
-    SessionEntry::SessionInfo(SessionInfoEntry {
-        base: EntryBase::new(parent_id.map(String::from), id.to_string()),
-        name: name.map(String::from),
     })
 }
 
@@ -1060,6 +1053,322 @@ fn v2_sidecar_integrity_valid_after_migration() -> PiResult<()> {
 
     // Validate integrity — should not error.
     store.validate_integrity()?;
+
+    Ok(())
+}
+
+// ─── Migration Tooling Tests ────────────────────────────────────────────────
+
+#[test]
+fn migrate_jsonl_to_v2_creates_verified_sidecar() -> PiResult<()> {
+    let dir = tempdir()?;
+    let entries = vec![
+        make_message_entry("m1", None, "first"),
+        make_message_entry("m2", Some("m1"), "second"),
+        make_message_entry("m3", Some("m2"), "third"),
+    ];
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+
+    let event = pi::session::migrate_jsonl_to_v2(&jsonl, "test-corr-001")?;
+
+    assert_eq!(event.outcome, "ok");
+    assert_eq!(event.source_format, "jsonl_v3");
+    assert_eq!(event.target_format, "native_v2");
+    assert!(event.verification.entry_count_match);
+    assert!(event.verification.hash_chain_match);
+    assert!(event.verification.index_consistent);
+    assert_eq!(event.correlation_id, "test-corr-001");
+
+    // Verify ledger was written.
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+    let ledger = store.read_migration_events()?;
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].phase, "forward");
+
+    Ok(())
+}
+
+#[test]
+fn verify_v2_against_jsonl_detects_matching_entries() -> PiResult<()> {
+    let dir = tempdir()?;
+    let entries = vec![
+        make_message_entry("v1", None, "hello"),
+        make_message_entry("v2", Some("v1"), "world"),
+    ];
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+    let store = pi::session::create_v2_sidecar_from_jsonl(&jsonl)?;
+
+    let verification = pi::session::verify_v2_against_jsonl(&jsonl, &store)?;
+
+    assert!(verification.entry_count_match);
+    assert!(verification.hash_chain_match);
+    assert!(verification.index_consistent);
+
+    Ok(())
+}
+
+#[test]
+fn rollback_v2_sidecar_removes_sidecar_directory() -> PiResult<()> {
+    let dir = tempdir()?;
+    let entries = vec![make_message_entry("r1", None, "test")];
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+
+    // Migrate forward.
+    pi::session::migrate_jsonl_to_v2(&jsonl, "rollback-test")?;
+    assert!(pi::session_store_v2::has_v2_sidecar(&jsonl));
+
+    // Rollback.
+    pi::session::rollback_v2_sidecar(&jsonl, "rollback-test")?;
+    assert!(!pi::session_store_v2::has_v2_sidecar(&jsonl));
+
+    // Original JSONL still intact.
+    assert!(jsonl.exists());
+
+    Ok(())
+}
+
+#[test]
+fn rollback_v2_sidecar_is_idempotent() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(dir.path(), &[make_message_entry("x", None, "data")]);
+
+    // Rollback when no sidecar exists — should succeed silently.
+    pi::session::rollback_v2_sidecar(&jsonl, "noop")?;
+    assert!(!pi::session_store_v2::has_v2_sidecar(&jsonl));
+
+    Ok(())
+}
+
+#[test]
+fn migration_status_unmigrated_when_no_sidecar() {
+    let dir = tempdir().unwrap();
+    let jsonl = build_test_jsonl(dir.path(), &[make_message_entry("s1", None, "data")]);
+    assert_eq!(pi::session::migration_status(&jsonl), MigrationState::Unmigrated);
+}
+
+#[test]
+fn migration_status_migrated_after_successful_migration() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(dir.path(), &[make_message_entry("s1", None, "data")]);
+    pi::session::migrate_jsonl_to_v2(&jsonl, "status-test")?;
+
+    assert_eq!(pi::session::migration_status(&jsonl), MigrationState::Migrated);
+
+    Ok(())
+}
+
+#[test]
+fn migration_status_partial_when_sidecar_incomplete() {
+    let dir = tempdir().unwrap();
+    let jsonl = build_test_jsonl(dir.path(), &[make_message_entry("s1", None, "data")]);
+
+    // Create a bare sidecar directory without proper structure.
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    fs::create_dir_all(&v2_root).unwrap();
+
+    assert_eq!(pi::session::migration_status(&jsonl), MigrationState::Partial);
+}
+
+#[test]
+fn migration_status_corrupt_when_index_damaged() -> PiResult<()> {
+    let dir = tempdir()?;
+    let entries = vec![
+        make_message_entry("c1", None, "one"),
+        make_message_entry("c2", Some("c1"), "two"),
+    ];
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+    pi::session::migrate_jsonl_to_v2(&jsonl, "corrupt-test")?;
+
+    // Corrupt the index file.
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let index_path = v2_root.join("index").join("offsets.jsonl");
+    fs::write(&index_path, "not valid json\n")?;
+
+    match pi::session::migration_status(&jsonl) {
+        MigrationState::Corrupt { .. } => {} // expected
+        other => panic!("Expected Corrupt, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn migrate_dry_run_validates_without_persisting() -> PiResult<()> {
+    let dir = tempdir()?;
+    let entries = vec![
+        make_message_entry("d1", None, "dry"),
+        make_message_entry("d2", Some("d1"), "run"),
+    ];
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+
+    let verification = pi::session::migrate_dry_run(&jsonl)?;
+
+    // Dry run should report success.
+    assert!(verification.entry_count_match);
+    assert!(verification.hash_chain_match);
+    assert!(verification.index_consistent);
+
+    // No sidecar should have been created.
+    assert!(!pi::session_store_v2::has_v2_sidecar(&jsonl));
+    assert_eq!(pi::session::migration_status(&jsonl), MigrationState::Unmigrated);
+
+    Ok(())
+}
+
+#[test]
+fn recover_partial_migration_cleans_up_and_optionally_re_migrates() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(dir.path(), &[make_message_entry("r1", None, "data")]);
+
+    // Create a partial sidecar.
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    fs::create_dir_all(&v2_root)?;
+
+    // Recover without re-migration.
+    let state = pi::session::recover_partial_migration(&jsonl, "recover-test", false)?;
+    assert_eq!(state, MigrationState::Unmigrated);
+    assert!(!v2_root.exists());
+
+    // Create partial again, recover WITH re-migration.
+    fs::create_dir_all(&v2_root)?;
+    let state = pi::session::recover_partial_migration(&jsonl, "recover-test-2", true)?;
+    assert_eq!(state, MigrationState::Migrated);
+    assert!(pi::session_store_v2::has_v2_sidecar(&jsonl));
+
+    Ok(())
+}
+
+#[test]
+fn migrate_then_rollback_then_re_migrate_round_trip() -> PiResult<()> {
+    let dir = tempdir()?;
+    let entries = vec![
+        make_message_entry("rt1", None, "alpha"),
+        make_message_entry("rt2", Some("rt1"), "beta"),
+        make_message_entry("rt3", Some("rt2"), "gamma"),
+    ];
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+
+    // Step 1: Migrate.
+    let event1 = pi::session::migrate_jsonl_to_v2(&jsonl, "round-trip")?;
+    assert_eq!(event1.outcome, "ok");
+
+    // Step 2: Rollback.
+    pi::session::rollback_v2_sidecar(&jsonl, "round-trip")?;
+    assert_eq!(pi::session::migration_status(&jsonl), MigrationState::Unmigrated);
+
+    // Step 3: Re-migrate.
+    let event2 = pi::session::migrate_jsonl_to_v2(&jsonl, "round-trip-2")?;
+    assert_eq!(event2.outcome, "ok");
+    assert_eq!(pi::session::migration_status(&jsonl), MigrationState::Migrated);
+
+    // Verify the re-migrated store has correct entry count.
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+    assert_eq!(store.entry_count(), 3);
+
+    Ok(())
+}
+
+#[test]
+fn migrate_empty_session_succeeds() -> PiResult<()> {
+    let dir = tempdir()?;
+    let entries: Vec<SessionEntry> = vec![];
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+
+    let event = pi::session::migrate_jsonl_to_v2(&jsonl, "empty-test")?;
+    assert_eq!(event.outcome, "ok");
+    assert!(event.verification.entry_count_match);
+    assert_eq!(pi::session::migration_status(&jsonl), MigrationState::Migrated);
+
+    Ok(())
+}
+
+#[test]
+fn migrate_large_session_preserves_all_entries() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut entries = Vec::new();
+    for i in 0..100 {
+        let parent = if i == 0 {
+            None
+        } else {
+            Some(format!("e{}", i - 1))
+        };
+        entries.push(make_message_entry(
+            &format!("e{i}"),
+            parent.as_deref(),
+            &format!("message number {i}"),
+        ));
+    }
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+
+    let event = pi::session::migrate_jsonl_to_v2(&jsonl, "large-test")?;
+    assert_eq!(event.outcome, "ok");
+    assert!(event.verification.entry_count_match);
+
+    // Verify all entries round-trip.
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+    assert_eq!(store.entry_count(), 100);
+
+    let frames = store.read_all_entries()?;
+    assert_eq!(frames.len(), 100);
+    assert_eq!(frames[0].entry_id, "e0");
+    assert_eq!(frames[99].entry_id, "e99");
+
+    Ok(())
+}
+
+#[test]
+fn migrate_branching_session_preserves_all_branches() -> PiResult<()> {
+    let dir = tempdir()?;
+    // Create a session with a fork:
+    //   root → a → b
+    //             → c (branch from a)
+    let entries = vec![
+        make_message_entry("root", None, "start"),
+        make_message_entry("a", Some("root"), "step A"),
+        make_message_entry("b", Some("a"), "branch 1"),
+        make_message_entry("c", Some("a"), "branch 2"),
+    ];
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+
+    let event = pi::session::migrate_jsonl_to_v2(&jsonl, "branch-test")?;
+    assert_eq!(event.outcome, "ok");
+    assert!(event.verification.entry_count_match);
+
+    // All 4 entries should be in the store.
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+    assert_eq!(store.entry_count(), 4);
+
+    // Active path from branch "b" should be: root → a → b.
+    let path_b = store.read_active_path("b")?;
+    let ids_b: Vec<&str> = path_b.iter().map(|f| f.entry_id.as_str()).collect();
+    assert_eq!(ids_b, vec!["root", "a", "b"]);
+
+    // Active path from branch "c" should be: root → a → c.
+    let path_c = store.read_active_path("c")?;
+    let ids_c: Vec<&str> = path_c.iter().map(|f| f.entry_id.as_str()).collect();
+    assert_eq!(ids_c, vec!["root", "a", "c"]);
+
+    Ok(())
+}
+
+#[test]
+fn migration_ledger_accumulates_events() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(dir.path(), &[make_message_entry("l1", None, "data")]);
+
+    // Migrate.
+    pi::session::migrate_jsonl_to_v2(&jsonl, "ledger-1")?;
+
+    // Check ledger has 1 event.
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+    let events = store.read_migration_events()?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].phase, "forward");
 
     Ok(())
 }

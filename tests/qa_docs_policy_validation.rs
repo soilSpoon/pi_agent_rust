@@ -2084,6 +2084,7 @@ fn evidence_logging_contract_perf_statistical_fields_include_required_percentile
 
 const ORCHESTRATE_SCRIPT_PATH: &str = "scripts/perf/orchestrate.sh";
 const BUNDLE_SCRIPT_PATH: &str = "scripts/perf/bundle.sh";
+const BENCH_EXTENSION_WORKLOADS_SCRIPT_PATH: &str = "scripts/bench_extension_workloads.sh";
 
 #[test]
 fn orchestrate_script_exists_and_is_executable() {
@@ -2239,6 +2240,33 @@ fn orchestrate_script_generates_baseline_variance_confidence_artifact() {
 }
 
 #[test]
+fn orchestrate_script_generates_pgo_pipeline_summary_artifact() {
+    let content = load_text(ORCHESTRATE_SCRIPT_PATH);
+
+    assert!(
+        content.contains("pgo_pipeline_summary.json"),
+        "orchestrate.sh must emit pgo_pipeline_summary.json"
+    );
+    assert!(
+        content.contains("pi.perf.pgo_pipeline_summary.v1"),
+        "orchestrate.sh must emit pi.perf.pgo_pipeline_summary.v1 schema"
+    );
+
+    for field in &[
+        "pgo_mode_requested",
+        "pgo_mode_effective",
+        "profile_data_state",
+        "fallback",
+        "comparison_artifacts",
+    ] {
+        assert!(
+            content.contains(field),
+            "pgo pipeline summary must include field: {field}"
+        );
+    }
+}
+
+#[test]
 fn orchestrate_script_references_contract_schemas() {
     let content = load_text(ORCHESTRATE_SCRIPT_PATH);
 
@@ -2334,6 +2362,62 @@ fn bundle_script_verifies_checksums_before_bundling() {
     assert!(
         content.contains("sha256sum"),
         "bundle.sh must use sha256sum for integrity verification"
+    );
+}
+
+#[test]
+fn bench_extension_workloads_script_exists_and_is_executable() {
+    let path = std::path::Path::new(BENCH_EXTENSION_WORKLOADS_SCRIPT_PATH);
+    assert!(
+        path.exists(),
+        "bench_extension_workloads.sh must exist at {BENCH_EXTENSION_WORKLOADS_SCRIPT_PATH}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(path).unwrap().permissions();
+        assert!(
+            perms.mode() & 0o111 != 0,
+            "bench_extension_workloads.sh must be executable"
+        );
+    }
+}
+
+#[test]
+fn bench_extension_workloads_script_supports_pgo_modes_and_fallback() {
+    let content = load_text(BENCH_EXTENSION_WORKLOADS_SCRIPT_PATH);
+
+    for token in &[
+        "BENCH_PGO_MODE",
+        "off|train|use|compare",
+        "BENCH_PGO_PROFILE_DATA",
+        "BENCH_PGO_ALLOW_FALLBACK",
+        "missing_profile_data",
+        "corrupt_profile_data",
+    ] {
+        assert!(
+            content.contains(token),
+            "bench_extension_workloads.sh must include token: {token}"
+        );
+    }
+}
+
+#[test]
+fn bench_extension_workloads_script_emits_pgo_comparison_and_event_schemas() {
+    let content = load_text(BENCH_EXTENSION_WORKLOADS_SCRIPT_PATH);
+
+    assert!(
+        content.contains("pi.perf.pgo_pipeline_event.v1"),
+        "bench_extension_workloads.sh must emit pi.perf.pgo_pipeline_event.v1 records"
+    );
+    assert!(
+        content.contains("pi.perf.pgo_comparison.v1"),
+        "bench_extension_workloads.sh must emit pi.perf.pgo_comparison.v1 comparison artifacts"
+    );
+    assert!(
+        content.contains("pgo_delta_"),
+        "bench_extension_workloads.sh must generate pgo_delta_*.json comparison files"
     );
 }
 

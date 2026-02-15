@@ -25,14 +25,16 @@ use pi::provider::Provider;
 use pi::providers::openai::OpenAIProvider;
 use pi::resources::ResourceLoader;
 use pi::rpc::{RpcOptions, run};
-use pi::session::{AutosaveDurabilityMode, Session, SessionMessage};
+use pi::session::{AutosaveDurabilityMode, Session, SessionEntry, SessionMessage};
 use pi::tools::ToolRegistry;
 use serde_json::Value;
+use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_BACKLOG_STATS_ROUNDTRIP_MS: u128 = 750;
+const MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS: u128 = 750;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -153,6 +155,76 @@ fn prepopulated_session() -> Session {
         },
     });
     session
+}
+
+fn large_export_session() -> Session {
+    let mut session = Session::in_memory();
+    session.header.provider = Some("openai".to_string());
+    session.header.model_id = Some("gpt-4o-mini".to_string());
+    session.header.thinking_level = Some("off".to_string());
+
+    let payload = "x".repeat(2048);
+    let now = chrono::Utc::now().timestamp_millis();
+    for idx in 0..600 {
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text(format!("export-{idx}-{payload}")),
+            timestamp: Some(now + idx),
+        });
+    }
+
+    session
+}
+
+fn large_fork_session() -> (Session, String, String) {
+    let mut session = Session::in_memory();
+    session.header.provider = Some("openai".to_string());
+    session.header.model_id = Some("gpt-4o-mini".to_string());
+    session.header.thinking_level = Some("off".to_string());
+
+    let payload = "y".repeat(1024);
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut target_id = None::<String>;
+    let mut target_text = None::<String>;
+    for idx in 0..900 {
+        let user_text = format!("fork-target-{idx}-{payload}");
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text(user_text.clone()),
+            timestamp: Some(now + idx),
+        });
+
+        if idx == 700 {
+            let SessionEntry::Message(message) = session
+                .entries
+                .last()
+                .expect("user message entry should exist")
+            else {
+                panic!("last entry should be a message");
+            };
+            target_id = message.base.id.clone();
+            target_text = Some(user_text);
+        }
+
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "assistant-{idx}"
+                )))],
+                api: "test".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: now + idx,
+            },
+        });
+    }
+
+    (
+        session,
+        target_id.expect("fork target id should be captured"),
+        target_text.expect("fork target text should be captured"),
+    )
 }
 
 // ─── get_state tests ─────────────────────────────────────────────────────────
@@ -819,6 +891,180 @@ fn rpc_get_session_stats_stays_responsive_with_backlog() {
             max_roundtrip_ms,
             MAX_BACKLOG_STATS_ROUNDTRIP_MS
         );
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
+#[test]
+fn rpc_export_html_large_payload_state_budget() {
+    let _harness = TestHarness::new("rpc_export_html_large_payload_state_budget");
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (in_tx, out_rx, server) = setup_rpc(large_export_session(), &handle);
+        let cx = asupersync::Cx::for_testing();
+        let export_dir = tempfile::tempdir().expect("tempdir");
+        let export_path = export_dir.path().join("rpc-export-session.html");
+
+        in_tx
+            .send(
+                &cx,
+                serde_json::json!({
+                    "id": "exp",
+                    "type": "export_html",
+                    "outputPath": export_path.display().to_string(),
+                })
+                .to_string(),
+            )
+            .await
+            .expect("send export_html");
+
+        let state_start = Instant::now();
+        in_tx
+            .send(
+                &cx,
+                serde_json::json!({
+                    "id": "state",
+                    "type": "get_state",
+                })
+                .to_string(),
+            )
+            .await
+            .expect("send get_state");
+
+        let mut state_roundtrip_ms = None::<u128>;
+        let mut export_seen = false;
+        let mut exported_path = None::<String>;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && (!export_seen || state_roundtrip_ms.is_none()) {
+            let line = recv_line(&out_rx, "export_html/get_state")
+                .await
+                .expect("recv line");
+            let value: Value = serde_json::from_str(line.trim()).expect("parse rpc response");
+            if value["type"] != "response" {
+                continue;
+            }
+
+            match value["id"].as_str() {
+                Some("state") => {
+                    assert_eq!(value["command"], "get_state");
+                    assert_eq!(value["success"], true);
+                    state_roundtrip_ms = Some(state_start.elapsed().as_millis());
+                }
+                Some("exp") => {
+                    assert_eq!(value["command"], "export_html");
+                    assert_eq!(value["success"], true);
+                    exported_path = value["data"]["path"].as_str().map(str::to_string);
+                    export_seen = true;
+                }
+                _ => {}
+            }
+        }
+
+        let state_roundtrip_ms =
+            state_roundtrip_ms.expect("expected get_state response in export_html scenario");
+        assert!(
+            state_roundtrip_ms <= MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS,
+            "get_state exceeded latency budget during export_html scenario ({}ms > {}ms)",
+            state_roundtrip_ms,
+            MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS
+        );
+        assert!(export_seen, "expected export_html response");
+        let exported_path = exported_path.expect("expected export_html response path");
+        assert!(
+            Path::new(&exported_path).exists(),
+            "expected exported html file to exist: {exported_path}"
+        );
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
+#[test]
+fn rpc_fork_large_payload_state_budget() {
+    let _harness = TestHarness::new("rpc_fork_large_payload_state_budget");
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (session, target_id, target_text) = large_fork_session();
+        let (in_tx, out_rx, server) = setup_rpc(session, &handle);
+        let cx = asupersync::Cx::for_testing();
+
+        in_tx
+            .send(
+                &cx,
+                serde_json::json!({
+                    "id": "fork",
+                    "type": "fork",
+                    "entryId": target_id,
+                })
+                .to_string(),
+            )
+            .await
+            .expect("send fork");
+
+        let state_start = Instant::now();
+        in_tx
+            .send(
+                &cx,
+                serde_json::json!({
+                    "id": "state",
+                    "type": "get_state",
+                })
+                .to_string(),
+            )
+            .await
+            .expect("send get_state");
+
+        let mut state_roundtrip_ms = None::<u128>;
+        let mut fork_seen = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && (!fork_seen || state_roundtrip_ms.is_none()) {
+            let line = recv_line(&out_rx, "fork/get_state")
+                .await
+                .expect("recv line");
+            let value: Value = serde_json::from_str(line.trim()).expect("parse rpc response");
+            if value["type"] != "response" {
+                continue;
+            }
+
+            match value["id"].as_str() {
+                Some("state") => {
+                    assert_eq!(value["command"], "get_state");
+                    assert_eq!(value["success"], true);
+                    state_roundtrip_ms = Some(state_start.elapsed().as_millis());
+                }
+                Some("fork") => {
+                    assert_eq!(value["command"], "fork");
+                    assert_eq!(value["success"], true);
+                    assert_eq!(value["data"]["text"], target_text);
+                    assert_eq!(value["data"]["cancelled"], false);
+                    fork_seen = true;
+                }
+                _ => {}
+            }
+        }
+
+        let state_roundtrip_ms =
+            state_roundtrip_ms.expect("expected get_state response in fork scenario");
+        assert!(
+            state_roundtrip_ms <= MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS,
+            "get_state exceeded latency budget during fork scenario ({}ms > {}ms)",
+            state_roundtrip_ms,
+            MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS
+        );
+        assert!(fork_seen, "expected fork response");
 
         drop(in_tx);
         let _ = server.await;
