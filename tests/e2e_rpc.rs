@@ -2161,6 +2161,75 @@ fn rpc_extension_ui_missing_request_id() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests: Extension UI — legacy id alias accepted
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rpc_extension_ui_id_alias_roundtrip() {
+    let _harness = TestHarness::new("rpc_extension_ui_id_alias_roundtrip");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (agent_session, manager) =
+            build_agent_session_with_extensions(Session::in_memory(), &cassette_dir);
+        let options = build_options(
+            &handle,
+            PathBuf::from("/tmp/auth_ui_id_alias.json"),
+            vec![],
+            vec![],
+        );
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
+
+        let mgr = manager.clone();
+        let ui_task = handle.spawn(async move {
+            let request = ExtensionUiRequest {
+                id: "req-legacy-1".to_string(),
+                method: "confirm".to_string(),
+                payload: json!({ "title": "Legacy id alias?", "timeout": 5000 }),
+                timeout_ms: Some(5000),
+                extension_id: None,
+            };
+            mgr.request_ui(request).await
+        });
+
+        let ui_event = recv_ui_request(&out_rx, "id_alias").await;
+        assert_eq!(ui_event["id"], "req-legacy-1");
+        assert_eq!(ui_event["method"], "confirm");
+
+        // Upstream accepts top-level "id" as a requestId alias for
+        // extension_ui_response.
+        let resp = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"req-legacy-1","type":"extension_ui_response","confirmed":true}"#,
+            "id_alias_response",
+        )
+        .await;
+        assert_ok(&resp, "extension_ui_response");
+        assert_eq!(resp["id"], "req-legacy-1");
+        assert_eq!(resp["data"]["resolved"], true);
+
+        let ui_result = ui_task.await;
+        let response = ui_result.expect("request_ui should succeed");
+        let response = response.expect("should have a response");
+        assert_eq!(response.value, Some(json!(true)));
+        assert!(!response.cancelled);
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Tests: Extension UI — sequential ordering (one at a time)
 // ---------------------------------------------------------------------------
 
