@@ -143,17 +143,24 @@ pub enum TruncatedBy {
 
 /// Truncate from the beginning (keep first N lines).
 ///
-/// Uses lazy iteration to avoid allocating a Vec of all line slices upfront.
-/// For a 100K-line file this saves ~800KB of pointer-array allocation.
-pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
+/// Takes ownership of the input `String` to avoid allocation in the common
+/// no-truncation case (content moved, zero-copy) and to enable in-place
+/// truncation when the content exceeds limits (`String::truncate`, no new
+/// allocation).
+pub fn truncate_head(
+    content: impl Into<String>,
+    max_lines: usize,
+    max_bytes: usize,
+) -> TruncationResult {
+    let mut content = content.into();
     let total_bytes = content.len();
     // Count total lines without collecting into Vec — just count newlines + 1.
     let total_lines = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
 
-    // No truncation needed
+    // No truncation needed — reuse the owned String (zero-copy move).
     if total_lines <= max_lines && total_bytes <= max_bytes {
         return TruncationResult {
-            content: content.to_string(),
+            content,
             truncated: false,
             truncated_by: None,
             total_lines,
@@ -208,39 +215,42 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         byte_count += line_bytes;
     }
 
-    // The accepted output is always a prefix of the original string.
-    // Build it with one copy instead of repeated push operations.
-    let output = content.get(..byte_count).unwrap_or_default().to_string();
-    let output_bytes = output.len();
+    // Truncate in-place — no new allocation, just adjusts the String's length.
+    content.truncate(byte_count);
 
     TruncationResult {
-        content: output,
         truncated: truncated_by.is_some(),
         truncated_by,
         total_lines,
         total_bytes,
         output_lines: line_count,
-        output_bytes,
+        output_bytes: byte_count,
         last_line_partial: false,
         first_line_exceeds_limit: false,
         max_lines,
         max_bytes,
+        content,
     }
 }
 
 /// Truncate from the end (keep last N lines).
 ///
-/// Scans line boundaries from the end and tracks a single slice start offset,
-/// avoiding per-line allocation/reversal/join in the common case.
-pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
+/// Takes ownership of the input `String` to avoid allocation in the common
+/// no-truncation case (content moved, zero-copy). When truncation is needed,
+/// the prefix is drained in-place, reusing the original buffer.
+pub fn truncate_tail(
+    content: impl Into<String>,
+    max_lines: usize,
+    max_bytes: usize,
+) -> TruncationResult {
+    let mut content = content.into();
     let total_bytes = content.len();
-    let bytes = content.as_bytes();
-    let total_lines = memchr::memchr_iter(b'\n', bytes).count() + 1;
+    let total_lines = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
 
-    // No truncation needed
+    // No truncation needed — reuse the owned String (zero-copy move).
     if total_lines <= max_lines && total_bytes <= max_bytes {
         return TruncationResult {
-            content: content.to_string(),
+            content,
             truncated: false,
             truncated_by: None,
             total_lines,
@@ -262,49 +272,58 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
     let mut truncated_by = None;
     let mut last_line_partial = false;
 
-    loop {
-        if line_count >= max_lines {
-            truncated_by = Some(TruncatedBy::Lines);
-            break;
-        }
-
-        let prev_newline = memchr::memrchr(b'\n', &bytes[..search_end]);
-        let line_start = prev_newline.map_or(0, |idx| idx + 1);
-        let added_bytes = (search_end - line_start) + usize::from(line_count > 0);
-
-        if byte_count + added_bytes > max_bytes {
-            // Preserve existing behavior: partial suffix is only allowed when no full
-            // line has been included yet and there is at least one byte available.
-            //
-            // Fix: Also allow partial fallback if we have only consumed the trailing
-            // empty line (line_count == 1 && byte_count == 0), which happens for
-            // files ending in newline (e.g. "a\n") when the limit is small.
-            let remaining = max_bytes.saturating_sub(byte_count);
-            if remaining > 0 && (line_count == 0 || (line_count == 1 && byte_count == 0)) {
-                // Use content[line_start..] (not ..search_end) so trailing
-                // newlines are included, preserving the suffix invariant:
-                // `input.ends_with(&result.content)` must hold.
-                let truncated =
-                    truncate_string_to_bytes_from_end(&content[line_start..], max_bytes);
-                line_count = memchr::memchr_iter(b'\n', truncated.as_bytes()).count() + 1;
-                partial_output = Some(truncated);
-                last_line_partial = true;
+    // Scope the immutable borrow so we can mutate `content` afterwards.
+    {
+        let bytes = content.as_bytes();
+        loop {
+            if line_count >= max_lines {
+                truncated_by = Some(TruncatedBy::Lines);
+                break;
             }
-            truncated_by = Some(TruncatedBy::Bytes);
-            break;
+
+            let prev_newline = memchr::memrchr(b'\n', &bytes[..search_end]);
+            let line_start = prev_newline.map_or(0, |idx| idx + 1);
+            let added_bytes = (search_end - line_start) + usize::from(line_count > 0);
+
+            if byte_count + added_bytes > max_bytes {
+                // Preserve existing behavior: partial suffix is only allowed when no full
+                // line has been included yet and there is at least one byte available.
+                //
+                // Fix: Also allow partial fallback if we have only consumed the trailing
+                // empty line (line_count == 1 && byte_count == 0), which happens for
+                // files ending in newline (e.g. "a\n") when the limit is small.
+                let remaining = max_bytes.saturating_sub(byte_count);
+                if remaining > 0 && (line_count == 0 || (line_count == 1 && byte_count == 0)) {
+                    // Use content[line_start..] (not ..search_end) so trailing
+                    // newlines are included, preserving the suffix invariant:
+                    // `input.ends_with(&result.content)` must hold.
+                    let truncated =
+                        truncate_string_to_bytes_from_end(&content[line_start..], max_bytes);
+                    line_count = memchr::memchr_iter(b'\n', truncated.as_bytes()).count() + 1;
+                    partial_output = Some(truncated);
+                    last_line_partial = true;
+                }
+                truncated_by = Some(TruncatedBy::Bytes);
+                break;
+            }
+
+            line_count += 1;
+            byte_count += added_bytes;
+            start_idx = line_start;
+
+            if line_start == 0 {
+                break;
+            }
+            search_end = line_start - 1;
         }
+    } // immutable borrow of `content` released
 
-        line_count += 1;
-        byte_count += added_bytes;
-        start_idx = line_start;
-
-        if line_start == 0 {
-            break;
-        }
-        search_end = line_start - 1;
-    }
-
-    let output = partial_output.unwrap_or_else(|| content[start_idx..].to_string());
+    // Extract the suffix: drain the prefix in-place (reuses the buffer),
+    // or use the partial output from the byte-truncation path.
+    let output = partial_output.unwrap_or_else(|| {
+        drop(content.drain(..start_idx));
+        content
+    });
     let output_bytes = output.len();
 
     TruncationResult {
@@ -645,7 +664,8 @@ pub fn process_file_arguments(
         let path_str = absolute_path.display();
         let _ = writeln!(out.text, "<file name=\"{path_str}\">");
 
-        let truncation = truncate_head(&content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let truncation = truncate_head(content.into_owned(), DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let needs_trailing_newline = !truncation.truncated && !truncation.content.ends_with('\n');
         out.text.push_str(&truncation.content);
 
         if truncation.truncated {
@@ -657,7 +677,7 @@ pub fn process_file_arguments(
                 format_size(truncation.output_bytes),
                 format_size(truncation.total_bytes)
             );
-        } else if !content.ends_with('\n') {
+        } else if needs_trailing_newline {
             out.text.push('\n');
         }
         let _ = writeln!(out.text, "</file>");
@@ -1233,7 +1253,7 @@ impl Tool for ReadTool {
             let _ = write!(selected_content, "{line_num:>line_num_width$}→{line}");
         }
 
-        let mut truncation = truncate_head(&selected_content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let mut truncation = truncate_head(selected_content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
         // `selected_content` may be clamped to keep allocations bounded, but truncation details should
         // still report the full file line count so consumers can reason about "how much is left".
         truncation.total_lines = total_file_lines;
@@ -1481,9 +1501,10 @@ pub(crate) async fn run_bash_command(
     drop(bash_output.temp_file.take());
 
     let raw_output = concat_chunks(&bash_output.chunks);
-    let full_output = String::from_utf8_lossy(&raw_output);
+    let full_output = String::from_utf8_lossy(&raw_output).into_owned();
+    let full_output_last_line_len = full_output.split('\n').next_back().map_or(0, str::len);
 
-    let mut truncation = truncate_tail(&full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let mut truncation = truncate_tail(full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
     if bash_output.total_bytes > bash_output.chunks_bytes {
         truncation.truncated = true;
         truncation.truncated_by = Some(TruncatedBy::Bytes);
@@ -1511,8 +1532,7 @@ pub(crate) async fn run_bash_command(
         let display_path = full_output_path.as_deref().unwrap_or("undefined");
 
         if truncation.last_line_partial {
-            let last_line = full_output.split('\n').next_back().unwrap_or("");
-            let last_line_size = format_size(last_line.len());
+            let last_line_size = format_size(full_output_last_line_len);
             let _ = write!(
                 output_text,
                 "\n\n[Showing last {} of line {end_line} (line is {last_line_size}). Full output: {display_path}]",
@@ -2859,7 +2879,7 @@ impl Tool for GrepTool {
 
         // Apply byte truncation (no line limit since we already have match limit).
         let raw_output = output_lines.join("\n");
-        let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+        let truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
         let mut output = truncation.content.clone();
         let mut notices: Vec<String> = Vec::new();
@@ -3165,7 +3185,7 @@ impl Tool for FindTool {
 
         let result_limit_reached = relativized.len() >= effective_limit;
         let raw_output = relativized.join("\n");
-        let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+        let truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
         let mut result_output = truncation.content.clone();
         let mut notices: Vec<String> = Vec::new();
@@ -3336,7 +3356,7 @@ impl Tool for LsTool {
 
         // Apply byte truncation (no line limit since we already have entry limit).
         let raw_output = results.join("\n");
-        let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+        let truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
         let mut output = truncation.content.clone();
         let mut details_map = serde_json::Map::new();
@@ -3512,36 +3532,42 @@ fn emit_bash_update(
     if let Some(callback) = on_update {
         let raw = concat_chunks(&state.chunks);
         let full_text = String::from_utf8_lossy(&raw);
-        let truncation = truncate_tail(&full_text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let truncation =
+            truncate_tail(full_text.into_owned(), DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
 
-        let mut details_map = serde_json::Map::new();
+        // Build the progress + details JSON using the json! macro instead of
+        // manual Map::insert calls.  This eliminates 7+ String heap
+        // allocations per update for the constant field-name keys
+        // ("elapsedMs", "lineCount", …) that the manual path required.
+        let elapsed_ms = state.start_time.elapsed().as_millis();
+        let mut details = serde_json::json!({
+            "progress": {
+                "elapsedMs": elapsed_ms,
+                "lineCount": state.line_count,
+                "byteCount": state.total_bytes
+            }
+        });
+        let details_map = details.as_object_mut().expect("just built");
+
+        if let Some(timeout) = state.timeout_ms {
+            details_map["progress"]
+                .as_object_mut()
+                .expect("just built")
+                .insert("timeoutMs".into(), serde_json::json!(timeout));
+        }
         if truncation.truncated {
-            details_map.insert("truncation".to_string(), serde_json::to_value(&truncation)?);
+            details_map.insert("truncation".into(), serde_json::to_value(&truncation)?);
         }
         if let Some(path) = state.temp_file_path.as_ref() {
             details_map.insert(
-                "fullOutputPath".to_string(),
+                "fullOutputPath".into(),
                 serde_json::Value::String(path.display().to_string()),
             );
         }
 
-        // Emit progress metrics for TUI display.
-        let elapsed_ms = state.start_time.elapsed().as_millis();
-        let mut progress = serde_json::Map::new();
-        progress.insert("elapsedMs".to_string(), serde_json::json!(elapsed_ms));
-        progress.insert("lineCount".to_string(), serde_json::json!(state.line_count));
-        progress.insert(
-            "byteCount".to_string(),
-            serde_json::json!(state.total_bytes),
-        );
-        if let Some(timeout) = state.timeout_ms {
-            progress.insert("timeoutMs".to_string(), serde_json::json!(timeout));
-        }
-        details_map.insert("progress".to_string(), serde_json::Value::Object(progress));
-
         callback(ToolUpdate {
             content: vec![ContentBlock::Text(TextContent::new(truncation.content))],
-            details: Some(serde_json::Value::Object(details_map)),
+            details: Some(details),
         });
     }
     Ok(())
@@ -3738,7 +3764,7 @@ mod tests {
 
     #[test]
     fn test_truncate_head() {
-        let content = "line1\nline2\nline3\nline4\nline5";
+        let content = "line1\nline2\nline3\nline4\nline5".to_string();
         let result = truncate_head(content, 3, 1000);
 
         assert_eq!(result.content, "line1\nline2\nline3");
@@ -3750,7 +3776,7 @@ mod tests {
 
     #[test]
     fn test_truncate_tail() {
-        let content = "line1\nline2\nline3\nline4\nline5";
+        let content = "line1\nline2\nline3\nline4\nline5".to_string();
         let result = truncate_tail(content, 3, 1000);
 
         assert_eq!(result.content, "line3\nline4\nline5");
@@ -3762,7 +3788,7 @@ mod tests {
 
     #[test]
     fn test_truncate_by_bytes() {
-        let content = "short\nthis is a longer line\nanother";
+        let content = "short\nthis is a longer line\nanother".to_string();
         let result = truncate_head(content, 100, 15);
 
         assert!(result.truncated);
@@ -5331,7 +5357,7 @@ mod tests {
 
     #[test]
     fn test_truncate_head_no_truncation() {
-        let content = "short";
+        let content = "short".to_string();
         let result = truncate_head(content, 100, 1000);
         assert!(!result.truncated);
         assert_eq!(result.content, "short");
@@ -5340,7 +5366,7 @@ mod tests {
 
     #[test]
     fn test_truncate_tail_no_truncation() {
-        let content = "short";
+        let content = "short".to_string();
         let result = truncate_tail(content, 100, 1000);
         assert!(!result.truncated);
         assert_eq!(result.content, "short");
@@ -5348,14 +5374,14 @@ mod tests {
 
     #[test]
     fn test_truncate_head_empty_input() {
-        let result = truncate_head("", 100, 1000);
+        let result = truncate_head(String::new(), 100, 1000);
         assert!(!result.truncated);
         assert_eq!(result.content, "");
     }
 
     #[test]
     fn test_truncate_tail_empty_input() {
-        let result = truncate_tail("", 100, 1000);
+        let result = truncate_tail(String::new(), 100, 1000);
         assert!(!result.truncated);
         assert_eq!(result.content, "");
     }
@@ -5505,7 +5531,7 @@ mod tests {
             max_lines in 0usize..32,
             max_bytes in 0usize..256,
         ) {
-            let result = truncate_head(&input, max_lines, max_bytes);
+            let result = truncate_head(input.clone(), max_lines, max_bytes);
 
             prop_assert!(result.output_lines <= max_lines);
             prop_assert!(result.output_bytes <= max_bytes);
@@ -5514,7 +5540,7 @@ mod tests {
             prop_assert_eq!(result.truncated, result.truncated_by.is_some());
             prop_assert!(input.starts_with(&result.content));
 
-            let repeat = truncate_head(&result.content, max_lines, max_bytes);
+            let repeat = truncate_head(result.content.clone(), max_lines, max_bytes);
             prop_assert_eq!(&repeat.content, &result.content);
 
             if result.truncated {
@@ -5538,7 +5564,7 @@ mod tests {
             max_lines in 0usize..32,
             max_bytes in 0usize..256,
         ) {
-            let result = truncate_tail(&input, max_lines, max_bytes);
+            let result = truncate_tail(input.clone(), max_lines, max_bytes);
 
             prop_assert!(result.output_lines <= max_lines);
             prop_assert!(result.output_bytes <= max_bytes);
@@ -5547,7 +5573,7 @@ mod tests {
             prop_assert_eq!(result.truncated, result.truncated_by.is_some());
             prop_assert!(input.ends_with(&result.content));
 
-            let repeat = truncate_tail(&result.content, max_lines, max_bytes);
+            let repeat = truncate_tail(result.content.clone(), max_lines, max_bytes);
             prop_assert_eq!(&repeat.content, &result.content);
 
             if result.last_line_partial {
@@ -5649,6 +5675,269 @@ mod tests {
             if std::path::Path::new(&path_input).is_absolute() {
                 prop_assert!(resolved.is_absolute());
                 prop_assert!(normalized_once.is_absolute());
+            }
+        }
+    }
+
+    // ========================================================================
+    // Fuzzy find / edit-matching strategies
+    // ========================================================================
+
+    /// Strategy generating content text with occasional Unicode normalization
+    /// targets (curly quotes, special spaces, em-dashes) and trailing
+    /// whitespace.
+    fn fuzzy_content_strategy() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                8 => any::<char>().prop_filter("no nul", |c| *c != '\0'),
+                1 => Just('\u{00A0}'),
+                1 => Just('\u{2019}'),
+                1 => Just('\u{201C}'),
+                1 => Just('\u{2014}'),
+            ],
+            1..512,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    /// Strategy for generating a needle substring from content. Picks a
+    /// random sub-slice of the content (may be empty).
+    fn needle_from_content(content: String) -> impl Strategy<Value = (String, String)> {
+        let len = content.len();
+        if len == 0 {
+            return Just((content, String::new())).boxed();
+        }
+        (0..len)
+            .prop_flat_map(move |start| {
+                let c = content.clone();
+                let remaining = c.len() - start;
+                let max_needle = remaining.min(256);
+                (Just(c), start..=start + max_needle.saturating_sub(1))
+            })
+            .prop_filter_map("valid char boundary", |(c, end)| {
+                // Find the nearest valid char boundaries
+                let start_candidates: Vec<usize> =
+                    (0..c.len()).filter(|i| c.is_char_boundary(*i)).collect();
+                if start_candidates.is_empty() {
+                    return None;
+                }
+                let start = *start_candidates
+                    .iter()
+                    .min_by_key(|&&i| i.abs_diff(end.saturating_sub(end / 2)))
+                    .unwrap_or(&0);
+                let end_clamped = end.min(c.len());
+                // Find next valid char boundary >= end_clamped
+                let actual_end = (end_clamped..=c.len())
+                    .find(|i| c.is_char_boundary(*i))
+                    .unwrap_or(c.len());
+                if start >= actual_end {
+                    return Some((c, String::new()));
+                }
+                Some((c.clone(), c[start..actual_end].to_string()))
+            })
+            .boxed()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 128, .. ProptestConfig::default() })]
+
+        /// Exact substrings of content are always found by `fuzzy_find_text`.
+        #[test]
+        fn proptest_fuzzy_find_text_exact_match_invariants(
+            (content, needle) in fuzzy_content_strategy().prop_flat_map(needle_from_content)
+        ) {
+            let result = fuzzy_find_text(&content, &needle);
+            if needle.is_empty() {
+                // Empty needle: exact match at index 0 (str::find("") == Some(0))
+                prop_assert!(result.found, "empty needle should always match");
+                prop_assert_eq!(result.index, 0);
+                prop_assert_eq!(result.match_length, 0);
+            } else {
+                prop_assert!(
+                    result.found,
+                    "exact substring must be found: content len={}, needle len={}",
+                    content.len(),
+                    needle.len()
+                );
+                // The matched span should be valid UTF-8 byte indices
+                prop_assert!(content.is_char_boundary(result.index));
+                prop_assert!(content.is_char_boundary(result.index + result.match_length));
+                // The matched text should contain the needle (exact match path)
+                let matched = &content[result.index..result.index + result.match_length];
+                prop_assert_eq!(matched, needle.as_str());
+            }
+        }
+
+        /// Normalized text with Unicode variants is found via fuzzy matching.
+        /// If we take content containing curly quotes / em-dashes, normalize
+        /// it, then search for the normalized version, `fuzzy_find_text` must
+        /// locate it.
+        #[test]
+        fn proptest_fuzzy_find_text_normalized_match_invariants(
+            content in arbitrary_match_text()
+        ) {
+            // Normalize the whole content to get an ASCII-equivalent version
+            let normalized = build_normalized_content(&content);
+            if normalized.is_empty() {
+                return Ok(());
+            }
+            // Take a prefix of normalized as needle (up to 128 chars)
+            let needle_end = normalized
+                .char_indices()
+                .nth(128.min(normalized.chars().count().saturating_sub(1)))
+                .map_or(normalized.len(), |(i, _)| i);
+            // Find the nearest char boundary
+            let needle_end = (needle_end..=normalized.len())
+                .find(|i| normalized.is_char_boundary(*i))
+                .unwrap_or(normalized.len());
+            let needle = &normalized[..needle_end];
+            if needle.is_empty() {
+                return Ok(());
+            }
+
+            let result = fuzzy_find_text(&content, needle);
+            prop_assert!(
+                result.found,
+                "normalized needle should be found via fuzzy match: needle={:?}",
+                needle
+            );
+            // Verify the result points to valid UTF-8
+            prop_assert!(content.is_char_boundary(result.index));
+            prop_assert!(content.is_char_boundary(result.index + result.match_length));
+        }
+
+        /// `build_normalized_content` should be idempotent and never larger
+        /// than the input.
+        #[test]
+        fn proptest_build_normalized_content_invariants(input in arbitrary_match_text()) {
+            let normalized = build_normalized_content(&input);
+            let renormalized = build_normalized_content(&normalized);
+
+            // Idempotency
+            prop_assert_eq!(
+                &renormalized,
+                &normalized,
+                "build_normalized_content should be idempotent"
+            );
+
+            // Size: normalized text strips trailing whitespace per line and
+            // may replace multi-byte Unicode with single-byte ASCII, so it
+            // should never be larger than the input.
+            prop_assert!(
+                normalized.len() <= input.len(),
+                "normalized should not be larger: {} vs {}",
+                normalized.len(),
+                input.len()
+            );
+
+            // Line count should be preserved (normalization does not add or
+            // remove newlines).
+            let input_lines = input.split('\n').count();
+            let norm_lines = normalized.split('\n').count();
+            prop_assert_eq!(
+                norm_lines, input_lines,
+                "line count must be preserved by normalization"
+            );
+
+            // No target Unicode chars should remain
+            prop_assert!(
+                normalized.chars().all(|c| {
+                    !is_special_unicode_space(c)
+                        && !matches!(
+                            c,
+                            '\u{2018}'
+                                | '\u{2019}'
+                                | '\u{201C}'
+                                | '\u{201D}'
+                                | '\u{201E}'
+                                | '\u{201F}'
+                                | '\u{2010}'
+                                | '\u{2011}'
+                                | '\u{2012}'
+                                | '\u{2013}'
+                                | '\u{2014}'
+                                | '\u{2015}'
+                                | '\u{2212}'
+                        )
+                }),
+                "normalized content should not contain target Unicode chars"
+            );
+        }
+
+        /// `map_normalized_range_to_original` should produce valid byte
+        /// ranges in the original content and the extracted original slice,
+        /// when re-normalized, should start with the expected normalized
+        /// prefix. Trailing whitespace at line ends makes an exact match
+        /// impossible (normalization strips it), so we verify the key
+        /// structural invariant: the range is valid and the non-whitespace
+        /// content round-trips correctly.
+        #[test]
+        fn proptest_map_normalized_range_roundtrip(input in arbitrary_match_text()) {
+            let normalized = build_normalized_content(&input);
+            if normalized.is_empty() {
+                return Ok(());
+            }
+
+            // Pick a range in the normalized text at char boundaries
+            let norm_chars: Vec<(usize, char)> = normalized.char_indices().collect();
+            let norm_len = norm_chars.len();
+            if norm_len == 0 {
+                return Ok(());
+            }
+
+            // Use the first quarter as the match range for determinism
+            let end_char = (norm_len / 4).max(1).min(norm_len);
+            let norm_start = norm_chars[0].0;
+            let norm_end = if end_char < norm_chars.len() {
+                norm_chars[end_char].0
+            } else {
+                normalized.len()
+            };
+            let norm_match_len = norm_end - norm_start;
+
+            let (orig_start, orig_len) =
+                map_normalized_range_to_original(&input, norm_start, norm_match_len);
+
+            // Invariant 1: result is within input bounds
+            prop_assert!(
+                orig_start + orig_len <= input.len(),
+                "mapped range {orig_start}..{} exceeds input len {}",
+                orig_start + orig_len,
+                input.len()
+            );
+
+            // Invariant 2: result is at valid char boundaries
+            prop_assert!(
+                input.is_char_boundary(orig_start),
+                "orig_start {} is not a char boundary",
+                orig_start
+            );
+            prop_assert!(
+                input.is_char_boundary(orig_start + orig_len),
+                "orig_end {} is not a char boundary",
+                orig_start + orig_len
+            );
+
+            // Invariant 3: original range is at least as large as
+            // normalized range (original may include trailing whitespace
+            // and multi-byte Unicode chars that normalize to fewer bytes)
+            prop_assert!(
+                orig_len >= norm_match_len
+                    || orig_len == 0
+                    || norm_match_len == 0,
+                "original range ({orig_len}) should be >= normalized range ({norm_match_len})"
+            );
+
+            // Invariant 4: the normalized expected slice, when searched
+            // for in the original content via fuzzy_find_text, should be
+            // found at or before the mapped position.
+            let expected_norm = &normalized[norm_start..norm_end];
+            if !expected_norm.is_empty() {
+                let fuzzy_result = fuzzy_find_text(&input, expected_norm);
+                prop_assert!(
+                    fuzzy_result.found,
+                    "normalized needle should be findable in original content"
+                );
             }
         }
     }

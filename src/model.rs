@@ -1444,10 +1444,12 @@ mod tests {
     }
 
     fn tool_call_strategy() -> impl Strategy<Value = ToolCall> {
+        // Use scalar_json_value_strategy for arguments to keep proptest
+        // strategy tree shallow enough for the default thread stack.
         (
             interesting_text_strategy(),
             interesting_text_strategy(),
-            bounded_json_value_strategy(),
+            scalar_json_value_strategy(),
             prop::option::of(interesting_text_strategy()),
         )
             .prop_map(|(id, name, arguments, thought_signature)| ToolCall {
@@ -1492,7 +1494,7 @@ mod tests {
 
     fn assistant_message_strategy() -> impl Strategy<Value = AssistantMessage> {
         (
-            prop::collection::vec(content_block_strategy(), 0..6),
+            prop::collection::vec(content_block_strategy(), 0..3),
             interesting_text_strategy(),
             interesting_text_strategy(),
             interesting_text_strategy(),
@@ -1521,8 +1523,8 @@ mod tests {
         (
             interesting_text_strategy(),
             interesting_text_strategy(),
-            prop::collection::vec(content_block_strategy(), 0..6),
-            prop::option::of(bounded_json_value_strategy()),
+            prop::collection::vec(content_block_strategy(), 0..3),
+            prop::option::of(scalar_json_value_strategy()),
             any::<bool>(),
             any::<i64>(),
         )
@@ -1545,7 +1547,7 @@ mod tests {
             interesting_text_strategy(),
             interesting_text_strategy(),
             any::<bool>(),
-            prop::option::of(bounded_json_value_strategy()),
+            prop::option::of(scalar_json_value_strategy()),
             any::<i64>(),
         )
             .prop_map(|(content, custom_type, display, details, timestamp)| {
@@ -1634,7 +1636,7 @@ mod tests {
         #[test]
         fn proptest_message_roundtrip_and_unknown_fields(
             message in message_strategy(),
-            extra_value in bounded_json_value_strategy(),
+            extra_value in scalar_json_value_strategy(),
         ) {
             let serialized = serde_json::to_value(&message).expect("message should serialize");
             let parsed: Message = serde_json::from_value(serialized.clone())
