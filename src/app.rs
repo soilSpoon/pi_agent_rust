@@ -68,7 +68,8 @@ struct RestoreResult {
 
 pub fn apply_piped_stdin(cli: &mut cli::Cli, stdin_content: Option<String>) {
     if let Some(stdin_content) = stdin_content {
-        let stdin_content = stdin_content.trim_end_matches(&['\r', '\n'][..]);
+        // Match pi-mono's `.trim()` — strip all leading/trailing whitespace.
+        let stdin_content = stdin_content.trim();
         if stdin_content.is_empty() {
             return;
         }

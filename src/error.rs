@@ -228,6 +228,25 @@ impl Error {
         }
     }
 
+    /// Stable machine-readable error category for automation and diagnostics.
+    #[must_use]
+    pub const fn category_code(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "config",
+            Self::Session(_) | Self::SessionNotFound { .. } => "session",
+            Self::Provider { .. } => "provider",
+            Self::Auth(_) => "auth",
+            Self::Tool { .. } => "tool",
+            Self::Validation(_) => "validation",
+            Self::Extension(_) => "extension",
+            Self::Io(_) => "io",
+            Self::Json(_) => "json",
+            Self::Sqlite(_) => "sqlite",
+            Self::Aborted => "runtime",
+            Self::Api(_) => "api",
+        }
+    }
+
     /// Classify auth/config errors into stable machine-readable diagnostics.
     #[must_use]
     pub fn auth_diagnostic(&self) -> Option<AuthDiagnostic> {
@@ -301,6 +320,11 @@ impl Error {
                 vec![("details", message.clone())],
             ),
         };
+
+        hints.context.push((
+            "error_category".to_string(),
+            self.category_code().to_string(),
+        ));
 
         if let Some(diagnostic) = self.auth_diagnostic() {
             hints.context.push((
@@ -1034,6 +1058,20 @@ mod tests {
     fn error_api_constructor() {
         let err = Error::api("404 not found");
         assert!(matches!(err, Error::Api(ref msg) if msg == "404 not found"));
+    }
+
+    #[test]
+    fn error_category_code_is_stable() {
+        assert_eq!(Error::auth("missing").category_code(), "auth");
+        assert_eq!(Error::provider("openai", "429").category_code(), "provider");
+        assert_eq!(Error::tool("bash", "failed").category_code(), "tool");
+        assert_eq!(Error::Aborted.category_code(), "runtime");
+    }
+
+    #[test]
+    fn hints_include_error_category_context() {
+        let hints = Error::tool("bash", "exit code 1").hints();
+        assert_eq!(context_value(&hints, "error_category"), Some("tool"));
     }
 
     // ─── Display message tests ──────────────────────────────────────────

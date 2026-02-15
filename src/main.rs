@@ -48,10 +48,22 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
+const EXIT_CODE_FAILURE: i32 = 1;
+const EXIT_CODE_USAGE: i32 = 2;
+const USAGE_ERROR_PATTERNS: &[&str] = &[
+    "@file arguments are not supported in rpc mode",
+    "--api-key requires a model to be specified via --provider/--model or --models",
+    "unknown --only categories",
+    "--only must include at least one category",
+    "theme file not found",
+    "theme spec is empty",
+];
+
 fn main() {
     if let Err(err) = main_impl() {
+        let exit_code = exit_code_for_error(&err);
         print_error_with_hints(&err);
-        std::process::exit(1);
+        std::process::exit(exit_code);
     }
 }
 
@@ -194,6 +206,36 @@ fn print_error_with_hints(err: &anyhow::Error) {
     }
 
     eprintln!("{err}");
+}
+
+fn exit_code_for_error(err: &anyhow::Error) -> i32 {
+    if is_usage_error(err) {
+        EXIT_CODE_USAGE
+    } else {
+        EXIT_CODE_FAILURE
+    }
+}
+
+fn is_usage_error(err: &anyhow::Error) -> bool {
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<clap::Error>().is_some())
+    {
+        return true;
+    }
+
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<pi::error::Error>()
+            .is_some_and(|pi_error| matches!(pi_error, pi::error::Error::Validation(_)))
+    }) {
+        return true;
+    }
+
+    let message = err.to_string().to_ascii_lowercase();
+    USAGE_ERROR_PATTERNS
+        .iter()
+        .any(|pattern| message.contains(pattern))
 }
 
 fn validate_theme_path_spec(theme_spec: Option<&str>, cwd: &Path) -> Result<()> {
@@ -823,6 +865,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         messages,
         &resources,
         runtime_handle.clone(),
+        &config,
     )
     .await
 }
@@ -2689,7 +2732,7 @@ async fn run_rpc_mode(
     .map_err(anyhow::Error::new)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_print_mode(
     session: &mut AgentSession,
     mode: &str,
@@ -2697,6 +2740,7 @@ async fn run_print_mode(
     messages: Vec<String>,
     resources: &ResourceLoader,
     runtime_handle: RuntimeHandle,
+    config: &Config,
 ) -> Result<()> {
     if mode != "text" && mode != "json" {
         bail!("Unknown mode: {mode}");
@@ -2749,6 +2793,12 @@ async fn run_print_mode(
                                 if let Ok(serialized) = serde_json::to_string(&ext_err) {
                                     println!("{serialized}");
                                 }
+                            } else {
+                                // Text mode: emit extension errors to stderr
+                                // (matches pi-mono's console.error() behavior).
+                                eprintln!(
+                                    "Warning: extension event '{ext_event_name}' failed: {err}"
+                                );
                             }
                         }
                     });
@@ -2774,24 +2824,40 @@ async fn run_print_mode(
         .map(|message| resources.expand_input(&message))
         .collect::<Vec<_>>();
 
+    let retry_enabled = config.retry_enabled();
+    let max_retries = config.retry_max_retries();
+    let is_json = mode == "json";
+
     if let Some(initial) = initial {
         let content = pi::app::build_initial_content(&initial);
         last_message = Some(
-            session
-                .run_with_content_with_abort(
-                    content,
-                    Some(abort_signal.clone()),
-                    make_event_handler(),
-                )
-                .await?,
+            run_print_prompt_with_retry(
+                session,
+                config,
+                &abort_signal,
+                &make_event_handler,
+                retry_enabled,
+                max_retries,
+                is_json,
+                PromptInput::Content(content),
+            )
+            .await?,
         );
     }
 
     for message in messages {
         last_message = Some(
-            session
-                .run_text_with_abort(message, Some(abort_signal.clone()), make_event_handler())
-                .await?,
+            run_print_prompt_with_retry(
+                session,
+                config,
+                &abort_signal,
+                &make_event_handler,
+                retry_enabled,
+                max_retries,
+                is_json,
+                PromptInput::Text(message),
+            )
+            .await?,
         );
     }
 
@@ -2831,6 +2897,214 @@ async fn run_print_mode(
 
     io::stdout().flush()?;
     Ok(())
+}
+
+/// Discriminated prompt input for retry helper.
+enum PromptInput {
+    Text(String),
+    Content(Vec<ContentBlock>),
+}
+
+/// Compute retry delay with exponential backoff (mirrors RPC mode logic).
+fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
+    let base = u64::from(config.retry_base_delay_ms());
+    let max = u64::from(config.retry_max_delay_ms());
+    let shift = attempt.saturating_sub(1);
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let delay = base.saturating_mul(multiplier).min(max);
+    u32::try_from(delay).unwrap_or(u32::MAX)
+}
+
+/// Emit a JSON-serialized [`AgentEvent`] to stdout (for JSON print mode).
+fn emit_json_event(event: &AgentEvent) {
+    if let Ok(serialized) = serde_json::to_string(event) {
+        println!("{serialized}");
+    }
+}
+
+/// Check whether a prompt result is a retryable error.
+fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
+    if !matches!(msg.stop_reason, StopReason::Error) {
+        return false;
+    }
+    let err_msg = msg.error_message.as_deref().unwrap_or("Request error");
+    pi::error::is_retryable_error(err_msg, Some(msg.usage.input), None)
+}
+
+/// Execute a single prompt with automatic retry and `AutoRetryStart`/`AutoRetryEnd`
+/// event emission. Mirrors the retry behaviour in RPC mode (`src/rpc.rs`).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_print_prompt_with_retry<H, EH>(
+    session: &mut AgentSession,
+    config: &Config,
+    abort_signal: &pi::agent::AbortSignal,
+    make_event_handler: &H,
+    retry_enabled: bool,
+    max_retries: u32,
+    is_json: bool,
+    input: PromptInput,
+) -> Result<AssistantMessage>
+where
+    H: Fn() -> EH + Sync,
+    EH: Fn(AgentEvent) + Send + Sync + 'static,
+{
+    // First attempt.
+    let first_result = match &input {
+        PromptInput::Text(text) => {
+            session
+                .run_text_with_abort(
+                    text.clone(),
+                    Some(abort_signal.clone()),
+                    make_event_handler(),
+                )
+                .await
+        }
+        PromptInput::Content(content) => {
+            session
+                .run_with_content_with_abort(
+                    content.clone(),
+                    Some(abort_signal.clone()),
+                    make_event_handler(),
+                )
+                .await
+        }
+    };
+
+    // Fast path: no retry needed.
+    if !retry_enabled {
+        return first_result.map_err(anyhow::Error::new);
+    }
+
+    let mut retry_count: u32 = 0;
+    let mut current_result = first_result;
+
+    loop {
+        match current_result {
+            Ok(msg) if msg.stop_reason == StopReason::Aborted => {
+                if retry_count > 0 && is_json {
+                    emit_json_event(&AgentEvent::AutoRetryEnd {
+                        success: false,
+                        attempt: retry_count,
+                        final_error: Some("Aborted".to_string()),
+                    });
+                }
+                return Ok(msg);
+            }
+            Ok(msg) if is_retryable_prompt_result(&msg) && retry_count < max_retries => {
+                let err_msg = msg
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Request error".to_string());
+
+                retry_count += 1;
+                let delay_ms = print_mode_retry_delay_ms(config, retry_count);
+                if is_json {
+                    emit_json_event(&AgentEvent::AutoRetryStart {
+                        attempt: retry_count,
+                        max_attempts: max_retries,
+                        delay_ms: u64::from(delay_ms),
+                        error_message: err_msg,
+                    });
+                }
+
+                asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(u64::from(delay_ms)),
+                )
+                .await;
+
+                // Re-send the same prompt (matches RPC retry behaviour).
+                current_result = match &input {
+                    PromptInput::Text(text) => {
+                        session
+                            .run_text_with_abort(
+                                text.clone(),
+                                Some(abort_signal.clone()),
+                                make_event_handler(),
+                            )
+                            .await
+                    }
+                    PromptInput::Content(content) => {
+                        session
+                            .run_with_content_with_abort(
+                                content.clone(),
+                                Some(abort_signal.clone()),
+                                make_event_handler(),
+                            )
+                            .await
+                    }
+                };
+            }
+            Ok(msg) => {
+                // Success or non-retryable error or max retries reached.
+                let success = !matches!(msg.stop_reason, StopReason::Error);
+                if retry_count > 0 && is_json {
+                    emit_json_event(&AgentEvent::AutoRetryEnd {
+                        success,
+                        attempt: retry_count,
+                        final_error: if success {
+                            None
+                        } else {
+                            msg.error_message.clone()
+                        },
+                    });
+                }
+                return Ok(msg);
+            }
+            Err(err) => {
+                let err_str = err.to_string();
+                if retry_count < max_retries && pi::error::is_retryable_error(&err_str, None, None)
+                {
+                    retry_count += 1;
+                    let delay_ms = print_mode_retry_delay_ms(config, retry_count);
+                    if is_json {
+                        emit_json_event(&AgentEvent::AutoRetryStart {
+                            attempt: retry_count,
+                            max_attempts: max_retries,
+                            delay_ms: u64::from(delay_ms),
+                            error_message: err_str,
+                        });
+                    }
+
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(u64::from(delay_ms)),
+                    )
+                    .await;
+
+                    current_result = match &input {
+                        PromptInput::Text(text) => {
+                            session
+                                .run_text_with_abort(
+                                    text.clone(),
+                                    Some(abort_signal.clone()),
+                                    make_event_handler(),
+                                )
+                                .await
+                        }
+                        PromptInput::Content(content) => {
+                            session
+                                .run_with_content_with_abort(
+                                    content.clone(),
+                                    Some(abort_signal.clone()),
+                                    make_event_handler(),
+                                )
+                                .await
+                        }
+                    };
+                } else {
+                    if retry_count > 0 && is_json {
+                        emit_json_event(&AgentEvent::AutoRetryEnd {
+                            success: false,
+                            attempt: retry_count,
+                            final_error: Some(err_str),
+                        });
+                    }
+                    return Err(anyhow::Error::new(err));
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2946,8 +3220,24 @@ fn default_export_path(input: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn exit_code_classifier_marks_usage_errors() {
+        let usage_err = anyhow!("Unknown --only categories: nope");
+        assert_eq!(exit_code_for_error(&usage_err), EXIT_CODE_USAGE);
+
+        let validation_err = anyhow::Error::new(pi::error::Error::validation("bad input"));
+        assert_eq!(exit_code_for_error(&validation_err), EXIT_CODE_USAGE);
+    }
+
+    #[test]
+    fn exit_code_classifier_defaults_to_general_failure() {
+        let runtime_err = anyhow::Error::new(pi::error::Error::auth("missing key"));
+        assert_eq!(exit_code_for_error(&runtime_err), EXIT_CODE_FAILURE);
+    }
 
     #[test]
     fn provider_from_token_numbered_choices() {
@@ -3223,5 +3513,107 @@ mod tests {
                 .and_then(serde_json::Value::as_bool)
                 .expect("local")
         );
+    }
+
+    // ================================================================
+    // Retry helper tests
+    // ================================================================
+
+    #[test]
+    fn print_mode_retry_delay_first_attempt_is_base() {
+        let config = Config {
+            retry: Some(pi::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(3),
+                base_delay_ms: Some(2000),
+                max_delay_ms: Some(60_000),
+            }),
+            ..Config::default()
+        };
+        assert_eq!(print_mode_retry_delay_ms(&config, 1), 2000);
+    }
+
+    #[test]
+    fn print_mode_retry_delay_doubles_each_attempt() {
+        let config = Config {
+            retry: Some(pi::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(5),
+                base_delay_ms: Some(1000),
+                max_delay_ms: Some(60_000),
+            }),
+            ..Config::default()
+        };
+        assert_eq!(print_mode_retry_delay_ms(&config, 2), 2000);
+        assert_eq!(print_mode_retry_delay_ms(&config, 3), 4000);
+    }
+
+    #[test]
+    fn print_mode_retry_delay_capped_at_max() {
+        let config = Config {
+            retry: Some(pi::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(10),
+                base_delay_ms: Some(2000),
+                max_delay_ms: Some(10_000),
+            }),
+            ..Config::default()
+        };
+        let delay = print_mode_retry_delay_ms(&config, 5);
+        assert!(delay <= 10_000, "delay {delay} should be capped at 10000");
+    }
+
+    #[test]
+    fn is_retryable_prompt_result_identifies_retryable_errors() {
+        use pi::model::{AssistantMessage, Usage};
+
+        let retryable = AssistantMessage {
+            content: vec![],
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("429 rate limit exceeded".to_string()),
+            timestamp: 0,
+        };
+        assert!(is_retryable_prompt_result(&retryable));
+
+        let not_retryable = AssistantMessage {
+            error_message: Some("invalid api key".to_string()),
+            ..retryable.clone()
+        };
+        assert!(!is_retryable_prompt_result(&not_retryable));
+
+        let success = AssistantMessage {
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            ..retryable
+        };
+        assert!(!is_retryable_prompt_result(&success));
+    }
+
+    #[test]
+    fn emit_json_event_serializes_retry_events() {
+        let start = AgentEvent::AutoRetryStart {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 2000,
+            error_message: "rate limited".to_string(),
+        };
+        let json = serde_json::to_value(&start).unwrap();
+        assert_eq!(json["type"], "auto_retry_start");
+        assert_eq!(json["attempt"], 1);
+        assert_eq!(json["maxAttempts"], 3);
+        assert_eq!(json["delayMs"], 2000);
+
+        let end = AgentEvent::AutoRetryEnd {
+            success: true,
+            attempt: 1,
+            final_error: None,
+        };
+        let json = serde_json::to_value(&end).unwrap();
+        assert_eq!(json["type"], "auto_retry_end");
+        assert!(json["success"].as_bool().unwrap());
     }
 }

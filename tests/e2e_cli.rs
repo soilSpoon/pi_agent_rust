@@ -965,8 +965,8 @@ fn e2e_cli_invalid_flag_is_error() {
 
     harness
         .harness
-        .assert_log("assert exit_code != 0 for invalid flag");
-    assert_ne!(result.exit_code, 0);
+        .assert_log("assert exit_code == 2 for invalid flag");
+    assert_exit_code(&harness.harness, &result, 2);
     assert_contains_case_insensitive(&harness.harness, &result.stderr, "error");
 }
 
@@ -2030,9 +2030,22 @@ fn e2e_cli_theme_flag_valid_builtin() {
 fn e2e_cli_theme_flag_invalid_path() {
     let harness = CliTestHarness::new("e2e_cli_theme_flag_invalid_path");
     let result = harness.run(&["--theme", "nonexistent.json", "--version"]);
-    assert_ne!(result.exit_code, 0);
+    assert_exit_code(&harness.harness, &result, 2);
     let combined = format!("{}\n{}", result.stdout, result.stderr);
     assert_contains_case_insensitive(&harness.harness, &combined, "theme file not found");
+}
+
+#[test]
+fn e2e_cli_doctor_invalid_only_value_is_usage_error() {
+    let harness = CliTestHarness::new("e2e_cli_doctor_invalid_only_value_is_usage_error");
+    let result = harness.run(&["doctor", "--only", "not-a-category"]);
+
+    assert_exit_code(&harness.harness, &result, 2);
+    assert_contains_case_insensitive(
+        &harness.harness,
+        &result.stderr,
+        "unknown --only categories",
+    );
 }
 
 #[test]
@@ -2746,12 +2759,7 @@ fn e2e_cli_json_mode_missing_api_key_fails_startup() {
     args.push("hello");
 
     let result = harness.run(&args);
-    assert!(
-        result.exit_code != 0,
-        "expected non-zero exit when API key is missing; stdout:\n{}\nstderr:\n{}",
-        result.stdout,
-        result.stderr
-    );
+    assert_exit_code(&harness.harness, &result, 1);
     assert_contains(&harness.harness, &result.stderr, "No API key");
 }
 
@@ -3161,10 +3169,7 @@ fn e2e_cli_rpc_mode_rejects_file_arguments() {
             ctx.push(("stderr".into(), result.stderr.clone()));
         });
 
-    assert_ne!(
-        result.exit_code, 0,
-        "expected non-zero exit for RPC mode @file argument"
-    );
+    assert_exit_code(&harness.harness, &result, 2);
     let combined = format!("{}\n{}", result.stderr, result.stdout).to_lowercase();
     assert!(
         combined.contains("rpc mode")
