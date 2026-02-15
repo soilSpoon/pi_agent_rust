@@ -29,13 +29,19 @@ fn assert_sse_chunking_invariant(data: &[u8]) {
     }
     let flush_char = parser_char.flush();
 
-    if data.len() >= 2 {
-        let mid = data.len() / 2;
-        let part1 = String::from_utf8_lossy(&data[..mid]);
-        let part2 = String::from_utf8_lossy(&data[mid..]);
+    // Split the already-converted string at a valid char boundary (not raw
+    // bytes) to avoid from_utf8_lossy producing different replacement chars
+    // at the split point vs the whole-input parse.
+    if input.len() >= 2 {
+        let mid = input.len() / 2;
+        let mut split_at = mid;
+        while !input.is_char_boundary(split_at) && split_at < input.len() {
+            split_at += 1;
+        }
+        let (part1, part2) = input.split_at(split_at);
         let mut parser_split = SseParser::new();
-        let mut events_split = parser_split.feed(&part1);
-        events_split.extend(parser_split.feed(&part2));
+        let mut events_split = parser_split.feed(part1);
+        events_split.extend(parser_split.feed(part2));
         let flush_split = parser_split.flush();
 
         assert_eq!(
