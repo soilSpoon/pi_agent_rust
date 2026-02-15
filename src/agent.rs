@@ -14,6 +14,7 @@
 
 use crate::auth::AuthStorage;
 use crate::compaction::{self, ResolvedCompactionSettings};
+use crate::compaction_worker::{CompactionQuota, CompactionWorkerState};
 use crate::error::{Error, Result};
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extension_tools::collect_extension_tool_wrappers;
@@ -1671,6 +1672,7 @@ pub struct AgentSession {
     pub extensions: Option<ExtensionRegion>,
     extensions_is_streaming: Arc<AtomicBool>,
     compaction_settings: ResolvedCompactionSettings,
+    compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
     auth_storage: Option<AuthStorage>,
 }
@@ -4021,6 +4023,7 @@ impl AgentSession {
             extensions: None,
             extensions_is_streaming: Arc::new(AtomicBool::new(false)),
             compaction_settings,
+            compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
             auth_storage: None,
         }
@@ -4124,11 +4127,125 @@ impl AgentSession {
         self.save_enabled
     }
 
+    /// Force-run compaction synchronously (used by `/compact` slash command).
     pub async fn compact_now(&mut self, on_event: impl Fn(AgentEvent) + Send + Sync) -> Result<()> {
-        self.maybe_compact(&on_event).await
+        self.compact_synchronous(&on_event).await
     }
 
-    async fn maybe_compact(&self, on_event: &(impl Fn(AgentEvent) + Send + Sync)) -> Result<()> {
+    /// Two-phase non-blocking compaction.
+    ///
+    /// **Phase 1** — apply a completed background compaction result (if any).
+    /// **Phase 2** — if quotas allow and the session needs compaction, start a
+    /// new background compaction thread.
+    async fn maybe_compact(
+        &mut self,
+        on_event: &(impl Fn(AgentEvent) + Send + Sync),
+    ) -> Result<()> {
+        if !self.compaction_settings.enabled {
+            return Ok(());
+        }
+
+        // Phase 1: apply completed background result.
+        if let Some(outcome) = self.compaction_worker.try_recv() {
+            match outcome {
+                Ok(result) => {
+                    self.apply_compaction_result(result, on_event).await?;
+                }
+                Err(e) => {
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
+        // Phase 2: start new background compaction if quotas allow.
+        if !self.compaction_worker.can_start() {
+            return Ok(());
+        }
+
+        let preparation = {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = self
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            let entries = session
+                .entries_for_current_path()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+        };
+
+        if let Some(prep) = preparation {
+            on_event(AgentEvent::AutoCompactionStart {
+                reason: "threshold".to_string(),
+            });
+
+            let provider = self.agent.provider();
+            let api_key = self
+                .agent
+                .stream_options()
+                .api_key
+                .clone()
+                .unwrap_or_default();
+
+            self.compaction_worker.start(prep, provider, api_key, None);
+        }
+
+        Ok(())
+    }
+
+    /// Apply a completed compaction result to the session.
+    async fn apply_compaction_result(
+        &self,
+        result: compaction::CompactionResult,
+        on_event: &(impl Fn(AgentEvent) + Send + Sync),
+    ) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+
+        let details = compaction::compaction_details_to_value(&result.details).ok();
+        let result_value = details.clone();
+
+        session.append_compaction(
+            result.summary,
+            result.first_kept_entry_id,
+            result.tokens_before,
+            details,
+            None, // from_hook
+        );
+
+        if self.save_enabled {
+            session
+                .flush_autosave(AutosaveFlushTrigger::Periodic)
+                .await?;
+        }
+
+        on_event(AgentEvent::AutoCompactionEnd {
+            result: result_value,
+            aborted: false,
+            will_retry: false,
+            error_message: None,
+        });
+
+        Ok(())
+    }
+
+    /// Run compaction synchronously (inline), blocking until completion.
+    async fn compact_synchronous(
+        &self,
+        on_event: &(impl Fn(AgentEvent) + Send + Sync),
+    ) -> Result<()> {
         if !self.compaction_settings.enabled {
             return Ok(());
         }
@@ -4161,40 +4278,9 @@ impl AgentSession {
                 .clone()
                 .unwrap_or_default();
 
-            // Note: We might want custom instructions from config, but for now None is fine.
             match compaction::compact(prep, provider, &api_key, None).await {
                 Ok(result) => {
-                    let cx = crate::agent_cx::AgentCx::for_request();
-                    let mut session = self
-                        .session
-                        .lock(cx.cx())
-                        .await
-                        .map_err(|e| Error::session(e.to_string()))?;
-
-                    let details = compaction::compaction_details_to_value(&result.details).ok();
-
-                    let result_value = details.clone();
-
-                    session.append_compaction(
-                        result.summary,
-                        result.first_kept_entry_id,
-                        result.tokens_before,
-                        details,
-                        None, // from_hook
-                    );
-
-                    if self.save_enabled {
-                        session
-                            .flush_autosave(AutosaveFlushTrigger::Periodic)
-                            .await?;
-                    }
-
-                    on_event(AgentEvent::AutoCompactionEnd {
-                        result: result_value,
-                        aborted: false,
-                        will_retry: false,
-                        error_message: None,
-                    });
+                    self.apply_compaction_result(result, on_event).await?;
                 }
                 Err(e) => {
                     on_event(AgentEvent::AutoCompactionEnd {

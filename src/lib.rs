@@ -48,6 +48,7 @@ pub mod autocomplete;
 pub mod buffer_shim;
 pub mod cli;
 pub mod compaction;
+pub mod compaction_worker;
 pub mod config;
 pub mod conformance;
 pub mod conformance_shapes;
