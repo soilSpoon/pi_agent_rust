@@ -31,7 +31,7 @@ use crate::session::SessionMessage;
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
-use asupersync::sync::Mutex;
+use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
 use memchr::memchr_iter;
 use serde_json::{Value, json};
@@ -1617,7 +1617,7 @@ async fn run_prompt_with_retry(
 
     loop {
         let (abort_handle, abort_signal) = AbortHandle::new();
-        if let Ok(mut guard) = abort_handle_slot.lock(&cx).await {
+        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
             *guard = Some(abort_handle);
         } else {
             is_streaming.store(false, Ordering::SeqCst);
@@ -1627,7 +1627,7 @@ async fn run_prompt_with_retry(
         let runtime_for_events = options.runtime_handle.clone();
 
         let result = {
-            let mut guard = match session.lock(&cx).await {
+            let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                 Ok(guard) => guard,
                 Err(err) => {
                     final_error = Some(format!("session lock failed: {err}"));
@@ -1684,7 +1684,7 @@ async fn run_prompt_with_retry(
             }
         };
 
-        if let Ok(mut guard) = abort_handle_slot.lock(&cx).await {
+        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
             *guard = None;
         }
 
@@ -1702,7 +1702,9 @@ async fn run_prompt_with_retry(
                     // Check if this error is retryable. Context overflow and
                     // auth failures should NOT be retried.
                     if let Some(ref err_msg) = final_error {
-                        let context_window = if let Ok(guard) = session.lock(&cx).await {
+                        let context_window = if let Ok(guard) =
+                            OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
+                        {
                             guard.session.lock(&cx).await.map_or(None, |inner| {
                                 current_model_entry(&inner, &options)
                                     .map(|e| e.model.context_window)
@@ -1737,8 +1739,7 @@ async fn run_prompt_with_retry(
             }
         }
 
-        let retry_enabled = shared_state
-            .lock(&cx)
+        let retry_enabled = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
             .await
             .is_ok_and(|state| state.auto_retry_enabled);
         if !retry_enabled || retry_count >= max_retries {
@@ -1799,8 +1800,7 @@ async fn run_prompt_with_retry(
         return;
     }
 
-    let auto_compaction_enabled = shared_state
-        .lock(&cx)
+    let auto_compaction_enabled = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
         .await
         .is_ok_and(|state| state.auto_compaction_enabled);
     if auto_compaction_enabled {

@@ -1485,6 +1485,16 @@ fn binary_size_candidate_builder_dedups_perf_profile() {
     );
 }
 
+#[test]
+fn binary_size_candidate_builder_dedups_release_profile() {
+    let target_dir = Path::new("/tmp/pi-agent-target");
+    let candidates = build_binary_size_candidate_paths(target_dir, "release");
+    assert_eq!(
+        candidates,
+        vec![target_dir.join("release/pi"), target_dir.join("perf/pi")]
+    );
+}
+
 fn write_stratification_artifact(path: &Path, invalidity_reasons: &[&str], include_full_e2e: bool) {
     let full_e2e_layer = include_full_e2e.then(|| {
         json!({

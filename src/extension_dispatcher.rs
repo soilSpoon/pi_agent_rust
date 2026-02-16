@@ -11721,7 +11721,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_error_code_unknown_maps_to_internal() {
+    fn protocol_error_code_completely_unknown_maps_to_internal() {
         assert_eq!(
             protocol_error_code("completely_unknown"),
             HostCallErrorCode::Internal
@@ -12118,7 +12118,7 @@ mod tests {
     }
 
     #[test]
-    fn hostcall_outcome_to_protocol_result_success_wraps_non_object() {
+    fn hostcall_outcome_to_protocol_result_success_wraps_plain_string() {
         let result = hostcall_outcome_to_protocol_result(
             "call-s2",
             HostcallOutcome::Success(serde_json::json!("plain string")),
@@ -12161,7 +12161,7 @@ mod tests {
     }
 
     #[test]
-    fn hostcall_outcome_to_protocol_result_stream_chunk() {
+    fn hostcall_outcome_to_protocol_result_stream_partial_chunk() {
         let result = hostcall_outcome_to_protocol_result(
             "call-sc1",
             HostcallOutcome::StreamChunk {

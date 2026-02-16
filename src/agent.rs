@@ -4439,7 +4439,8 @@ impl AgentSession {
     ) -> Result<()> {
         // Either use the pre-warmed JS runtime (booted concurrently with startup)
         // or create a fresh one inline.
-        let (manager, _tools) = if let Some(pre) = pre_warmed {
+        #[allow(unused_variables)]
+        let (manager, tools) = if let Some(pre) = pre_warmed {
             pre.manager.set_js_runtime(pre.js_runtime);
             (pre.manager, pre.tools)
         } else {
