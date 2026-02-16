@@ -1082,9 +1082,10 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 3);
-        assert!(seen
-            .iter()
-            .all(|(call_id, _, _, _)| call_id == "call-stream"));
+        assert!(
+            seen.iter()
+                .all(|(call_id, _, _, _)| call_id == "call-stream")
+        );
         assert_eq!(seen[0].1, 0);
         assert_eq!(seen[1].1, 1);
         assert_eq!(seen[2].1, 2);

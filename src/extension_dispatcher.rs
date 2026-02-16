@@ -323,9 +323,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     ) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         Box::pin(async move {
             let cap = request.required_capability();
-            let check = self
-                .snapshot
-                .lookup(&cap, request.extension_id.as_deref());
+            let check = self.snapshot.lookup(&cap, request.extension_id.as_deref());
             if check.decision != PolicyDecision::Allow {
                 let outcome = HostcallOutcome::Error {
                     code: "denied".to_string(),

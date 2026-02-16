@@ -1407,9 +1407,18 @@ pub async fn run(
                     crate::session::Session::in_memory()
                 };
                 new_session.header.parent_session = parent_path;
-                new_session.header.provider.clone_from(&header_snapshot.provider);
-                new_session.header.model_id.clone_from(&header_snapshot.model_id);
-                new_session.header.thinking_level.clone_from(&header_snapshot.thinking_level);
+                new_session
+                    .header
+                    .provider
+                    .clone_from(&header_snapshot.provider);
+                new_session
+                    .header
+                    .model_id
+                    .clone_from(&header_snapshot.model_id);
+                new_session
+                    .header
+                    .thinking_level
+                    .clone_from(&header_snapshot.thinking_level);
                 new_session.entries = entries;
                 new_session.leaf_id = leaf_id;
                 new_session.ensure_entry_ids();
@@ -1458,7 +1467,11 @@ pub async fn run(
                     let inner_session = guard.session.lock(&cx).await.map_err(|err| {
                         Error::session(format!("inner session lock failed: {err}"))
                     })?;
-                    inner_session.entries_for_current_path().into_iter().cloned().collect::<Vec<_>>()
+                    inner_session
+                        .entries_for_current_path()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
                 };
                 let messages = fork_messages_from_entries(&path_entries);
                 let _ = out_tx.send(response_ok(
@@ -3362,7 +3375,6 @@ async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Res
     }
     guard.persist_session().await
 }
-
 
 /// Extract user messages from a pre-captured list of session entries.
 ///
