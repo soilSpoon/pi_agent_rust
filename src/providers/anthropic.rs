@@ -281,8 +281,6 @@ where
 {
     event_source: SseStream<S>,
     partial: AssistantMessage,
-    current_text: String,
-    current_thinking: String,
     current_tool_json: String,
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
@@ -316,8 +314,6 @@ where
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
-            current_text: String::new(),
-            current_thinking: String::new(),
             current_tool_json: String::new(),
             current_tool_id: None,
             current_tool_name: None,
@@ -388,14 +384,12 @@ where
 
         match content_block {
             AnthropicContentBlock::Text => {
-                self.current_text.clear();
                 self.partial
                     .content
                     .push(ContentBlock::Text(TextContent::new("")));
                 StreamEvent::TextStart { content_index }
             }
             AnthropicContentBlock::Thinking => {
-                self.current_thinking.clear();
                 self.partial
                     .content
                     .push(ContentBlock::Thinking(ThinkingContent {
@@ -429,7 +423,6 @@ where
         match delta {
             AnthropicDelta::TextDelta { text } => {
                 if let Some(text) = text {
-                    self.current_text.push_str(&text);
                     if let Some(ContentBlock::Text(t)) = self.partial.content.get_mut(idx) {
                         t.text.push_str(&text);
                     }
@@ -443,7 +436,6 @@ where
             }
             AnthropicDelta::ThinkingDelta { thinking } => {
                 if let Some(thinking) = thinking {
-                    self.current_thinking.push_str(&thinking);
                     if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx) {
                         t.thinking.push_str(&thinking);
                     }
@@ -484,18 +476,19 @@ where
         let idx = index as usize;
 
         match self.partial.content.get_mut(idx) {
-            Some(ContentBlock::Text(_)) => {
-                // t.text already has identical content from push_str during deltas;
-                // no need to clone_from — just take the accumulator for the event.
-                let content = std::mem::take(&mut self.current_text);
+            Some(ContentBlock::Text(t)) => {
+                // Clone the accumulated text from the partial for the TextEnd event.
+                // The partial keeps its text intact for the Done message
+                // (finalize_assistant_message replaces the agent's accumulated message).
+                let content = t.text.clone();
                 Some(StreamEvent::TextEnd {
                     content_index: idx,
                     content,
                 })
             }
-            Some(ContentBlock::Thinking(_)) => {
-                // t.thinking already has identical content from push_str during deltas.
-                let content = std::mem::take(&mut self.current_thinking);
+            Some(ContentBlock::Thinking(t)) => {
+                // Clone the accumulated thinking from the partial for the ThinkingEnd event.
+                let content = t.thinking.clone();
                 Some(StreamEvent::ThinkingEnd {
                     content_index: idx,
                     content,

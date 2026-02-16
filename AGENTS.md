@@ -63,16 +63,18 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 ### Release Profile
 
-The release build optimizes for binary size:
+The release build optimizes for runtime speed:
 
 ```toml
 [profile.release]
-opt-level = "z"     # Optimize for size (lean binary for distribution)
+opt-level = 3       # Maximum optimization for speed (inlining, vectorization, loop unrolling)
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols
 ```
+
+jemalloc is enabled by default for 10-20% improvement on allocation-heavy paths.
 
 ---
 

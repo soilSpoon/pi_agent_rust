@@ -843,7 +843,7 @@ fn setup_gemini(
     sse: &str,
 ) -> (Arc<dyn pi::provider::Provider>, MockHttpServer) {
     let server = harness.start_mock_http_server();
-    let route = "/v1beta/models/golden-gemini:streamGenerateContent?alt=sse&key=golden-test-key";
+    let route = "/v1beta/models/golden-gemini:streamGenerateContent?alt=sse";
     server.add_route("POST", route, make_sse_response(sse));
     let base_url = format!("{}/v1beta", server.base_url());
     let mut entry = make_entry("google", "golden-gemini", &base_url);

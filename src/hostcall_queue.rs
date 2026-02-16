@@ -1123,6 +1123,66 @@ mod tests {
     }
 
     #[test]
+    fn bravo_zero_window_config_clamps_to_single_recovery_window() {
+        let mut config = deterministic_config();
+        config.max_consecutive_read_bias_windows = 0;
+        config.writer_recovery_windows = 0;
+        let mut policy = BravoContentionState::new(config);
+
+        let first = policy.observe(sample(85, 15, 100, 300, 0));
+        assert_eq!(first.next_mode, BravoBiasMode::ReadBiased);
+        assert_eq!(policy.snapshot().consecutive_read_bias_windows, 1);
+
+        let second = policy.observe(sample(86, 14, 100, 320, 0));
+        assert_eq!(second.previous_mode, BravoBiasMode::ReadBiased);
+        assert_eq!(second.next_mode, BravoBiasMode::WriterRecovery);
+        assert_eq!(second.signature, ContentionSignature::ReadDominant);
+        assert!(!second.rollback_triggered);
+
+        let recovery = policy.snapshot();
+        assert_eq!(recovery.writer_recovery_remaining, 1);
+        assert_eq!(recovery.consecutive_read_bias_windows, 0);
+
+        let third = policy.observe(sample(45, 55, 120, 450, 0));
+        assert_eq!(third.previous_mode, BravoBiasMode::WriterRecovery);
+        assert_eq!(third.next_mode, BravoBiasMode::Balanced);
+        assert!(third.switched);
+        assert_eq!(policy.snapshot().writer_recovery_remaining, 0);
+    }
+
+    #[test]
+    fn bravo_writer_recovery_starvation_refresh_clamps_to_one_when_config_is_zero() {
+        let mut config = deterministic_config();
+        config.writer_recovery_windows = 0;
+        let mut policy = BravoContentionState::new(config);
+
+        let _ = policy.observe(sample(82, 18, 100, 280, 0));
+        let starvation = policy.observe(sample(75, 25, 100, 8_200, 3));
+        assert_eq!(starvation.previous_mode, BravoBiasMode::ReadBiased);
+        assert_eq!(starvation.next_mode, BravoBiasMode::WriterRecovery);
+        assert!(starvation.rollback_triggered);
+        assert_eq!(policy.snapshot().writer_recovery_remaining, 1);
+
+        let repeated_starvation = policy.observe(sample(70, 30, 100, 8_600, 2));
+        assert_eq!(
+            repeated_starvation.previous_mode,
+            BravoBiasMode::WriterRecovery
+        );
+        assert_eq!(repeated_starvation.next_mode, BravoBiasMode::WriterRecovery);
+        assert!(!repeated_starvation.rollback_triggered);
+        assert_eq!(
+            repeated_starvation.signature,
+            ContentionSignature::WriterStarvationRisk
+        );
+        assert_eq!(policy.snapshot().writer_recovery_remaining, 1);
+
+        let exit = policy.observe(sample(48, 52, 140, 420, 0));
+        assert_eq!(exit.previous_mode, BravoBiasMode::WriterRecovery);
+        assert_eq!(exit.next_mode, BravoBiasMode::Balanced);
+        assert_eq!(policy.snapshot().writer_recovery_remaining, 0);
+    }
+
+    #[test]
     fn bravo_policy_enforces_writer_fairness_budget() {
         let mut config = deterministic_config();
         config.max_consecutive_read_bias_windows = 2;
