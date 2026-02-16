@@ -12,6 +12,9 @@ use crate::extensions_js::{
     ExtensionRepairEvent, ExtensionToolDef, HostcallKind, HostcallRequest, PiJsRuntime,
     PiJsRuntimeConfig, js_to_json, json_to_js,
 };
+use crate::hostcall_rewrite::{
+    HostcallRewriteEngine, HostcallRewritePlan, HostcallRewritePlanKind,
+};
 use crate::permissions::{PermissionStore, PersistedDecision};
 use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
@@ -34,7 +37,8 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicU64, Ordering as StdOrdering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -8214,6 +8218,16 @@ const HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC: &str = "canonical_generic_v1"
 const HOSTCALL_MARSHALLING_PATH_FAST_OPCODE: &str = "interned_opcode_arena_v1";
 const HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK: &str = "canonical_fallback_v1";
 const HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS: &str = "opcode_payload_shape_miss";
+const HOSTCALL_MARSHALLING_FALLBACK_REWRITE_DIVERGENCE: &str = "rewrite_semantic_divergence";
+const HOSTCALL_REWRITE_RULE_BASELINE: &str = "baseline_canonical";
+const HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION: &str = "fuse_hash_dispatch_fast_opcode";
+const HOSTCALL_REWRITE_COST_BASELINE: u32 = 100;
+const HOSTCALL_REWRITE_COST_FAST_OPCODE: u32 = 35;
+
+fn hostcall_rewrite_engine() -> &'static HostcallRewriteEngine {
+    static ENGINE: OnceLock<HostcallRewriteEngine> = OnceLock::new();
+    ENGINE.get_or_init(HostcallRewriteEngine::from_env)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostcallMarshallingTelemetry {
@@ -8221,6 +8235,10 @@ struct HostcallMarshallingTelemetry {
     latency_us: u64,
     fallback_reason: Option<String>,
     fallback_count: u64,
+    rewrite_rule: Option<String>,
+    rewrite_expected_cost_delta: i64,
+    rewrite_observed_cost_delta: i64,
+    rewrite_fallback_reason: Option<String>,
 }
 
 impl Default for HostcallMarshallingTelemetry {
@@ -8230,6 +8248,10 @@ impl Default for HostcallMarshallingTelemetry {
             latency_us: 0,
             fallback_reason: None,
             fallback_count: 0,
+            rewrite_rule: None,
+            rewrite_expected_cost_delta: 0,
+            rewrite_observed_cost_delta: 0,
+            rewrite_fallback_reason: None,
         }
     }
 }
@@ -8262,36 +8284,105 @@ impl<'a> HostcallPayloadArena<'a> {
     }
 
     fn marshal(&self) -> HostcallMarshallingArtifacts {
-        let started = Instant::now();
-        if let Some(opcode) = self.opcode
-            && let Some((params_hash, args_shape_hash)) = self.hash_fast_opcode(opcode)
-        {
-            return HostcallMarshallingArtifacts {
-                params_hash,
-                args_shape_hash,
-                telemetry: HostcallMarshallingTelemetry {
-                    path: HOSTCALL_MARSHALLING_PATH_FAST_OPCODE.to_string(),
-                    latency_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    fallback_reason: None,
-                    fallback_count: 0,
-                },
-            };
+        let baseline_started = Instant::now();
+        let baseline_params_hash = hostcall_params_hash(self.method, self.params);
+        let baseline_args_shape_hash = hostcall_params_shape_hash(self.method, self.params);
+        let baseline_latency_us =
+            u64::try_from(baseline_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+
+        let baseline_plan = HostcallRewritePlan {
+            kind: HostcallRewritePlanKind::BaselineCanonical,
+            estimated_cost: HOSTCALL_REWRITE_COST_BASELINE,
+            rule_id: HOSTCALL_REWRITE_RULE_BASELINE,
+        };
+
+        let mut fallback_reason = self
+            .opcode
+            .map(|_| HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS.to_string());
+        let mut fast_candidate_hashes: Option<(String, String)> = None;
+        let mut fast_candidate_latency_us = 0_u64;
+        let mut rewrite_candidates = Vec::new();
+
+        if let Some(opcode) = self.opcode {
+            let fast_started = Instant::now();
+            let maybe_fast = self.hash_fast_opcode(opcode);
+            let fast_latency =
+                u64::try_from(fast_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if let Some((fast_params_hash, fast_args_shape_hash)) = maybe_fast {
+                if fast_params_hash == baseline_params_hash
+                    && fast_args_shape_hash == baseline_args_shape_hash
+                {
+                    fallback_reason = None;
+                    fast_candidate_latency_us = fast_latency;
+                    fast_candidate_hashes = Some((fast_params_hash, fast_args_shape_hash));
+                    rewrite_candidates.push(HostcallRewritePlan {
+                        kind: HostcallRewritePlanKind::FastOpcodeFusion,
+                        estimated_cost: HOSTCALL_REWRITE_COST_FAST_OPCODE,
+                        rule_id: HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION,
+                    });
+                } else {
+                    fallback_reason =
+                        Some(HOSTCALL_MARSHALLING_FALLBACK_REWRITE_DIVERGENCE.to_string());
+                }
+            }
         }
 
+        let rewrite_decision =
+            hostcall_rewrite_engine().select_plan(baseline_plan, &rewrite_candidates);
+        let use_fast_rewrite = rewrite_decision.selected.kind
+            == HostcallRewritePlanKind::FastOpcodeFusion
+            && fast_candidate_hashes.is_some();
+
+        let (params_hash, args_shape_hash, path, latency_us, rewrite_rule) = if use_fast_rewrite {
+            let (params_hash, args_shape_hash) =
+                fast_candidate_hashes.expect("fast rewrite selected without hashes");
+            (
+                params_hash,
+                args_shape_hash,
+                HOSTCALL_MARSHALLING_PATH_FAST_OPCODE.to_string(),
+                fast_candidate_latency_us,
+                Some(rewrite_decision.selected.rule_id.to_string()),
+            )
+        } else {
+            let path = if self.opcode.is_some() {
+                HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK.to_string()
+            } else {
+                HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC.to_string()
+            };
+            (
+                baseline_params_hash,
+                baseline_args_shape_hash,
+                path,
+                baseline_latency_us,
+                None,
+            )
+        };
+
+        let rewrite_fallback_reason = if use_fast_rewrite {
+            None
+        } else {
+            rewrite_decision.fallback_reason.map(str::to_string)
+        };
+        let rewrite_observed_cost_delta = if use_fast_rewrite {
+            let baseline_latency = i64::try_from(baseline_latency_us).unwrap_or(i64::MAX);
+            let fast_latency = i64::try_from(fast_candidate_latency_us).unwrap_or(i64::MAX);
+            baseline_latency.saturating_sub(fast_latency)
+        } else {
+            0
+        };
+
         HostcallMarshallingArtifacts {
-            params_hash: hostcall_params_hash(self.method, self.params),
-            args_shape_hash: hostcall_params_shape_hash(self.method, self.params),
+            params_hash,
+            args_shape_hash,
             telemetry: HostcallMarshallingTelemetry {
-                path: if self.opcode.is_some() {
-                    HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK.to_string()
-                } else {
-                    HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC.to_string()
-                },
-                latency_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                fallback_reason: self
-                    .opcode
-                    .map(|_| HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS.to_string()),
+                path,
+                latency_us,
+                fallback_reason,
                 fallback_count: 0,
+                rewrite_rule,
+                rewrite_expected_cost_delta: rewrite_decision.expected_cost_delta,
+                rewrite_observed_cost_delta,
+                rewrite_fallback_reason,
             },
         }
     }
@@ -12809,9 +12900,15 @@ impl JsRuntimeHost {
     /// Upgrade the weak manager reference.  Returns `None` if the
     /// `ExtensionManager` has already been dropped (shutdown in progress).
     fn manager(&self) -> Option<ExtensionManager> {
-        self.manager_ref
-            .upgrade()
-            .map(|inner| ExtensionManager { inner })
+        self.manager_ref.upgrade().map(|inner| {
+            let snapshot = Arc::new(RwLock::new(Arc::new(RegistrySnapshot::default())));
+            let snapshot_version = Arc::new(AtomicU64::new(0));
+            ExtensionManager {
+                inner,
+                snapshot,
+                snapshot_version,
+            }
+        })
     }
 }
 
@@ -15137,6 +15234,10 @@ fn log_hostcall_end(
     let marshalling_latency_us = marshalling.latency_us;
     let marshalling_fallback_reason = marshalling.fallback_reason.as_deref();
     let marshalling_fallback_count = marshalling.fallback_count;
+    let marshalling_rewrite_rule = marshalling.rewrite_rule.as_deref();
+    let marshalling_rewrite_expected_cost_delta = marshalling.rewrite_expected_cost_delta;
+    let marshalling_rewrite_observed_cost_delta = marshalling.rewrite_observed_cost_delta;
+    let marshalling_rewrite_fallback_reason = marshalling.rewrite_fallback_reason.as_deref();
 
     if is_error {
         tracing::warn!(
@@ -15158,6 +15259,10 @@ fn log_hostcall_end(
             marshalling_latency_us,
             marshalling_fallback_reason = marshalling_fallback_reason,
             marshalling_fallback_count,
+            marshalling_rewrite_rule = marshalling_rewrite_rule,
+            marshalling_rewrite_expected_cost_delta,
+            marshalling_rewrite_observed_cost_delta,
+            marshalling_rewrite_fallback_reason = marshalling_rewrite_fallback_reason,
             error_code = error_code,
             "Hostcall end (error)"
         );
@@ -15181,6 +15286,10 @@ fn log_hostcall_end(
             marshalling_latency_us,
             marshalling_fallback_reason = marshalling_fallback_reason,
             marshalling_fallback_count,
+            marshalling_rewrite_rule = marshalling_rewrite_rule,
+            marshalling_rewrite_expected_cost_delta,
+            marshalling_rewrite_observed_cost_delta,
+            marshalling_rewrite_fallback_reason = marshalling_rewrite_fallback_reason,
             "Hostcall end (success)"
         );
     }
@@ -15843,20 +15952,35 @@ async fn dispatch_shared_allowed(
             // The reactor mesh assigns a shard for this opcode; actual parallel
             // execution on shard threads is activated via enable_hostcall_reactor().
             if let Some(ref manager) = ctx.manager {
-                if let Some(Ok(reactor_req)) = manager.reactor_submit(
+                match manager.reactor_submit(
                     call.call_id.clone(),
                     opcode,
                     params_without_key(&call.params, "op"),
                 ) {
-                    tracing::trace!(
-                        event = "host_call.reactor_routed",
-                        call_id = %call.call_id,
-                        shard_id = reactor_req.shard_id,
-                        global_seq = reactor_req.global_seq,
-                        shard_seq = reactor_req.shard_seq,
-                        opcode = opcode.code(),
-                        "Hostcall routed through reactor mesh"
-                    );
+                    Some(Ok(reactor_req)) => {
+                        tracing::trace!(
+                            event = "host_call.reactor_routed",
+                            call_id = %call.call_id,
+                            shard_id = reactor_req.shard_id,
+                            global_seq = reactor_req.global_seq,
+                            shard_seq = reactor_req.shard_seq,
+                            opcode = opcode.code(),
+                            "Hostcall routed through reactor mesh"
+                        );
+                    }
+                    Some(Err(backpressure)) => {
+                        tracing::warn!(
+                            event = "host_call.reactor_backpressure",
+                            call_id = %call.call_id,
+                            shard_id = backpressure.shard_id,
+                            queue_depth = backpressure.depth,
+                            queue_capacity = backpressure.capacity,
+                            opcode = opcode.code(),
+                            stall_reason = "lane_overflow",
+                            "Hostcall reactor lane saturated; dispatch continues on shared fast lane"
+                        );
+                    }
+                    None => {}
                 }
             }
             dispatch_shared_allowed_fast(ctx, call, opcode).await
@@ -17887,16 +18011,62 @@ async fn await_js_task(
     }
 }
 
+/// Immutable snapshot of frequently-read extension registry metadata.
+///
+/// Published via RCU-style swap: writers hold the mutex, build a new snapshot,
+/// then atomically replace the shared `Arc`. Readers grab the `Arc` without
+/// any lock, paying only an atomic increment for the refcount.
+#[derive(Clone, Default)]
+pub(crate) struct RegistrySnapshot {
+    /// Pre-computed set of event names with at least one registered hook.
+    pub hook_bitmap: HashSet<String>,
+    /// Whether any event hooks are registered at all.
+    pub has_any_hooks: bool,
+    /// Current session handle (cheap `Arc` clone).
+    pub session: Option<Arc<dyn ExtensionSession>>,
+    /// Filtered tool list for event dispatch context.
+    pub active_tools: Option<Vec<String>>,
+    /// Registered provider specs.
+    pub providers: Vec<Value>,
+    /// Registered flags.
+    pub flags: Vec<Value>,
+    /// Current working directory.
+    pub cwd: Option<String>,
+    /// Model registry key-value pairs.
+    pub model_registry_values: HashMap<String, String>,
+    /// Current provider identifier.
+    pub current_provider: Option<String>,
+    /// Current model identifier.
+    pub current_model_id: Option<String>,
+    /// Current thinking level.
+    pub current_thinking_level: Option<String>,
+    /// Global kill-switch for hostcall compatibility lane.
+    pub hostcall_compat_kill_switch_global: bool,
+    /// Per-extension kill-switch set.
+    pub hostcall_compat_kill_switch_extensions: HashSet<String>,
+    /// Monotonic version counter (seqlock-style) for cache invalidation.
+    pub version: u64,
+}
+
 /// Extension manager for handling loaded extensions.
 #[derive(Clone)]
 pub struct ExtensionManager {
     inner: Arc<Mutex<ExtensionManagerInner>>,
+    /// Lock-free read path: immutable snapshot swapped via RCU.
+    /// Readers grab the `Arc` via `RwLock::read()` (uncontended fast path).
+    /// Writers hold the mutex, build a new snapshot, then swap under a brief
+    /// write-lock.  The old snapshot is reclaimed when its last reader drops.
+    snapshot: Arc<RwLock<Arc<RegistrySnapshot>>>,
+    /// Monotonic seqlock counter for cheap staleness checks.
+    snapshot_version: Arc<AtomicU64>,
 }
 
 #[cfg(feature = "wasm-host")]
 #[derive(Clone, Default)]
 pub(crate) struct ExtensionManagerHandle {
     inner: Weak<Mutex<ExtensionManagerInner>>,
+    snapshot: Option<Arc<RwLock<Arc<RegistrySnapshot>>>>,
+    snapshot_version: Option<Arc<AtomicU64>>,
 }
 
 #[cfg(feature = "wasm-host")]
@@ -17904,11 +18074,23 @@ impl ExtensionManagerHandle {
     fn new(manager: &ExtensionManager) -> Self {
         Self {
             inner: Arc::downgrade(&manager.inner),
+            snapshot: Some(Arc::clone(&manager.snapshot)),
+            snapshot_version: Some(Arc::clone(&manager.snapshot_version)),
         }
     }
 
     fn upgrade(&self) -> Option<ExtensionManager> {
-        self.inner.upgrade().map(|inner| ExtensionManager { inner })
+        self.inner.upgrade().map(|inner| ExtensionManager {
+            inner,
+            snapshot: self
+                .snapshot
+                .clone()
+                .unwrap_or_else(|| Arc::new(RwLock::new(Arc::new(RegistrySnapshot::default())))),
+            snapshot_version: self
+                .snapshot_version
+                .clone()
+                .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
+        })
     }
 }
 
@@ -18168,8 +18350,12 @@ impl ExtensionManager {
     pub fn new() -> Self {
         let mut inner = ExtensionManagerInner::default();
         Self::load_persisted_permissions(&mut inner);
+        let snapshot = Arc::new(RwLock::new(Arc::new(RegistrySnapshot::default())));
+        let snapshot_version = Arc::new(AtomicU64::new(0));
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            snapshot,
+            snapshot_version,
         }
     }
 
@@ -18180,8 +18366,12 @@ impl ExtensionManager {
             ..Default::default()
         };
         Self::load_persisted_permissions(&mut inner);
+        let snapshot = Arc::new(RwLock::new(Arc::new(RegistrySnapshot::default())));
+        let snapshot_version = Arc::new(AtomicU64::new(0));
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            snapshot,
+            snapshot_version,
         }
     }
 
@@ -18197,6 +18387,78 @@ impl ExtensionManager {
                 tracing::warn!("Failed to load extension permissions: {e}");
             }
         }
+    }
+
+    // ── RCU snapshot helpers ───────────────────────────────────────────
+
+    /// Build a `RegistrySnapshot` from the current inner state.
+    ///
+    /// Caller must already hold the mutex on `inner`.
+    fn build_snapshot_from_inner(inner: &ExtensionManagerInner) -> RegistrySnapshot {
+        RegistrySnapshot {
+            hook_bitmap: inner.hook_bitmap.clone(),
+            has_any_hooks: !inner.hook_bitmap.is_empty(),
+            session: inner.session.clone(),
+            active_tools: inner.active_tools.clone(),
+            providers: inner.providers.clone(),
+            flags: inner.flags.clone(),
+            cwd: inner.cwd.clone(),
+            model_registry_values: inner.model_registry_values.clone(),
+            current_provider: inner.current_provider.clone(),
+            current_model_id: inner.current_model_id.clone(),
+            current_thinking_level: inner.current_thinking_level.clone(),
+            hostcall_compat_kill_switch_global: inner.hostcall_compat_kill_switch_global,
+            hostcall_compat_kill_switch_extensions: inner
+                .hostcall_compat_kill_switch_extensions
+                .clone(),
+            version: inner.ctx_generation,
+        }
+    }
+
+    /// Atomically publish a new snapshot, replacing the old one.
+    ///
+    /// Previous readers keep their `Arc` alive until they drop it.
+    fn publish_snapshot(&self, snap: RegistrySnapshot) {
+        let version = snap.version;
+        {
+            let mut guard = self.snapshot.write().unwrap();
+            *guard = Arc::new(snap);
+        }
+        self.snapshot_version.store(version, StdOrdering::Release);
+    }
+
+    /// Grab the current snapshot without touching the mutex.
+    ///
+    /// Cost: one `RwLock::read()` (uncontended fast-path) + `Arc::clone`.
+    fn read_snapshot(&self) -> Arc<RegistrySnapshot> {
+        Arc::clone(&self.snapshot.read().unwrap())
+    }
+
+    /// Current snapshot version (seqlock counter).
+    ///
+    /// Cheap atomic load — useful for staleness checks without cloning.
+    pub fn snapshot_version(&self) -> u64 {
+        self.snapshot_version.load(StdOrdering::Acquire)
+    }
+
+    /// Rebuild and publish the snapshot from current inner state.
+    ///
+    /// Call this after any mutation to fields captured in `RegistrySnapshot`.
+    /// Caller must already hold the mutex.
+    fn refresh_snapshot_locked(&self, inner: &ExtensionManagerInner) {
+        let snap = Self::build_snapshot_from_inner(inner);
+        self.publish_snapshot(snap);
+    }
+
+    /// Rebuild and publish the snapshot, releasing the mutex guard before
+    /// publishing to avoid prolonging lock hold time.
+    fn refresh_snapshot_with_guard_release(
+        &self,
+        guard: std::sync::MutexGuard<'_, ExtensionManagerInner>,
+    ) {
+        let snap = Self::build_snapshot_from_inner(&guard);
+        drop(guard);
+        self.publish_snapshot(snap);
     }
 
     /// Set the budget for extension operations.
@@ -19505,15 +19767,12 @@ impl ExtensionManager {
     /// Get reactor mesh telemetry snapshot.
     #[must_use]
     pub fn reactor_telemetry(&self) -> Option<HostcallReactorTelemetry> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|guard| {
-                guard
-                    .hostcall_reactor
-                    .as_ref()
-                    .map(HostcallReactorMesh::telemetry)
-            })
+        self.inner.lock().ok().and_then(|guard| {
+            guard
+                .hostcall_reactor
+                .as_ref()
+                .map(HostcallReactorMesh::telemetry)
+        })
     }
 
     // ------------------------------------------------------------------
@@ -19888,23 +20147,27 @@ impl ExtensionManager {
     pub fn clear_ui_sender(&self) {
         let mut guard = self.inner.lock().unwrap();
         guard.ui_sender = None;
+        drop(guard);
     }
 
     pub fn set_js_runtime(&self, runtime: JsExtensionRuntimeHandle) {
         let mut guard = self.inner.lock().unwrap();
         guard.js_runtime = Some(runtime);
+        drop(guard);
     }
 
     pub fn set_cwd(&self, cwd: String) {
         let mut guard = self.inner.lock().unwrap();
         guard.cwd = Some(cwd);
         guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
     pub fn set_model_registry_values(&self, values: HashMap<String, String>) {
         let mut guard = self.inner.lock().unwrap();
         guard.model_registry_values = values;
         guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
     #[cfg(feature = "wasm-host")]
@@ -20027,11 +20290,12 @@ impl ExtensionManager {
         guard.policy_prompt_cache.clone()
     }
 
+    /// Lock-free: reads from the RCU snapshot.
     pub fn active_tools(&self) -> Option<Vec<String>> {
-        let guard = self.inner.lock().unwrap();
-        guard.active_tools.clone()
+        self.read_snapshot().active_tools.clone()
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn load_js_extensions(&self, specs: Vec<JsExtensionLoadSpec>) -> Result<()> {
         let runtime = self
             .js_runtime()
@@ -20133,6 +20397,7 @@ impl ExtensionManager {
             guard
                 .runtime_risk_states
                 .retain(|ext_id, _| active_extension_ids.contains(ext_id));
+            self.refresh_snapshot_with_guard_release(guard);
         }
         Ok(())
     }
@@ -20175,6 +20440,7 @@ impl ExtensionManager {
             let mut guard = self.inner.lock().unwrap();
             guard.extensions.extend(registrations);
             guard.wasm_extensions.extend(wasm_handles);
+            drop(guard);
         }
         Ok(())
     }
@@ -20185,55 +20451,62 @@ impl ExtensionManager {
         guard.wasm_extensions.clone()
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     pub fn set_session(&self, session: Arc<dyn ExtensionSession>) {
         let mut guard = self.inner.lock().unwrap();
         guard.session = Some(session);
         guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
+    /// Lock-free: reads from the RCU snapshot.
     pub fn session_handle(&self) -> Option<Arc<dyn ExtensionSession>> {
-        let guard = self.inner.lock().unwrap();
-        guard.session.clone()
+        self.read_snapshot().session.clone()
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     pub fn set_active_tools(&self, tools: Vec<String>) {
         let mut guard = self.inner.lock().unwrap();
         guard.active_tools = Some(tools);
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
+    /// Lock-free: reads from the RCU snapshot.
     pub fn current_model(&self) -> (Option<String>, Option<String>) {
-        let guard = self.inner.lock().unwrap();
-        (
-            guard.current_provider.clone(),
-            guard.current_model_id.clone(),
-        )
+        let snap = self.read_snapshot();
+        (snap.current_provider.clone(), snap.current_model_id.clone())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     pub fn set_current_model(&self, provider: Option<String>, model_id: Option<String>) {
         let mut guard = self.inner.lock().unwrap();
         guard.current_provider = provider;
         guard.current_model_id = model_id;
         guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
+    /// Lock-free: reads from the RCU snapshot.
     pub fn current_thinking_level(&self) -> Option<String> {
-        let guard = self.inner.lock().unwrap();
-        guard.current_thinking_level.clone()
+        self.read_snapshot().current_thinking_level.clone()
     }
 
     pub fn set_current_thinking_level(&self, level: Option<String>) {
         let mut guard = self.inner.lock().unwrap();
         guard.current_thinking_level = level;
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
     /// Collect tool definitions from all registered extensions.
     pub fn extension_tool_defs(&self) -> Vec<Value> {
         let guard = self.inner.lock().unwrap();
-        guard
+        let result = guard
             .extensions
             .iter()
             .flat_map(|ext| ext.tools.iter().cloned())
-            .collect()
+            .collect();
+        drop(guard);
+        result
     }
 
     pub fn register(&self, payload: RegisterPayload) {
@@ -20243,6 +20516,7 @@ impl ExtensionManager {
             guard.hook_bitmap.insert(hook.clone());
         }
         guard.extensions.push(payload);
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
     pub fn has_command(&self, name: &str) -> bool {
@@ -21200,6 +21474,7 @@ impl ExtensionManager {
     /// Dispatch a `tool_result` event to registered extensions and return the
     /// last handler response (if any).
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn dispatch_tool_result(
         &self,
         tool_call: &crate::model::ToolCall,
@@ -21307,21 +21582,25 @@ impl ExtensionManager {
     pub fn invalidate_ctx_cache(&self) {
         let mut guard = self.inner.lock().unwrap();
         guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
     /// Check whether any extension has registered a hook for the given event
     /// name.  O(1) lookup via pre-computed bitmap.
+    ///
+    /// Lock-free: reads from the RCU snapshot.
     pub fn has_hook_for(&self, event_name: &str) -> bool {
-        let guard = self.inner.lock().unwrap();
-        guard.hook_bitmap.contains(event_name)
+        let snap = self.read_snapshot();
+        snap.hook_bitmap.contains(event_name)
     }
 
     /// Returns `true` if at least one event hook is registered across all
     /// extensions.  Use this as a fast-path gate to skip event serialization
     /// entirely when no hooks are present.
+    ///
+    /// Lock-free: reads from the RCU snapshot.
     pub fn has_any_event_hooks(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
-        !guard.hook_bitmap.is_empty()
+        self.read_snapshot().has_any_hooks
     }
 }
 
@@ -31770,13 +32049,52 @@ mod tests {
 
         manager.disable_hostcall_reactor();
         assert!(!manager.hostcall_reactor_enabled());
-        assert!(manager
+        assert!(
+            manager
+                .reactor_submit(
+                    "should-none".to_string(),
+                    CommonHostcallOpcode::SessionGetState,
+                    json!({}),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extension_manager_reactor_backpressure_propagates() {
+        let manager = ExtensionManager::new();
+        manager.enable_hostcall_reactor(HostcallReactorConfig {
+            shard_count: 1,
+            lane_capacity: 1,
+            core_ids: None,
+        });
+
+        let first = manager
             .reactor_submit(
-                "should-none".to_string(),
+                "bp-0".to_string(),
                 CommonHostcallOpcode::SessionGetState,
                 json!({}),
             )
-            .is_none());
+            .expect("reactor enabled")
+            .expect("first submit should fit");
+        assert_eq!(first.shard_id, 0);
+
+        let overflow = manager
+            .reactor_submit(
+                "bp-1".to_string(),
+                CommonHostcallOpcode::SessionGetState,
+                json!({}),
+            )
+            .expect("reactor enabled")
+            .expect_err("second submit should overflow lane");
+        assert_eq!(overflow.shard_id, 0);
+        assert_eq!(overflow.depth, 1);
+        assert_eq!(overflow.capacity, 1);
+
+        let telemetry = manager.reactor_telemetry().expect("telemetry snapshot");
+        assert_eq!(telemetry.rejected_enqueues, 1);
+
+        manager.disable_hostcall_reactor();
     }
 
     fn typed_tool_read_payload(call_id: &str, path: &str) -> HostCallPayload {
@@ -32084,7 +32402,42 @@ mod tests {
                 HOSTCALL_MARSHALLING_PATH_FAST_OPCODE
             );
             assert!(artifacts.telemetry.fallback_reason.is_none());
+            assert_eq!(
+                artifacts.telemetry.rewrite_rule.as_deref(),
+                Some(HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION)
+            );
+            assert!(artifacts.telemetry.rewrite_expected_cost_delta > 0);
+            assert!(artifacts.telemetry.rewrite_fallback_reason.is_none());
         }
+    }
+
+    #[test]
+    fn hostcall_marshalling_shape_miss_reports_rewrite_fallback() {
+        let params = json!({
+            "name": "read",
+            "input": {
+                "path": "a.txt"
+            },
+            "extra": true
+        });
+
+        let artifacts =
+            HostcallPayloadArena::new("tool", &params, Some(CommonHostcallOpcode::ToolRead))
+                .marshal();
+
+        assert_eq!(
+            artifacts.telemetry.path,
+            HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK
+        );
+        assert_eq!(
+            artifacts.telemetry.fallback_reason.as_deref(),
+            Some(HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS)
+        );
+        assert!(artifacts.telemetry.rewrite_rule.is_none());
+        assert_eq!(
+            artifacts.telemetry.rewrite_fallback_reason.as_deref(),
+            Some("no_better_candidate")
+        );
     }
 
     #[test]
