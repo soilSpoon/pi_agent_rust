@@ -487,10 +487,7 @@ mod tests {
             estimated_fused_cost(4),
             FUSED_OPCODE_FIXED_COST_UNITS + 4 * FUSED_OPCODE_STEP_COST_UNITS
         );
-        assert_eq!(
-            estimated_fused_cost(0),
-            FUSED_OPCODE_FIXED_COST_UNITS
-        );
+        assert_eq!(estimated_fused_cost(0), FUSED_OPCODE_FIXED_COST_UNITS);
     }
 
     #[test]
@@ -543,14 +540,13 @@ mod tests {
     #[test]
     fn compiler_skips_windows_with_empty_opcodes() {
         let compiler = HostcallSuperinstructionCompiler::new(true, 1, 4);
-        let traces = vec![
-            opcode_trace(&["a", "", "c"]),
-            opcode_trace(&["a", "", "c"]),
-        ];
+        let traces = vec![opcode_trace(&["a", "", "c"]), opcode_trace(&["a", "", "c"])];
         let plans = compiler.compile_plans(&traces);
         // Windows containing "" are skipped
         assert!(
-            plans.iter().all(|p| p.opcode_window.iter().all(|op| !op.trim().is_empty())),
+            plans
+                .iter()
+                .all(|p| p.opcode_window.iter().all(|op| !op.trim().is_empty())),
             "no plan should contain empty opcodes"
         );
     }
