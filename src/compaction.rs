@@ -17,7 +17,7 @@ use crate::session::{SessionEntry, SessionMessage, session_message_to_model};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -123,18 +123,45 @@ impl FileOperations {
     }
 }
 
-fn extract_file_ops_from_message(message: &SessionMessage, file_ops: &mut FileOperations) {
+fn build_tool_status_map(messages: &[SessionMessage]) -> HashMap<String, bool> {
+    let mut status = HashMap::new();
+    for msg in messages {
+        if let SessionMessage::ToolResult {
+            tool_call_id,
+            is_error,
+            ..
+        } = msg
+        {
+            status.insert(tool_call_id.clone(), !*is_error);
+        }
+    }
+    status
+}
+
+fn extract_file_ops_from_message(
+    message: &SessionMessage,
+    file_ops: &mut FileOperations,
+    tool_status: &HashMap<String, bool>,
+) {
     let SessionMessage::Assistant { message } = message else {
         return;
     };
 
     for block in &message.content {
         let ContentBlock::ToolCall(ToolCall {
-            name, arguments, ..
+            id,
+            name,
+            arguments,
+            ..
         }) = block
         else {
             continue;
         };
+
+        // Only track successful tool calls.
+        if !tool_status.get(id).copied().unwrap_or(false) {
+            continue;
+        }
 
         let Some(path) = arguments.get("path").and_then(Value::as_str) else {
             continue;
@@ -177,17 +204,23 @@ fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String>) {
 }
 
 fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
+    let escape = |s: &String| s.replace('<', "&lt;").replace('>', "&gt;");
+
     let mut sections = Vec::new();
     if !read_files.is_empty() {
         sections.push(format!(
             "<read-files>\n{}\n</read-files>",
-            read_files.join("\n")
+            read_files.iter().map(escape).collect::<Vec<_>>().join("\n")
         ));
     }
     if !modified_files.is_empty() {
         sections.push(format!(
             "<modified-files>\n{}\n</modified-files>",
-            modified_files.join("\n")
+            modified_files
+                .iter()
+                .map(escape)
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
     if sections.is_empty() {
@@ -796,6 +829,10 @@ pub fn prepare_compaction(
             usage_messages.push(msg);
         }
     }
+    // Calculate the tokens *currently* occupied by the segment we are about to compact.
+    // If the segment includes a previous compaction summary, this counts the *summary* tokens,
+    // not the original uncompressed history tokens. This effectively tracks the "compressed size"
+    // of the history prior to the new cut point.
     let tokens_before = estimate_context_tokens(&usage_messages).tokens;
 
     if !should_compact(tokens_before, settings.context_window_tokens, &settings) {
@@ -870,11 +907,14 @@ pub fn prepare_compaction(
         }
     }
 
+    let mut tool_status = build_tool_status_map(&messages_to_summarize);
+    tool_status.extend(build_tool_status_map(&turn_prefix_messages));
+
     for msg in &messages_to_summarize {
-        extract_file_ops_from_message(msg, &mut file_ops);
+        extract_file_ops_from_message(msg, &mut file_ops, &tool_status);
     }
     for msg in &turn_prefix_messages {
-        extract_file_ops_from_message(msg, &mut file_ops);
+        extract_file_ops_from_message(msg, &mut file_ops, &tool_status);
     }
 
     Some(CompactionPreparation {
@@ -1203,7 +1243,9 @@ mod tests {
     fn extract_file_ops_read() {
         let msg = make_assistant_tool_call("read", json!({"path": "/foo/bar.rs"}));
         let mut ops = FileOperations::default();
-        extract_file_ops_from_message(&msg, &mut ops);
+        let mut status = HashMap::new();
+        status.insert("call_1".to_string(), true);
+        extract_file_ops_from_message(&msg, &mut ops, &status);
         assert!(ops.read.contains("/foo/bar.rs"));
         assert!(ops.written.is_empty());
         assert!(ops.edited.is_empty());
@@ -1213,7 +1255,9 @@ mod tests {
     fn extract_file_ops_write() {
         let msg = make_assistant_tool_call("write", json!({"path": "/out.txt"}));
         let mut ops = FileOperations::default();
-        extract_file_ops_from_message(&msg, &mut ops);
+        let mut status = HashMap::new();
+        status.insert("call_1".to_string(), true);
+        extract_file_ops_from_message(&msg, &mut ops, &status);
         assert!(ops.written.contains("/out.txt"));
         assert!(ops.read.is_empty());
     }
@@ -1222,15 +1266,29 @@ mod tests {
     fn extract_file_ops_edit() {
         let msg = make_assistant_tool_call("edit", json!({"path": "/src/main.rs"}));
         let mut ops = FileOperations::default();
-        extract_file_ops_from_message(&msg, &mut ops);
+        let mut status = HashMap::new();
+        status.insert("call_1".to_string(), true);
+        extract_file_ops_from_message(&msg, &mut ops, &status);
         assert!(ops.edited.contains("/src/main.rs"));
+    }
+
+    #[test]
+    fn extract_file_ops_ignores_failed_tools() {
+        let msg = make_assistant_tool_call("read", json!({"path": "/secret.rs"}));
+        let mut ops = FileOperations::default();
+        let mut status = HashMap::new();
+        status.insert("call_1".to_string(), false); // Failed!
+        extract_file_ops_from_message(&msg, &mut ops, &status);
+        assert!(ops.read.is_empty());
     }
 
     #[test]
     fn extract_file_ops_ignores_other_tools() {
         let msg = make_assistant_tool_call("bash", json!({"command": "ls"}));
         let mut ops = FileOperations::default();
-        extract_file_ops_from_message(&msg, &mut ops);
+        let mut status = HashMap::new();
+        status.insert("call_1".to_string(), true);
+        extract_file_ops_from_message(&msg, &mut ops, &status);
         assert!(ops.read.is_empty());
         assert!(ops.written.is_empty());
         assert!(ops.edited.is_empty());
@@ -1240,7 +1298,8 @@ mod tests {
     fn extract_file_ops_ignores_user_messages() {
         let msg = make_user_text("read the file /foo.rs");
         let mut ops = FileOperations::default();
-        extract_file_ops_from_message(&msg, &mut ops);
+        let status = HashMap::new();
+        extract_file_ops_from_message(&msg, &mut ops, &status);
         assert!(ops.read.is_empty());
     }
 
@@ -1889,7 +1948,9 @@ mod tests {
     fn prepare_compaction_tracks_file_ops() {
         let entries = vec![
             tool_call_entry("1", "read", "/src/main.rs"),
+            tool_result_entry("1r", "ok"),
             tool_call_entry("2", "edit", "/src/lib.rs"),
+            tool_result_entry("2r", "ok"),
             user_entry("3", &"x".repeat(100_000)),
             assistant_entry("4", &"y".repeat(100_000), 80000, 30000),
             user_entry("5", "recent"),
