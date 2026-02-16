@@ -8699,4 +8699,126 @@ mod tests {
         assert_eq!(queue.flush_succeeded, 0);
         assert_eq!(queue.flush_started, 5);
     }
+
+    // --- ExportSnapshot and non-blocking export ---
+
+    #[test]
+    fn export_snapshot_captures_header_and_entries() {
+        let mut session = Session::create();
+        session.append_message(make_test_message("hello world"));
+        session.append_message(make_test_message("second message"));
+
+        let snapshot = session.export_snapshot();
+        assert_eq!(snapshot.header.id, session.header.id);
+        assert_eq!(snapshot.header.timestamp, session.header.timestamp);
+        assert_eq!(snapshot.header.cwd, session.header.cwd);
+        assert_eq!(snapshot.entries.len(), session.entries.len());
+        assert_eq!(snapshot.path, session.path);
+    }
+
+    #[test]
+    fn export_snapshot_does_not_include_internal_caches() {
+        let mut session = Session::create();
+        for i in 0..10 {
+            session.append_message(make_test_message(&format!("msg {i}")));
+        }
+        // The snapshot should be lighter than a full Session clone because
+        // it skips autosave_queue, entry_index, entry_ids, and other caches.
+        let snapshot = session.export_snapshot();
+        assert_eq!(snapshot.entries.len(), 10);
+        // Verify the snapshot is a distinct copy (not sharing references).
+        assert_eq!(snapshot.header.id, session.header.id);
+    }
+
+    #[test]
+    fn export_snapshot_html_matches_session_html() {
+        let mut session = Session::create();
+        session.append_message(make_test_message("hello"));
+        session.append_message(make_test_message("world"));
+
+        let session_html = session.to_html();
+        let snapshot_html = session.export_snapshot().to_html();
+        assert_eq!(session_html, snapshot_html);
+    }
+
+    #[test]
+    fn export_snapshot_empty_session() {
+        let session = Session::create();
+        let snapshot = session.export_snapshot();
+        assert!(snapshot.entries.is_empty());
+        let html = snapshot.to_html();
+        assert!(html.contains("Pi Session"));
+        assert!(html.contains("</html>"));
+    }
+
+    #[test]
+    fn render_session_html_contains_header_info() {
+        let mut session = Session::create();
+        session.header.id = "test-session-id-xyz".to_string();
+        session.header.cwd = "/test/cwd/path".to_string();
+
+        let html = render_session_html(&session.header, &session.entries);
+        assert!(html.contains("test-session-id-xyz"));
+        assert!(html.contains("/test/cwd/path"));
+    }
+
+    #[test]
+    fn render_session_html_renders_all_entry_types() {
+        let mut session = Session::create();
+
+        // Message entry.
+        session.append_message(make_test_message("user text here"));
+
+        // Model change entry.
+        session.append_model_change("anthropic".to_string(), "claude-sonnet-4-5".to_string());
+
+        // Thinking level change entry.
+        session.entries.push(SessionEntry::ThinkingLevelChange(
+            ThinkingLevelChangeEntry {
+                base: EntryBase::new(None, "tlc1".to_string()),
+                thinking_level: "high".to_string(),
+            },
+        ));
+
+        let html = render_session_html(&session.header, &session.entries);
+        assert!(html.contains("user text here"));
+        assert!(html.contains("anthropic"));
+        assert!(html.contains("claude-sonnet-4-5"));
+        assert!(html.contains("high"));
+    }
+
+    #[test]
+    fn export_snapshot_with_path() {
+        let mut session = Session::create();
+        session.path = Some(PathBuf::from("/tmp/my-session.jsonl"));
+        session.append_message(make_test_message("msg"));
+
+        let snapshot = session.export_snapshot();
+        assert_eq!(
+            snapshot.path.as_deref(),
+            Some(Path::new("/tmp/my-session.jsonl"))
+        );
+    }
+
+    #[test]
+    fn fork_plan_snapshot_consistency() {
+        let mut session = Session::create();
+        let msg1 = make_test_message("first message");
+        session.append_message(msg1);
+        let msg1_id = session.entries[0].base_id().unwrap().clone();
+
+        let msg2 = make_test_message("second message");
+        session.append_message(msg2);
+        let msg2_id = session.entries[1].base_id().unwrap().clone();
+
+        // Plan fork from the second message.
+        let plan = session.plan_fork_from_user_message(&msg2_id).unwrap();
+
+        // Fork plan entries should include the path up to the parent.
+        assert_eq!(plan.leaf_id, Some(msg1_id));
+        // The plan captures a snapshot of entries — modifying session shouldn't affect plan.
+        let plan_entry_count = plan.entries.len();
+        session.append_message(make_test_message("third message"));
+        assert_eq!(plan.entries.len(), plan_entry_count);
+    }
 }

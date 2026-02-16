@@ -44,6 +44,7 @@ fn loom_epoch_pin_blocks_reclamation_until_release() {
             assert_eq!(snapshot.reclamation_mode, HostcallQueueMode::Ebr);
             assert!(snapshot.retired_backlog >= 2);
             assert_eq!(snapshot.reclaimed_total, 0);
+            drop(queue);
         });
 
         worker.join().expect("worker join");
@@ -55,6 +56,7 @@ fn loom_epoch_pin_blocks_reclamation_until_release() {
         let snapshot = queue.snapshot();
         assert_eq!(snapshot.retired_backlog, 0);
         assert!(snapshot.reclaimed_total >= 2);
+        drop(queue);
     });
 }
 
@@ -84,6 +86,7 @@ fn loom_concurrent_enqueue_dequeue_keeps_values_unique() {
 
         let mut queue = queue.lock().expect("lock queue");
         let drained = queue.drain_all();
+        drop(queue);
         let mut values = drained.into_iter().collect::<Vec<_>>();
         values.sort_unstable();
         assert_eq!(values, vec![10, 11]);

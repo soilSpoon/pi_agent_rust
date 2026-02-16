@@ -3072,13 +3072,12 @@ fn capture_baseline_cross_env_diagnosis_emits_structured_report_and_log() {
         .output()
         .expect("run capture_baseline cross-env diagnosis");
 
-    if !output.status.success() {
-        panic!(
-            "capture_baseline diagnosis failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(
+        output.status.success(),
+        "capture_baseline diagnosis failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     assert!(
         diagnosis_out.exists(),
