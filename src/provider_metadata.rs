@@ -2647,4 +2647,120 @@ mod tests {
             );
         }
     }
+
+    mod proptest_provider_metadata {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// `provider_metadata` never panics on arbitrary input.
+            #[test]
+            fn provider_metadata_never_panics(s in ".*") {
+                let _ = provider_metadata(&s);
+            }
+
+            /// Empty string always returns None.
+            #[test]
+            fn provider_metadata_empty_returns_none(_dummy in 0..10u32) {
+                assert!(provider_metadata("").is_none());
+                assert!(canonical_provider_id("").is_none());
+                assert!(provider_auth_env_keys("").is_empty());
+                assert!(provider_routing_defaults("").is_none());
+            }
+
+            /// All canonical IDs resolve to themselves.
+            #[test]
+            fn canonical_ids_resolve_to_self(idx in 0..PROVIDER_METADATA.len()) {
+                let meta = &PROVIDER_METADATA[idx];
+                let resolved = canonical_provider_id(meta.canonical_id);
+                assert_eq!(resolved, Some(meta.canonical_id));
+            }
+
+            /// Lookup is case-insensitive for all canonical IDs.
+            #[test]
+            fn case_insensitive_lookup(idx in 0..PROVIDER_METADATA.len()) {
+                let meta = &PROVIDER_METADATA[idx];
+                let upper = provider_metadata(&meta.canonical_id.to_uppercase());
+                let lower = provider_metadata(&meta.canonical_id.to_lowercase());
+                assert!(upper.is_some());
+                assert!(lower.is_some());
+                assert_eq!(upper.unwrap().canonical_id, lower.unwrap().canonical_id);
+            }
+
+            /// All aliases resolve to the same canonical ID.
+            #[test]
+            fn aliases_resolve_to_canonical(idx in 0..PROVIDER_METADATA.len()) {
+                let meta = &PROVIDER_METADATA[idx];
+                for alias in meta.aliases {
+                    let resolved = canonical_provider_id(alias);
+                    assert_eq!(
+                        resolved,
+                        Some(meta.canonical_id),
+                        "alias '{alias}' should resolve to '{}'",
+                        meta.canonical_id
+                    );
+                }
+            }
+
+            /// `canonical_provider_id` is idempotent.
+            #[test]
+            fn canonical_id_is_idempotent(idx in 0..PROVIDER_METADATA.len()) {
+                let meta = &PROVIDER_METADATA[idx];
+                let first = canonical_provider_id(meta.canonical_id).unwrap();
+                let second = canonical_provider_id(first).unwrap();
+                assert_eq!(first, second);
+            }
+
+            /// Unknown providers return None.
+            #[test]
+            fn unknown_provider_returns_none(s in "[a-z]{20,30}") {
+                // 20+ char lowercase strings won't match any provider
+                assert!(provider_metadata(&s).is_none());
+                assert!(canonical_provider_id(&s).is_none());
+                assert!(provider_auth_env_keys(&s).is_empty());
+                assert!(provider_routing_defaults(&s).is_none());
+            }
+
+            /// Auth env keys (when present) are valid environment variable names.
+            #[test]
+            fn auth_env_keys_are_valid_env_vars(idx in 0..PROVIDER_METADATA.len()) {
+                let meta = &PROVIDER_METADATA[idx];
+                let keys = provider_auth_env_keys(meta.canonical_id);
+                // Some providers (e.g. ollama) have no auth keys — that's valid.
+                for &key in keys {
+                    assert!(!key.is_empty());
+                    assert!(
+                        key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                        "invalid env var name: {key}"
+                    );
+                }
+            }
+
+            /// `provider_auth_env_keys` matches `provider_metadata().auth_env_keys`.
+            #[test]
+            fn auth_keys_consistent_with_metadata(idx in 0..PROVIDER_METADATA.len()) {
+                let meta = &PROVIDER_METADATA[idx];
+                let keys = provider_auth_env_keys(meta.canonical_id);
+                assert_eq!(keys, meta.auth_env_keys);
+            }
+
+            /// `provider_routing_defaults` matches `provider_metadata().routing_defaults`.
+            #[test]
+            fn routing_defaults_consistent_with_metadata(idx in 0..PROVIDER_METADATA.len()) {
+                let meta = &PROVIDER_METADATA[idx];
+                let defaults = provider_routing_defaults(meta.canonical_id);
+                match (defaults, meta.routing_defaults) {
+                    (Some(d), Some(m)) => {
+                        assert_eq!(d.base_url, m.base_url);
+                        assert_eq!(d.api, m.api);
+                    }
+                    (None, None) => {}
+                    _ => panic!(
+                        "mismatch for '{}': fn={:?} meta={:?}",
+                        meta.canonical_id, defaults, meta.routing_defaults
+                    ),
+                }
+            }
+        }
+    }
 }

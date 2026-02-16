@@ -2037,4 +2037,142 @@ mod tests {
             "Nothing before the turn to summarize"
         );
     }
+
+    mod proptest_compaction {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// `calculate_context_tokens`: if total > 0, returns total.
+            #[test]
+            fn calc_context_tokens_total_wins(
+                input in 0..1_000_000u64,
+                output in 0..1_000_000u64,
+                total in 1..2_000_000u64,
+            ) {
+                let usage = Usage {
+                    input,
+                    output,
+                    total_tokens: total,
+                    ..Usage::default()
+                };
+                assert_eq!(calculate_context_tokens(&usage), total);
+            }
+
+            /// `calculate_context_tokens`: if total == 0, returns input + output.
+            #[test]
+            fn calc_context_tokens_fallback(
+                input in 0..1_000_000u64,
+                output in 0..1_000_000u64,
+            ) {
+                let usage = Usage {
+                    input,
+                    output,
+                    total_tokens: 0,
+                    ..Usage::default()
+                };
+                assert_eq!(calculate_context_tokens(&usage), input + output);
+            }
+
+            /// `should_compact` returns false when disabled.
+            #[test]
+            fn should_compact_disabled_returns_false(
+                ctx_tokens in 0..1_000_000u64,
+                window in 0..500_000u32,
+            ) {
+                let settings = ResolvedCompactionSettings {
+                    enabled: false,
+                    context_window_tokens: window,
+                    reserve_tokens: 16_384,
+                    keep_recent_tokens: 20_000,
+                };
+                assert!(!should_compact(ctx_tokens, window, &settings));
+            }
+
+            /// `should_compact` threshold: tokens > window - reserve.
+            #[test]
+            fn should_compact_threshold(
+                ctx_tokens in 0..500_000u64,
+                window in 0..300_000u32,
+                reserve in 0..100_000u32,
+            ) {
+                let settings = ResolvedCompactionSettings {
+                    enabled: true,
+                    context_window_tokens: window,
+                    reserve_tokens: reserve,
+                    keep_recent_tokens: 20_000,
+                };
+                let threshold = u64::from(window).saturating_sub(u64::from(reserve));
+                let result = should_compact(ctx_tokens, window, &settings);
+                assert_eq!(result, ctx_tokens > threshold);
+            }
+
+            /// `format_file_operations`: empty lists produce empty string.
+            #[test]
+            fn format_file_ops_empty(_dummy in 0..10u32) {
+                let result = format_file_operations(&[], &[]);
+                assert!(result.is_empty());
+            }
+
+            /// `format_file_operations`: read files produce `<read-files>` tag.
+            #[test]
+            fn format_file_ops_read_tag(
+                files in prop::collection::vec("[a-z./]{1,20}", 1..5),
+            ) {
+                let result = format_file_operations(&files, &[]);
+                assert!(result.contains("<read-files>"));
+                assert!(result.contains("</read-files>"));
+                assert!(!result.contains("<modified-files>"));
+                for f in &files {
+                    assert!(result.contains(f.as_str()));
+                }
+            }
+
+            /// `format_file_operations`: modified files produce `<modified-files>` tag.
+            #[test]
+            fn format_file_ops_modified_tag(
+                files in prop::collection::vec("[a-z./]{1,20}", 1..5),
+            ) {
+                let result = format_file_operations(&[], &files);
+                assert!(!result.contains("<read-files>"));
+                assert!(result.contains("<modified-files>"));
+                assert!(result.contains("</modified-files>"));
+                for f in &files {
+                    assert!(result.contains(f.as_str()));
+                }
+            }
+
+            /// `compute_file_lists`: modified = edited ∪ written, read_only = read \ modified.
+            #[test]
+            fn compute_file_lists_set_algebra(
+                read in prop::collection::hash_set("[a-z]{1,5}", 0..5),
+                written in prop::collection::hash_set("[a-z]{1,5}", 0..5),
+                edited in prop::collection::hash_set("[a-z]{1,5}", 0..5),
+            ) {
+                let file_ops = FileOperations {
+                    read: read.clone(),
+                    written: written.clone(),
+                    edited: edited.clone(),
+                };
+                let (read_only, modified) = compute_file_lists(&file_ops);
+                // Modified = edited ∪ written
+                let expected_modified: HashSet<&String> =
+                    edited.iter().chain(written.iter()).collect();
+                let actual_modified: HashSet<&String> = modified.iter().collect();
+                assert_eq!(actual_modified, expected_modified);
+                // Read-only = read \ modified (no overlap)
+                for f in &read_only {
+                    assert!(!modified.contains(f), "overlap: {f}");
+                    assert!(read.contains(f));
+                }
+                // Both are sorted
+                for pair in read_only.windows(2) {
+                    assert!(pair[0] <= pair[1]);
+                }
+                for pair in modified.windows(2) {
+                    assert!(pair[0] <= pair[1]);
+                }
+            }
+        }
+    }
 }
