@@ -8015,12 +8015,12 @@ mod tests {
 
     #[test]
     fn test_clone_has_independent_persisted_entry_count() {
-        let mut session = Session::create();
+        let session = Session::create();
         // Set initial count
         session.persisted_entry_count.store(10, Ordering::SeqCst);
 
         // Clone the session
-        let mut clone = session.clone();
+        let clone = session.clone();
 
         // Verify clone sees initial value
         assert_eq!(clone.persisted_entry_count.load(Ordering::SeqCst), 10);

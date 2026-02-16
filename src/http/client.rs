@@ -384,15 +384,18 @@ async fn read_response_head(
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(8192);
     let mut scratch = [0u8; READ_CHUNK_BYTES];
+    let mut search_start = 0;
 
     loop {
         if buf.len() > MAX_HEADER_BYTES {
             return Err(Error::api("HTTP response headers too large"));
         }
 
-        if let Some(pos) = find_headers_end(&buf) {
-            let head = &buf[..pos];
-            let leftover = buf[pos..].to_vec();
+        let haystack = &buf[search_start..];
+        if let Some(pos) = find_headers_end(haystack) {
+            let absolute_pos = search_start + pos;
+            let head = &buf[..absolute_pos];
+            let leftover = buf[absolute_pos..].to_vec();
             let (status, headers) = parse_response_head(head)?;
             return Ok((status, headers, leftover));
         }
@@ -401,7 +404,9 @@ async fn read_response_head(
         if n == 0 {
             return Err(Error::api("HTTP connection closed before headers"));
         }
+        let old_len = buf.len();
         buf.extend_from_slice(&scratch[..n]);
+        search_start = old_len.saturating_sub(3);
     }
 }
 

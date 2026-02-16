@@ -317,7 +317,13 @@ where
                     // Hard UTF-8 error: skip invalid sequence, keep the rest.
                     let mut remainder = bytes;
                     remainder.drain(..valid_len + invalid_len);
-                    self.utf8_buffer = remainder;
+
+                    // Try to recover valid text from the remainder immediately
+                    match std::str::from_utf8(&remainder) {
+                        Ok(s) => self.feed_to_pending(s),
+                        Err(_) => self.utf8_buffer = remainder,
+                    }
+
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
                 }
 
@@ -345,7 +351,13 @@ where
                 if let Some(invalid_len) = err.error_len() {
                     // Hard UTF-8 error: skip invalid sequence, keep the rest.
                     utf8_buffer.drain(..valid_len + invalid_len);
-                    self.utf8_buffer = utf8_buffer;
+
+                    // Try to recover valid text from the remainder immediately
+                    match std::str::from_utf8(&utf8_buffer) {
+                        Ok(s) => self.feed_to_pending(s),
+                        Err(_) => self.utf8_buffer = utf8_buffer,
+                    }
+
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
                 }
 
@@ -1081,6 +1093,34 @@ data: {"type":"message_stop"}
                 .expect("second item")
                 .expect_err("second should be utf8 error");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{diag}");
+        });
+    }
+
+    #[test]
+    fn test_stream_resumes_parsing_remainder_after_utf8_error() {
+        // "data: ok\n\n" (valid) + 0xFF (invalid) + "data: after\n\n" (valid)
+        // Sent in one chunk.
+        // Expect: Ok(ok), Err(invalid), Ok(after)
+
+        let mut bytes = b"data: ok\n\n".to_vec();
+        bytes.push(0xFF);
+        bytes.extend_from_slice(b"data: after\n\n");
+
+        let mut stream = SseStream::new(stream::iter(vec![Ok(bytes)]));
+
+        futures::executor::block_on(async {
+            // 1. "ok"
+            let first = stream.next().await.expect("1").expect("ok");
+            assert_eq!(first.data, "ok");
+
+            // 2. Error
+            let err = stream.next().await.expect("2").expect_err("error");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+            // 3. "after"
+            // Ensure the remainder was successfully processed and didn't get dropped
+            let second = stream.next().await.expect("3").expect("after");
+            assert_eq!(second.data, "after");
         });
     }
 

@@ -1933,9 +1933,6 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             let mut partial = Vec::new();
 
             loop {
-                // If we have a partial suffix, copy it to the start of the buffer
-                // to simplify the read logic, or just append to it?
-                // Simpler: read into buf, then process `partial + buf`.
                 let read = reader.read(&mut buf).map_err(|err| err.to_string())?;
                 if read == 0 {
                     // EOF. Flush partial if any (lossy).
@@ -1952,122 +1949,122 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 }
 
                 let chunk = &buf[..read];
-                let (valid, suffix) = if partial.is_empty() {
-                    // Fast path: try parsing the whole chunk
-                    match std::str::from_utf8(chunk) {
-                        Ok(s) => (s, None),
-                        Err(e) => {
-                            let valid_len = e.valid_up_to();
-                            let s = std::str::from_utf8(&chunk[..valid_len])
-                                .map_err(|err| err.to_string())?;
-                            if e.error_len().is_none() {
-                                // Incomplete sequence at end
-                                (s, Some(&chunk[valid_len..]))
-                            } else {
-                                // Invalid sequence in middle - valid up to error,
-                                // but we might want to recover.
-                                // Simplest robust strategy: use from_utf8_lossy on the whole thing?
-                                // No, that replaces.
-                                // We want to wait for more data ONLY if it's an incomplete sequence at the end.
-                                // If error_len() is Some, it's a real error.
-                                // If error_len() is None, it's incomplete.
-                                (s, Some(&chunk[valid_len..]))
-                            }
-                        }
-                    }
-                } else {
-                    // Slow path: append to partial
-                    partial.extend_from_slice(chunk);
-                    match std::str::from_utf8(&partial) {
-                        Ok(s) => {
-                            // This borrows from partial, which we are about to clear.
-                            // We need to emit and clear.
-                            // To return a &str, we can't mutate partial.
-                            // Let's just handle logic inline.
-                            let text = s.to_string();
-                            let frame = if stdout {
-                                ExecStreamFrame::Stdout(text)
-                            } else {
-                                ExecStreamFrame::Stderr(text)
-                            };
-                            if tx.send(frame).is_err() {
-                                return Ok(());
-                            }
-                            partial.clear();
-                            continue;
-                        }
-                        Err(e) => {
-                            let valid_len = e.valid_up_to();
-                            let s = std::str::from_utf8(&partial[..valid_len])
-                                .map_err(|err| err.to_string())?;
-                            let text = s.to_string();
-                            if !text.is_empty() {
-                                let frame = if stdout {
-                                    ExecStreamFrame::Stdout(text)
-                                } else {
-                                    ExecStreamFrame::Stderr(text)
-                                };
-                                if tx.send(frame).is_err() {
-                                    return Ok(());
-                                }
-                            }
-                            
-                            if e.error_len().is_none() {
-                                // Incomplete at end
-                                let new_partial = partial[valid_len..].to_vec();
-                                partial = new_partial;
-                                continue;
-                            } else {
-                                // Real error. Emit replacement and continue?
-                                // String::from_utf8_lossy will handle this gracefully.
-                                // But we want to preserve the incomplete suffix check.
-                                // Ideally we'd valid-up-to, then replace one char, then try again?
-                                // Too complex. 
-                                // Let's just treat "real error" as "emit lossy and clear".
-                                // BUT we must distinguish "incomplete" from "invalid".
-                                // std::str::from_utf8 returns Utf8Error.
-                                // error_len() is None if incomplete.
-                                // So if None, keep suffix.
-                                // If Some, it's invalid. We can consume the invalid part (lossy) or just emit it.
-                                // Let's simplify: 
-                                // If we have partial, and we added data, and it's STILL valid_up_to same point and error_len is None?
-                                // Actually, if we have partial data and add more, and it's still incomplete, we just keep accumulating.
-                                // LIMIT: if partial grows too large (e.g. 4KB), force flush lossy.
-                                if partial.len() > 4096 {
-                                     let text = String::from_utf8_lossy(&partial).to_string();
-                                     let frame = if stdout {
-                                        ExecStreamFrame::Stdout(text)
+
+                // If we have partial data, we must append the new chunk and process the combined buffer.
+                // If partial is empty, we can process the chunk directly (fast path).
+                if partial.is_empty() {
+                    let mut processed = 0;
+                    loop {
+                        match std::str::from_utf8(&chunk[processed..]) {
+                            Ok(s) => {
+                                if !s.is_empty() {
+                                    let frame = if stdout {
+                                        ExecStreamFrame::Stdout(s.to_string())
                                     } else {
-                                        ExecStreamFrame::Stderr(text)
+                                        ExecStreamFrame::Stderr(s.to_string())
                                     };
                                     if tx.send(frame).is_err() {
                                         return Ok(());
                                     }
-                                    partial.clear();
-                                } else {
-                                    let new_partial = partial[valid_len..].to_vec();
-                                    partial = new_partial;
                                 }
-                                continue;
+                                break;
+                            }
+                            Err(e) => {
+                                let valid_len = e.valid_up_to();
+                                if valid_len > 0 {
+                                    let s = std::str::from_utf8(
+                                        &chunk[processed..processed + valid_len],
+                                    )
+                                    .expect("valid utf8 prefix");
+                                    let frame = if stdout {
+                                        ExecStreamFrame::Stdout(s.to_string())
+                                    } else {
+                                        ExecStreamFrame::Stderr(s.to_string())
+                                    };
+                                    if tx.send(frame).is_err() {
+                                        return Ok(());
+                                    }
+                                    processed += valid_len;
+                                }
+
+                                if let Some(len) = e.error_len() {
+                                    // Invalid sequence: emit replacement and skip
+                                    let frame = if stdout {
+                                        ExecStreamFrame::Stdout("\u{FFFD}".to_string())
+                                    } else {
+                                        ExecStreamFrame::Stderr("\u{FFFD}".to_string())
+                                    };
+                                    if tx.send(frame).is_err() {
+                                        return Ok(());
+                                    }
+                                    processed += len;
+                                } else {
+                                    // Incomplete at end: buffer the remainder
+                                    partial.extend_from_slice(&chunk[processed..]);
+                                    break;
+                                }
                             }
                         }
                     }
-                };
+                } else {
+                    partial.extend_from_slice(chunk);
+                    let mut processed = 0;
+                    loop {
+                        match std::str::from_utf8(&partial[processed..]) {
+                            Ok(s) => {
+                                if !s.is_empty() {
+                                    let frame = if stdout {
+                                        ExecStreamFrame::Stdout(s.to_string())
+                                    } else {
+                                        ExecStreamFrame::Stderr(s.to_string())
+                                    };
+                                    if tx.send(frame).is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                partial.clear();
+                                break;
+                            }
+                            Err(e) => {
+                                let valid_len = e.valid_up_to();
+                                if valid_len > 0 {
+                                    let s = std::str::from_utf8(
+                                        &partial[processed..processed + valid_len],
+                                    )
+                                    .expect("valid utf8 prefix");
+                                    let frame = if stdout {
+                                        ExecStreamFrame::Stdout(s.to_string())
+                                    } else {
+                                        ExecStreamFrame::Stderr(s.to_string())
+                                    };
+                                    if tx.send(frame).is_err() {
+                                        return Ok(());
+                                    }
+                                    processed += valid_len;
+                                }
 
-                // Logic for the fast path (partial was empty)
-                if !valid.is_empty() {
-                    let frame = if stdout {
-                        ExecStreamFrame::Stdout(valid.to_string())
-                    } else {
-                        ExecStreamFrame::Stderr(valid.to_string())
-                    };
-                    if tx.send(frame).is_err() {
-                        return Ok(());
+                                if let Some(len) = e.error_len() {
+                                    // Invalid sequence
+                                    let frame = if stdout {
+                                        ExecStreamFrame::Stdout("\u{FFFD}".to_string())
+                                    } else {
+                                        ExecStreamFrame::Stderr("\u{FFFD}".to_string())
+                                    };
+                                    if tx.send(frame).is_err() {
+                                        return Ok(());
+                                    }
+                                    processed += len;
+                                } else {
+                                    // Incomplete at end
+                                    // Move remaining bytes to start of partial
+                                    let remaining = partial.len() - processed;
+                                    partial.copy_within(processed.., 0);
+                                    partial.truncate(remaining);
+                                    break;
+                                }
+                            }
+                        }
                     }
-                }
-
-                if let Some(s) = suffix {
-                    partial.extend_from_slice(s);
                 }
             }
             Ok(())
@@ -4088,6 +4085,61 @@ mod tests {
                 )
                 .await
                 .expect("verify async iterator result");
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dispatcher_exec_hostcall_handles_invalid_utf8() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Output 'a', then invalid 0xFF, then 'b'.
+            // Expected: 'a' in one chunk (or part of chunk), then replacement char, then 'b'.
+            // Note: printf '\xff' might vary by shell, but \377 should work.
+            runtime
+                .eval(
+                    r#"
+                    globalThis.output = "";
+                    pi.exec("sh", ["-c", "printf 'a\\377b'"], { stream: true })
+                        .then(async (stream) => {
+                            for await (const chunk of stream) {
+                                if (chunk.stdout) globalThis.output += chunk.stdout;
+                            }
+                        });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    // \uFFFD is the replacement character
+                    if (globalThis.output !== "a\uFFFDb") {
+                        throw new Error("Expected 'a\\uFFFDb', got: " + globalThis.output + " (len " + globalThis.output.length + ")");
+                    }
+                "#,
+                )
+                .await
+                .expect("verify invalid utf8 handling");
         });
     }
 

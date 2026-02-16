@@ -2344,6 +2344,15 @@ impl Tool for EditTool {
         // Restore original file permissions (tempfile defaults to 0o600) before persisting.
         if let Some(perms) = original_perms {
             let _ = temp_file.as_file().set_permissions(perms);
+        } else {
+            // Default to 0644 (rw-r--r--) instead of tempfile's 0600 if we couldn't read original perms.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = temp_file
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o644));
+            }
         }
 
         temp_file
