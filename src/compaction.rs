@@ -206,30 +206,44 @@ fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String>) {
     (read_only, modified_files)
 }
 
-fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
-    let escape = |s: &String| s.replace('<', "&lt;").replace('>', "&gt;");
+fn write_escaped_file_list(out: &mut String, tag: &str, files: &[String]) {
+    out.push('<');
+    out.push_str(tag);
+    out.push_str(">\n");
+    for (i, file) in files.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        // Inline escape: replace < and > in file paths
+        for ch in file.chars() {
+            match ch {
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                _ => out.push(ch),
+            }
+        }
+    }
+    out.push_str("\n</");
+    out.push_str(tag);
+    out.push('>');
+}
 
-    let mut sections = Vec::new();
-    if !read_files.is_empty() {
-        sections.push(format!(
-            "<read-files>\n{}\n</read-files>",
-            read_files.iter().map(escape).collect::<Vec<_>>().join("\n")
-        ));
-    }
-    if !modified_files.is_empty() {
-        sections.push(format!(
-            "<modified-files>\n{}\n</modified-files>",
-            modified_files
-                .iter()
-                .map(escape)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    if sections.is_empty() {
+fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
+    if read_files.is_empty() && modified_files.is_empty() {
         return String::new();
     }
-    format!("\n\n{}", sections.join("\n\n"))
+
+    let mut out = String::from("\n\n");
+    if !read_files.is_empty() {
+        write_escaped_file_list(&mut out, "read-files", read_files);
+    }
+    if !modified_files.is_empty() {
+        if !read_files.is_empty() {
+            out.push_str("\n\n");
+        }
+        write_escaped_file_list(&mut out, "modified-files", modified_files);
+    }
+    out
 }
 
 // =============================================================================
@@ -473,22 +487,14 @@ fn find_cut_point(
         accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg_entry.message));
 
         if accumulated_tokens >= u64::from(keep_recent_tokens) {
-            let mut found = false;
-            // Find the largest cut point <= i (start earlier or at i to keep enough tokens)
-            for &cut_point in cut_points.iter().rev() {
-                if cut_point <= i {
-                    cut_index = cut_point;
-                    found = true;
-                    break;
-                }
+            // Binary search: find the largest cut point <= i.
+            // `partition_point` returns the index of the first element > i,
+            // so idx-1 is the largest element <= i (if any).
+            let pos = cut_points.partition_point(|&cp| cp <= i);
+            if pos > 0 {
+                cut_index = cut_points[pos - 1];
             }
-            if !found {
-                // If no cut point <= i (e.g. i is before the first valid cut),
-                // fall back to the earliest valid cut point.
-                if let Some(&first) = cut_points.first() {
-                    cut_index = first;
-                }
-            }
+            // else: no cut point <= i, keep the fallback (cut_points[0])
             break;
         }
     }
@@ -530,104 +536,195 @@ const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversati
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
 
-fn serialize_conversation(messages: &[Message]) -> String {
-    let mut parts: Vec<String> = Vec::new();
+fn push_message_separator(out: &mut String) {
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+}
 
-    for msg in messages {
-        match msg {
-            Message::User(user) => {
-                let content = match &user.content {
-                    UserContent::Text(text) => text.clone(),
-                    UserContent::Blocks(blocks) => blocks
-                        .iter()
-                        .filter_map(|c| match c {
-                            ContentBlock::Text(text) => Some(text.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(""),
-                };
-                if !content.is_empty() {
-                    parts.push(format!("[User]: {content}"));
-                }
-            }
-            Message::Custom(custom) => {
-                let label = if custom.custom_type.trim().is_empty() {
-                    "Custom".to_string()
-                } else {
-                    format!("Custom:{}", custom.custom_type)
-                };
-                if !custom.content.trim().is_empty() {
-                    parts.push(format!("[{label}]: {}", custom.content));
-                }
-            }
-            Message::Assistant(assistant) => {
-                let mut text_parts = Vec::new();
-                let mut thinking_parts = Vec::new();
-                let mut tool_calls = Vec::new();
+fn user_has_serializable_content(user: &UserMessage) -> bool {
+    match &user.content {
+        UserContent::Text(text) => !text.is_empty(),
+        UserContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|c| matches!(c, ContentBlock::Text(t) if !t.text.is_empty())),
+    }
+}
 
-                for block in &assistant.content {
-                    match block {
-                        ContentBlock::Text(text) => text_parts.push(text.text.clone()),
-                        ContentBlock::Thinking(thinking) => {
-                            thinking_parts.push(thinking.thinking.clone());
-                        }
-                        ContentBlock::ToolCall(call) => {
-                            let args_str = call.arguments.as_object().map_or_else(
-                                || {
-                                    serde_json::to_string(&call.arguments)
-                                        .unwrap_or_else(|_| call.arguments.to_string())
-                                },
-                                |obj| {
-                                    obj.iter()
-                                        .map(|(k, v)| {
-                                            format!(
-                                                "{k}={}",
-                                                serde_json::to_string(v)
-                                                    .unwrap_or_else(|_| v.to_string())
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                },
-                            );
-                            tool_calls.push(format!("{}({args_str})", call.name));
-                        }
-                        ContentBlock::Image(_) => {}
-                    }
-                }
+fn append_user_message(out: &mut String, user: &UserMessage) {
+    if !user_has_serializable_content(user) {
+        return;
+    }
 
-                if !thinking_parts.is_empty() {
-                    parts.push(format!(
-                        "[Assistant thinking]: {}",
-                        thinking_parts.join("\n")
-                    ));
-                }
-                if !text_parts.is_empty() {
-                    parts.push(format!("[Assistant]: {}", text_parts.join("\n")));
-                }
-                if !tool_calls.is_empty() {
-                    parts.push(format!("[Assistant tool calls]: {}", tool_calls.join("; ")));
-                }
-            }
-            Message::ToolResult(tool) => {
-                let content = tool
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        ContentBlock::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !content.is_empty() {
-                    parts.push(format!("[Tool result]: {content}"));
+    push_message_separator(out);
+    out.push_str("[User]: ");
+    match &user.content {
+        UserContent::Text(text) => out.push_str(text),
+        UserContent::Blocks(blocks) => {
+            for block in blocks {
+                if let ContentBlock::Text(text) = block {
+                    out.push_str(&text.text);
                 }
             }
         }
     }
+}
 
-    parts.join("\n\n")
+fn append_custom_message(out: &mut String, custom_type: &str, content: &str) {
+    if content.trim().is_empty() {
+        return;
+    }
+
+    push_message_separator(out);
+    out.push('[');
+    if custom_type.trim().is_empty() {
+        out.push_str("Custom");
+    } else {
+        out.push_str("Custom:");
+        out.push_str(custom_type);
+    }
+    out.push_str("]: ");
+    out.push_str(content);
+}
+
+fn assistant_content_flags(assistant: &AssistantMessage) -> (bool, bool, bool) {
+    let mut has_thinking = false;
+    let mut has_text = false;
+    let mut has_tools = false;
+    for block in &assistant.content {
+        match block {
+            ContentBlock::Thinking(_) => has_thinking = true,
+            ContentBlock::Text(_) => has_text = true,
+            ContentBlock::ToolCall(_) => has_tools = true,
+            ContentBlock::Image(_) => {}
+        }
+    }
+    (has_thinking, has_text, has_tools)
+}
+
+fn append_assistant_thinking(out: &mut String, assistant: &AssistantMessage) {
+    push_message_separator(out);
+    out.push_str("[Assistant thinking]: ");
+    let mut first = true;
+    for block in &assistant.content {
+        if let ContentBlock::Thinking(thinking) = block {
+            if !first {
+                out.push('\n');
+            }
+            out.push_str(&thinking.thinking);
+            first = false;
+        }
+    }
+}
+
+fn append_assistant_text(out: &mut String, assistant: &AssistantMessage) {
+    push_message_separator(out);
+    out.push_str("[Assistant]: ");
+    let mut first = true;
+    for block in &assistant.content {
+        if let ContentBlock::Text(text) = block {
+            if !first {
+                out.push('\n');
+            }
+            out.push_str(&text.text);
+            first = false;
+        }
+    }
+}
+
+fn append_tool_call_arguments(out: &mut String, arguments: &Value) {
+    if let Some(obj) = arguments.as_object() {
+        let mut first_kv = true;
+        for (k, v) in obj {
+            if !first_kv {
+                out.push_str(", ");
+            }
+            out.push_str(k);
+            out.push('=');
+            match serde_json::to_string(v) {
+                Ok(s) => out.push_str(&s),
+                Err(_) => {
+                    let _ = write!(out, "{v}");
+                }
+            }
+            first_kv = false;
+        }
+    } else {
+        match serde_json::to_string(arguments) {
+            Ok(s) => out.push_str(&s),
+            Err(_) => {
+                let _ = write!(out, "{arguments}");
+            }
+        }
+    }
+}
+
+fn append_assistant_tool_calls(out: &mut String, assistant: &AssistantMessage) {
+    push_message_separator(out);
+    out.push_str("[Assistant tool calls]: ");
+    let mut first = true;
+    for block in &assistant.content {
+        if let ContentBlock::ToolCall(call) = block {
+            if !first {
+                out.push_str("; ");
+            }
+            out.push_str(&call.name);
+            out.push('(');
+            append_tool_call_arguments(out, &call.arguments);
+            out.push(')');
+            first = false;
+        }
+    }
+}
+
+fn append_assistant_message(out: &mut String, assistant: &AssistantMessage) {
+    let (has_thinking, has_text, has_tools) = assistant_content_flags(assistant);
+    if has_thinking {
+        append_assistant_thinking(out, assistant);
+    }
+    if has_text {
+        append_assistant_text(out, assistant);
+    }
+    if has_tools {
+        append_assistant_tool_calls(out, assistant);
+    }
+}
+
+fn tool_result_has_serializable_content(content: &[ContentBlock]) -> bool {
+    content
+        .iter()
+        .any(|c| matches!(c, ContentBlock::Text(t) if !t.text.is_empty()))
+}
+
+fn append_tool_result_message(out: &mut String, content: &[ContentBlock]) {
+    if !tool_result_has_serializable_content(content) {
+        return;
+    }
+
+    push_message_separator(out);
+    out.push_str("[Tool result]: ");
+    for block in content {
+        if let ContentBlock::Text(text) = block {
+            out.push_str(&text.text);
+        }
+    }
+}
+
+fn serialize_conversation(messages: &[Message]) -> String {
+    let mut out = String::new();
+
+    for msg in messages {
+        match msg {
+            Message::User(user) => append_user_message(&mut out, user),
+            Message::Custom(custom) => {
+                append_custom_message(&mut out, &custom.custom_type, &custom.content);
+            }
+            Message::Assistant(assistant) => append_assistant_message(&mut out, assistant),
+            Message::ToolResult(tool) => append_tool_result_message(&mut out, &tool.content),
+        }
+    }
+
+    out
 }
 
 async fn complete_simple(
@@ -1180,8 +1277,8 @@ mod tests {
 
     #[test]
     fn estimate_tokens_user_text() {
-        let msg = make_user_text("hello world"); // 11 chars => ceil(11/4) = 3
-        assert_eq!(estimate_tokens(&msg), 3);
+        let msg = make_user_text("hello world"); // 11 chars => ceil(11/3) = 4
+        assert_eq!(estimate_tokens(&msg), 4);
     }
 
     #[test]
@@ -1192,14 +1289,14 @@ mod tests {
 
     #[test]
     fn estimate_tokens_assistant_text() {
-        let msg = make_assistant_text("hello", 10, 5); // 5 chars => ceil(5/4) = 2
+        let msg = make_assistant_text("hello", 10, 5); // 5 chars => ceil(5/3) = 2
         assert_eq!(estimate_tokens(&msg), 2);
     }
 
     #[test]
     fn estimate_tokens_tool_result() {
-        let msg = make_tool_result("file contents here"); // 18 chars => ceil(18/4) = 5
-        assert_eq!(estimate_tokens(&msg), 5);
+        let msg = make_tool_result("file contents here"); // 18 chars => ceil(18/3) = 6
+        assert_eq!(estimate_tokens(&msg), 6);
     }
 
     #[test]
@@ -1211,8 +1308,8 @@ mod tests {
             details: None,
             timestamp: Some(0),
         };
-        // 19 chars => ceil(19/4) = 5
-        assert_eq!(estimate_tokens(&msg), 5);
+        // 19 chars => ceil(19/3) = 7
+        assert_eq!(estimate_tokens(&msg), 7);
     }
 
     // ── estimate_context_tokens ──────────────────────────────────────
@@ -1226,7 +1323,7 @@ mod tests {
         ];
         let estimate = estimate_context_tokens(&messages);
         // Last assistant usage: input=50, output=10, total=60
-        // Trailing after that: "bye" = ceil(3/4) = 1
+        // Trailing after that: "bye" = ceil(3/3) = 1
         assert_eq!(estimate.tokens, 61);
         assert_eq!(estimate.last_usage_index, Some(1));
     }
@@ -1235,7 +1332,7 @@ mod tests {
     fn estimate_context_no_assistant() {
         let messages = vec![make_user_text("hello"), make_user_text("world")];
         let estimate = estimate_context_tokens(&messages);
-        // No assistant messages, so sum estimate_tokens for all: ceil(5/4)+ceil(5/4) = 2+2 = 4
+        // No assistant messages, so sum estimate_tokens for all: ceil(5/3)+ceil(5/3) = 2+2 = 4
         assert_eq!(estimate.tokens, 4);
         assert!(estimate.last_usage_index.is_none());
     }
@@ -1826,7 +1923,7 @@ mod tests {
             })]),
             timestamp: None,
         };
-        // Image = 4800 chars -> ceil(4800/4) = 1200
+        // Image = 3600 chars (IMAGE_CHAR_ESTIMATE) -> ceil(3600/3) = 1200
         assert_eq!(estimate_tokens(&msg), 1200);
     }
 
@@ -1839,8 +1936,8 @@ mod tests {
             })]),
             timestamp: None,
         };
-        // 20 chars -> ceil(20/4) = 5
-        assert_eq!(estimate_tokens(&msg), 5);
+        // 20 chars -> ceil(20/3) = 7
+        assert_eq!(estimate_tokens(&msg), 7);
     }
 
     #[test]
@@ -1855,8 +1952,8 @@ mod tests {
             timestamp: None,
             extra: HashMap::new(),
         };
-        // 7 + 3 = 10 chars -> ceil(10/4) = 3
-        assert_eq!(estimate_tokens(&msg), 3);
+        // 7 + 3 = 10 chars -> ceil(10/3) = 4
+        assert_eq!(estimate_tokens(&msg), 4);
     }
 
     #[test]
@@ -1865,7 +1962,8 @@ mod tests {
             summary: "a".repeat(40),
             from_id: "id".to_string(),
         };
-        assert_eq!(estimate_tokens(&msg), 10);
+        // 40 chars -> ceil(40/3) = 14
+        assert_eq!(estimate_tokens(&msg), 14);
     }
 
     #[test]
@@ -1874,7 +1972,8 @@ mod tests {
             summary: "a".repeat(80),
             tokens_before: 5000,
         };
-        assert_eq!(estimate_tokens(&msg), 20);
+        // 80 chars -> ceil(80/3) = 27
+        assert_eq!(estimate_tokens(&msg), 27);
     }
 
     // ── prepare_compaction ──────────────────────────────────────────

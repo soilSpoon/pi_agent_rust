@@ -267,7 +267,9 @@ fn tool_result(tool_call_id: &str, tool_name: &str, content: &str) -> SessionMes
 }
 
 fn text_of_tokens(tokens: usize) -> String {
-    "a".repeat(tokens.saturating_mul(4))
+    // Must match CHARS_PER_TOKEN_ESTIMATE (currently 3) in src/compaction.rs
+    // so that ceil(n*3 / 3) == n tokens exactly.
+    "a".repeat(tokens.saturating_mul(3))
 }
 
 fn entry_id(entry: &SessionEntry) -> Option<&str> {
@@ -699,7 +701,11 @@ fn compact_appends_file_operations_and_sorts_lists() {
                 ("read", json!({"path": "c.txt"})),
             ]),
         ),
-        message_entry("u2", Some("a1"), user_text(text_of_tokens(1))),
+        message_entry("tr1", Some("a1"), tool_result("call-0", "read", "ok")),
+        message_entry("tr2", Some("tr1"), tool_result("call-1", "write", "ok")),
+        message_entry("tr3", Some("tr2"), tool_result("call-2", "edit", "ok")),
+        message_entry("tr4", Some("tr3"), tool_result("call-3", "read", "ok")),
+        message_entry("u2", Some("tr4"), user_text(text_of_tokens(1))),
     ];
 
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
@@ -744,7 +750,8 @@ fn compact_seeds_file_ops_from_previous_compaction_details() {
             Some("c0"),
             assistant_with_tool_calls(vec![("read", json!({"path": "r2.txt"}))]),
         ),
-        message_entry("u1", Some("a1"), user_text(text_of_tokens(1))),
+        message_entry("tr1", Some("a1"), tool_result("call-0", "read", "ok")),
+        message_entry("u1", Some("tr1"), user_text(text_of_tokens(1))),
     ];
 
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
@@ -788,7 +795,8 @@ fn compact_does_not_seed_file_ops_when_previous_compaction_from_hook() {
             Some("c0"),
             assistant_with_tool_calls(vec![("read", json!({"path": "r2.txt"}))]),
         ),
-        message_entry("u1", Some("a1"), user_text(text_of_tokens(1))),
+        message_entry("tr1", Some("a1"), tool_result("call-0", "read", "ok")),
+        message_entry("u1", Some("tr1"), user_text(text_of_tokens(1))),
     ];
 
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
@@ -1063,7 +1071,8 @@ fn compaction_pipeline_save_and_open_round_trip_rehydrates_compaction_context() 
     run_async(async move { before.save().await }).expect("save before-compaction session");
     harness.record_artifact("session-before-compaction.jsonl", &before_path);
 
-    let prep = prepare_compaction(&session.entries, make_settings(3)).expect("prep");
+    // "keep" = 4 chars → ceil(4/3) = 2 tokens. u1(1) + a1(2) + u2(1) = 4.
+    let prep = prepare_compaction(&session.entries, make_settings(4)).expect("prep");
     log_preparation(&harness, &session.entries, &prep);
     assert_eq!(prep.first_kept_entry_id, "u1");
 
@@ -1148,12 +1157,16 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
                 ("edit", json!({"path": "m1.txt"})),
             ]),
         ),
-        message_entry("u1", Some("a0"), user_text(text_of_tokens(1))),
+        message_entry("tr0a", Some("a0"), tool_result("call-0", "read", "ok")),
+        message_entry("tr0b", Some("tr0a"), tool_result("call-1", "edit", "ok")),
+        message_entry("u1", Some("tr0b"), user_text(text_of_tokens(1))),
+        // "keep" = 4 chars → ceil(4/3) = 2 tokens
         message_entry("a1", Some("u1"), assistant_text("keep", 0)),
         message_entry("u2", Some("a1"), user_text(text_of_tokens(1))),
     ];
 
-    let prep1 = prepare_compaction(&entries, make_settings(3)).expect("prep1");
+    // u1(1) + a1(2) + u2(1) = 4 tokens to keep
+    let prep1 = prepare_compaction(&entries, make_settings(4)).expect("prep1");
     assert_eq!(prep1.first_kept_entry_id, "u1");
     let provider1_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S1"]));
     let result1 = run_async(async move { compact(prep1, provider1_dyn, "test-key", None).await })
@@ -1185,8 +1198,18 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
         ]),
     ));
     entries2.push(message_entry(
-        "u4",
+        "tr3a",
         Some("a3"),
+        tool_result("call-0", "read", "ok"),
+    ));
+    entries2.push(message_entry(
+        "tr3b",
+        Some("tr3a"),
+        tool_result("call-1", "write", "ok"),
+    ));
+    entries2.push(message_entry(
+        "u4",
+        Some("tr3b"),
         user_text(text_of_tokens(1)),
     ));
 
@@ -1289,7 +1312,8 @@ fn prepare_compaction_ignores_malformed_previous_compaction_details() {
             Some("c0"),
             assistant_with_tool_calls(vec![("read", json!({"path": "r2.txt"}))]),
         ),
-        message_entry("u1", Some("a1"), user_text(text_of_tokens(1))),
+        message_entry("tr1", Some("a1"), tool_result("call-0", "read", "ok")),
+        message_entry("u1", Some("tr1"), user_text(text_of_tokens(1))),
     ];
 
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
@@ -1384,14 +1408,15 @@ fn prepare_compaction_turn_prefix_tool_calls_contribute_to_file_ops() {
             Some("u1"),
             assistant_with_tool_calls(vec![("edit", json!({"path": "turn.txt"}))]),
         ),
-        message_entry("a2", Some("a1"), assistant_text(text_of_tokens(1), 100)),
+        message_entry("tr1", Some("a1"), tool_result("call-0", "edit", "ok")),
+        message_entry("a2", Some("tr1"), assistant_text(text_of_tokens(1), 100)),
     ];
 
     let prep = prepare_compaction(&entries, make_settings(0)).expect("prep");
     log_preparation(&harness, &entries, &prep);
     assert!(prep.is_split_turn);
     assert_eq!(prep.messages_to_summarize.len(), 2);
-    assert_eq!(prep.turn_prefix_messages.len(), 2);
+    assert_eq!(prep.turn_prefix_messages.len(), 3);
 
     let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["TURN"]));
     let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
