@@ -200,7 +200,7 @@ fn large_fork_session() -> (Session, String, String) {
             else {
                 panic!("last entry should be a message");
             };
-            target_id = message.base.id.clone();
+            target_id.clone_from(&message.base.id);
             target_text = Some(user_text);
         }
 
@@ -887,9 +887,7 @@ fn rpc_get_session_stats_stays_responsive_with_backlog() {
 
         assert!(
             max_roundtrip_ms <= MAX_BACKLOG_STATS_ROUNDTRIP_MS,
-            "get_session_stats should remain responsive under backlog (max={}ms, budget={}ms)",
-            max_roundtrip_ms,
-            MAX_BACKLOG_STATS_ROUNDTRIP_MS
+            "get_session_stats should remain responsive under backlog (max={max_roundtrip_ms}ms, budget={MAX_BACKLOG_STATS_ROUNDTRIP_MS}ms)",
         );
 
         drop(in_tx);
@@ -971,9 +969,7 @@ fn rpc_export_html_large_payload_state_budget() {
             state_roundtrip_ms.expect("expected get_state response in export_html scenario");
         assert!(
             state_roundtrip_ms <= MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS,
-            "get_state exceeded latency budget during export_html scenario ({}ms > {}ms)",
-            state_roundtrip_ms,
-            MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS
+            "get_state exceeded latency budget during export_html scenario ({state_roundtrip_ms}ms > {MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS}ms)",
         );
         assert!(export_seen, "expected export_html response");
         let exported_path = exported_path.expect("expected export_html response path");
@@ -1060,9 +1056,7 @@ fn rpc_fork_large_payload_state_budget() {
             state_roundtrip_ms.expect("expected get_state response in fork scenario");
         assert!(
             state_roundtrip_ms <= MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS,
-            "get_state exceeded latency budget during fork scenario ({}ms > {}ms)",
-            state_roundtrip_ms,
-            MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS
+            "get_state exceeded latency budget during fork scenario ({state_roundtrip_ms}ms > {MAX_FORK_EXPORT_STATE_ROUNDTRIP_MS}ms)",
         );
         assert!(fork_seen, "expected fork response");
 

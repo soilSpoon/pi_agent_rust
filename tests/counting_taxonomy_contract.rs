@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -46,9 +47,10 @@ fn write_fixture_parity_log(path: &Path) {
 
     let mut lines = String::new();
     for suite in suites {
-        lines.push_str(&format!(
+        let _ = write!(
+            lines,
             "Running tests/{suite}.rs (target/debug/deps/{suite}-abcdef)\n"
-        ));
+        );
         lines.push_str(
             "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
         );
@@ -227,8 +229,7 @@ fn counting_taxonomy_validator_rejects_missing_required_labels() {
     providers_metrics.retain(|m| {
         m.get("granularity_label")
             .and_then(Value::as_str)
-            .map(|label| label != "provider_alias_ids")
-            .unwrap_or(true)
+            .map_or(true, |label| label != "provider_alias_ids")
     });
 
     fs::write(

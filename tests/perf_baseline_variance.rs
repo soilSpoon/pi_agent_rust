@@ -58,11 +58,11 @@ impl VarianceClass {
         }
     }
 
-    fn is_acceptable(self) -> bool {
+    const fn is_acceptable(self) -> bool {
         matches!(self, Self::Low | Self::Medium)
     }
 
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
@@ -73,7 +73,7 @@ impl VarianceClass {
 
 /// t-distribution critical values for common degrees of freedom.
 /// Used for computing confidence intervals with small sample sizes.
-fn t_critical_95(df: usize) -> f64 {
+const fn t_critical_95(df: usize) -> f64 {
     match df {
         1 => 12.706,
         2 => 4.303,
@@ -94,7 +94,7 @@ fn t_critical_95(df: usize) -> f64 {
     }
 }
 
-fn t_critical_99(df: usize) -> f64 {
+const fn t_critical_99(df: usize) -> f64 {
     match df {
         1 => 63.657,
         2 => 9.925,
@@ -226,6 +226,7 @@ fn compute_variance_stats(samples: &[f64]) -> Option<VarianceStats> {
     })
 }
 
+#[allow(clippy::cast_sign_loss)]
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -234,7 +235,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     let lo = idx.floor() as usize;
     let hi = (lo + 1).min(sorted.len() - 1);
     let frac = idx - lo as f64;
-    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    sorted[hi].mul_add(frac, sorted[lo] * (1.0 - frac))
 }
 
 fn project_root() -> PathBuf {
@@ -420,7 +421,7 @@ fn inline_json_parse_variance_is_acceptable() {
             let _: Value = serde_json::from_str(msg).unwrap();
         }
         let elapsed_us = start.elapsed().as_nanos() as f64 / 1000.0;
-        let per_parse_us = elapsed_us / iterations_per_round as f64;
+        let per_parse_us = elapsed_us / f64::from(iterations_per_round);
         round_means.push(per_parse_us);
     }
 
@@ -672,10 +673,7 @@ fn marginal_improvement_detected_as_inconclusive() {
         marginal_stats.confidence_interval_95.lower,
         marginal_stats.confidence_interval_95.upper
     );
-    eprintln!(
-        "  Overlapping:     {} (claim is inconclusive)",
-        overlapping
-    );
+    eprintln!("  Overlapping:     {overlapping} (claim is inconclusive)");
 
     // With ~5% improvement but high variance and only 5 samples,
     // the CIs should overlap, making the claim inconclusive
