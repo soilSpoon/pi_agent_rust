@@ -417,6 +417,10 @@
     {
       "description": "Layered extension benchmark artifact linking cold-load, per-call, and full E2E evidence with claim-integrity guards",
       "name": "pi.perf.extension_benchmark_stratification.v1"
+    },
+    {
+      "description": "Phase-1 realistic/matched-state matrix validation with stage attribution and release-gate readiness",
+      "name": "pi.perf.phase1_matrix_validation.v1"
     }
   ]
 }

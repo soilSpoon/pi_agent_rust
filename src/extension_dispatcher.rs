@@ -19,16 +19,18 @@ use asupersync::channel::oneshot;
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde_json::Value;
+use sha2::Digest as _;
 
 use crate::connectors::{Connector, http::HttpConnector};
 use crate::error::Result;
 use crate::extensions::EXTENSION_EVENT_TIMEOUT_MS;
 use crate::extensions::{
-    DangerousCommandClass, ExecMediationResult, ExtensionBody, ExtensionMessage, ExtensionPolicy,
-    ExtensionSession, ExtensionUiRequest, ExtensionUiResponse, HostCallError, HostCallErrorCode,
-    HostCallPayload, HostResultPayload, HostStreamChunk, PROTOCOL_VERSION, PolicyDecision,
-    PolicyProfile, PolicySnapshot, classify_ui_hostcall_error, evaluate_exec_mediation,
-    required_capability_for_host_call_static, ui_response_value_for_op,
+    Capability, DangerousCommandClass, ExecMediationResult, ExtensionBody, ExtensionMessage,
+    ExtensionPolicy, ExtensionSession, ExtensionUiRequest, ExtensionUiResponse, HostCallError,
+    HostCallErrorCode, HostCallPayload, HostResultPayload, HostStreamChunk, PROTOCOL_VERSION,
+    PolicyCheck, PolicyDecision, PolicyProfile, PolicySnapshot, classify_ui_hostcall_error,
+    evaluate_exec_mediation, hash_canonical_json, required_capability_for_host_call_static,
+    ui_response_value_for_op,
 };
 use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, js_to_json, json_to_js};
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, WallClock};
@@ -52,6 +54,8 @@ pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     policy: ExtensionPolicy,
     /// Precomputed O(1) capability decision table.
     snapshot: PolicySnapshot,
+    /// Deterministic policy snapshot version hash for provenance/telemetry.
+    snapshot_version: String,
 }
 
 fn protocol_hostcall_op(params: &Value) -> Option<&str> {
@@ -105,6 +109,23 @@ fn protocol_normalize_output(value: Value) -> Value {
         value
     } else {
         serde_json::json!({ "value": value })
+    }
+}
+
+fn policy_snapshot_version(policy: &ExtensionPolicy) -> String {
+    let mut hasher = sha2::Sha256::new();
+    match serde_json::to_value(policy) {
+        Ok(value) => hash_canonical_json(&value, &mut hasher),
+        Err(err) => hasher.update(err.to_string().as_bytes()),
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn policy_lookup_path(capability: &str) -> &'static str {
+    if Capability::parse(capability).is_some() {
+        "policy_snapshot_table"
+    } else {
+        "policy_snapshot_fallback"
     }
 }
 
@@ -296,6 +317,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         cwd: PathBuf,
         policy: ExtensionPolicy,
     ) -> Self {
+        let snapshot_version = policy_snapshot_version(&policy);
         let snapshot = PolicySnapshot::compile(&policy);
         Self {
             runtime,
@@ -306,7 +328,38 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             cwd,
             policy,
             snapshot,
+            snapshot_version,
         }
+    }
+
+    fn policy_lookup(
+        &self,
+        capability: &str,
+        extension_id: Option<&str>,
+    ) -> (PolicyCheck, &'static str) {
+        (
+            self.snapshot.lookup(capability, extension_id),
+            policy_lookup_path(capability),
+        )
+    }
+
+    fn emit_policy_decision_telemetry(
+        &self,
+        capability: &str,
+        extension_id: Option<&str>,
+        lookup_path: &str,
+        check: &PolicyCheck,
+    ) {
+        tracing::debug!(
+            target: "pi.extensions.policy_snapshot",
+            snapshot_version = %self.snapshot_version,
+            lookup_path,
+            capability = %capability,
+            extension_id = %extension_id.unwrap_or("<none>"),
+            decision = ?check.decision,
+            decision_provenance = %check.reason,
+            "Extension policy decision evaluated"
+        );
     }
 
     /// Drain pending hostcall requests from the JS runtime.
@@ -323,7 +376,13 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     ) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         Box::pin(async move {
             let cap = request.required_capability();
-            let check = self.snapshot.lookup(&cap, request.extension_id.as_deref());
+            let (check, lookup_path) = self.policy_lookup(&cap, request.extension_id.as_deref());
+            self.emit_policy_decision_telemetry(
+                &cap,
+                request.extension_id.as_deref(),
+                lookup_path,
+                &check,
+            );
             if check.decision != PolicyDecision::Allow {
                 let outcome = HostcallOutcome::Error {
                     code: "denied".to_string(),
@@ -424,7 +483,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn dispatch_protocol_host_call(&self, payload: &HostCallPayload) -> HostcallOutcome {
         if let Some(cap) = required_capability_for_host_call_static(payload) {
-            let check = self.snapshot.lookup(cap, None);
+            let (check, lookup_path) = self.policy_lookup(cap, None);
+            self.emit_policy_decision_telemetry(cap, None, lookup_path, &check);
             if check.decision != PolicyDecision::Allow {
                 return HostcallOutcome::Error {
                     code: "denied".to_string(),
@@ -1562,6 +1622,45 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(ui_response_value_for_op("select", &response), Value::Null);
+    }
+
+    #[test]
+    fn policy_snapshot_version_is_deterministic_for_equivalent_policies() {
+        let mut policy_a = ExtensionPolicy::default();
+        let mut override_a = ExtensionOverride::default();
+        override_a.allow.push("exec".to_string());
+        policy_a
+            .per_extension
+            .insert("ext.alpha".to_string(), override_a.clone());
+        policy_a
+            .per_extension
+            .insert("ext.beta".to_string(), override_a);
+
+        let mut policy_b = ExtensionPolicy::default();
+        let mut override_b = ExtensionOverride::default();
+        override_b.allow.push("exec".to_string());
+        // Insert in reverse order to verify canonical hashing is order-insensitive.
+        policy_b
+            .per_extension
+            .insert("ext.beta".to_string(), override_b.clone());
+        policy_b
+            .per_extension
+            .insert("ext.alpha".to_string(), override_b);
+
+        assert_eq!(
+            policy_snapshot_version(&policy_a),
+            policy_snapshot_version(&policy_b)
+        );
+    }
+
+    #[test]
+    fn policy_lookup_path_marks_known_vs_fallback_capabilities() {
+        assert_eq!(policy_lookup_path("read"), "policy_snapshot_table");
+        assert_eq!(policy_lookup_path("READ"), "policy_snapshot_table");
+        assert_eq!(
+            policy_lookup_path("non_standard_custom_capability"),
+            "policy_snapshot_fallback"
+        );
     }
 
     struct NullSession;
