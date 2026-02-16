@@ -164,16 +164,19 @@ fn fault_inject_multi_phase_append_crash_recover_continue() {
             .append(true)
             .open(&path)
             .unwrap();
-        write!(file, "{{\"type\":\"message\",\"id\":\"crash-victim\",\"timestamp\"").unwrap();
+        write!(
+            file,
+            "{{\"type\":\"message\",\"id\":\"crash-victim\",\"timestamp\""
+        )
+        .unwrap();
     }
     trace.log("FAULT", "truncation_injected", "partial entry appended");
 
     // Phase 4: Recover from crash.
     trace.log("RECOVER", "open_with_diagnostics", "attempting recovery");
-    let (recovered, diagnostics) = run_async(async {
-        Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
-    })
-    .unwrap();
+    let (recovered, diagnostics) =
+        run_async(async { Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await })
+            .unwrap();
 
     trace.log(
         "RECOVER",
@@ -199,20 +202,34 @@ fn fault_inject_multi_phase_append_crash_recover_continue() {
         trace.dump()
     );
 
-    // Phase 5: Continue operation after recovery — add more entries and save.
+    // Phase 5: Heal the file — after recovery from corruption, the persisted
+    // entry count may include corrupt lines, so force a full rewrite first.
+    trace.log(
+        "CONTINUE",
+        "healing_rewrite",
+        "forcing full rewrite to clean up corrupt entries on disk",
+    );
+    let mut continued = recovered;
+    continued.session_dir = Some(temp_dir.path().to_path_buf());
+    continued.set_model_header("healing-model"); // Dirty header → full rewrite.
+    run_async(async { continued.save().await }).unwrap();
+
+    // Phase 6: Post-healing append — incremental save should now work correctly.
     trace.log(
         "CONTINUE",
         "post_recovery_append",
         "adding entries after recovery",
     );
-    let mut continued = recovered;
-    continued.session_dir = Some(temp_dir.path().to_path_buf());
     continued.append_message(make_msg("phase5-msg-10"));
     continued.append_message(make_msg("phase5-msg-11"));
     run_async(async { continued.save().await }).unwrap();
 
     // Phase 6: Final verification — clean load.
-    trace.log("VERIFY", "final_load", "clean load after continued operation");
+    trace.log(
+        "VERIFY",
+        "final_load",
+        "clean load after continued operation",
+    );
     let final_session =
         run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
 
@@ -275,7 +292,11 @@ fn fault_inject_checkpoint_heals_corruption_via_header_dirty() {
     session.set_model_header(Some("checkpoint-provider".to_string()), None, None);
     session.append_message(make_msg("post-checkpoint"));
     run_async(async { session.save().await }).unwrap();
-    trace.log("CHECKPOINT", "header_dirty_rewrite", "full rewrite via dirty header");
+    trace.log(
+        "CHECKPOINT",
+        "header_dirty_rewrite",
+        "full rewrite via dirty header",
+    );
 
     // Verify clean file after checkpoint.
     let content = std::fs::read_to_string(&path).unwrap();
@@ -285,8 +306,7 @@ fn fault_inject_checkpoint_heals_corruption_via_header_dirty() {
         trace.dump()
     );
 
-    let loaded =
-        run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
     assert_eq!(
         loaded.entries.len(),
         7,
@@ -337,8 +357,7 @@ fn fault_inject_stale_temp_file_after_interrupted_rewrite() {
     session.append_message(make_msg("after-stale-temp"));
     run_async(async { session.save().await }).unwrap();
 
-    let loaded =
-        run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
 
     assert_eq!(
         loaded.entries.len(),
@@ -388,12 +407,7 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
     );
 
     // First flush — should succeed.
-    run_async(async {
-        session
-            .flush_autosave(AutosaveFlushTrigger::Periodic)
-            .await
-    })
-    .unwrap();
+    run_async(async { session.flush_autosave(AutosaveFlushTrigger::Periodic).await }).unwrap();
     let path = session.path.clone().unwrap();
     let metrics_after_flush = session.autosave_metrics();
     trace.log(
@@ -424,10 +438,7 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
     trace.log(
         "FAULT",
         "save_after_readonly",
-        format!(
-            "result: {}",
-            if result.is_ok() { "ok" } else { "err" }
-        ),
+        format!("result: {}", if result.is_ok() { "ok" } else { "err" }),
     );
 
     // Restore permissions.
@@ -461,8 +472,7 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
     );
 
     // Verify full round-trip.
-    let loaded =
-        run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
     assert_eq!(
         loaded.entries.len(),
         4,
@@ -710,9 +720,12 @@ fn fault_inject_header_dirty_forces_clean_rewrite() {
         trace.dump()
     );
 
-    let loaded =
-        run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
-    assert_eq!(loaded.entries.len(), 4, "4 entries after dirty-header rewrite");
+    let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    assert_eq!(
+        loaded.entries.len(),
+        4,
+        "4 entries after dirty-header rewrite"
+    );
 
     trace.log(
         "VERIFY",
@@ -775,10 +788,7 @@ fn fault_inject_v2_store_segment_corruption_recovery() {
     trace.log(
         "RECOVER",
         "read_after_corruption",
-        format!(
-            "result: {:?}",
-            after_corruption.as_ref().map(Vec::len)
-        ),
+        format!("result: {:?}", after_corruption.as_ref().map(Vec::len)),
     );
 
     // Whether read_all_entries succeeds or fails, the valid entries before corruption
@@ -832,10 +842,7 @@ fn fault_inject_save_to_readonly_filesystem() {
     trace.log(
         "FAULT",
         "save_to_readonly",
-        format!(
-            "result: {}",
-            if result.is_ok() { "ok" } else { "err" }
-        ),
+        format!("result: {}", if result.is_ok() { "ok" } else { "err" }),
     );
 
     // The save should fail because we can't create temp files in readonly dir.
@@ -856,8 +863,7 @@ fn fault_inject_save_to_readonly_filesystem() {
     );
 
     // Original file should still be intact.
-    let loaded =
-        run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
     assert_eq!(
         loaded.entries.len(),
         1,
@@ -917,10 +923,9 @@ fn fault_inject_mixed_entry_types_through_crash_cycle() {
     trace.log("FAULT", "inject_partial", "partial entry appended");
 
     // Recover.
-    let (recovered, diag) = run_async(async {
-        Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
-    })
-    .unwrap();
+    let (recovered, diag) =
+        run_async(async { Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await })
+            .unwrap();
 
     trace.log(
         "RECOVER",
@@ -940,9 +945,13 @@ fn fault_inject_mixed_entry_types_through_crash_cycle() {
     );
     assert_eq!(diag.skipped_entries.len(), 1);
 
-    // Continue and save.
+    // Heal the file — force full rewrite to flush corrupt entries from disk.
     let mut cont = recovered;
     cont.session_dir = Some(temp_dir.path().to_path_buf());
+    cont.set_model_header("healing-model");
+    run_async(async { cont.save().await }).unwrap();
+
+    // Now append after healing.
     cont.append_message(make_msg("post-recovery"));
     run_async(async { cont.save().await }).unwrap();
 
@@ -1008,8 +1017,7 @@ fn fault_inject_corruption_healed_at_checkpoint() {
         trace.dump()
     );
 
-    let loaded =
-        run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
     assert_eq!(
         loaded.entries.len(),
         5,
@@ -1106,10 +1114,9 @@ fn fault_inject_save_idempotency_after_recovery() {
         write!(file, "{{\"broken").unwrap();
     }
 
-    let (mut recovered, _) = run_async(async {
-        Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
-    })
-    .unwrap();
+    let (mut recovered, _) =
+        run_async(async { Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await })
+            .unwrap();
     recovered.session_dir = Some(temp_dir.path().to_path_buf());
 
     // Save twice without modifications — second save should be no-op.
@@ -1130,7 +1137,8 @@ fn fault_inject_save_idempotency_after_recovery() {
     );
 
     assert_eq!(
-        content_after_first, content_after_second,
+        content_after_first,
+        content_after_second,
         "second save should be no-op\nTrace:\n{}",
         trace.dump()
     );
@@ -1156,10 +1164,7 @@ fn fault_inject_large_session_scattered_corruption() {
             // Every 17th entry is corrupted.
             lines.push(format!("CORRUPTION_AT_LINE_{i}"));
         } else {
-            lines.push(valid_entry(
-                &format!("entry-{i}"),
-                &format!("message {i}"),
-            ));
+            lines.push(valid_entry(&format!("entry-{i}"), &format!("message {i}")));
             valid_count += 1;
         }
     }

@@ -310,13 +310,14 @@ fn variance_class_high_for_noisy_data() {
 fn confidence_interval_contains_true_mean() {
     // Generate samples from a known distribution
     // True mean = 100, with small noise
-    let samples = vec![98.5, 101.2, 99.8, 100.5, 100.0, 99.3, 100.7, 99.9, 100.1, 100.3];
+    let samples = vec![
+        98.5, 101.2, 99.8, 100.5, 100.0, 99.3, 100.7, 99.9, 100.1, 100.3,
+    ];
     let stats = compute_variance_stats(&samples).unwrap();
 
     // The 95% CI should contain the true mean (100.0) for well-behaved data
     assert!(
-        stats.confidence_interval_95.lower <= 100.0
-            && stats.confidence_interval_95.upper >= 100.0,
+        stats.confidence_interval_95.lower <= 100.0 && stats.confidence_interval_95.upper >= 100.0,
         "95% CI [{}, {}] should contain true mean 100.0",
         stats.confidence_interval_95.lower,
         stats.confidence_interval_95.upper
@@ -390,7 +391,10 @@ fn two_samples_minimum_produces_valid_stats() {
 
     let stats = stats.unwrap();
     assert_eq!(stats.count, 2);
-    assert!((stats.mean - 150.0).abs() < f64::EPSILON, "mean should be 150");
+    assert!(
+        (stats.mean - 150.0).abs() < f64::EPSILON,
+        "mean should be 150"
+    );
 }
 
 #[test]
@@ -629,7 +633,9 @@ fn claim_requires_sufficient_samples() {
 #[test]
 fn improvement_claim_requires_non_overlapping_ci() {
     // To claim "X is faster than Y", their 95% CIs should not overlap
-    let baseline = vec![100.0, 102.0, 98.0, 101.0, 99.0, 100.5, 99.5, 100.2, 99.8, 100.3];
+    let baseline = vec![
+        100.0, 102.0, 98.0, 101.0, 99.0, 100.5, 99.5, 100.2, 99.8, 100.3,
+    ];
     let improved = vec![80.0, 82.0, 78.0, 81.0, 79.0, 80.5, 79.5, 80.2, 79.8, 80.3];
 
     let baseline_stats = compute_variance_stats(&baseline).unwrap();
@@ -642,8 +648,7 @@ fn improvement_claim_requires_non_overlapping_ci() {
     assert!(
         non_overlapping,
         "To claim improvement, improved CI upper ({:.2}) must be < baseline CI lower ({:.2})",
-        improved_stats.confidence_interval_95.upper,
-        baseline_stats.confidence_interval_95.lower
+        improved_stats.confidence_interval_95.upper, baseline_stats.confidence_interval_95.lower
     );
 }
 
@@ -665,13 +670,11 @@ fn marginal_improvement_detected_as_inconclusive() {
     eprintln!("\n=== Marginal Improvement Detection ===");
     eprintln!(
         "  Baseline 95% CI: [{:.2}, {:.2}]",
-        baseline_stats.confidence_interval_95.lower,
-        baseline_stats.confidence_interval_95.upper
+        baseline_stats.confidence_interval_95.lower, baseline_stats.confidence_interval_95.upper
     );
     eprintln!(
         "  Marginal 95% CI: [{:.2}, {:.2}]",
-        marginal_stats.confidence_interval_95.lower,
-        marginal_stats.confidence_interval_95.upper
+        marginal_stats.confidence_interval_95.lower, marginal_stats.confidence_interval_95.upper
     );
     eprintln!("  Overlapping:     {overlapping} (claim is inconclusive)");
 

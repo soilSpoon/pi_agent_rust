@@ -227,9 +227,7 @@ fn counting_taxonomy_validator_rejects_missing_required_labels() {
         .as_array_mut()
         .expect("providers metrics should exist");
     providers_metrics.retain(|m| {
-        m.get("granularity_label")
-            .and_then(Value::as_str)
-            != Some("provider_alias_ids")
+        m.get("granularity_label").and_then(Value::as_str) != Some("provider_alias_ids")
     });
 
     fs::write(

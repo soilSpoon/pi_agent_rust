@@ -235,14 +235,12 @@ pub(crate) fn enqueue_session_index_snapshot_update(
         path = %update.path.display(),
         "Session index dispatcher unavailable; falling back to synchronous update"
     );
-    if let Err(err) =
-        SessionIndex::for_sessions_root(&update.sessions_root).index_session_snapshot(
-            &update.path,
-            &update.header,
-            update.message_count,
-            update.name,
-        )
-    {
+    if let Err(err) = SessionIndex::for_sessions_root(&update.sessions_root).index_session_snapshot(
+        &update.path,
+        &update.header,
+        update.message_count,
+        update.name,
+    ) {
         tracing::warn!(
             sessions_root = %update.sessions_root.display(),
             path = %update.path.display(),

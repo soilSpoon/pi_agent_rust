@@ -1330,6 +1330,50 @@ fn perf_sli_confidence_and_evidence_labels_are_machine_enforced() {
     }
 }
 
+#[test]
+fn run_all_claim_integrity_gate_wires_fail_closed_conditions() {
+    let run_all = load_text("scripts/e2e/run_all.sh");
+
+    for token in [
+        "CLAIM_INTEGRITY_REQUIRED",
+        "PERF_BASELINE_CONFIDENCE_JSON",
+        "PERF_EXTENSION_STRATIFICATION_JSON",
+        "claim_integrity.missing_or_stale_evidence",
+        "claim_integrity.missing_required_result_field",
+        "claim_integrity.scenario_without_sli_mapping",
+        "claim_integrity.sli_without_thresholds",
+        "claim_integrity.missing_absolute_or_relative_values",
+        "claim_integrity.invalid_evidence_class",
+        "claim_integrity.invalid_confidence_label",
+        "claim_integrity.microbench_only_claim",
+        "claim_integrity.global_claim_missing_partition_coverage",
+    ] {
+        assert!(
+            run_all.contains(token),
+            "scripts/e2e/run_all.sh must enforce claim-integrity token: {token}"
+        );
+    }
+}
+
+#[test]
+fn ci_workflow_runs_perf_claim_integrity_bundle_before_run_all_gate() {
+    let ci = load_text(CI_WORKFLOW_PATH);
+
+    for token in [
+        "Generate perf claim-integrity evidence bundle [linux]",
+        "./scripts/perf/orchestrate.sh",
+        "--profile ci",
+        "PERF_BASELINE_CONFIDENCE_JSON",
+        "PERF_EXTENSION_STRATIFICATION_JSON",
+        "CLAIM_INTEGRITY_REQUIRED=1",
+    ] {
+        assert!(
+            ci.contains(token),
+            "CI workflow must include claim-integrity gate wiring token: {token}"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Section 6: CI gate remediation guidance
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2266,7 +2310,10 @@ exit 0
 #[test]
 fn orchestrate_script_exists_and_is_executable() {
     let path = std::path::Path::new(ORCHESTRATE_SCRIPT_PATH);
-    assert!(path.exists(), "orchestrate.sh must exist at {ORCHESTRATE_SCRIPT_PATH}");
+    assert!(
+        path.exists(),
+        "orchestrate.sh must exist at {ORCHESTRATE_SCRIPT_PATH}"
+    );
 
     #[cfg(unix)]
     {
@@ -2282,16 +2329,16 @@ fn orchestrate_script_exists_and_is_executable() {
 #[test]
 fn bundle_script_exists_and_is_executable() {
     let path = std::path::Path::new(BUNDLE_SCRIPT_PATH);
-    assert!(path.exists(), "bundle.sh must exist at {BUNDLE_SCRIPT_PATH}");
+    assert!(
+        path.exists(),
+        "bundle.sh must exist at {BUNDLE_SCRIPT_PATH}"
+    );
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::metadata(path).unwrap().permissions();
-        assert!(
-            perms.mode() & 0o111 != 0,
-            "bundle.sh must be executable"
-        );
+        assert!(perms.mode() & 0o111 != 0, "bundle.sh must be executable");
     }
 }
 
@@ -2481,13 +2528,7 @@ fn orchestrate_script_supports_correlation_id() {
 fn bundle_script_supports_required_operations() {
     let content = load_text(BUNDLE_SCRIPT_PATH);
 
-    let required_ops = [
-        "--verify",
-        "--extract",
-        "--list",
-        "--inventory",
-        "--latest",
-    ];
+    let required_ops = ["--verify", "--extract", "--list", "--inventory", "--latest"];
 
     for op in &required_ops {
         assert!(
@@ -2893,10 +2934,7 @@ fn run_manifest_schema_in_evidence_instance() {
     let found = schemas
         .iter()
         .any(|s| s["schema_id"].as_str() == Some("pi.perf.run_manifest.v1"));
-    assert!(
-        found,
-        "pi.perf.run_manifest.v1 must be in schema registry"
-    );
+    assert!(found, "pi.perf.run_manifest.v1 must be in schema registry");
 }
 
 #[test]

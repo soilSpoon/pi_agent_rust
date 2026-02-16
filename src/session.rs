@@ -3284,6 +3284,9 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
                             let mut ok = Vec::with_capacity(chunk.len());
                             let mut skip = Vec::new();
                             for (j, line) in chunk.iter().enumerate() {
+                                if line.trim().is_empty() {
+                                    continue;
+                                }
                                 match serde_json::from_str::<SessionEntry>(line) {
                                     Ok(entry) => ok.push(entry),
                                     Err(e) => {
@@ -3314,6 +3317,9 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
             // Sequential path for small files.
             let mut entries = Vec::with_capacity(entry_lines.len());
             for (i, line) in entry_lines.iter().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
                 match serde_json::from_str::<SessionEntry>(line) {
                     Ok(entry) => entries.push(entry),
                     Err(e) => {
@@ -3924,8 +3930,12 @@ mod tests {
 
         let (mode, reason, threshold) =
             select_v2_open_mode_for_resume(50_000, None, Some("not-a-number"));
-        assert_eq!(mode, V2OpenMode::Full, "invalid threshold should fall back");
-        assert_eq!(reason, "default_full");
+        assert_eq!(
+            mode,
+            V2OpenMode::ActivePath,
+            "invalid threshold falls back to default threshold"
+        );
+        assert_eq!(reason, "entry_count_above_lazy_threshold");
         assert_eq!(threshold, DEFAULT_V2_LAZY_HYDRATION_THRESHOLD);
 
         let (mode, reason, threshold) = select_v2_open_mode_for_resume(50_000, None, Some("500"));

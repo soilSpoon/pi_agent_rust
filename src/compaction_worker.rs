@@ -118,7 +118,10 @@ impl CompactionWorkerState {
         api_key: String,
         custom_instructions: Option<String>,
     ) {
-        debug_assert!(self.can_start(), "start() called while can_start() is false");
+        debug_assert!(
+            self.can_start(),
+            "start() called while can_start() is false"
+        );
 
         let (tx, rx) = mpsc::channel();
         let now = Instant::now();

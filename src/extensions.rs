@@ -29682,9 +29682,16 @@ mod tests {
             payload.params.get("key").and_then(Value::as_str),
             Some("value")
         );
-        assert!(
-            payload.context.is_none(),
-            "unsupported session ops should omit typed opcode context and use fallback"
+        // get_state is a recognized typed opcode, so context should be present.
+        assert_eq!(
+            payload.context,
+            Some(json!({
+                "typed_opcode": {
+                    "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+                    "version": HOSTCALL_OPCODE_VERSION,
+                    "code": "session.get_state"
+                }
+            }))
         );
     }
 
