@@ -821,4 +821,180 @@ mod tests {
         assert_eq!(snap.total_us, 19800);
         assert_eq!(snap.max_us, 99);
     }
+
+    mod proptest_session_metrics {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// After recording n values, count == n and total == sum.
+            #[test]
+            fn timing_counter_sum_and_count(
+                values in prop::collection::vec(0u64..10_000, 0..50)
+            ) {
+                let counter = TimingCounter::new();
+                for &v in &values {
+                    counter.record(v);
+                }
+                let snap = counter.snapshot();
+                assert_eq!(snap.count, values.len() as u64);
+                assert_eq!(
+                    snap.total_us,
+                    values.iter().copied().sum::<u64>()
+                );
+            }
+
+            /// max_us tracks the maximum recorded value.
+            #[test]
+            fn timing_counter_tracks_max(
+                values in prop::collection::vec(0u64..100_000, 1..50)
+            ) {
+                let counter = TimingCounter::new();
+                for &v in &values {
+                    counter.record(v);
+                }
+                let snap = counter.snapshot();
+                assert_eq!(snap.max_us, *values.iter().max().unwrap());
+            }
+
+            /// avg_us == total_us / count (integer division).
+            #[test]
+            fn timing_snapshot_avg_is_floor_division(
+                values in prop::collection::vec(1u64..10_000, 1..50)
+            ) {
+                let counter = TimingCounter::new();
+                for &v in &values {
+                    counter.record(v);
+                }
+                let snap = counter.snapshot();
+                let expected = snap.total_us / snap.count;
+                assert_eq!(snap.avg_us, expected);
+            }
+
+            /// Empty counter snapshot has all zeros.
+            #[test]
+            fn empty_counter_snapshot(_dummy in 0..1u8) {
+                let counter = TimingCounter::new();
+                let snap = counter.snapshot();
+                assert_eq!(snap.count, 0);
+                assert_eq!(snap.total_us, 0);
+                assert_eq!(snap.max_us, 0);
+                assert_eq!(snap.avg_us, 0);
+            }
+
+            /// After reset, snapshot returns all zeros.
+            #[test]
+            fn timing_reset_clears(values in prop::collection::vec(1u64..1000, 1..20)) {
+                let counter = TimingCounter::new();
+                for &v in &values {
+                    counter.record(v);
+                }
+                counter.reset();
+                let snap = counter.snapshot();
+                assert_eq!(snap.count, 0);
+                assert_eq!(snap.total_us, 0);
+                assert_eq!(snap.max_us, 0);
+            }
+
+            /// `ByteCounter` tracks sum and count correctly.
+            #[test]
+            fn byte_counter_sum_and_count(
+                values in prop::collection::vec(0u64..100_000, 0..50)
+            ) {
+                let counter = ByteCounter::new();
+                for &v in &values {
+                    counter.record(v);
+                }
+                let snap = counter.snapshot();
+                assert_eq!(snap.count, values.len() as u64);
+                assert_eq!(snap.total_bytes, values.iter().copied().sum::<u64>());
+            }
+
+            /// `ByteCounter` avg_bytes is floor division.
+            #[test]
+            fn byte_counter_avg(
+                values in prop::collection::vec(1u64..10_000, 1..50)
+            ) {
+                let counter = ByteCounter::new();
+                for &v in &values {
+                    counter.record(v);
+                }
+                let snap = counter.snapshot();
+                assert_eq!(snap.avg_bytes, snap.total_bytes / snap.count);
+            }
+
+            /// `ByteCounter` reset clears all.
+            #[test]
+            fn byte_counter_reset(values in prop::collection::vec(1u64..1000, 1..10)) {
+                let counter = ByteCounter::new();
+                for &v in &values {
+                    counter.record(v);
+                }
+                counter.reset();
+                let snap = counter.snapshot();
+                assert_eq!(snap.count, 0);
+                assert_eq!(snap.total_bytes, 0);
+            }
+
+            /// `TimingSnapshot` display is "n=0" when count == 0.
+            #[test]
+            fn timing_display_zero(_dummy in 0..1u8) {
+                let snap = TimingSnapshot {
+                    count: 0,
+                    total_us: 0,
+                    max_us: 0,
+                    avg_us: 0,
+                };
+                assert_eq!(format!("{snap}"), "n=0");
+            }
+
+            /// `TimingSnapshot` display contains all fields when count > 0.
+            #[test]
+            fn timing_display_nonzero(
+                count in 1u64..1000,
+                total_us in 1u64..1_000_000,
+                max_us in 1u64..1_000_000
+            ) {
+                let snap = TimingSnapshot {
+                    count,
+                    total_us,
+                    max_us,
+                    avg_us: total_us / count,
+                };
+                let display = format!("{snap}");
+                assert!(display.contains(&format!("n={count}")));
+                assert!(display.contains("avg="));
+                assert!(display.contains("max="));
+                assert!(display.contains("total="));
+            }
+
+            /// `ByteSnapshot` display is "n=0" when count == 0.
+            #[test]
+            fn byte_display_zero(_dummy in 0..1u8) {
+                let snap = ByteSnapshot {
+                    count: 0,
+                    total_bytes: 0,
+                    avg_bytes: 0,
+                };
+                assert_eq!(format!("{snap}"), "n=0");
+            }
+
+            /// `ByteSnapshot` display contains count and bytes when count > 0.
+            #[test]
+            fn byte_display_nonzero(
+                count in 1u64..1000,
+                total in 1u64..1_000_000
+            ) {
+                let snap = ByteSnapshot {
+                    count,
+                    total_bytes: total,
+                    avg_bytes: total / count,
+                };
+                let display = format!("{snap}");
+                assert!(display.contains(&format!("n={count}")));
+                assert!(display.contains("avg="));
+                assert!(display.contains("total="));
+            }
+        }
+    }
 }

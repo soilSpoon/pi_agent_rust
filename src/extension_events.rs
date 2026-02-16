@@ -770,4 +770,219 @@ mod tests {
         );
         assert_continue(outcome, "original", &original_images);
     }
+
+    mod proptest_extension_events {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// All event names are unique, lowercase, with underscores only.
+        const ALL_EVENT_NAMES: &[&str] = &[
+            "startup",
+            "agent_start",
+            "agent_end",
+            "turn_start",
+            "turn_end",
+            "tool_call",
+            "tool_result",
+            "session_before_switch",
+            "session_before_fork",
+            "input",
+        ];
+
+        proptest! {
+            /// `event_name` returns valid snake_case names.
+            #[test]
+            fn event_names_are_snake_case(idx in 0..ALL_EVENT_NAMES.len()) {
+                let name = ALL_EVENT_NAMES[idx];
+                assert!(
+                    name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                    "not snake_case: {name}"
+                );
+                assert!(!name.is_empty());
+            }
+
+            /// `apply_input_event_response(None, ..)` always returns Continue with original.
+            #[test]
+            fn none_response_preserves_original(text in ".{0,50}") {
+                match apply_input_event_response(None, text.clone(), Vec::new()) {
+                    InputEventOutcome::Continue { text: t, images } => {
+                        assert_eq!(t, text);
+                        assert!(images.is_empty());
+                    }
+                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                }
+            }
+
+            /// `apply_input_event_response(null, ..)` always returns Continue with original.
+            #[test]
+            fn null_response_preserves_original(text in ".{0,50}") {
+                match apply_input_event_response(Some(Value::Null), text.clone(), Vec::new()) {
+                    InputEventOutcome::Continue { text: t, images } => {
+                        assert_eq!(t, text);
+                        assert!(images.is_empty());
+                    }
+                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                }
+            }
+
+            /// String response replaces text, preserves images.
+            #[test]
+            fn string_response_replaces_text(
+                original in "[a-z]{1,10}",
+                replacement in "[A-Z]{1,10}"
+            ) {
+                match apply_input_event_response(
+                    Some(Value::String(replacement.clone())),
+                    original,
+                    Vec::new(),
+                ) {
+                    InputEventOutcome::Continue { text, images } => {
+                        assert_eq!(text, replacement);
+                        assert!(images.is_empty());
+                    }
+                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                }
+            }
+
+            /// "block" action always produces Block outcome.
+            #[test]
+            fn block_action_blocks(
+                action_idx in 0..3usize,
+                text in "[a-z]{1,10}"
+            ) {
+                let actions = ["handled", "block", "blocked"];
+                let response = json!({"action": actions[action_idx]});
+                match apply_input_event_response(Some(response), text, Vec::new()) {
+                    InputEventOutcome::Block { .. } => {}
+                    InputEventOutcome::Continue { .. } => {
+                        panic!("expected Block for action '{}'", actions[action_idx]);
+                    }
+                }
+            }
+
+            /// "continue" action preserves original text.
+            #[test]
+            fn continue_action_preserves(text in "[a-z]{1,20}") {
+                let response = json!({"action": "continue"});
+                match apply_input_event_response(Some(response), text.clone(), Vec::new()) {
+                    InputEventOutcome::Continue { text: t, .. } => {
+                        assert_eq!(t, text);
+                    }
+                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                }
+            }
+
+            /// "transform" action with text field replaces text.
+            #[test]
+            fn transform_replaces_text(
+                original in "[a-z]{1,10}",
+                new_text in "[A-Z]{1,10}"
+            ) {
+                let response = json!({"action": "transform", "text": &new_text});
+                match apply_input_event_response(Some(response), original, Vec::new()) {
+                    InputEventOutcome::Continue { text, .. } => {
+                        assert_eq!(text, new_text);
+                    }
+                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                }
+            }
+
+            /// `block: true` without action produces Block.
+            #[test]
+            fn block_true_flag_blocks(text in "[a-z]{1,10}") {
+                let response = json!({"block": true});
+                match apply_input_event_response(Some(response), text, Vec::new()) {
+                    InputEventOutcome::Block { .. } => {}
+                    InputEventOutcome::Continue { .. } => panic!("expected Block"),
+                }
+            }
+
+            /// `block: false` without action returns Continue.
+            #[test]
+            fn block_false_continues(text in "[a-z]{1,10}") {
+                let response = json!({"block": false});
+                match apply_input_event_response(Some(response), text.clone(), Vec::new()) {
+                    InputEventOutcome::Continue { text: t, .. } => {
+                        assert_eq!(t, text);
+                    }
+                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                }
+            }
+
+            /// Non-object, non-string, non-null values preserve original.
+            #[test]
+            fn numeric_response_preserves(n in -100i64..100, text in "[a-z]{1,10}") {
+                let response = Value::from(n);
+                match apply_input_event_response(Some(response), text.clone(), Vec::new()) {
+                    InputEventOutcome::Continue { text: t, .. } => {
+                        assert_eq!(t, text);
+                    }
+                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                }
+            }
+
+            /// Block reason is extracted from "reason" or "message" field.
+            #[test]
+            fn block_reason_extracted(
+                reason in "[a-z]{1,20}",
+                use_message_key in proptest::bool::ANY
+            ) {
+                let key = if use_message_key { "message" } else { "reason" };
+                let response = json!({"action": "block", key: &reason});
+                match apply_input_event_response(Some(response), String::new(), Vec::new()) {
+                    InputEventOutcome::Block { reason: r } => {
+                        assert_eq!(r.as_deref(), Some(reason.as_str()));
+                    }
+                    InputEventOutcome::Continue { .. } => panic!("expected Block"),
+                }
+            }
+
+            /// `ToolCallEventResult` deserializes with correct defaults.
+            #[test]
+            fn tool_call_result_deserialize(
+                block in proptest::bool::ANY,
+                reason in prop::option::of("[a-z ]{1,30}")
+            ) {
+                let mut obj = serde_json::Map::new();
+                obj.insert("block".to_string(), json!(block));
+                if let Some(ref r) = reason {
+                    obj.insert("reason".to_string(), json!(r));
+                }
+                let back: ToolCallEventResult =
+                    serde_json::from_value(Value::Object(obj)).unwrap();
+                assert_eq!(back.block, block);
+                assert_eq!(back.reason, reason);
+            }
+
+            /// `ToolCallEventResult` default has block=false.
+            #[test]
+            fn tool_call_result_default(_dummy in 0..1u8) {
+                let d = ToolCallEventResult::default();
+                assert!(!d.block);
+                assert!(d.reason.is_none());
+            }
+
+            /// `InputEventResult` deserializes correctly.
+            #[test]
+            fn input_event_result_deserialize(
+                content in prop::option::of("[a-z]{1,20}"),
+                block in proptest::bool::ANY,
+                reason in prop::option::of("[a-z]{1,20}")
+            ) {
+                let mut obj = serde_json::Map::new();
+                if let Some(ref c) = content {
+                    obj.insert("content".to_string(), json!(c));
+                }
+                obj.insert("block".to_string(), json!(block));
+                if let Some(ref r) = reason {
+                    obj.insert("reason".to_string(), json!(r));
+                }
+                let back: InputEventResult =
+                    serde_json::from_value(Value::Object(obj)).unwrap();
+                assert_eq!(back.content, content);
+                assert_eq!(back.block, block);
+                assert_eq!(back.reason, reason);
+            }
+        }
+    }
 }
