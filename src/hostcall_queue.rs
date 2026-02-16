@@ -1368,6 +1368,149 @@ mod tests {
         assert!(snapshot.reclaimed_total >= 10_000);
     }
 
+    // ── Additional public API coverage ──
+
+    #[test]
+    fn contention_sample_total_acquires_sums_reads_and_writes() {
+        let s = sample(100, 50, 0, 0, 0);
+        assert_eq!(s.total_acquires(), 150);
+
+        let zero = ContentionSample::default();
+        assert_eq!(zero.total_acquires(), 0);
+
+        let max = ContentionSample {
+            read_acquires: u64::MAX,
+            write_acquires: 1,
+            ..Default::default()
+        };
+        assert_eq!(max.total_acquires(), u64::MAX, "saturating_add on overflow");
+    }
+
+    #[test]
+    fn contention_sample_read_ratio_permille_values() {
+        // All reads → 1000 permille
+        let all_reads = sample(100, 0, 0, 0, 0);
+        assert_eq!(all_reads.read_ratio_permille(), 1000);
+
+        // All writes → 0 permille
+        let all_writes = sample(0, 100, 0, 0, 0);
+        assert_eq!(all_writes.read_ratio_permille(), 0);
+
+        // Balanced → ~500 permille
+        let balanced = sample(50, 50, 0, 0, 0);
+        assert_eq!(balanced.read_ratio_permille(), 500);
+
+        // Zero total → 0 (no division by zero)
+        let zero = ContentionSample::default();
+        assert_eq!(zero.read_ratio_permille(), 0);
+
+        // 75% reads → 750 permille
+        let three_quarter = sample(75, 25, 0, 0, 0);
+        assert_eq!(three_quarter.read_ratio_permille(), 750);
+    }
+
+    #[test]
+    fn bravo_contention_state_mode_accessor() {
+        let state = BravoContentionState::new(deterministic_config());
+        assert_eq!(state.mode(), BravoBiasMode::Balanced);
+
+        let mut state2 = BravoContentionState::new(deterministic_config());
+        // Feed read-dominant sample to transition to ReadBiased
+        let _ = state2.observe(sample(80, 10, 0, 0, 0));
+        assert_eq!(state2.mode(), BravoBiasMode::ReadBiased);
+    }
+
+    #[test]
+    fn s3fifo_config_from_capacities_computes_fields() {
+        let config = S3FifoConfig::from_capacities(256, 2048);
+        // tenant_budget = overflow/2 = 1024
+        assert_eq!(config.tenant_budget, 1024);
+        // ghost_capacity = (256+2048)*2 = 4608, above min of 16
+        assert_eq!(config.ghost_capacity, 4608);
+        assert_eq!(config.min_signal_samples, 32);
+        assert_eq!(config.max_signalless_streak, 64);
+        assert_eq!(config.unstable_rejection_streak, 16);
+
+        // Small capacities → enforced minimums
+        let small = S3FifoConfig::from_capacities(1, 1);
+        assert_eq!(small.tenant_budget, 1); // max(1/2, 1) = max(0, 1) = 1
+        assert_eq!(small.ghost_capacity, 16); // max((1+1)*2, 16) = max(4, 16) = 16
+    }
+
+    #[test]
+    fn queue_with_capacities_creates_functional_queue() {
+        let mut queue: HostcallRequestQueue<u32> = HostcallRequestQueue::with_capacities(4, 8);
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+
+        let result = queue.push_back(42);
+        assert!(matches!(
+            result,
+            HostcallQueueEnqueueResult::FastPath { .. }
+        ));
+        assert!(!queue.is_empty());
+        assert_eq!(queue.len(), 1);
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.fast_capacity, 4);
+        assert_eq!(snapshot.overflow_capacity, 8);
+    }
+
+    #[test]
+    fn queue_clear_resets_state() {
+        let mut queue = HostcallRequestQueue::with_mode(2, 4, HostcallQueueMode::Ebr);
+        let _ = queue.push_back(1_u8);
+        let _ = queue.push_back(2_u8);
+        let _ = queue.push_back(3_u8); // spills to overflow
+        assert!(!queue.is_empty());
+
+        queue.clear();
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.max_depth_seen, 0);
+        assert_eq!(snapshot.overflow_enqueued_total, 0);
+        assert_eq!(snapshot.overflow_rejected_total, 0);
+    }
+
+    #[test]
+    fn queue_reclamation_mode_accessor() {
+        let ebr = HostcallRequestQueue::<u8>::with_mode(2, 2, HostcallQueueMode::Ebr);
+        assert_eq!(ebr.reclamation_mode(), HostcallQueueMode::Ebr);
+
+        let fallback =
+            HostcallRequestQueue::<u8>::with_mode(2, 2, HostcallQueueMode::SafeFallback);
+        assert_eq!(
+            fallback.reclamation_mode(),
+            HostcallQueueMode::SafeFallback
+        );
+    }
+
+    #[test]
+    fn queue_force_safe_fallback_switches_mode() {
+        let mut queue: HostcallRequestQueue<u8> =
+            HostcallRequestQueue::with_mode(2, 2, HostcallQueueMode::Ebr);
+        assert_eq!(queue.reclamation_mode(), HostcallQueueMode::Ebr);
+
+        queue.force_safe_fallback();
+        assert_eq!(queue.reclamation_mode(), HostcallQueueMode::SafeFallback);
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.fallback_transitions, 1);
+
+        // Calling again is idempotent (no extra transition counted)
+        queue.force_safe_fallback();
+        let snapshot2 = queue.snapshot();
+        assert_eq!(snapshot2.fallback_transitions, 1);
+    }
+
+    #[test]
+    fn queue_default_uses_standard_capacities() {
+        let queue: HostcallRequestQueue<u8> = HostcallRequestQueue::default();
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.fast_capacity, HOSTCALL_FAST_RING_CAPACITY);
+        assert_eq!(snapshot.overflow_capacity, HOSTCALL_OVERFLOW_CAPACITY);
+    }
+
     #[test]
     fn loom_epoch_pin_blocks_reclamation_until_release() {
         use loom::sync::atomic::{AtomicBool, Ordering as LoomOrdering};
