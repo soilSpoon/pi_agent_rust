@@ -3286,6 +3286,24 @@ pub struct RuntimeHostcallTelemetryEvent {
     pub risk_score: f64,
     pub timeout_ms: Option<u64>,
     pub latency_ms: u64,
+    /// Dispatch lane selected for this hostcall (`fast`, `compat`, or `unknown`).
+    #[serde(default = "runtime_hostcall_lane_default")]
+    pub lane: String,
+    /// Deterministic lane decision reason code.
+    #[serde(default)]
+    pub lane_decision_reason: String,
+    /// Fallback reason code when compat lane is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_fallback_reason: Option<String>,
+    /// Lane matrix key (`method|opcode_or_fallback|capability_class`).
+    #[serde(default)]
+    pub lane_matrix_key: String,
+    /// Portion of latency attributed to lane dispatch execution.
+    #[serde(default)]
+    pub lane_dispatch_latency_ms: u64,
+    /// Lane dispatch share of total call latency in basis points (0..=10000).
+    #[serde(default)]
+    pub lane_latency_share_bps: u64,
     pub outcome: String,
     pub outcome_error_code: Option<String>,
     pub selected_action: RuntimeRiskActionValue,
@@ -3300,6 +3318,10 @@ pub struct RuntimeHostcallTelemetryEvent {
     pub extraction_budget_us: u64,
     pub extraction_budget_exceeded: bool,
     pub redaction_summary: String,
+}
+
+fn runtime_hostcall_lane_default() -> String {
+    "unknown".to_string()
 }
 
 impl Default for RuntimeHostcallTelemetryEvent {
@@ -3319,6 +3341,12 @@ impl Default for RuntimeHostcallTelemetryEvent {
             risk_score: 0.0,
             timeout_ms: None,
             latency_ms: 0,
+            lane: runtime_hostcall_lane_default(),
+            lane_decision_reason: String::new(),
+            lane_fallback_reason: None,
+            lane_matrix_key: "unknown|fallback|unknown".to_string(),
+            lane_dispatch_latency_ms: 0,
+            lane_latency_share_bps: 0,
             outcome: "success".to_string(),
             outcome_error_code: None,
             selected_action: RuntimeRiskActionValue::Allow,
@@ -7637,10 +7665,17 @@ enum HostcallOpcodeSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommonHostcallOpcode {
+    // Tool operations
     ToolRead,
     ToolWrite,
     ToolEdit,
     ToolBash,
+    // Session operations (via "session" method) — hot getters/setters
+    SessionGetState,
+    SessionGetMessages,
+    SessionGetEntries,
+    SessionGetBranch,
+    SessionGetFile,
     SessionGetName,
     SessionSetName,
     SessionGetModel,
@@ -7648,11 +7683,20 @@ enum CommonHostcallOpcode {
     SessionGetThinkingLevel,
     SessionSetThinkingLevel,
     SessionSetLabel,
+    // Events operations (via "events" method)
     EventsGetActiveTools,
     EventsGetAllTools,
     EventsSetActiveTools,
     EventsEmit,
     EventsList,
+    EventsGetModel,
+    EventsSetModel,
+    EventsGetThinkingLevel,
+    EventsSetThinkingLevel,
+    EventsGetFlag,
+    EventsListFlags,
+    EventsAppendEntry,
+    EventsRegisterCommand,
 }
 
 impl CommonHostcallOpcode {
@@ -7662,6 +7706,11 @@ impl CommonHostcallOpcode {
             Self::ToolWrite => "tool.write",
             Self::ToolEdit => "tool.edit",
             Self::ToolBash => "tool.bash",
+            Self::SessionGetState => "session.get_state",
+            Self::SessionGetMessages => "session.get_messages",
+            Self::SessionGetEntries => "session.get_entries",
+            Self::SessionGetBranch => "session.get_branch",
+            Self::SessionGetFile => "session.get_file",
             Self::SessionGetName => "session.get_name",
             Self::SessionSetName => "session.set_name",
             Self::SessionGetModel => "session.get_model",
@@ -7674,13 +7723,26 @@ impl CommonHostcallOpcode {
             Self::EventsSetActiveTools => "events.set_active_tools",
             Self::EventsEmit => "events.emit",
             Self::EventsList => "events.list",
+            Self::EventsGetModel => "events.get_model",
+            Self::EventsSetModel => "events.set_model",
+            Self::EventsGetThinkingLevel => "events.get_thinking_level",
+            Self::EventsSetThinkingLevel => "events.set_thinking_level",
+            Self::EventsGetFlag => "events.get_flag",
+            Self::EventsListFlags => "events.list_flags",
+            Self::EventsAppendEntry => "events.append_entry",
+            Self::EventsRegisterCommand => "events.register_command",
         }
     }
 
     const fn method(self) -> &'static str {
         match self {
             Self::ToolRead | Self::ToolWrite | Self::ToolEdit | Self::ToolBash => "tool",
-            Self::SessionGetName
+            Self::SessionGetState
+            | Self::SessionGetMessages
+            | Self::SessionGetEntries
+            | Self::SessionGetBranch
+            | Self::SessionGetFile
+            | Self::SessionGetName
             | Self::SessionSetName
             | Self::SessionGetModel
             | Self::SessionSetModel
@@ -7691,7 +7753,15 @@ impl CommonHostcallOpcode {
             | Self::EventsGetAllTools
             | Self::EventsSetActiveTools
             | Self::EventsEmit
-            | Self::EventsList => "events",
+            | Self::EventsList
+            | Self::EventsGetModel
+            | Self::EventsSetModel
+            | Self::EventsGetThinkingLevel
+            | Self::EventsSetThinkingLevel
+            | Self::EventsGetFlag
+            | Self::EventsListFlags
+            | Self::EventsAppendEntry
+            | Self::EventsRegisterCommand => "events",
         }
     }
 
@@ -7700,7 +7770,12 @@ impl CommonHostcallOpcode {
             Self::ToolRead => "read",
             Self::ToolWrite | Self::ToolEdit => "write",
             Self::ToolBash => "exec",
-            Self::SessionGetName
+            Self::SessionGetState
+            | Self::SessionGetMessages
+            | Self::SessionGetEntries
+            | Self::SessionGetBranch
+            | Self::SessionGetFile
+            | Self::SessionGetName
             | Self::SessionSetName
             | Self::SessionGetModel
             | Self::SessionSetModel
@@ -7711,7 +7786,15 @@ impl CommonHostcallOpcode {
             | Self::EventsGetAllTools
             | Self::EventsSetActiveTools
             | Self::EventsEmit
-            | Self::EventsList => "events",
+            | Self::EventsList
+            | Self::EventsGetModel
+            | Self::EventsSetModel
+            | Self::EventsGetThinkingLevel
+            | Self::EventsSetThinkingLevel
+            | Self::EventsGetFlag
+            | Self::EventsListFlags
+            | Self::EventsAppendEntry
+            | Self::EventsRegisterCommand => "events",
         }
     }
 
@@ -7719,7 +7802,12 @@ impl CommonHostcallOpcode {
         match self {
             Self::ToolRead | Self::ToolWrite | Self::ToolEdit => "filesystem",
             Self::ToolBash => "execution",
-            Self::SessionGetName
+            Self::SessionGetState
+            | Self::SessionGetMessages
+            | Self::SessionGetEntries
+            | Self::SessionGetBranch
+            | Self::SessionGetFile
+            | Self::SessionGetName
             | Self::SessionSetName
             | Self::SessionGetModel
             | Self::SessionSetModel
@@ -7730,7 +7818,15 @@ impl CommonHostcallOpcode {
             | Self::EventsGetAllTools
             | Self::EventsSetActiveTools
             | Self::EventsEmit
-            | Self::EventsList => "events",
+            | Self::EventsList
+            | Self::EventsGetModel
+            | Self::EventsSetModel
+            | Self::EventsGetThinkingLevel
+            | Self::EventsSetThinkingLevel
+            | Self::EventsGetFlag
+            | Self::EventsListFlags
+            | Self::EventsAppendEntry
+            | Self::EventsRegisterCommand => "events",
         }
     }
 
@@ -7740,6 +7836,11 @@ impl CommonHostcallOpcode {
             Self::ToolWrite => "tool|tool.write|filesystem",
             Self::ToolEdit => "tool|tool.edit|filesystem",
             Self::ToolBash => "tool|tool.bash|execution",
+            Self::SessionGetState => "session|session.get_state|session",
+            Self::SessionGetMessages => "session|session.get_messages|session",
+            Self::SessionGetEntries => "session|session.get_entries|session",
+            Self::SessionGetBranch => "session|session.get_branch|session",
+            Self::SessionGetFile => "session|session.get_file|session",
             Self::SessionGetName => "session|session.get_name|session",
             Self::SessionSetName => "session|session.set_name|session",
             Self::SessionGetModel => "session|session.get_model|session",
@@ -7752,6 +7853,14 @@ impl CommonHostcallOpcode {
             Self::EventsSetActiveTools => "events|events.set_active_tools|events",
             Self::EventsEmit => "events|events.emit|events",
             Self::EventsList => "events|events.list|events",
+            Self::EventsGetModel => "events|events.get_model|events",
+            Self::EventsSetModel => "events|events.set_model|events",
+            Self::EventsGetThinkingLevel => "events|events.get_thinking_level|events",
+            Self::EventsSetThinkingLevel => "events|events.set_thinking_level|events",
+            Self::EventsGetFlag => "events|events.get_flag|events",
+            Self::EventsListFlags => "events|events.list_flags|events",
+            Self::EventsAppendEntry => "events|events.append_entry|events",
+            Self::EventsRegisterCommand => "events|events.register_command|events",
         }
     }
 }
@@ -7789,6 +7898,15 @@ struct HostcallLaneDecision {
     opcode: Option<CommonHostcallOpcode>,
     capability_class: &'static str,
     matrix_key: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostcallLaneExecution {
+    lane: HostcallDispatchLane,
+    decision_reason: String,
+    fallback_reason: Option<String>,
+    matrix_key: &'static str,
+    dispatch_latency_ms: u64,
 }
 
 // ============================================================================
@@ -7957,6 +8075,11 @@ fn parse_common_hostcall_opcode_code(code: &str) -> Option<CommonHostcallOpcode>
         "tool.write" => Some(CommonHostcallOpcode::ToolWrite),
         "tool.edit" => Some(CommonHostcallOpcode::ToolEdit),
         "tool.bash" => Some(CommonHostcallOpcode::ToolBash),
+        "session.get_state" => Some(CommonHostcallOpcode::SessionGetState),
+        "session.get_messages" => Some(CommonHostcallOpcode::SessionGetMessages),
+        "session.get_entries" => Some(CommonHostcallOpcode::SessionGetEntries),
+        "session.get_branch" => Some(CommonHostcallOpcode::SessionGetBranch),
+        "session.get_file" => Some(CommonHostcallOpcode::SessionGetFile),
         "session.get_name" => Some(CommonHostcallOpcode::SessionGetName),
         "session.set_name" => Some(CommonHostcallOpcode::SessionSetName),
         "session.get_model" => Some(CommonHostcallOpcode::SessionGetModel),
@@ -7969,6 +8092,14 @@ fn parse_common_hostcall_opcode_code(code: &str) -> Option<CommonHostcallOpcode>
         "events.set_active_tools" => Some(CommonHostcallOpcode::EventsSetActiveTools),
         "events.emit" => Some(CommonHostcallOpcode::EventsEmit),
         "events.list" => Some(CommonHostcallOpcode::EventsList),
+        "events.get_model" => Some(CommonHostcallOpcode::EventsGetModel),
+        "events.set_model" => Some(CommonHostcallOpcode::EventsSetModel),
+        "events.get_thinking_level" => Some(CommonHostcallOpcode::EventsGetThinkingLevel),
+        "events.set_thinking_level" => Some(CommonHostcallOpcode::EventsSetThinkingLevel),
+        "events.get_flag" => Some(CommonHostcallOpcode::EventsGetFlag),
+        "events.list_flags" => Some(CommonHostcallOpcode::EventsListFlags),
+        "events.append_entry" => Some(CommonHostcallOpcode::EventsAppendEntry),
+        "events.register_command" => Some(CommonHostcallOpcode::EventsRegisterCommand),
         _ => None,
     }
 }
@@ -7991,6 +8122,11 @@ fn derive_common_hostcall_opcode(method: &str, params: &Value) -> Option<CommonH
         "session" => {
             let op = hostcall_param_op(params).map(normalize_opcode_token)?;
             match op.as_str() {
+                "getstate" => Some(CommonHostcallOpcode::SessionGetState),
+                "getmessages" => Some(CommonHostcallOpcode::SessionGetMessages),
+                "getentries" => Some(CommonHostcallOpcode::SessionGetEntries),
+                "getbranch" => Some(CommonHostcallOpcode::SessionGetBranch),
+                "getfile" => Some(CommonHostcallOpcode::SessionGetFile),
                 "getname" => Some(CommonHostcallOpcode::SessionGetName),
                 "setname" => Some(CommonHostcallOpcode::SessionSetName),
                 "getmodel" => Some(CommonHostcallOpcode::SessionGetModel),
@@ -8009,6 +8145,14 @@ fn derive_common_hostcall_opcode(method: &str, params: &Value) -> Option<CommonH
                 "setactivetools" => Some(CommonHostcallOpcode::EventsSetActiveTools),
                 "emit" => Some(CommonHostcallOpcode::EventsEmit),
                 "list" => Some(CommonHostcallOpcode::EventsList),
+                "getmodel" => Some(CommonHostcallOpcode::EventsGetModel),
+                "setmodel" => Some(CommonHostcallOpcode::EventsSetModel),
+                "getthinkinglevel" => Some(CommonHostcallOpcode::EventsGetThinkingLevel),
+                "setthinkinglevel" => Some(CommonHostcallOpcode::EventsSetThinkingLevel),
+                "getflag" => Some(CommonHostcallOpcode::EventsGetFlag),
+                "listflags" => Some(CommonHostcallOpcode::EventsListFlags),
+                "appendentry" => Some(CommonHostcallOpcode::EventsAppendEntry),
+                "registercommand" => Some(CommonHostcallOpcode::EventsRegisterCommand),
                 _ => None,
             }
         }
@@ -8197,6 +8341,30 @@ fn select_hostcall_lane(call: &HostCallPayload) -> Result<HostcallLaneDecision> 
                 matrix_key: fallback_lane_matrix_key(call, capability_class),
             })
         }
+    }
+}
+
+fn apply_hostcall_lane_kill_switch(
+    ctx: &HostCallContext<'_>,
+    call: &HostCallPayload,
+    lane: HostcallLaneDecision,
+) -> HostcallLaneDecision {
+    if lane.lane == HostcallDispatchLane::Compat {
+        return lane;
+    }
+    let Some(manager) = ctx.manager.as_ref() else {
+        return lane;
+    };
+    let Some(reason) = manager.hostcall_compat_kill_switch_reason(ctx.extension_id) else {
+        return lane;
+    };
+    let capability_class = hostcall_capability_class(call);
+    HostcallLaneDecision {
+        lane: HostcallDispatchLane::Compat,
+        reason,
+        opcode: None,
+        capability_class,
+        matrix_key: fallback_lane_matrix_key(call, capability_class),
     }
 }
 
@@ -13982,12 +14150,23 @@ fn log_hostcall_end(
     method: &str,
     params_hash: &str,
     duration_ms: u64,
+    lane_execution: Option<&HostcallLaneExecution>,
     outcome: &HostcallOutcome,
 ) {
     let (is_error, error_code) = match outcome {
         HostcallOutcome::Success(_) | HostcallOutcome::StreamChunk { .. } => (false, None),
         HostcallOutcome::Error { code, .. } => (true, Some(code.as_str())),
     };
+    let lane = lane_execution.map(|meta| meta.lane.as_str());
+    let lane_decision_reason = lane_execution.map(|meta| meta.decision_reason.as_str());
+    let lane_fallback_reason = lane_execution.and_then(|meta| meta.fallback_reason.as_deref());
+    let lane_matrix_key = lane_execution.map(|meta| meta.matrix_key);
+    let lane_dispatch_latency_ms = lane_execution.map_or(0, |meta| meta.dispatch_latency_ms);
+    let lane_latency_share_bps = lane_dispatch_latency_ms
+        .saturating_mul(10_000)
+        .checked_div(duration_ms)
+        .unwrap_or(0)
+        .min(10_000);
 
     if is_error {
         tracing::warn!(
@@ -13999,6 +14178,12 @@ fn log_hostcall_end(
             method = %method,
             params_hash = %params_hash,
             duration_ms,
+            lane = lane,
+            lane_decision_reason = lane_decision_reason,
+            lane_fallback_reason = lane_fallback_reason,
+            lane_matrix_key = lane_matrix_key,
+            lane_dispatch_latency_ms,
+            lane_latency_share_bps,
             error_code = error_code,
             "Hostcall end (error)"
         );
@@ -14012,6 +14197,12 @@ fn log_hostcall_end(
             method = %method,
             params_hash = %params_hash,
             duration_ms,
+            lane = lane,
+            lane_decision_reason = lane_decision_reason,
+            lane_fallback_reason = lane_fallback_reason,
+            lane_matrix_key = lane_matrix_key,
+            lane_dispatch_latency_ms,
+            lane_latency_share_bps,
             "Hostcall end (success)"
         );
     }
@@ -14146,6 +14337,7 @@ pub async fn dispatch_host_call_shared(
                     &method,
                     &params_hash,
                     duration_ms,
+                    None,
                     &outcome,
                 );
                 return outcome_to_host_result(&call_id, &outcome);
@@ -14157,6 +14349,7 @@ pub async fn dispatch_host_call_shared(
     let is_exec = capability == "exec";
 
     let mut runtime_risk_decision = None;
+    let mut lane_execution: Option<HostcallLaneExecution> = None;
     let outcome = if decision == PolicyDecision::Allow {
         if let Some(manager) = ctx.manager.as_ref() {
             runtime_risk_decision = manager.evaluate_runtime_risk(
@@ -14205,13 +14398,19 @@ pub async fn dispatch_host_call_shared(
         let dispatched = if shadow_mode {
             // SEC-7.1: Shadow mode — score is recorded but call is always allowed.
             // Alerts are still generated with counterfactual actions for review.
-            dispatch_shared_allowed(ctx, &call).await
+            let (outcome, lane_meta) = dispatch_shared_allowed(ctx, &call).await;
+            lane_execution = lane_meta;
+            outcome
         } else {
             match runtime_risk_decision
                 .as_ref()
                 .map_or(RuntimeRiskAction::Allow, |d| d.action)
             {
-                RuntimeRiskAction::Allow => dispatch_shared_allowed(ctx, &call).await,
+                RuntimeRiskAction::Allow => {
+                    let (outcome, lane_meta) = dispatch_shared_allowed(ctx, &call).await;
+                    lane_execution = lane_meta;
+                    outcome
+                }
                 RuntimeRiskAction::Harden => {
                     if runtime_risk_is_dangerous(capability) {
                         // SEC-5.1: Alert for anomaly-based hardening denial.
@@ -14253,7 +14452,9 @@ pub async fn dispatch_host_call_shared(
                             ),
                         }
                     } else {
-                        dispatch_shared_allowed(ctx, &call).await
+                        let (outcome, lane_meta) = dispatch_shared_allowed(ctx, &call).await;
+                        lane_execution = lane_meta;
+                        outcome
                     }
                 }
                 RuntimeRiskAction::Deny => {
@@ -14381,6 +14582,7 @@ pub async fn dispatch_host_call_shared(
         &method,
         &params_hash,
         duration_ms,
+        lane_execution.as_ref(),
         &outcome,
     );
 
@@ -14398,6 +14600,7 @@ pub async fn dispatch_host_call_shared(
             risk_decision,
             outcome_error_code,
             duration_ms,
+            lane_execution.as_ref(),
         );
     }
 
@@ -14565,7 +14768,7 @@ async fn resolve_shared_policy_prompt(
 async fn dispatch_shared_allowed(
     ctx: &HostCallContext<'_>,
     call: &HostCallPayload,
-) -> HostcallOutcome {
+) -> (HostcallOutcome, Option<HostcallLaneExecution>) {
     let lane = match select_hostcall_lane(call) {
         Ok(lane) => lane,
         Err(err) => {
@@ -14577,12 +14780,23 @@ async fn dispatch_shared_allowed(
                 reason = %err,
                 "Rejecting hostcall due to invalid typed opcode metadata"
             );
-            return HostcallOutcome::Error {
-                code: "invalid_request".to_string(),
-                message: err.to_string(),
-            };
+            return (
+                HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: err.to_string(),
+                },
+                Some(HostcallLaneExecution {
+                    lane: HostcallDispatchLane::Compat,
+                    decision_reason: "typed_opcode_validation_error".to_string(),
+                    fallback_reason: Some("typed_opcode_validation_error".to_string()),
+                    matrix_key: "unknown|fallback|unknown",
+                    dispatch_latency_ms: 0,
+                }),
+            );
         }
     };
+    let lane = apply_hostcall_lane_kill_switch(ctx, call, lane);
+    let fallback_reason = (lane.lane == HostcallDispatchLane::Compat).then_some(lane.reason);
 
     tracing::debug!(
         event = "host_call.lane_decision",
@@ -14595,12 +14809,14 @@ async fn dispatch_shared_allowed(
         lane_matrix_method = lane.opcode.map_or("fallback", CommonHostcallOpcode::method),
         capability_class = lane.capability_class,
         opcode = lane.opcode.map(CommonHostcallOpcode::code),
+        fallback_reason,
         opcode_schema = HOSTCALL_OPCODE_SCHEMA_VERSION,
         opcode_version = HOSTCALL_OPCODE_VERSION,
         "Selected hostcall dispatch lane"
     );
 
-    match lane.lane {
+    let dispatch_started_at = Instant::now();
+    let outcome = match lane.lane {
         HostcallDispatchLane::Fast => {
             let Some(opcode) = lane.opcode else {
                 tracing::warn!(
@@ -14610,15 +14826,38 @@ async fn dispatch_shared_allowed(
                     method = %call.method,
                     "Fast lane selected without opcode; rejecting call"
                 );
-                return HostcallOutcome::Error {
-                    code: "invalid_request".to_string(),
-                    message: "Invalid hostcall lane state: fast lane requires opcode".to_string(),
-                };
+                return (
+                    HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "Invalid hostcall lane state: fast lane requires opcode"
+                            .to_string(),
+                    },
+                    Some(HostcallLaneExecution {
+                        lane: HostcallDispatchLane::Fast,
+                        decision_reason: "invalid_lane_state".to_string(),
+                        fallback_reason: None,
+                        matrix_key: lane.matrix_key,
+                        dispatch_latency_ms: 0,
+                    }),
+                );
             };
             dispatch_shared_allowed_fast(ctx, call, opcode).await
         }
         HostcallDispatchLane::Compat => dispatch_shared_allowed_legacy(ctx, call).await,
-    }
+    };
+
+    let dispatch_latency_ms =
+        u64::try_from(dispatch_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    (
+        outcome,
+        Some(HostcallLaneExecution {
+            lane: lane.lane,
+            decision_reason: lane.reason.to_string(),
+            fallback_reason: fallback_reason.map(ToString::to_string),
+            matrix_key: lane.matrix_key,
+            dispatch_latency_ms,
+        }),
+    )
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -14825,6 +15064,211 @@ async fn dispatch_shared_allowed_fast(
                 manager,
                 ctx.tools,
                 "list",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        // --- New fast-lane session getters (bd-3ar8v.4.12) ---
+        CommonHostcallOpcode::SessionGetState => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "get_state",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionGetMessages => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "get_messages",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionGetEntries => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "get_entries",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionGetBranch => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "get_branch",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::SessionGetFile => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(
+                &call.call_id,
+                manager,
+                "get_file",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        // --- New fast-lane events operations (bd-3ar8v.4.12) ---
+        CommonHostcallOpcode::EventsGetModel => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "get_model",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsSetModel => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "set_model",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsGetThinkingLevel => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "get_thinking_level",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsSetThinkingLevel => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "set_thinking_level",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsGetFlag => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "get_flag",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsListFlags => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "list_flags",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsAppendEntry => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "append_entry",
+                params_without_key(&call.params, "op"),
+            )
+            .await
+        }
+        CommonHostcallOpcode::EventsRegisterCommand => {
+            let Some(ref manager) = ctx.manager else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                "register_command",
                 params_without_key(&call.params, "op"),
             )
             .await
@@ -16439,6 +16883,10 @@ struct ExtensionManagerInner {
     security_alert_seq: u64,
     /// Per-extension trust state (SEC-5.2).
     trust_states: HashMap<String, ExtensionTrustState>,
+    /// Emergency global kill-switch forcing hostcalls into compatibility lane.
+    hostcall_compat_kill_switch_global: bool,
+    /// Emergency per-extension kill-switch forcing hostcalls into compatibility lane.
+    hostcall_compat_kill_switch_extensions: HashSet<String>,
     /// Kill-switch audit trail (SEC-5.2).
     kill_switch_audit: VecDeque<KillSwitchAuditEntry>,
     /// Trust onboarding decision log (SEC-5.2).
@@ -17266,7 +17714,11 @@ impl ExtensionManager {
         })
     }
 
-    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::significant_drop_tightening,
+        clippy::too_many_arguments
+    )]
     fn record_runtime_risk_outcome(
         &self,
         extension_id: Option<&str>,
@@ -17275,6 +17727,7 @@ impl ExtensionManager {
         decision: &RuntimeRiskDecision,
         outcome_error_code: Option<&str>,
         duration_ms: u64,
+        lane_execution: Option<&HostcallLaneExecution>,
     ) {
         let mut guard = self.inner.lock().unwrap();
         if !guard.runtime_risk_config.enabled {
@@ -17351,6 +17804,37 @@ impl ExtensionManager {
             state.last_capability = Some(decision.capability.clone());
             state.last_method = Some(decision.method.clone());
             state.last_resource_target_class = Some(decision.resource_target_class.clone());
+            let (
+                lane,
+                lane_decision_reason,
+                lane_fallback_reason,
+                lane_matrix_key,
+                lane_dispatch_latency_ms,
+            ) = lane_execution.map_or_else(
+                || {
+                    (
+                        "unknown".to_string(),
+                        String::new(),
+                        None,
+                        "unknown|fallback|unknown".to_string(),
+                        0,
+                    )
+                },
+                |meta| {
+                    (
+                        meta.lane.as_str().to_string(),
+                        meta.decision_reason.clone(),
+                        meta.fallback_reason.clone(),
+                        meta.matrix_key.to_string(),
+                        meta.dispatch_latency_ms,
+                    )
+                },
+            );
+            let lane_latency_share_bps = lane_dispatch_latency_ms
+                .saturating_mul(10_000)
+                .checked_div(duration_ms)
+                .unwrap_or(0)
+                .min(10_000);
 
             let telemetry = RuntimeHostcallTelemetryEvent {
                 schema: RUNTIME_HOSTCALL_TELEMETRY_SCHEMA_VERSION.to_string(),
@@ -17367,6 +17851,12 @@ impl ExtensionManager {
                 risk_score: decision.risk_score,
                 timeout_ms: decision.timeout_ms,
                 latency_ms: duration_ms,
+                lane,
+                lane_decision_reason,
+                lane_fallback_reason,
+                lane_matrix_key,
+                lane_dispatch_latency_ms,
+                lane_latency_share_bps,
                 outcome: if is_error {
                     "error".to_string()
                 } else {
@@ -17711,6 +18201,104 @@ impl ExtensionManager {
             .iter()
             .cloned()
             .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // Hostcall lane emergency controls
+    // ------------------------------------------------------------------
+
+    /// Enable or disable the global hostcall compatibility-lane kill-switch.
+    ///
+    /// When enabled, all hostcalls that would normally use the fast lane are
+    /// deterministically routed through the compatibility lane.
+    pub fn set_hostcall_compat_kill_switch_global(&self, enabled: bool) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.hostcall_compat_kill_switch_global = enabled;
+        drop(guard);
+
+        if enabled {
+            tracing::warn!(
+                event = "host_call.compat_kill_switch.global",
+                enabled,
+                "Enabled global hostcall compatibility-lane kill-switch"
+            );
+        } else {
+            tracing::info!(
+                event = "host_call.compat_kill_switch.global",
+                enabled,
+                "Disabled global hostcall compatibility-lane kill-switch"
+            );
+        }
+    }
+
+    /// Enable or disable per-extension hostcall compatibility-lane kill-switch.
+    ///
+    /// When enabled for `extension_id`, fast-lane-eligible hostcalls from that
+    /// extension are routed through the compatibility lane.
+    pub fn set_hostcall_compat_kill_switch_for_extension(&self, extension_id: &str, enabled: bool) {
+        let extension_id = extension_id.trim();
+        if extension_id.is_empty() {
+            return;
+        }
+
+        let mut guard = self.inner.lock().unwrap();
+        if enabled {
+            guard
+                .hostcall_compat_kill_switch_extensions
+                .insert(extension_id.to_string());
+        } else {
+            guard
+                .hostcall_compat_kill_switch_extensions
+                .remove(extension_id);
+        }
+        drop(guard);
+
+        if enabled {
+            tracing::warn!(
+                event = "host_call.compat_kill_switch.extension",
+                extension_id = %extension_id,
+                enabled,
+                "Enabled per-extension hostcall compatibility-lane kill-switch"
+            );
+        } else {
+            tracing::info!(
+                event = "host_call.compat_kill_switch.extension",
+                extension_id = %extension_id,
+                enabled,
+                "Disabled per-extension hostcall compatibility-lane kill-switch"
+            );
+        }
+    }
+
+    pub fn hostcall_compat_kill_switch_global(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.hostcall_compat_kill_switch_global)
+    }
+
+    pub fn hostcall_compat_kill_switch_for_extension(&self, extension_id: &str) -> bool {
+        self.inner.lock().ok().is_some_and(|guard| {
+            guard
+                .hostcall_compat_kill_switch_extensions
+                .contains(extension_id)
+        })
+    }
+
+    fn hostcall_compat_kill_switch_reason(
+        &self,
+        extension_id: Option<&str>,
+    ) -> Option<&'static str> {
+        let guard = self.inner.lock().ok()?;
+        if guard.hostcall_compat_kill_switch_global {
+            return Some("forced_compat_global_kill_switch");
+        }
+        if extension_id.is_some_and(|id| guard.hostcall_compat_kill_switch_extensions.contains(id))
+        {
+            return Some("forced_compat_extension_kill_switch");
+        }
+        drop(guard);
+        None
     }
 
     // ------------------------------------------------------------------
@@ -19541,7 +20129,7 @@ pub fn extension_event_from_agent(
 /// Cheap extraction of just the extension event name from an agent event,
 /// without serializing the payload.  Use this to check `has_hook_for()`
 /// before paying the `serde_json::to_value()` cost.
-pub fn extension_event_name_from_agent(event: &AgentEvent) -> Option<ExtensionEventName> {
+pub const fn extension_event_name_from_agent(event: &AgentEvent) -> Option<ExtensionEventName> {
     match event {
         AgentEvent::AgentStart { .. } => Some(ExtensionEventName::AgentStart),
         AgentEvent::AgentEnd { .. } => Some(ExtensionEventName::AgentEnd),
@@ -19602,6 +20190,8 @@ pub const fn is_lifecycle_event(event: &ExtensionEventName) -> bool {
 /// // In the hot loop:
 /// coalescer.dispatch_fire_and_forget(event_name, data, &runtime_handle);
 /// ```
+type EventBatchBuffer = Arc<Mutex<Vec<(ExtensionEventName, Option<Value>)>>>;
+
 pub struct EventCoalescer {
     manager: ExtensionManager,
     /// For coalescable events, stores the latest pending payload keyed by
@@ -19614,7 +20204,7 @@ pub struct EventCoalescer {
     /// Batch buffer for non-coalescable events.  Events accumulate here and
     /// are dispatched together in a single JS bridge call when the drain
     /// task fires.
-    batch_buffer: Arc<Mutex<Vec<(ExtensionEventName, Option<Value>)>>>,
+    batch_buffer: EventBatchBuffer,
     /// Whether a batch drain task is already scheduled.
     batch_drain_scheduled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -29301,6 +29891,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn hostcall_fast_lane_matrix_entries_are_consistent() {
         let matrix = [
             (
@@ -29415,6 +30006,99 @@ mod tests {
                 "events",
                 "events|events.list|events",
             ),
+            // --- new session getters ---
+            (
+                CommonHostcallOpcode::SessionGetState,
+                "session",
+                "session.get_state",
+                "session",
+                "session|session.get_state|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionGetMessages,
+                "session",
+                "session.get_messages",
+                "session",
+                "session|session.get_messages|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionGetEntries,
+                "session",
+                "session.get_entries",
+                "session",
+                "session|session.get_entries|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionGetBranch,
+                "session",
+                "session.get_branch",
+                "session",
+                "session|session.get_branch|session",
+            ),
+            (
+                CommonHostcallOpcode::SessionGetFile,
+                "session",
+                "session.get_file",
+                "session",
+                "session|session.get_file|session",
+            ),
+            // --- new events operations ---
+            (
+                CommonHostcallOpcode::EventsGetModel,
+                "events",
+                "events.get_model",
+                "events",
+                "events|events.get_model|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsSetModel,
+                "events",
+                "events.set_model",
+                "events",
+                "events|events.set_model|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsGetThinkingLevel,
+                "events",
+                "events.get_thinking_level",
+                "events",
+                "events|events.get_thinking_level|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsSetThinkingLevel,
+                "events",
+                "events.set_thinking_level",
+                "events",
+                "events|events.set_thinking_level|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsGetFlag,
+                "events",
+                "events.get_flag",
+                "events",
+                "events|events.get_flag|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsListFlags,
+                "events",
+                "events.list_flags",
+                "events",
+                "events|events.list_flags|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsAppendEntry,
+                "events",
+                "events.append_entry",
+                "events",
+                "events|events.append_entry|events",
+            ),
+            (
+                CommonHostcallOpcode::EventsRegisterCommand,
+                "events",
+                "events.register_command",
+                "events",
+                "events|events.register_command|events",
+            ),
         ];
 
         for (opcode, method, code, capability_class, matrix_key) in matrix {
@@ -29473,6 +30157,410 @@ mod tests {
                 .contains("does not match payload-derived opcode"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn select_hostcall_lane_fast_for_new_session_getters() {
+        let cases: &[(&str, CommonHostcallOpcode)] = &[
+            ("get_state", CommonHostcallOpcode::SessionGetState),
+            ("get_messages", CommonHostcallOpcode::SessionGetMessages),
+            ("get_entries", CommonHostcallOpcode::SessionGetEntries),
+            ("get_branch", CommonHostcallOpcode::SessionGetBranch),
+            ("get_file", CommonHostcallOpcode::SessionGetFile),
+        ];
+        for (op, expected_opcode) in cases {
+            let payload = HostCallPayload {
+                call_id: format!("lane-session-{op}"),
+                capability: "session".to_string(),
+                method: "session".to_string(),
+                params: json!({ "op": op }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+            let lane = select_hostcall_lane(&payload)
+                .unwrap_or_else(|e| panic!("lane decision for op={op} failed: {e}"));
+            assert_eq!(
+                lane.lane,
+                HostcallDispatchLane::Fast,
+                "session op '{op}' should route to fast lane"
+            );
+            assert_eq!(lane.reason, "typed_opcode_derived_v1");
+            assert_eq!(lane.opcode, Some(*expected_opcode));
+            assert_eq!(lane.capability_class, "session");
+        }
+    }
+
+    #[test]
+    fn select_hostcall_lane_fast_for_new_events_ops() {
+        let cases: &[(&str, CommonHostcallOpcode)] = &[
+            ("get_model", CommonHostcallOpcode::EventsGetModel),
+            ("set_model", CommonHostcallOpcode::EventsSetModel),
+            (
+                "get_thinking_level",
+                CommonHostcallOpcode::EventsGetThinkingLevel,
+            ),
+            (
+                "set_thinking_level",
+                CommonHostcallOpcode::EventsSetThinkingLevel,
+            ),
+            ("get_flag", CommonHostcallOpcode::EventsGetFlag),
+            ("list_flags", CommonHostcallOpcode::EventsListFlags),
+            ("append_entry", CommonHostcallOpcode::EventsAppendEntry),
+            (
+                "register_command",
+                CommonHostcallOpcode::EventsRegisterCommand,
+            ),
+        ];
+        for (op, expected_opcode) in cases {
+            let payload = HostCallPayload {
+                call_id: format!("lane-events-{op}"),
+                capability: "events".to_string(),
+                method: "events".to_string(),
+                params: json!({ "op": op }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+            let lane = select_hostcall_lane(&payload)
+                .unwrap_or_else(|e| panic!("lane decision for op={op} failed: {e}"));
+            assert_eq!(
+                lane.lane,
+                HostcallDispatchLane::Fast,
+                "events op '{op}' should route to fast lane"
+            );
+            assert_eq!(lane.reason, "typed_opcode_derived_v1");
+            assert_eq!(lane.opcode, Some(*expected_opcode));
+            assert_eq!(lane.capability_class, "events");
+        }
+    }
+
+    #[test]
+    fn session_append_entry_still_falls_back_to_compat() {
+        // "append_entry" with method="session" is NOT a fast-lane opcode
+        // (only method="events" has EventsAppendEntry).
+        let payload = HostCallPayload {
+            call_id: "session-append-compat".to_string(),
+            capability: "session".to_string(),
+            method: "session".to_string(),
+            params: json!({ "op": "append_entry", "customType": "metric", "data": {} }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+        let lane = select_hostcall_lane(&payload).expect("lane decision");
+        assert_eq!(lane.lane, HostcallDispatchLane::Compat);
+        assert!(lane.opcode.is_none());
+    }
+
+    #[test]
+    fn all_opcodes_have_consistent_round_trip_code_parse() {
+        // Every opcode's code() must round-trip through parse_common_hostcall_opcode_code().
+        let all_opcodes = [
+            CommonHostcallOpcode::ToolRead,
+            CommonHostcallOpcode::ToolWrite,
+            CommonHostcallOpcode::ToolEdit,
+            CommonHostcallOpcode::ToolBash,
+            CommonHostcallOpcode::SessionGetState,
+            CommonHostcallOpcode::SessionGetMessages,
+            CommonHostcallOpcode::SessionGetEntries,
+            CommonHostcallOpcode::SessionGetBranch,
+            CommonHostcallOpcode::SessionGetFile,
+            CommonHostcallOpcode::SessionGetName,
+            CommonHostcallOpcode::SessionSetName,
+            CommonHostcallOpcode::SessionGetModel,
+            CommonHostcallOpcode::SessionSetModel,
+            CommonHostcallOpcode::SessionGetThinkingLevel,
+            CommonHostcallOpcode::SessionSetThinkingLevel,
+            CommonHostcallOpcode::SessionSetLabel,
+            CommonHostcallOpcode::EventsGetActiveTools,
+            CommonHostcallOpcode::EventsGetAllTools,
+            CommonHostcallOpcode::EventsSetActiveTools,
+            CommonHostcallOpcode::EventsEmit,
+            CommonHostcallOpcode::EventsList,
+            CommonHostcallOpcode::EventsGetModel,
+            CommonHostcallOpcode::EventsSetModel,
+            CommonHostcallOpcode::EventsGetThinkingLevel,
+            CommonHostcallOpcode::EventsSetThinkingLevel,
+            CommonHostcallOpcode::EventsGetFlag,
+            CommonHostcallOpcode::EventsListFlags,
+            CommonHostcallOpcode::EventsAppendEntry,
+            CommonHostcallOpcode::EventsRegisterCommand,
+        ];
+        assert_eq!(
+            all_opcodes.len(),
+            29,
+            "expected 29 total opcodes (was 16, added 13 new)"
+        );
+        for opcode in &all_opcodes {
+            let code = opcode.code();
+            let parsed = parse_common_hostcall_opcode_code(code);
+            assert_eq!(
+                parsed,
+                Some(*opcode),
+                "round-trip failed for opcode code '{code}'"
+            );
+        }
+    }
+
+    fn typed_tool_read_payload(call_id: &str, path: &str) -> HostCallPayload {
+        HostCallPayload {
+            call_id: call_id.to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: json!({
+                "name": "read",
+                "input": { "path": path }
+            }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: Some(json!({
+                "typed_opcode": {
+                    "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+                    "version": HOSTCALL_OPCODE_VERSION,
+                    "code": "tool.read"
+                }
+            })),
+        }
+    }
+
+    #[test]
+    fn dispatch_shared_allowed_global_kill_switch_forces_compat_lane() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("lane_global.txt");
+        std::fs::write(&file, "lane-global").expect("write test file");
+
+        let tools = ToolRegistry::new(&["read"], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let manager = ExtensionManager::new();
+        manager.set_hostcall_compat_kill_switch_global(true);
+
+        let ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.lane.global"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let payload = typed_tool_read_payload("lane-global", file.to_str().expect("utf-8 path"));
+        let (outcome, lane_meta) =
+            run_async(async { dispatch_shared_allowed(&ctx, &payload).await });
+        let lane_meta = lane_meta.expect("lane metadata");
+        assert_eq!(lane_meta.lane, HostcallDispatchLane::Compat);
+        assert_eq!(
+            lane_meta.decision_reason,
+            "forced_compat_global_kill_switch"
+        );
+        assert_eq!(
+            lane_meta.fallback_reason.as_deref(),
+            Some("forced_compat_global_kill_switch")
+        );
+        assert_eq!(lane_meta.matrix_key, "tool|fallback|filesystem");
+
+        match outcome {
+            HostcallOutcome::Success(value) => {
+                let output = serde_json::to_string(&value).expect("serialize read output");
+                assert!(output.contains("lane-global"));
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_shared_allowed_extension_kill_switch_only_affects_target_extension() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("lane_ext.txt");
+        std::fs::write(&file, "lane-ext").expect("write test file");
+
+        let tools = ToolRegistry::new(&["read"], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let manager = ExtensionManager::new();
+        manager.set_hostcall_compat_kill_switch_for_extension("ext.compat", true);
+
+        let payload = typed_tool_read_payload("lane-ext", file.to_str().expect("utf-8 path"));
+
+        let compat_ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.compat"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager.clone()),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+        let (_outcome, compat_lane_meta) =
+            run_async(async { dispatch_shared_allowed(&compat_ctx, &payload).await });
+        let compat_lane_meta = compat_lane_meta.expect("compat lane metadata");
+        assert_eq!(compat_lane_meta.lane, HostcallDispatchLane::Compat);
+        assert_eq!(
+            compat_lane_meta.decision_reason,
+            "forced_compat_extension_kill_switch"
+        );
+        assert_eq!(
+            compat_lane_meta.fallback_reason.as_deref(),
+            Some("forced_compat_extension_kill_switch")
+        );
+
+        let fast_ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.other"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+        let (_outcome, fast_lane_meta) =
+            run_async(async { dispatch_shared_allowed(&fast_ctx, &payload).await });
+        let fast_lane_meta = fast_lane_meta.expect("fast lane metadata");
+        assert_eq!(fast_lane_meta.lane, HostcallDispatchLane::Fast);
+        assert_eq!(fast_lane_meta.decision_reason, "typed_opcode_context_v1");
+        assert!(fast_lane_meta.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn dispatch_shared_allowed_fast_and_forced_compat_match_on_malformed_payload() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&["read"], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+
+        let fast_manager = ExtensionManager::new();
+        let compat_manager = ExtensionManager::new();
+        compat_manager.set_hostcall_compat_kill_switch_global(true);
+
+        let malformed = HostCallPayload {
+            call_id: "lane-malformed".to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "read", "input": {} }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: Some(json!({
+                "typed_opcode": {
+                    "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+                    "version": HOSTCALL_OPCODE_VERSION,
+                    "code": "tool.read"
+                }
+            })),
+        };
+
+        let fast_ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.fast"),
+            tools: &tools,
+            http: &http,
+            manager: Some(fast_manager),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+        let compat_ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.compat"),
+            tools: &tools,
+            http: &http,
+            manager: Some(compat_manager),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let (fast_outcome, fast_lane_meta) =
+            run_async(async { dispatch_shared_allowed(&fast_ctx, &malformed).await });
+        let (compat_outcome, compat_lane_meta) =
+            run_async(async { dispatch_shared_allowed(&compat_ctx, &malformed).await });
+
+        assert_eq!(
+            fast_lane_meta.expect("fast lane metadata").lane,
+            HostcallDispatchLane::Fast
+        );
+        assert_eq!(
+            compat_lane_meta.expect("compat lane metadata").lane,
+            HostcallDispatchLane::Compat
+        );
+
+        match (fast_outcome, compat_outcome) {
+            (
+                HostcallOutcome::Error {
+                    code: fast_code,
+                    message: fast_msg,
+                },
+                HostcallOutcome::Error {
+                    code: compat_code,
+                    message: compat_msg,
+                },
+            ) => {
+                assert_eq!(fast_code, compat_code);
+                assert_eq!(fast_msg, compat_msg);
+            }
+            (fast_other, compat_other) => {
+                panic!("expected both errors, got fast={fast_other:?} compat={compat_other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_hostcall_telemetry_records_lane_reason_fallback_and_latency_share() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("lane_telemetry.txt");
+        std::fs::write(&file, "lane-telemetry").expect("write test file");
+
+        let tools = ToolRegistry::new(&["read"], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let manager = ExtensionManager::new();
+        manager.set_runtime_risk_config(RuntimeRiskConfig {
+            enabled: true,
+            enforce: false,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 256,
+            decision_timeout_ms: 200,
+            fail_closed: true,
+        });
+        manager.set_hostcall_compat_kill_switch_global(true);
+
+        let ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.telemetry"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager.clone()),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+        let payload = typed_tool_read_payload("lane-telemetry", file.to_str().expect("utf-8 path"));
+        let result = run_async(async { dispatch_host_call_shared(&ctx, payload).await });
+        assert!(
+            !result.is_error,
+            "dispatch must succeed: {:?}",
+            result.error
+        );
+
+        let telemetry = manager.runtime_hostcall_telemetry_artifact();
+        let entry = telemetry.entries.last().expect("telemetry entry");
+        assert_eq!(entry.lane, "compat");
+        assert_eq!(
+            entry.lane_decision_reason,
+            "forced_compat_global_kill_switch"
+        );
+        assert_eq!(
+            entry.lane_fallback_reason.as_deref(),
+            Some("forced_compat_global_kill_switch")
+        );
+        assert_eq!(entry.lane_matrix_key, "tool|fallback|filesystem");
+        assert!(entry.lane_dispatch_latency_ms <= entry.latency_ms);
+        assert!(entry.lane_latency_share_bps <= 10_000);
     }
 
     #[test]
@@ -33715,6 +34803,7 @@ mod tests {
                 &decision,
                 None,
                 1,
+                None,
             );
             if decision
                 .triggers
@@ -33768,6 +34857,7 @@ mod tests {
             &d1,
             None,
             1,
+            None,
         );
         // If first call was Harden, second exec call should trigger escalation
         if matches!(d1.action, RuntimeRiskAction::Harden) {
@@ -33870,6 +34960,7 @@ mod tests {
             &d1,
             None,
             1,
+            None,
         );
         // Second call: dangerous exec → transition from safe to dangerous
         let d2 = manager
@@ -33934,6 +35025,7 @@ mod tests {
                     &decision,
                     None,
                     1,
+                    None,
                 );
                 run_triggers.push(decision.triggers.clone());
             }
@@ -36206,6 +37298,7 @@ mod tests {
         let mgr = ExtensionManager::new();
         let guard = mgr.inner.lock().unwrap();
         assert!(guard.ctx_cache.is_none());
+        drop(guard);
     }
 
     // ---- Coalescable event tests ----

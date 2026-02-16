@@ -11571,7 +11571,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         )
     }
 
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn reset_for_warm_reload(&self) -> Result<PiJsWarmResetReport> {
         let rust_pending_hostcalls =
             u64::try_from(self.hostcall_tracker.borrow().pending_count()).unwrap_or(u64::MAX);
@@ -11613,20 +11613,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         report.pending_tasks_before = reset_payload.before.pending_tasks;
         report.pending_hostcalls_before = reset_payload.before.pending_hostcalls;
         report.pending_timers_before = reset_payload.before.pending_timers;
-
-        let _before_registry_entries = reset_payload.before.extensions
-            + reset_payload.before.tools
-            + reset_payload.before.commands
-            + reset_payload.before.hooks
-            + reset_payload.before.event_bus_hooks
-            + reset_payload.before.providers
-            + reset_payload.before.shortcuts
-            + reset_payload.before.message_renderers
-            + reset_payload.before.pending_tasks
-            + reset_payload.before.pending_hostcalls
-            + reset_payload.before.pending_timers
-            + reset_payload.before.pending_event_listener_lists
-            + reset_payload.before.provider_streams;
 
         let residual_after = reset_payload.after.extensions
             + reset_payload.after.tools
@@ -16913,6 +16899,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn reset_transient_state_preserves_compiled_cache_and_clears_transient_state() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
