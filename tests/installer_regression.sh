@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="${ROOT}/install.sh"
 UNINSTALLER="${ROOT}/uninstall.sh"
+SKILL_SMOKE="${ROOT}/scripts/skill-smoke.sh"
 WORK_ROOT="${TMPDIR:-/tmp}/pi-installer-regression-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 PASS_COUNT=0
@@ -74,6 +75,17 @@ fi
 exit 0
 EOF
   chmod +x "${dir}/fakebin/cosign"
+}
+
+write_cp_fail_stub() {
+  local dir="$1"
+  cat > "${dir}/fakebin/cp" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "cp fixture: forced failure" >&2
+exit 1
+STUB
+  chmod +x "${dir}/fakebin/cp"
 }
 
 write_artifact_binary() {
@@ -234,6 +246,20 @@ test_help_lists_installer_flags() {
   assert_output_contains "$dir" "--no-agent-skills"
 }
 
+test_skill_smoke_script_passes() {
+  local dir
+  dir="$(case_dir "skill-smoke-script")"
+
+  if ! (
+    cd "$ROOT"
+    bash "$SKILL_SMOKE" > "${dir}/output.log" 2>&1
+  ); then
+    echo "skill smoke script failed" >&2
+    cat "${dir}/output.log" >&2
+    return 1
+  fi
+}
+
 test_invalid_completions_value_fails() {
   local dir
   dir="$(case_dir "invalid-completions")"
@@ -392,6 +418,86 @@ test_existing_custom_skill_dirs_are_not_overwritten() {
   }
 }
 
+test_skill_copy_failure_preserves_existing_managed_skills() {
+  local dir artifact artifact_url checksum claude_skill codex_skill
+  dir="$(case_dir "agent-skills-copy-fail-preserve-existing")"
+  write_existing_pi_stub "$dir"
+  write_cp_fail_stub "$dir"
+
+  claude_skill="${dir}/home/.claude/skills/pi-agent-rust/SKILL.md"
+  codex_skill="${dir}/home/.codex/skills/pi-agent-rust/SKILL.md"
+  mkdir -p "$(dirname "$claude_skill")" "$(dirname "$codex_skill")"
+  cat > "$claude_skill" <<'SKILL'
+<!-- pi_agent_rust installer managed skill -->
+# OLD CLAUDE SKILL
+SKILL
+  cat > "$codex_skill" <<'SKILL'
+<!-- pi_agent_rust installer managed skill -->
+# OLD CODEX SKILL
+SKILL
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --no-completions
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Skills:    failed (unable to write skill files)"
+  grep -Fq "OLD CLAUDE SKILL" "$claude_skill" || {
+    echo "existing managed Claude skill should be preserved when copy fails" >&2
+    return 1
+  }
+  grep -Fq "OLD CODEX SKILL" "$codex_skill" || {
+    echo "existing managed Codex skill should be preserved when copy fails" >&2
+    return 1
+  }
+}
+
+test_skill_custom_plus_copy_failure_reports_partial() {
+  local dir artifact artifact_url checksum codex_custom
+  dir="$(case_dir "agent-skills-custom-plus-copy-fail-partial")"
+  write_existing_pi_stub "$dir"
+  write_cp_fail_stub "$dir"
+
+  codex_custom="${dir}/home/.codex/skills/pi-agent-rust/SKILL.md"
+  mkdir -p "$(dirname "$codex_custom")"
+  cat > "$codex_custom" <<'SKILL'
+# Custom Codex skill without installer marker
+SKILL
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --no-completions
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Skills:    partial (custom skill kept; other install failed)"
+  [ -f "$codex_custom" ] || {
+    echo "custom Codex skill should be preserved" >&2
+    return 1
+  }
+  if [ -f "${dir}/home/.claude/skills/pi-agent-rust/SKILL.md" ]; then
+    echo "Claude skill should not be created when copy fails" >&2
+    return 1
+  fi
+}
+
 test_uninstall_removes_only_installer_managed_skills() {
   local dir managed_skill custom_skill
   dir="$(case_dir "uninstall-managed-skills-only")"
@@ -460,6 +566,34 @@ STATE
   fi
   if [ -e "${recorded_codex}" ]; then
     echo "installer-managed Codex skill at recorded path should be removed" >&2
+    return 1
+  fi
+}
+
+test_uninstall_skips_unexpected_skill_paths() {
+  local dir state_file unexpected_dir unexpected_skill
+  dir="$(case_dir "uninstall-skip-unexpected-skill-path")"
+  unexpected_dir="${dir}/home/custom/pi-agent-rust"
+  unexpected_skill="${unexpected_dir}/SKILL.md"
+  mkdir -p "$unexpected_dir"
+
+  cat > "$unexpected_skill" <<'SKILL'
+<!-- pi_agent_rust installer managed skill -->
+# Managed marker on unexpected path
+SKILL
+
+  state_file="${dir}/state/pi-agent-rust/install-state.env"
+  mkdir -p "$(dirname "$state_file")"
+  cat > "$state_file" <<STATE
+PIAR_AGENT_SKILL_CODEX_PATH='${unexpected_dir}'
+STATE
+
+  run_uninstaller "$dir" --yes --no-gum
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Skipping unexpected skill directory path: ${unexpected_dir}"
+  if [ ! -f "$unexpected_skill" ]; then
+    echo "unexpected skill path should be preserved" >&2
     return 1
   fi
 }
@@ -703,6 +837,7 @@ main() {
   fi
 
   run_test test_help_lists_installer_flags
+  run_test test_skill_smoke_script_passes
   run_test test_invalid_completions_value_fails
   run_test test_unknown_option_fails
   run_test test_missing_option_value_fails
@@ -711,8 +846,11 @@ main() {
   run_test test_agent_skills_install_by_default
   run_test test_no_agent_skills_opt_out
   run_test test_existing_custom_skill_dirs_are_not_overwritten
+  run_test test_skill_copy_failure_preserves_existing_managed_skills
+  run_test test_skill_custom_plus_copy_failure_reports_partial
   run_test test_uninstall_removes_only_installer_managed_skills
   run_test test_uninstall_uses_recorded_skill_paths
+  run_test test_uninstall_skips_unexpected_skill_paths
   run_test test_checksum_inline_success
   run_test test_checksum_mismatch_fails_hard
   run_test test_checksum_missing_manifest_entry_fails_hard

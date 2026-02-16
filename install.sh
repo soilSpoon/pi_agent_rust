@@ -1433,91 +1433,192 @@ is_installer_managed_skill_file() {
   grep -Fq "$AGENT_SKILL_MARKER" "$file" 2>/dev/null
 }
 
+is_expected_skill_destination() {
+  local destination="$1"
+  [ -n "$destination" ] || return 1
+  case "$destination" in
+    */skills/${AGENT_SKILL_NAME}) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 pi_agent_skill_inline_content() {
   cat <<'SKILL'
 ---
 name: pi-agent-rust
 description: >-
-  Operates pi_agent_rust CLI, providers, sessions, extensions, and installer workflows.
-  Use when working in pi_agent_rust repos, debugging provider/tool/session behavior,
-  or validating install/uninstall and migration paths.
+  Speeds up pi_agent_rust development and verification workflows. Use when editing providers,
+  tools, sessions, extensions, installer/uninstaller logic, or triaging regressions in this repo.
 ---
 
 <!-- pi_agent_rust installer managed skill -->
 
 # Pi Agent Rust
 
-## Quick Start
+## Use This Skill When
 
-```bash
-# Heavy builds/checks should be offloaded when available
-rch exec -- cargo check --all-targets
-rch exec -- cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+- You are working inside `pi_agent_rust` and need the fastest path to safe, verified edits.
+- You are touching provider/tool/session/extension behavior and need targeted triage.
+- You are changing installer/uninstaller/skill install behavior and need deterministic safety checks.
+- You need symptom-first debugging playbooks instead of ad-hoc command hunting.
 
-# Installer regression harness
-bash tests/installer_regression.sh
-```
-
-Set isolated build temp dirs in multi-agent environments:
+## 60-Second Bootstrap
 
 ```bash
 export CARGO_TARGET_DIR="/data/tmp/pi_agent_rust/${USER:-agent}"
 export TMPDIR="/data/tmp/pi_agent_rust/${USER:-agent}/tmp"
 mkdir -p "$TMPDIR"
+
+rch exec -- cargo check --all-targets
+rch exec -- cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+bash tests/installer_regression.sh
 ```
+
+## Symptom Router
+
+| Symptom | First 3 Commands |
+|---|---|
+| Provider stream/tool-call regression | `cargo test provider_streaming -- --nocapture` ; `rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs` ; `cargo test conformance` |
+| Session replay/index drift | `cargo test session -- --nocapture` ; `rg -n "Session|save|open|index|jsonl|sqlite" src/session.rs src/session_index.rs` ; `cargo test conformance` |
+| Extension policy/runtime failure | `cargo test extension -- --nocapture` ; `rg -n "policy|hostcall|capability|quickjs|deny|allow" src/extensions.rs src/extensions_js.rs` ; `cargo test conformance` |
+| Installer/uninstaller/skill issue | `bash tests/installer_regression.sh` ; `rg -n "AGENT_SKILL_STATUS|CHECKSUM_STATUS|SIGSTORE_STATUS|COMPLETIONS_STATUS" install.sh` ; `rg -n "managed skill|expected skill directory|PIAR_AGENT_SKILL" uninstall.sh` |
+| Interactive vs RPC divergence | `cargo test e2e_rpc -- --nocapture` ; `rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance` |
+
+For deeper diagnosis, use `references/DEBUGGING-PLAYBOOKS.md`.
+
+## Non-Negotiables
+
+- Read `AGENTS.md` first, then follow it exactly.
+- Do not delete files or run destructive git/filesystem commands.
+- Keep edits in-place; avoid creating variant files for the same purpose.
+- Use `main` semantics in docs/scripts; do not introduce `master`.
+- Prefer `rg` for fast text recon and `ast-grep` for structural matching/refactors.
+- Prefer `rch exec -- <cargo ...>` for heavy compile/test workloads.
+- After substantive edits, run compile/lint/format gates and the smallest relevant regression slice.
 
 ## Core Workflow
 
-- Read `AGENTS.md` first for project rules.
-- Keep edits minimal and in-place; avoid file proliferation.
-- Use `rg` for text search and `ast-grep` for structural matching.
-- Prefer `rch exec -- <cargo ...>` for heavy compilation/test commands.
-- Run targeted tests first, then broaden.
+- [ ] Recon: identify exact change surface and invariants.
+- [ ] Implement: minimal, behavior-focused patch with explicit failure semantics.
+- [ ] Validate: targeted tests first, broaden only as needed.
+- [ ] Verify UX: error/status output is explicit, stable, and non-ambiguous.
+- [ ] Sync docs: update `README.md` when flags/behavior/user guidance changed.
+
+## Changed Files -> Required Tests
+
+| Changed Files (examples) | Minimum Required Tests |
+|---|---|
+| `install.sh`, `uninstall.sh`, `.claude/skills/pi-agent-rust/**` | `bash -n install.sh uninstall.sh tests/installer_regression.sh` ; `shellcheck -x install.sh uninstall.sh tests/installer_regression.sh` ; `bash tests/installer_regression.sh` ; `bash scripts/skill-smoke.sh` |
+| `src/providers/**`, `src/provider.rs`, `src/sse.rs` | `cargo test provider_streaming` ; `cargo test conformance` |
+| `src/session.rs`, `src/session_index.rs`, `src/session_test.rs` | `cargo test session` ; `cargo test conformance` |
+| `src/extensions.rs`, `src/extensions_js.rs` | `cargo test extension` ; `cargo test conformance` |
+| `src/tools.rs` | `cargo test tools` ; `cargo test conformance` |
+| `src/interactive.rs`, `src/rpc.rs`, `src/main.rs` | `cargo test e2e_rpc` ; `cargo test conformance` |
+
+## Do Not Run Yet
+
+Run these only after targeted repro + focused slice indicates need:
+
+- Broad `cargo test` across entire workspace when a narrower slice already reproduces.
+- Heavy multi-surface runs before confirming changed-file impact.
+- Repeated full conformance loops while the core failing slice is still unstable.
 
 ## High-Value Commands
 
 ```bash
-# Installer + shell harness
-bash tests/installer_regression.sh
-bash -n install.sh
-bash -n uninstall.sh
+# Fast recon
+git status --short
+rg -n "install|uninstall|skill|checksum|sigstore|completion|provider|session|extension" \
+  install.sh uninstall.sh README.md tests/installer_regression.sh src/
+
+# Installer + skill safety gates
+bash -n install.sh uninstall.sh tests/installer_regression.sh
 shellcheck -x install.sh uninstall.sh tests/installer_regression.sh
+bash tests/installer_regression.sh
+bash scripts/skill-smoke.sh
 
-# Common Rust gates
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
+# Rust gates
+rch exec -- cargo check --all-targets
+rch exec -- cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-
-# Focused test slices
-cargo test conformance
-cargo test provider_streaming
-cargo test tools
 ```
+
+For an expanded command cookbook, see `references/COMMANDS.md`.
+For deep incident triage, see `references/DEBUGGING-PLAYBOOKS.md`.
 
 ## Critical Files
 
-- `src/main.rs`: CLI entry + mode dispatch.
-- `src/agent.rs`: agent loop + tool iteration boundaries.
-- `src/providers/`: backend provider implementations.
+- `src/main.rs`: CLI entry and mode dispatch.
+- `src/agent.rs`: agent loop and tool iteration behavior.
+- `src/provider.rs`: provider trait contract.
+- `src/providers/`: provider implementations and factory wiring.
 - `src/tools.rs`: built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`).
 - `src/session.rs`: JSONL session persistence.
-- `src/session_index.rs`: session index + metadata cache.
-- `install.sh` / `uninstall.sh`: install lifecycle and migration behavior.
+- `src/session_index.rs`: session index and metadata cache.
+- `src/extensions.rs` + `src/extensions_js.rs`: extension policy and QuickJS bridge.
+- `src/interactive.rs` + `src/rpc.rs`: TUI and RPC/stdin surfaces.
+- `install.sh` + `uninstall.sh`: install lifecycle, migration, and skill management.
+- `tests/installer_regression.sh`: installer regression harness.
+- `scripts/skill-smoke.sh`: skill integrity + inline-sync validation.
 
-## Installer-Specific Expectations
+## Known Footguns
 
-- Default behavior should remain non-destructive and idempotent.
-- Status/progress text should go to stderr when stdout is used as a data channel.
-- Custom artifact and checksum/signature branches must fail clearly and predictably.
-- Keep installer summary lines concise and machine-readable enough for logs.
+- Custom artifact install paths without compatible release context can fall back incorrectly if not explicitly guarded.
+- Skill status can become misleading on mixed outcomes unless partial/failure branches are explicit.
+- Uninstall logic must enforce both marker checks and expected destination path shape.
+- Installer progress/status text should stay on stderr when stdout is used for data plumbing.
+- Bundled skill and inline fallback can silently drift unless explicitly checked.
+
+## Patch Patterns
+
+### Pattern 1: Mixed Outcome Status Clarity
+
+```bash
+# BEFORE: everything collapsed into "skipped custom"
+if [ "$skipped_custom" -ge 1 ]; then
+  AGENT_SKILL_STATUS="skipped (existing custom skill)"
+fi
+
+# AFTER: distinguish custom-skip from write failure
+if [ "$skipped_custom" -ge 1 ] && [ "$failed_writes" -ge 1 ]; then
+  AGENT_SKILL_STATUS="partial (custom skill kept; other install failed)"
+elif [ "$skipped_custom" -ge 1 ]; then
+  AGENT_SKILL_STATUS="skipped (existing custom skill)"
+fi
+```
+
+### Pattern 2: Safe Skill Replacement
+
+```bash
+# BEFORE: remove destination before validating copy result
+rm -rf "$destination"
+cp "$source" "$destination/SKILL.md"
+
+# AFTER: stage then atomically move into place
+staged="$(mktemp -d ...)"
+cp "$source" "$staged/SKILL.md"
+mv "$staged" "$destination"
+```
+
+## Failure Triage
+
+- Installer summary/status mismatch:
+  trace `AGENT_SKILL_STATUS`, `CHECKSUM_STATUS`, and `COMPLETIONS_STATUS` in `install.sh`.
+- Install/uninstall safety concern:
+  verify marker checks and expected destination guards in both scripts.
+- Provider/session/extension regressions:
+  use symptom router, then follow `references/DEBUGGING-PLAYBOOKS.md`.
+- Docs drift:
+  ensure `README.md` flags/examples match current installer behavior.
 
 ## Done Criteria
 
-- Code compiles/checks cleanly for changed surfaces.
-- Relevant tests pass (especially installer harness when install/uninstall logic changes).
-- New flags/options are reflected in `README.md`.
-- Behavior is explicit on failure paths; avoid silent fallback surprises.
+- Changed-file matrix minimum tests passed.
+- Compile/lint/format checks passed for touched surfaces.
+- Installer/skill changes pass `tests/installer_regression.sh` and `scripts/skill-smoke.sh`.
+- Behavior is explicit on failure paths; no silent fallback surprises.
+- Skill docs and inline fallback remain aligned and current.
 SKILL
 }
 
@@ -1525,6 +1626,30 @@ install_skill_to_destination() {
   local destination="$1"
   local source_kind="$2"
   local source_path="$3"
+
+  if ! is_expected_skill_destination "$destination"; then
+    warn "Skipping unexpected skill destination path: $destination"
+    return 1
+  fi
+
+  case "$source_kind" in
+    dir)
+      if [ ! -d "$source_path" ] || [ ! -f "$source_path/SKILL.md" ]; then
+        warn "Invalid bundled skill source directory: $source_path"
+        return 1
+      fi
+      ;;
+    file)
+      if [ ! -f "$source_path" ]; then
+        warn "Missing skill source file: $source_path"
+        return 1
+      fi
+      ;;
+    *)
+      warn "Unknown skill source kind: $source_kind"
+      return 1
+      ;;
+  esac
 
   local existing_skill="$destination/SKILL.md"
   if [ -e "$destination" ] && [ ! -f "$existing_skill" ]; then
@@ -1536,33 +1661,74 @@ install_skill_to_destination() {
     return 2
   fi
 
-  rm -rf "$destination" 2>/dev/null || true
-  if ! mkdir -p "$destination" 2>/dev/null; then
-    warn "Failed to create skill directory: $destination"
+  local destination_parent
+  destination_parent="$(dirname "$destination")"
+  if ! mkdir -p "$destination_parent" 2>/dev/null; then
+    warn "Failed to create skill parent directory: $destination_parent"
+    return 1
+  fi
+
+  local staged_destination=""
+  staged_destination="$(mktemp -d "${destination_parent}/.${AGENT_SKILL_NAME}.tmp.XXXXXX" 2>/dev/null || true)"
+  if [ -z "$staged_destination" ] || [ ! -d "$staged_destination" ]; then
+    warn "Failed to create staging directory for skill install: $destination"
     return 1
   fi
 
   case "$source_kind" in
     dir)
-      if ! cp -R "$source_path/." "$destination/" 2>/dev/null; then
+      if ! cp -R "$source_path/." "$staged_destination/" 2>/dev/null; then
         warn "Failed to install bundled skill into $destination"
+        rm -rf "$staged_destination" 2>/dev/null || true
         return 1
       fi
       ;;
     file)
-      if ! cp "$source_path" "$destination/SKILL.md" 2>/dev/null; then
+      if ! cp "$source_path" "$staged_destination/SKILL.md" 2>/dev/null; then
         warn "Failed to install skill file into $destination"
+        rm -rf "$staged_destination" 2>/dev/null || true
         return 1
       fi
       ;;
-    *)
-      warn "Unknown skill source kind: $source_kind"
-      return 1
-      ;;
   esac
 
-  if [ -f "$destination/SKILL.md" ] && ! is_installer_managed_skill_file "$destination/SKILL.md"; then
-    printf '\n<!-- %s -->\n' "$AGENT_SKILL_MARKER" >> "$destination/SKILL.md"
+  if [ ! -f "$staged_destination/SKILL.md" ]; then
+    warn "Skill install failed: missing SKILL.md at $destination"
+    rm -rf "$staged_destination" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! is_installer_managed_skill_file "$staged_destination/SKILL.md"; then
+    if ! printf '\n<!-- %s -->\n' "$AGENT_SKILL_MARKER" >> "$staged_destination/SKILL.md"; then
+      warn "Failed to mark skill as installer-managed at $destination"
+      rm -rf "$staged_destination" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  if ! is_installer_managed_skill_file "$staged_destination/SKILL.md"; then
+    warn "Skill install failed: managed marker missing at $destination"
+    rm -rf "$staged_destination" 2>/dev/null || true
+    return 1
+  fi
+
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    if ! rm -rf "$destination" 2>/dev/null; then
+      warn "Failed to replace existing skill directory: $destination"
+      rm -rf "$staged_destination" 2>/dev/null || true
+      return 1
+    fi
+  fi
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    warn "Failed to clear existing skill directory: $destination"
+    rm -rf "$staged_destination" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! mv "$staged_destination" "$destination" 2>/dev/null; then
+    warn "Failed to move staged skill into place: $destination"
+    rm -rf "$staged_destination" 2>/dev/null || true
+    return 1
   fi
 
   return 0
@@ -1648,20 +1814,28 @@ install_agent_skills() {
   local installed_claude=0
   local installed_codex=0
   local skipped_custom=0
+  local failed_writes=0
+  local install_rc=0
 
   if install_skill_to_destination "$AGENT_SKILL_CLAUDE_PATH" "$source_kind" "$source_path"; then
     installed_claude=1
   else
-    if [ "$?" -eq 2 ]; then
+    install_rc=$?
+    if [ "$install_rc" -eq 2 ]; then
       skipped_custom=$((skipped_custom + 1))
+    else
+      failed_writes=$((failed_writes + 1))
     fi
   fi
 
   if install_skill_to_destination "$AGENT_SKILL_CODEX_PATH" "$source_kind" "$source_path"; then
     installed_codex=1
   else
-    if [ "$?" -eq 2 ]; then
+    install_rc=$?
+    if [ "$install_rc" -eq 2 ]; then
       skipped_custom=$((skipped_custom + 1))
+    else
+      failed_writes=$((failed_writes + 1))
     fi
   fi
 
@@ -1675,17 +1849,36 @@ install_agent_skills() {
     return 0
   fi
   if [ "$installed_claude" -eq 1 ] && [ "$installed_codex" -eq 0 ]; then
-    AGENT_SKILL_STATUS="installed (claude only)"
-    warn "Installed ${AGENT_SKILL_NAME} skill for Claude only (${source_desc})"
+    if [ "$failed_writes" -ge 1 ]; then
+      AGENT_SKILL_STATUS="partial (claude installed; codex failed)"
+      warn "Installed ${AGENT_SKILL_NAME} skill for Claude, but Codex install failed (${source_desc})"
+    elif [ "$skipped_custom" -ge 1 ]; then
+      AGENT_SKILL_STATUS="installed (claude only; codex custom kept)"
+      warn "Installed ${AGENT_SKILL_NAME} skill for Claude; kept existing custom Codex skill (${source_desc})"
+    else
+      AGENT_SKILL_STATUS="installed (claude only)"
+      warn "Installed ${AGENT_SKILL_NAME} skill for Claude only (${source_desc})"
+    fi
     return 0
   fi
   if [ "$installed_claude" -eq 0 ] && [ "$installed_codex" -eq 1 ]; then
-    AGENT_SKILL_STATUS="installed (codex only)"
-    warn "Installed ${AGENT_SKILL_NAME} skill for Codex only (${source_desc})"
+    if [ "$failed_writes" -ge 1 ]; then
+      AGENT_SKILL_STATUS="partial (codex installed; claude failed)"
+      warn "Installed ${AGENT_SKILL_NAME} skill for Codex, but Claude install failed (${source_desc})"
+    elif [ "$skipped_custom" -ge 1 ]; then
+      AGENT_SKILL_STATUS="installed (codex only; claude custom kept)"
+      warn "Installed ${AGENT_SKILL_NAME} skill for Codex; kept existing custom Claude skill (${source_desc})"
+    else
+      AGENT_SKILL_STATUS="installed (codex only)"
+      warn "Installed ${AGENT_SKILL_NAME} skill for Codex only (${source_desc})"
+    fi
     return 0
   fi
 
-  if [ "$skipped_custom" -ge 1 ]; then
+  if [ "$skipped_custom" -ge 1 ] && [ "$failed_writes" -ge 1 ]; then
+    AGENT_SKILL_STATUS="partial (custom skill kept; other install failed)"
+    warn "Kept existing custom skill at one destination; install failed at another (${source_desc})"
+  elif [ "$skipped_custom" -ge 1 ]; then
     AGENT_SKILL_STATUS="skipped (existing custom skill)"
   else
     AGENT_SKILL_STATUS="failed (unable to write skill files)"

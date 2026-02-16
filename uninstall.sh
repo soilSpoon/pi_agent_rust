@@ -226,6 +226,15 @@ is_managed_skill_file() {
   grep -q "$AGENT_SKILL_MARKER" "$path" 2>/dev/null
 }
 
+is_expected_skill_directory() {
+  local dir="$1"
+  [ -n "$dir" ] || return 1
+  case "$dir" in
+    */skills/${AGENT_SKILL_NAME}) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 remove_file_if_exists() {
   local path="$1"
   if [ -e "$path" ] || [ -L "$path" ]; then
@@ -347,6 +356,10 @@ remove_installed_skills() {
   local dir=""
   for dir in "$claude_dir" "$codex_dir"; do
     [ -n "$dir" ] || continue
+    if ! is_expected_skill_directory "$dir"; then
+      warn "Skipping unexpected skill directory path: $dir"
+      continue
+    fi
     local skill_file="$dir/SKILL.md"
     [ -f "$skill_file" ] || continue
     if ! is_managed_skill_file "$skill_file"; then
