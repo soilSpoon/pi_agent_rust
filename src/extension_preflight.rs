@@ -4223,7 +4223,7 @@ const c = arguments.callee;
                 // Identifiers ending in "eval" like "retrieval(" should not match
                 let text = format!("{prefix}eval(x)");
                 // Only "eval(" at word boundary should match
-                let expected = !is_js_ident_continue(prefix.as_bytes().last().unwrap().clone());
+                let expected = !is_js_ident_continue(*prefix.as_bytes().last().unwrap());
                 assert!(
                     contains_eval_call(&text) == expected,
                     "eval detection mismatch for '{text}': expected {expected}"

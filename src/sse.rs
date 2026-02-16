@@ -208,9 +208,6 @@ impl SseParser {
             );
             if consumed < data.len() {
                 self.buffer.push_str(&data[consumed..]);
-                self.scanned_len = self.buffer.len();
-            } else {
-                self.scanned_len = 0;
             }
         } else {
             // Slow path: combine with existing buffered data, then process.
@@ -227,13 +224,10 @@ impl SseParser {
             );
             if consumed > 0 {
                 self.buffer.drain(..consumed);
-                // After draining, the remaining buffer is the tail which we just scanned.
-                self.scanned_len = self.buffer.len();
-            } else {
-                // Nothing consumed, buffer grew. The entire buffer has been scanned.
-                self.scanned_len = self.buffer.len();
             }
         }
+        // Whether we drained or not, the entire remaining buffer has been scanned.
+        self.scanned_len = self.buffer.len();
     }
 
     /// Feed data to the parser and extract any complete events.
