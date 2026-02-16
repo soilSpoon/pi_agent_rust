@@ -27,7 +27,7 @@ fn all_classified_suites(root: &Path) -> HashSet<String> {
     let Ok(text) = std::fs::read_to_string(&toml_path) else {
         return HashSet::new();
     };
-    let Ok(table) = text.parse::<toml::Value>() else {
+    let Ok(table) = text.parse::<toml::Table>() else {
         return HashSet::new();
     };
 

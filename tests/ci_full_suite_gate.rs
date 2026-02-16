@@ -104,7 +104,7 @@ fn parse_waivers(root: &Path) -> (Vec<Waiver>, Vec<WaiverValidation>) {
     let Ok(text) = std::fs::read_to_string(&toml_path) else {
         return (Vec::new(), Vec::new());
     };
-    let Ok(table) = text.parse::<toml::Value>() else {
+    let Ok(table) = text.parse::<toml::Table>() else {
         return (Vec::new(), Vec::new());
     };
 

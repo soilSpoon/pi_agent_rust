@@ -664,7 +664,7 @@ fn full_suite_gate_includes_reproduce_commands_for_remediation() {
 fn suite_classification_exists_and_valid() {
     let content = load_text(SUITE_CLASSIFICATION_PATH);
     assert!(
-        content.parse::<toml::Value>().is_ok(),
+        content.parse::<toml::Table>().is_ok(),
         "suite_classification.toml must be valid TOML"
     );
 }

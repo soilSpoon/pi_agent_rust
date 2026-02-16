@@ -32,7 +32,7 @@ fn suite_counts(root: &Path) -> (usize, usize, usize) {
     let Ok(text) = std::fs::read_to_string(&toml_path) else {
         return (0, 0, 0);
     };
-    let Ok(table) = text.parse::<toml::Value>() else {
+    let Ok(table) = text.parse::<toml::Table>() else {
         return (0, 0, 0);
     };
 
@@ -54,7 +54,7 @@ fn quarantine_waiver_counts(root: &Path) -> (usize, usize) {
     let Ok(text) = std::fs::read_to_string(&toml_path) else {
         return (0, 0);
     };
-    let Ok(table) = text.parse::<toml::Value>() else {
+    let Ok(table) = text.parse::<toml::Table>() else {
         return (0, 0);
     };
 

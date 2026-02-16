@@ -3392,7 +3392,8 @@ mod tests {
             fn seq_next_saturates(start in u64::MAX - 5..=u64::MAX) {
                 let s = Seq(start);
                 let n = s.next();
-                assert!(n.value() <= u64::MAX, "must not overflow");
+                // Verify next() does not panic and produces a valid value.
+                let _ = n.value();
                 assert!(n >= s, "must be monotonic even at saturation boundary");
             }
 

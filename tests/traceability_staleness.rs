@@ -21,7 +21,7 @@ fn load_suite_classification(root: &Path) -> HashMap<String, Vec<String>> {
     let path = root.join("tests/suite_classification.toml");
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    let table: toml::Value = content
+    let table: toml::Table = content
         .parse()
         .unwrap_or_else(|e| panic!("invalid TOML in {}: {e}", path.display()));
 

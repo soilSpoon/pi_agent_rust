@@ -283,10 +283,11 @@ fn suite_classification_exists() {
 #[test]
 fn suite_classification_is_valid_toml() {
     let content = load_text(SUITE_CLASSIFICATION_PATH);
-    assert!(
-        content.parse::<toml::Value>().is_ok(),
-        "suite_classification.toml must be valid TOML"
-    );
+    // Use toml::Table (document) parse — toml 1.0 changed Value::from_str
+    // to parse a single value expression rather than a full TOML document.
+    if let Err(e) = content.parse::<toml::Table>() {
+        panic!("suite_classification.toml must be valid TOML: {e}");
+    }
 }
 
 #[test]
