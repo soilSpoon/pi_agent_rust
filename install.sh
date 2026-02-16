@@ -421,6 +421,7 @@ show_header() {
   [ "$QUIET" -eq 1 ] && return 0
   local logo
   local header_version
+  local header_indent="   "
   if [ -n "$VERSION" ]; then
     header_version="$VERSION"
   else
@@ -432,29 +433,31 @@ show_header() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     local styled_logo
     styled_logo="$(pi_ascii_logo_gum "$logo")"
+    styled_logo="${styled_logo}"$'\n'
     gum style \
       --border double \
       --border-foreground 45 \
       --padding "1 3" \
       --margin "1 0" \
       "$styled_logo" \
-      "$(gum style --foreground 51 --bold 'Pi Agent Rust Installer')" \
-      "$(gum style --foreground 45 --bold "Install target version: ${header_version}")" \
-      "$(gum style --foreground 117 --bold 'Based on Pi Agent by Mario Zechner')" \
-      "$(gum style --foreground 123 --bold 'Rust version by Jeffrey Emanuel')" \
-      "$(gum style --foreground 81 --bold 'Fast Rust-native coding agent installer')" \
-      "$(gum style --foreground 75 --bold 'Checksum verification by default | Optional Sigstore/cosign')" \
-      "$(gum style --foreground 111 --bold "Repository: ${OWNER}/${REPO}")"
+      "$(gum style --foreground 51 --bold "${header_indent}Pi Agent Rust Installer")" \
+      "$(gum style --foreground 226 --bold "${header_indent}Install target version: ${header_version}")" \
+      "$(gum style --foreground 201 --bold "${header_indent}Based on Pi Agent by Mario Zechner")" \
+      "$(gum style --foreground 118 --bold "${header_indent}Rust version by Jeffrey Emanuel")" \
+      "$(gum style --foreground 81 --bold "${header_indent}Fast Rust-native coding agent installer")" \
+      "$(gum style --foreground 214 --bold "${header_indent}Checksum verification by default | Optional Sigstore/cosign")" \
+      "$(gum style --foreground 45 --bold "${header_indent}Repository: ${OWNER}/${REPO}")"
   else
     echo ""
     pi_ascii_logo_ansi "$logo"
-    echo -e "\033[1;38;5;51mPi Agent Rust Installer\033[0m"
-    echo -e "\033[1;38;5;45mInstall target version: ${header_version}\033[0m"
-    echo -e "\033[1;38;5;117mBased on Pi Agent by Mario Zechner\033[0m"
-    echo -e "\033[1;38;5;123mRust version by Jeffrey Emanuel\033[0m"
-    echo -e "\033[1;38;5;81mFast Rust-native coding agent installer\033[0m"
-    echo -e "\033[1;38;5;75mChecksum verification by default | Optional Sigstore/cosign\033[0m"
-    echo -e "\033[1;38;5;111mRepository: ${OWNER}/${REPO}\033[0m"
+    echo ""
+    echo -e "\033[1;38;5;51m${header_indent}Pi Agent Rust Installer\033[0m"
+    echo -e "\033[1;38;5;226m${header_indent}Install target version: ${header_version}\033[0m"
+    echo -e "\033[1;38;5;201m${header_indent}Based on Pi Agent by Mario Zechner\033[0m"
+    echo -e "\033[1;38;5;118m${header_indent}Rust version by Jeffrey Emanuel\033[0m"
+    echo -e "\033[1;38;5;81m${header_indent}Fast Rust-native coding agent installer\033[0m"
+    echo -e "\033[1;38;5;214m${header_indent}Checksum verification by default | Optional Sigstore/cosign\033[0m"
+    echo -e "\033[1;38;5;45m${header_indent}Repository: ${OWNER}/${REPO}\033[0m"
     echo ""
   fi
 }
