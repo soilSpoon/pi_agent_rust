@@ -1754,6 +1754,10 @@ impl SecurityScanner {
 // Pattern detection helpers
 // ============================================================================
 
+const fn is_js_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
 /// Check for `eval(...)` that isn't in a property name or string context.
 fn contains_eval_call(text: &str) -> bool {
     let mut search = text;
@@ -1761,8 +1765,8 @@ fn contains_eval_call(text: &str) -> bool {
         // Not preceded by a dot (method call on object) or letter (part of
         // another identifier like `retrieval`).
         if pos == 0
-            || !search.as_bytes()[pos - 1].is_ascii_alphanumeric()
-                && search.as_bytes()[pos - 1] != b'.'
+            || (!is_js_ident_continue(search.as_bytes()[pos - 1])
+                && search.as_bytes()[pos - 1] != b'.')
         {
             return true;
         }
@@ -4219,10 +4223,28 @@ const c = arguments.callee;
                 // Identifiers ending in "eval" like "retrieval(" should not match
                 let text = format!("{prefix}eval(x)");
                 // Only "eval(" at word boundary should match
-                let expected = !prefix.as_bytes().last().unwrap().is_ascii_alphanumeric();
+                let expected = !is_js_ident_continue(prefix.as_bytes().last().unwrap().clone());
                 assert!(
                     contains_eval_call(&text) == expected,
                     "eval detection mismatch for '{text}': expected {expected}"
+                );
+            }
+
+            #[test]
+            fn eval_call_no_false_positive_on_underscore_identifiers() {
+                let text = "my_eval('code')";
+                assert!(
+                    !contains_eval_call(text),
+                    "underscore identifier prefix should not trigger eval detection: {text}"
+                );
+            }
+
+            #[test]
+            fn eval_call_no_false_positive_on_dollar_identifiers() {
+                let text = "$eval('code')";
+                assert!(
+                    !contains_eval_call(text),
+                    "dollar identifier prefix should not trigger eval detection: {text}"
                 );
             }
 

@@ -15256,10 +15256,6 @@ function __pi_path_join(...parts) {
     let out = '';
     for (const part of parts) {
         if (!part) continue;
-        if (part.startsWith('/')) {
-            out = part;
-            continue;
-        }
         if (out === '' || out.endsWith('/')) {
             out += part;
         } else {
@@ -20676,6 +20672,38 @@ export default ConfigLoader;
             assert_eq!(r["nextTickRan"], serde_json::json!(true));
             assert_eq!(r["hrtimeIsArray"], serde_json::json!(true));
             assert_eq!(r["hrtimeLength"], serde_json::json!(2));
+        });
+    }
+
+    #[test]
+    fn pijs_pi_path_join_behavior() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.joinResults = {};
+                    globalThis.joinResults.concatAbs = pi.path.join('/a', '/b');
+                    globalThis.joinResults.normal = pi.path.join('a', 'b');
+                    globalThis.joinResults.root = pi.path.join('/', 'a');
+                    globalThis.joinResults.dots = pi.path.join('/a', '..', 'b');
+                    globalThis.joinResults.done = true;
+                    ",
+                )
+                .await
+                .expect("eval pi.path.join");
+
+            let r = get_global_json(&runtime, "joinResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            // Should be /a/b, NOT /b (bug fix)
+            assert_eq!(r["concatAbs"], serde_json::json!("/a/b"));
+            assert_eq!(r["normal"], serde_json::json!("a/b"));
+            assert_eq!(r["root"], serde_json::json!("/a"));
+            assert_eq!(r["dots"], serde_json::json!("/b"));
         });
     }
 
