@@ -2018,7 +2018,10 @@ missing_cells = [
         "reasons": cell["missing_reasons"],
     }
     for cell in cells
-    if "missing_matrix_source_record" in cell.get("missing_reasons", [])
+    if any(
+        isinstance(reason, str) and reason.startswith("missing_stage_metrics:")
+        for reason in cell.get("missing_reasons", [])
+    )
 ]
 
 suite_logs = {}
