@@ -572,6 +572,189 @@ mod tests {
         );
     }
 
+    // ── Additional public API coverage ──
+
+    #[test]
+    fn config_clamps_minimums_and_ceilings() {
+        let tiny = S3FifoConfig {
+            live_capacity: 0,
+            small_capacity: 0,
+            ghost_capacity: 0,
+            max_entries_per_owner: 0,
+            fallback_window: 0,
+            min_ghost_hits_in_window: 100,
+            max_budget_rejections_in_window: 100,
+        };
+        let policy = S3FifoPolicy::<String>::new(tiny);
+        let cfg = policy.config();
+        assert!(cfg.live_capacity >= 2, "live_capacity min is 2");
+        assert!(cfg.small_capacity >= 1, "small_capacity min is 1");
+        assert!(cfg.ghost_capacity >= 1, "ghost_capacity min is 1");
+        assert!(cfg.max_entries_per_owner >= 1, "per-owner min is 1");
+        assert!(cfg.fallback_window >= 1, "fallback_window min is 1");
+        // min_ghost_hits_in_window clamped to fallback_window
+        assert!(cfg.min_ghost_hits_in_window <= cfg.fallback_window);
+        // max_budget_rejections_in_window clamped to fallback_window
+        assert!(cfg.max_budget_rejections_in_window <= cfg.fallback_window);
+    }
+
+    #[test]
+    fn live_depth_reflects_small_plus_main() {
+        let mut policy = S3FifoPolicy::new(config());
+        assert_eq!(policy.live_depth(), 0);
+
+        // Admit to small
+        policy.access("ext-a", "k1".to_string());
+        assert_eq!(policy.live_depth(), 1);
+
+        // Admit another to small
+        policy.access("ext-b", "k2".to_string());
+        assert_eq!(policy.live_depth(), 2);
+
+        // Promote k1 to main
+        policy.access("ext-a", "k1".to_string());
+        // k1 moved from small to main, live_depth unchanged
+        assert_eq!(policy.live_depth(), 2);
+        assert_no_duplicates(&policy);
+    }
+
+    #[test]
+    fn telemetry_counters_accumulate_correctly() {
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            small_capacity: 1,
+            max_entries_per_owner: 3,
+            ..config()
+        });
+
+        // 1 admission
+        policy.access("ext-a", "k1".to_string());
+        let tel = policy.telemetry();
+        assert_eq!(tel.admissions_total, 1);
+        assert_eq!(tel.promotions_total, 0);
+        assert_eq!(tel.ghost_hits_total, 0);
+        assert_eq!(tel.budget_rejections_total, 0);
+        assert_eq!(tel.small_depth, 1);
+        assert_eq!(tel.main_depth, 0);
+
+        // Promote k1 small → main
+        policy.access("ext-a", "k1".to_string());
+        let tel = policy.telemetry();
+        assert_eq!(tel.promotions_total, 1);
+        assert_eq!(tel.small_depth, 0);
+        assert_eq!(tel.main_depth, 1);
+
+        // Admit k2 → small, evicts to ghost since small_capacity=1
+        policy.access("ext-a", "k2".to_string());
+        policy.access("ext-a", "k3".to_string());
+        // k2 was evicted from small to ghost when k3 entered
+        let tel = policy.telemetry();
+        assert!(tel.ghost_depth >= 1, "evicted key should be in ghost");
+    }
+
+    #[test]
+    fn telemetry_owner_live_counts_track_per_owner() {
+        let mut policy = S3FifoPolicy::new(config());
+        policy.access("ext-a", "k1".to_string());
+        policy.access("ext-b", "k2".to_string());
+        let tel = policy.telemetry();
+        assert_eq!(tel.owner_live_counts.get("ext-a"), Some(&1));
+        assert_eq!(tel.owner_live_counts.get("ext-b"), Some(&1));
+    }
+
+    #[test]
+    fn hit_main_reorders_without_changing_depth() {
+        // Use a large fallback_window so fallback doesn't trigger during setup
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            fallback_window: 32,
+            min_ghost_hits_in_window: 0,
+            ..config()
+        });
+        // Admit and promote both keys
+        policy.access("ext-a", "k1".to_string());
+        policy.access("ext-a", "k1".to_string()); // promote k1 to main
+        policy.access("ext-b", "k2".to_string());
+        policy.access("ext-b", "k2".to_string()); // promote k2 to main
+
+        let before = policy.telemetry();
+        let depth_before = before.main_depth;
+
+        // HitMain on k1 — should just reorder, no depth change
+        let decision = policy.access("ext-a", "k1".to_string());
+        assert_eq!(decision.kind, S3FifoDecisionKind::HitMain);
+        assert_eq!(policy.telemetry().main_depth, depth_before);
+        assert_no_duplicates(&policy);
+    }
+
+    #[test]
+    fn ghost_queue_evicts_oldest_when_at_capacity() {
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            ghost_capacity: 2,
+            small_capacity: 1,
+            ..config()
+        });
+
+        // Fill small with different keys; each evicts the previous to ghost
+        policy.access("ext-a", "k1".to_string()); // small: [k1]
+        policy.access("ext-b", "k2".to_string()); // small: [k2], ghost: [k1]
+        policy.access("ext-a", "k3".to_string()); // small: [k3], ghost: [k1, k2]
+        assert_eq!(policy.telemetry().ghost_depth, 2);
+
+        // One more eviction exceeds ghost_capacity=2 → k1 should be dropped
+        policy.access("ext-b", "k4".to_string()); // small: [k4], ghost: [k2, k3]
+        assert_eq!(policy.telemetry().ghost_depth, 2);
+        assert_no_duplicates(&policy);
+    }
+
+    #[test]
+    fn capacity_enforcement_evicts_to_stay_within_live_capacity() {
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            live_capacity: 3,
+            small_capacity: 2,
+            ghost_capacity: 8,
+            max_entries_per_owner: 10,
+            // Prevent fallback from triggering during the test
+            fallback_window: 32,
+            min_ghost_hits_in_window: 0,
+            max_budget_rejections_in_window: 32,
+        });
+
+        // Fill beyond live_capacity — each key from a different owner
+        for i in 0..6 {
+            policy.access(&format!("ext-{i}"), format!("k{i}"));
+        }
+
+        // live_depth must not exceed live_capacity
+        assert!(policy.live_depth() <= 3, "live_depth must respect capacity");
+        // Evicted keys should be in ghost
+        assert!(policy.telemetry().ghost_depth >= 3);
+        assert_no_duplicates(&policy);
+    }
+
+    #[test]
+    fn default_config_has_sensible_values() {
+        let cfg = S3FifoConfig::default();
+        assert_eq!(cfg.live_capacity, 256);
+        assert_eq!(cfg.small_capacity, 64);
+        assert_eq!(cfg.ghost_capacity, 512);
+        assert_eq!(cfg.max_entries_per_owner, 64);
+        assert_eq!(cfg.fallback_window, 32);
+        assert_eq!(cfg.min_ghost_hits_in_window, 2);
+        assert_eq!(cfg.max_budget_rejections_in_window, 12);
+    }
+
+    #[test]
+    fn decision_fields_reflect_current_state() {
+        let mut policy = S3FifoPolicy::new(config());
+        let d1 = policy.access("ext-a", "k1".to_string());
+        assert_eq!(d1.kind, S3FifoDecisionKind::AdmitSmall);
+        assert_eq!(d1.tier, S3FifoTier::Small);
+        assert!(!d1.ghost_hit);
+        assert!(d1.fallback_reason.is_none());
+        assert_eq!(d1.live_depth, 1);
+        assert_eq!(d1.small_depth, 1);
+        assert_eq!(d1.main_depth, 0);
+    }
+
     #[test]
     fn clear_fallback_resets_policy_gate() {
         let mut policy = S3FifoPolicy::new(S3FifoConfig {
