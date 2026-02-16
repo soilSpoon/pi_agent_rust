@@ -1042,9 +1042,9 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
     let parsed_required_stage_keys = required_stage_keys
         .iter()
         .map(|value| {
-            value
-                .as_str()
-                .ok_or_else(|| "stage_summary.required_stage_keys entries must be strings".to_string())
+            value.as_str().ok_or_else(|| {
+                "stage_summary.required_stage_keys entries must be strings".to_string()
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let expected_required_stage_keys = vec!["open_ms", "append_ms", "save_ms", "index_ms"];
@@ -1063,10 +1063,19 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             .get(*key)
             .and_then(Value::as_u64)
             .ok_or_else(|| {
-                format!(
-                    "stage_summary.operation_stage_coverage.{key} must be an integer count"
-                )
+                format!("stage_summary.operation_stage_coverage.{key} must be an integer count")
             })?;
+    }
+    let unexpected_stage_coverage_keys = operation_stage_coverage
+        .keys()
+        .filter(|key| !expected_required_stage_keys.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unexpected_stage_coverage_keys.is_empty() {
+        return Err(format!(
+            "stage_summary.operation_stage_coverage has unexpected keys: {:?}",
+            unexpected_stage_coverage_keys
+        ));
     }
     let covered_cells = stage_summary
         .get("covered_cells")
@@ -2471,6 +2480,18 @@ fn phase1_matrix_validator_rejects_stage_summary_count_mismatch() {
 }
 
 #[test]
+fn phase1_matrix_validator_rejects_unexpected_stage_coverage_key() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["stage_summary"]["operation_stage_coverage"]["unexpected_ms"] = json!(1);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("unexpected keys"),
+        "expected unexpected stage coverage key failure, got: {err}"
+    );
+}
+
+#[test]
 fn phase1_matrix_validator_rejects_non_primary_ordering_policy() {
     let malformed = json!({
         "schema": PHASE1_MATRIX_SCHEMA,
@@ -3226,7 +3247,9 @@ fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
         "phase5 readiness must fail closed when any required stage metric is missing"
     );
 
-    let matrix_cells = matrix["matrix_cells"].as_array().expect("matrix_cells array");
+    let matrix_cells = matrix["matrix_cells"]
+        .as_array()
+        .expect("matrix_cells array");
     let has_missing_index_reason = matrix_cells.iter().any(|cell| {
         cell["stage_attribution"]["index_ms"].is_null()
             && cell["missing_reasons"].as_array().is_some_and(|reasons| {

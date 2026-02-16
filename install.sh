@@ -160,6 +160,22 @@ pi_ascii_logo() {
 ASCII
 }
 
+pi_ascii_logo_normalized() {
+  local logo="$1"
+  local line=""
+  local max_width=0
+
+  while IFS= read -r line; do
+    if [ "${#line}" -gt "$max_width" ]; then
+      max_width="${#line}"
+    fi
+  done <<< "$logo"
+
+  while IFS= read -r line; do
+    printf '%-*s\n' "$max_width" "$line"
+  done <<< "$logo"
+}
+
 pi_ascii_logo_gum() {
   local logo="$1"
   local palette=(45 51 39 33 69 75)
@@ -373,6 +389,7 @@ show_header() {
   [ "$QUIET" -eq 1 ] && return 0
   local logo
   logo="$(pi_ascii_logo)"
+  logo="$(pi_ascii_logo_normalized "$logo")"
 
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     local styled_logo

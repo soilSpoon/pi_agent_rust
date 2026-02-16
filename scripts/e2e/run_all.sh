@@ -8448,6 +8448,10 @@ if claim_integrity_gate_active:
         "present": sorted(observed_realistic_session_shapes),
         "missing": list(missing_realistic_session_shapes),
         "overall_status": "pass" if not missing_realistic_session_shapes else "fail",
+        "source_record_stream": realistic_session_shape_coverage_source,
+        "source_workload_path": str(realistic_shape_coverage_path)
+        if realistic_shape_coverage_path is not None
+        else None,
         "source": realistic_session_shape_coverage_source,
         "source_path": str(realistic_shape_coverage_path)
         if realistic_shape_coverage_path is not None
@@ -8476,7 +8480,10 @@ if claim_integrity_gate_active:
                     "reason": (
                         "coverage present in baseline confidence records"
                         if passed
-                        else "missing required scenario/partition record"
+                        else (
+                            "missing_matrix_source_record: missing required "
+                            "scenario/partition record"
+                        )
                     ),
                 }
             )
