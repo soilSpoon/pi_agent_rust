@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="${ROOT}/install.sh"
+UNINSTALLER="${ROOT}/uninstall.sh"
 WORK_ROOT="${TMPDIR:-/tmp}/pi-installer-regression-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 PASS_COUNT=0
@@ -160,6 +161,26 @@ run_installer() {
   )
 }
 
+run_uninstaller() {
+  local dir="$1"
+  shift
+  local out="${dir}/output.log"
+  local rc_file="${dir}/exit_code"
+  local path_value="${dir}/fakebin:/usr/bin:/bin"
+
+  (
+    set +e
+    HOME="${dir}/home" \
+    XDG_STATE_HOME="${dir}/state" \
+    XDG_DATA_HOME="${dir}/data" \
+    XDG_CONFIG_HOME="${dir}/config" \
+    PATH="${path_value}" \
+    SHELL="/bin/bash" \
+    bash "${UNINSTALLER}" "$@" >"${out}" 2>&1
+    echo "$?" > "${rc_file}"
+  )
+}
+
 exit_code_of() {
   local dir="$1"
   cat "${dir}/exit_code"
@@ -299,6 +320,10 @@ test_agent_skills_install_by_default() {
     echo "missing managed marker in Codex skill" >&2
     return 1
   }
+  grep -Fq "## High-Value Commands" "$claude_skill" || {
+    echo "installed skill should include high-value command section" >&2
+    return 1
+  }
 }
 
 test_no_agent_skills_opt_out() {
@@ -365,6 +390,78 @@ test_existing_custom_skill_dirs_are_not_overwritten() {
     echo "Codex custom skill dir should be preserved" >&2
     return 1
   }
+}
+
+test_uninstall_removes_only_installer_managed_skills() {
+  local dir managed_skill custom_skill
+  dir="$(case_dir "uninstall-managed-skills-only")"
+
+  managed_skill="${dir}/home/.claude/skills/pi-agent-rust/SKILL.md"
+  custom_skill="${dir}/home/.codex/skills/pi-agent-rust/SKILL.md"
+  mkdir -p "$(dirname "$managed_skill")" "$(dirname "$custom_skill")"
+
+  cat > "$managed_skill" <<'SKILL'
+<!-- pi_agent_rust installer managed skill -->
+# Managed skill
+SKILL
+  cat > "$custom_skill" <<'SKILL'
+# Custom local skill (no installer marker)
+SKILL
+
+  run_uninstaller "$dir" --yes --no-gum
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Removed installer-managed skill: ${dir}/home/.claude/skills/pi-agent-rust"
+  assert_output_contains "$dir" "Skipping non-managed skill directory: ${dir}/home/.codex/skills/pi-agent-rust"
+  if [ -e "${dir}/home/.claude/skills/pi-agent-rust" ]; then
+    echo "installer-managed Claude skill directory should be removed" >&2
+    return 1
+  fi
+  if [ ! -f "${dir}/home/.codex/skills/pi-agent-rust/SKILL.md" ]; then
+    echo "custom Codex skill directory should be preserved" >&2
+    return 1
+  fi
+}
+
+test_uninstall_uses_recorded_skill_paths() {
+  local dir state_file recorded_codex managed_claude managed_codex
+  dir="$(case_dir "uninstall-recorded-skill-paths")"
+  recorded_codex="${dir}/home/custom-codex-home/skills/pi-agent-rust"
+
+  managed_claude="${dir}/home/.claude/skills/pi-agent-rust/SKILL.md"
+  managed_codex="${recorded_codex}/SKILL.md"
+  mkdir -p "$(dirname "$managed_claude")" "$(dirname "$managed_codex")"
+
+  cat > "$managed_claude" <<'SKILL'
+<!-- pi_agent_rust installer managed skill -->
+# Managed Claude skill
+SKILL
+  cat > "$managed_codex" <<'SKILL'
+<!-- pi_agent_rust installer managed skill -->
+# Managed Codex skill (recorded path)
+SKILL
+
+  state_file="${dir}/state/pi-agent-rust/install-state.env"
+  mkdir -p "$(dirname "$state_file")"
+  cat > "$state_file" <<STATE
+PIAR_AGENT_SKILL_STATUS='installed (claude,codex)'
+PIAR_AGENT_SKILL_CLAUDE_PATH='${dir}/home/.claude/skills/pi-agent-rust'
+PIAR_AGENT_SKILL_CODEX_PATH='${recorded_codex}'
+STATE
+
+  run_uninstaller "$dir" --yes --no-gum
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Removed installer-managed skill: ${dir}/home/.claude/skills/pi-agent-rust"
+  assert_output_contains "$dir" "Removed installer-managed skill: ${recorded_codex}"
+  if [ -e "${dir}/home/.claude/skills/pi-agent-rust" ]; then
+    echo "installer-managed Claude skill should be removed" >&2
+    return 1
+  fi
+  if [ -e "${recorded_codex}" ]; then
+    echo "installer-managed Codex skill at recorded path should be removed" >&2
+    return 1
+  fi
 }
 
 test_checksum_inline_success() {
@@ -614,6 +711,8 @@ main() {
   run_test test_agent_skills_install_by_default
   run_test test_no_agent_skills_opt_out
   run_test test_existing_custom_skill_dirs_are_not_overwritten
+  run_test test_uninstall_removes_only_installer_managed_skills
+  run_test test_uninstall_uses_recorded_skill_paths
   run_test test_checksum_inline_success
   run_test test_checksum_mismatch_fails_hard
   run_test test_checksum_missing_manifest_entry_fails_hard
