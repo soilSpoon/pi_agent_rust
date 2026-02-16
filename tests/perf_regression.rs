@@ -781,15 +781,12 @@ fn binary_size_check() {
                 return;
             }
             Err(err) => {
-                harness.log().info_ctx(
+                harness.log().info(
                     "missing_release_binary",
-                    &[
-                        ("strict_mode", "true"),
-                        ("env", PI_PERF_STRICT_ENV),
-                        ("checked", checked.as_str()),
-                    ],
+                    format!("strict_mode=true env={PI_PERF_STRICT_ENV} checked={checked}",),
                 );
-                panic!("{err}");
+                assert!(!strict_mode, "{err}");
+                return;
             }
         }
     };
