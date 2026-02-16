@@ -39,6 +39,16 @@
         "policy_profile",
         "risk_score",
         "latency_ms",
+        "lane",
+        "lane_decision_reason",
+        "lane_matrix_key",
+        "lane_dispatch_latency_ms",
+        "lane_latency_share_bps",
+        "marshalling_path",
+        "marshalling_latency_us",
+        "marshalling_fallback_count",
+        "marshalling_superinstruction_expected_cost_delta",
+        "marshalling_superinstruction_observed_cost_delta",
         "outcome",
         "selected_action",
         "reason_codes",
@@ -92,6 +102,57 @@
         "latency_ms": {
           "type": "integer",
           "minimum": 0
+        },
+        "lane": {
+          "type": "string",
+          "enum": ["fast", "compat", "unknown"]
+        },
+        "lane_decision_reason": {
+          "type": "string"
+        },
+        "lane_fallback_reason": {
+          "type": ["string", "null"]
+        },
+        "lane_matrix_key": {
+          "type": "string"
+        },
+        "lane_dispatch_latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lane_latency_share_bps": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "marshalling_path": {
+          "type": "string"
+        },
+        "marshalling_latency_us": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "marshalling_fallback_reason": {
+          "type": ["string", "null"]
+        },
+        "marshalling_fallback_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "marshalling_superinstruction_trace_signature": {
+          "type": ["string", "null"]
+        },
+        "marshalling_superinstruction_plan_id": {
+          "type": ["string", "null"]
+        },
+        "marshalling_superinstruction_expected_cost_delta": {
+          "type": "integer"
+        },
+        "marshalling_superinstruction_observed_cost_delta": {
+          "type": "integer"
+        },
+        "marshalling_superinstruction_deopt_reason": {
+          "type": ["string", "null"]
         },
         "outcome": {
           "type": "string",

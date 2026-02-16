@@ -36,6 +36,7 @@ const SUITE_CLASSIFICATION_PATH: &str = "tests/suite_classification.toml";
 const TEST_DOUBLE_INVENTORY_PATH: &str = "docs/test_double_inventory.json";
 const FULL_SUITE_GATE_PATH: &str = "tests/ci_full_suite_gate.rs";
 const COVERAGE_BASELINE_PATH: &str = "docs/coverage-baseline-map.json";
+const RUNTIME_HOSTCALL_TELEMETRY_SCHEMA_PATH: &str = "docs/schema/runtime_hostcall_telemetry.json";
 
 fn load_json(path: &str) -> Value {
     let content = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"));
@@ -1710,6 +1711,48 @@ fn test_double_inventory_schema_is_versioned() {
         schema.starts_with("pi.qa.test_double_inventory"),
         "inventory schema must be pi.qa.test_double_inventory.*, got: {schema}"
     );
+}
+
+#[test]
+fn runtime_hostcall_telemetry_schema_is_versioned() {
+    let schema = load_json(RUNTIME_HOSTCALL_TELEMETRY_SCHEMA_PATH);
+    assert_eq!(
+        schema["properties"]["schema"]["enum"][0], "pi.ext.hostcall_telemetry.v1",
+        "runtime hostcall telemetry schema id must be versioned and canonical"
+    );
+    assert_eq!(
+        schema["$defs"]["event"]["properties"]["schema"]["enum"][0], "pi.ext.hostcall_telemetry.v1",
+        "runtime hostcall telemetry event schema id must match artifact schema"
+    );
+}
+
+#[test]
+fn runtime_hostcall_telemetry_schema_requires_lane_and_marshalling_fields() {
+    let schema = load_json(RUNTIME_HOSTCALL_TELEMETRY_SCHEMA_PATH);
+    let required: HashSet<String> = schema["$defs"]["event"]["required"]
+        .as_array()
+        .expect("runtime hostcall telemetry event.required must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+
+    for field in [
+        "lane",
+        "lane_decision_reason",
+        "lane_matrix_key",
+        "lane_dispatch_latency_ms",
+        "lane_latency_share_bps",
+        "marshalling_path",
+        "marshalling_latency_us",
+        "marshalling_fallback_count",
+        "marshalling_superinstruction_expected_cost_delta",
+        "marshalling_superinstruction_observed_cost_delta",
+    ] {
+        assert!(
+            required.contains(field),
+            "runtime hostcall telemetry schema must require field: {field}"
+        );
+    }
 }
 
 #[test]

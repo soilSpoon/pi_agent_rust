@@ -117,6 +117,56 @@ fn e2e_runtime_hostcall_telemetry_logs_required_fields() {
     assert_eq!(telemetry.entry_count, telemetry.entries.len());
 
     for event in &telemetry.entries {
+        assert!(
+            matches!(event.lane.as_str(), "fast" | "compat" | "unknown"),
+            "unexpected lane value for {}: {}",
+            event.call_id,
+            event.lane
+        );
+        assert!(
+            !event.lane_matrix_key.trim().is_empty(),
+            "lane matrix key must be populated for {}",
+            event.call_id
+        );
+        assert!(
+            event.lane_latency_share_bps <= 10_000,
+            "lane latency share must be basis points for {}",
+            event.call_id
+        );
+        assert!(
+            !event.marshalling_path.trim().is_empty(),
+            "marshalling path must be populated for {}",
+            event.call_id
+        );
+        if let Some(trace_signature) = event
+            .marshalling_superinstruction_trace_signature
+            .as_deref()
+        {
+            assert!(
+                !trace_signature.trim().is_empty(),
+                "superinstruction trace signature must not be blank for {}",
+                event.call_id
+            );
+        }
+        if let Some(plan_id) = event.marshalling_superinstruction_plan_id.as_deref() {
+            assert!(
+                !plan_id.trim().is_empty(),
+                "superinstruction plan id must not be blank for {}",
+                event.call_id
+            );
+            assert!(
+                event.marshalling_superinstruction_trace_signature.is_some(),
+                "superinstruction plan id requires trace signature for {}",
+                event.call_id
+            );
+        }
+        if let Some(deopt_reason) = event.marshalling_superinstruction_deopt_reason.as_deref() {
+            assert!(
+                !deopt_reason.trim().is_empty(),
+                "superinstruction deopt reason must not be blank for {}",
+                event.call_id
+            );
+        }
         harness
             .log()
             .info_ctx("runtime_risk_telemetry", "runtime telemetry event", |ctx| {
@@ -135,6 +185,32 @@ fn e2e_runtime_hostcall_telemetry_logs_required_fields() {
                     format!("{:?}", event.selected_action).to_lowercase(),
                 ));
                 ctx.push(("latency_ms".into(), event.latency_ms.to_string()));
+                ctx.push(("lane".into(), event.lane.clone()));
+                ctx.push(("lane_matrix_key".into(), event.lane_matrix_key.clone()));
+                ctx.push((
+                    "lane_dispatch_latency_ms".into(),
+                    event.lane_dispatch_latency_ms.to_string(),
+                ));
+                ctx.push((
+                    "lane_latency_share_bps".into(),
+                    event.lane_latency_share_bps.to_string(),
+                ));
+                ctx.push(("marshalling_path".into(), event.marshalling_path.clone()));
+                ctx.push((
+                    "marshalling_latency_us".into(),
+                    event.marshalling_latency_us.to_string(),
+                ));
+                ctx.push((
+                    "marshalling_fallback_count".into(),
+                    event.marshalling_fallback_count.to_string(),
+                ));
+                ctx.push((
+                    "marshalling_superinstruction_plan_id".into(),
+                    event
+                        .marshalling_superinstruction_plan_id
+                        .clone()
+                        .unwrap_or_default(),
+                ));
                 ctx.push(("correlation_id".into(), correlation_id.clone()));
                 ctx.push(("redaction_summary".into(), event.redaction_summary.clone()));
                 ctx.push((
@@ -190,6 +266,14 @@ fn e2e_runtime_hostcall_telemetry_logs_required_fields() {
             "reason_codes",
             "action",
             "latency_ms",
+            "lane",
+            "lane_matrix_key",
+            "lane_dispatch_latency_ms",
+            "lane_latency_share_bps",
+            "marshalling_path",
+            "marshalling_latency_us",
+            "marshalling_fallback_count",
+            "marshalling_superinstruction_plan_id",
             "correlation_id",
             "redaction_summary",
             "explanation_level",
