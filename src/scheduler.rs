@@ -16,6 +16,7 @@
 
 use std::cmp::Ordering;
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 use std::fmt;
@@ -524,6 +525,8 @@ pub struct ReactorMeshConfig {
     pub shard_count: usize,
     /// Maximum queued envelopes per shard lane.
     pub lane_capacity: usize,
+    /// Optional topology snapshot for deterministic shard placement planning.
+    pub topology: Option<ReactorTopologySnapshot>,
 }
 
 impl Default for ReactorMeshConfig {
@@ -531,7 +534,199 @@ impl Default for ReactorMeshConfig {
         Self {
             shard_count: 4,
             lane_capacity: 1024,
+            topology: None,
         }
+    }
+}
+
+/// Core descriptor used by topology-aware shard placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReactorTopologyCore {
+    pub core_id: usize,
+    pub numa_node: usize,
+}
+
+/// Lightweight machine-provided topology snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReactorTopologySnapshot {
+    pub cores: Vec<ReactorTopologyCore>,
+}
+
+impl ReactorTopologySnapshot {
+    /// Build a normalized topology snapshot from `(core_id, numa_node)` pairs.
+    #[must_use]
+    pub fn from_core_node_pairs(pairs: &[(usize, usize)]) -> Self {
+        let mut cores = pairs
+            .iter()
+            .map(|(core_id, numa_node)| ReactorTopologyCore {
+                core_id: *core_id,
+                numa_node: *numa_node,
+            })
+            .collect::<Vec<_>>();
+        cores.sort_unstable();
+        cores.dedup();
+        Self { cores }
+    }
+}
+
+/// Explicit fallback reason emitted by topology planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactorPlacementFallbackReason {
+    /// No topology snapshot was available at planning time.
+    TopologyUnavailable,
+    /// A topology snapshot was provided but had no usable cores.
+    TopologyEmpty,
+    /// Topology is available but only one NUMA node exists.
+    SingleNumaNode,
+}
+
+impl ReactorPlacementFallbackReason {
+    #[must_use]
+    pub const fn as_code(self) -> &'static str {
+        match self {
+            Self::TopologyUnavailable => "topology_unavailable",
+            Self::TopologyEmpty => "topology_empty",
+            Self::SingleNumaNode => "single_numa_node",
+        }
+    }
+}
+
+/// Deterministic shard binding produced by placement planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReactorShardBinding {
+    pub shard_id: usize,
+    pub core_id: usize,
+    pub numa_node: usize,
+}
+
+/// Machine-readable shard placement manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactorPlacementManifest {
+    pub shard_count: usize,
+    pub numa_node_count: usize,
+    pub bindings: Vec<ReactorShardBinding>,
+    pub fallback_reason: Option<ReactorPlacementFallbackReason>,
+}
+
+impl ReactorPlacementManifest {
+    /// Plan deterministic shard placement from optional topology.
+    #[must_use]
+    pub fn plan(shard_count: usize, topology: Option<&ReactorTopologySnapshot>) -> Self {
+        if shard_count == 0 {
+            return Self {
+                shard_count: 0,
+                numa_node_count: 0,
+                bindings: Vec::new(),
+                fallback_reason: None,
+            };
+        }
+
+        let Some(topology) = topology else {
+            let bindings = (0..shard_count)
+                .map(|shard_id| ReactorShardBinding {
+                    shard_id,
+                    core_id: shard_id,
+                    numa_node: 0,
+                })
+                .collect::<Vec<_>>();
+            return Self {
+                shard_count,
+                numa_node_count: 1,
+                bindings,
+                fallback_reason: Some(ReactorPlacementFallbackReason::TopologyUnavailable),
+            };
+        };
+
+        if topology.cores.is_empty() {
+            let bindings = (0..shard_count)
+                .map(|shard_id| ReactorShardBinding {
+                    shard_id,
+                    core_id: shard_id,
+                    numa_node: 0,
+                })
+                .collect::<Vec<_>>();
+            return Self {
+                shard_count,
+                numa_node_count: 1,
+                bindings,
+                fallback_reason: Some(ReactorPlacementFallbackReason::TopologyEmpty),
+            };
+        }
+
+        let mut by_node = BTreeMap::<usize, Vec<usize>>::new();
+        for core in &topology.cores {
+            by_node
+                .entry(core.numa_node)
+                .or_default()
+                .push(core.core_id);
+        }
+        for cores in by_node.values_mut() {
+            cores.sort_unstable();
+            cores.dedup();
+        }
+        let nodes = by_node
+            .into_iter()
+            .filter(|(_, cores)| !cores.is_empty())
+            .collect::<Vec<_>>();
+
+        if nodes.is_empty() {
+            let bindings = (0..shard_count)
+                .map(|shard_id| ReactorShardBinding {
+                    shard_id,
+                    core_id: shard_id,
+                    numa_node: 0,
+                })
+                .collect::<Vec<_>>();
+            return Self {
+                shard_count,
+                numa_node_count: 1,
+                bindings,
+                fallback_reason: Some(ReactorPlacementFallbackReason::TopologyEmpty),
+            };
+        }
+
+        let node_count = nodes.len();
+        let fallback_reason = if node_count == 1 {
+            Some(ReactorPlacementFallbackReason::SingleNumaNode)
+        } else {
+            None
+        };
+
+        let mut bindings = Vec::with_capacity(shard_count);
+        for shard_id in 0..shard_count {
+            let node_idx = shard_id % node_count;
+            let (numa_node, cores) = &nodes[node_idx];
+            let core_idx = (shard_id / node_count) % cores.len();
+            bindings.push(ReactorShardBinding {
+                shard_id,
+                core_id: cores[core_idx],
+                numa_node: *numa_node,
+            });
+        }
+
+        Self {
+            shard_count,
+            numa_node_count: node_count,
+            bindings,
+            fallback_reason,
+        }
+    }
+
+    /// Render placement manifest as stable machine-readable JSON.
+    #[must_use]
+    pub fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "shard_count": self.shard_count,
+            "numa_node_count": self.numa_node_count,
+            "fallback_reason": self.fallback_reason.map(ReactorPlacementFallbackReason::as_code),
+            "bindings": self.bindings.iter().map(|binding| {
+                serde_json::json!({
+                    "shard_id": binding.shard_id,
+                    "core_id": binding.core_id,
+                    "numa_node": binding.numa_node
+                })
+            }).collect::<Vec<_>>()
+        })
     }
 }
 
@@ -636,6 +831,7 @@ pub struct ReactorMesh {
     shard_seq: Vec<u64>,
     rr_cursor: usize,
     rejected_enqueues: u64,
+    placement_manifest: ReactorPlacementManifest,
 }
 
 impl ReactorMesh {
@@ -648,6 +844,8 @@ impl ReactorMesh {
     pub fn new(config: ReactorMeshConfig) -> Self {
         let shard_count = config.shard_count.max(1);
         let lane_capacity = config.lane_capacity.max(1);
+        let placement_manifest =
+            ReactorPlacementManifest::plan(shard_count, config.topology.as_ref());
         let lanes = (0..shard_count)
             .map(|_| SpscLane::new(lane_capacity))
             .collect::<Vec<_>>();
@@ -657,6 +855,7 @@ impl ReactorMesh {
             shard_seq: vec![0; shard_count],
             rr_cursor: 0,
             rejected_enqueues: 0,
+            placement_manifest,
         }
     }
 
@@ -692,6 +891,12 @@ impl ReactorMesh {
             max_queue_depths: self.lanes.iter().map(|lane| lane.max_depth).collect(),
             rejected_enqueues: self.rejected_enqueues,
         }
+    }
+
+    /// Deterministic shard placement manifest used by this mesh.
+    #[must_use]
+    pub fn placement_manifest(&self) -> &ReactorPlacementManifest {
+        &self.placement_manifest
     }
 
     const fn next_global_seq(&mut self) -> Seq {
@@ -1767,6 +1972,7 @@ mod tests {
         let mut mesh = ReactorMesh::new(ReactorMeshConfig {
             shard_count: 8,
             lane_capacity: 64,
+            topology: None,
         });
 
         let first = mesh
@@ -1794,6 +2000,7 @@ mod tests {
         let mut mesh = ReactorMesh::new(ReactorMeshConfig {
             shard_count: 3,
             lane_capacity: 64,
+            topology: None,
         });
 
         let mut routed = Vec::new();
@@ -1812,6 +2019,7 @@ mod tests {
         let mut mesh = ReactorMesh::new(ReactorMeshConfig {
             shard_count: 4,
             lane_capacity: 64,
+            topology: None,
         });
 
         let mut expected = Vec::new();
@@ -1862,6 +2070,7 @@ mod tests {
         let mut mesh = ReactorMesh::new(ReactorMeshConfig {
             shard_count: 1,
             lane_capacity: 2,
+            topology: None,
         });
 
         mesh.enqueue_event("evt-0".to_string(), serde_json::json!({}))
@@ -1880,5 +2089,71 @@ mod tests {
         assert_eq!(telemetry.rejected_enqueues, 1);
         assert_eq!(telemetry.max_queue_depths, vec![2]);
         assert_eq!(telemetry.queue_depths, vec![2]);
+    }
+
+    #[test]
+    fn reactor_placement_manifest_is_deterministic_across_runs() {
+        let topology =
+            ReactorTopologySnapshot::from_core_node_pairs(&[(0, 0), (1, 0), (2, 1), (3, 1)]);
+        let first = ReactorPlacementManifest::plan(8, Some(&topology));
+        let second = ReactorPlacementManifest::plan(8, Some(&topology));
+        assert_eq!(first, second);
+        assert_eq!(first.fallback_reason, None);
+    }
+
+    #[test]
+    fn reactor_placement_manifest_spreads_across_numa_nodes_round_robin() {
+        let topology =
+            ReactorTopologySnapshot::from_core_node_pairs(&[(0, 0), (1, 0), (4, 1), (5, 1)]);
+        let manifest = ReactorPlacementManifest::plan(6, Some(&topology));
+        let observed_nodes = manifest
+            .bindings
+            .iter()
+            .map(|binding| binding.numa_node)
+            .collect::<Vec<_>>();
+        assert_eq!(observed_nodes, vec![0, 1, 0, 1, 0, 1]);
+
+        let observed_cores = manifest
+            .bindings
+            .iter()
+            .map(|binding| binding.core_id)
+            .collect::<Vec<_>>();
+        assert_eq!(observed_cores, vec![0, 4, 1, 5, 0, 4]);
+    }
+
+    #[test]
+    fn reactor_placement_manifest_records_fallback_when_topology_missing() {
+        let manifest = ReactorPlacementManifest::plan(3, None);
+        assert_eq!(
+            manifest.fallback_reason,
+            Some(ReactorPlacementFallbackReason::TopologyUnavailable)
+        );
+        assert_eq!(manifest.numa_node_count, 1);
+        assert_eq!(manifest.bindings.len(), 3);
+        assert_eq!(manifest.bindings[0].core_id, 0);
+        assert_eq!(manifest.bindings[2].core_id, 2);
+    }
+
+    #[test]
+    fn reactor_mesh_exposes_machine_readable_placement_manifest() {
+        let topology = ReactorTopologySnapshot::from_core_node_pairs(&[(2, 0), (3, 0)]);
+        let mesh = ReactorMesh::new(ReactorMeshConfig {
+            shard_count: 3,
+            lane_capacity: 8,
+            topology: Some(topology),
+        });
+        let manifest = mesh.placement_manifest();
+        let as_json = manifest.as_json();
+        assert_eq!(as_json["shard_count"], serde_json::json!(3));
+        assert_eq!(as_json["numa_node_count"], serde_json::json!(1));
+        assert_eq!(
+            as_json["fallback_reason"],
+            serde_json::json!(Some("single_numa_node"))
+        );
+        assert_eq!(
+            as_json["bindings"].as_array().map(|v| v.len()),
+            Some(3),
+            "expected per-shard binding rows"
+        );
     }
 }
