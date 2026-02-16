@@ -17,7 +17,6 @@ use crate::session::{SessionEntry, SessionMessage, session_message_to_model};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::Arc;

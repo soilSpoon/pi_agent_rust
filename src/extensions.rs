@@ -23232,20 +23232,22 @@ impl ExtensionManager {
     ///
     /// On cache miss the context is rebuilt from the current inner state and
     /// stored for future dispatches within the same generation.
-    async fn get_or_build_ctx_payload(&self) -> Value {
+    ///
+    /// Returns `Arc<Value>` so callers can share the payload cheaply.
+    async fn get_or_build_ctx_payload(&self) -> Arc<Value> {
         // Seqlock fast-path: read version without any lock.
         let version = self.snapshot_version();
 
-        // Check cache under a brief mutex lock.
+        // Check cache under a brief mutex lock (Arc clone = atomic increment).
         let cached = {
             let guard = self.inner.lock().unwrap();
             guard.ctx_cache.clone()
         };
 
-        // Cache hit: version matches → return immediately.
+        // Cache hit: version matches → return Arc (no deep clone).
         if let Some(ref c) = cached {
             if c.generation == version {
-                return c.payload.clone();
+                return Arc::clone(&c.payload);
             }
         }
 
@@ -23258,7 +23260,7 @@ impl ExtensionManager {
         drop(snap);
 
         // Rebuild.
-        let payload = Self::build_ctx_payload(has_ui, session, cwd, &registry).await;
+        let payload = Arc::new(Self::build_ctx_payload(has_ui, session, cwd, &registry).await);
 
         // Store in cache (best-effort; if another thread updated generation
         // between our snapshot and now, the cache will simply be stale and
@@ -23269,7 +23271,7 @@ impl ExtensionManager {
             if guard.ctx_generation == version {
                 guard.ctx_cache = Some(CachedEventContext {
                     generation: version,
-                    payload: payload.clone(),
+                    payload: Arc::clone(&payload),
                 });
             }
         }
