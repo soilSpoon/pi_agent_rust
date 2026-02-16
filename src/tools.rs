@@ -1125,7 +1125,10 @@ impl Tool for ReadTool {
         use std::pin::Pin;
         use std::task::Poll;
 
-        async fn read_some<R: AsyncRead + Unpin>(reader: &mut R, dst: &mut [u8]) -> std::io::Result<usize> {
+        async fn read_some<R: AsyncRead + Unpin>(
+            reader: &mut R,
+            dst: &mut [u8],
+        ) -> std::io::Result<usize> {
             futures::future::poll_fn(|cx| {
                 let mut read_buf = ReadBuf::new(dst);
                 match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
@@ -1246,7 +1249,7 @@ impl Tool for ReadTool {
         // We need:
         // 1. Total line count.
         // 2. Content for the requested range (offset/limit) OR head/tail if no range.
-        
+
         // If range is requested, we can just scan line endings until offset, capture, then stop.
         // BUT, user might want "total lines" context. The original implementation provided `total_file_lines`.
         // To provide `total_file_lines`, we MUST scan the whole file.
@@ -1258,67 +1261,64 @@ impl Tool for ReadTool {
         // - Maintain a buffer for "content we want to keep".
         //   - If no range: Keep first N bytes (head) and last N bytes (tail).
         //   - If range: Keep bytes between line X and Y.
-        
+
         // Reset file to start if we read some bytes
         if initial_read > 0 {
-             file.seek(SeekFrom::Start(0)).await
-                 .map_err(|e| Error::tool("read", format!("Failed to seek: {e}")))?;
+            file.seek(SeekFrom::Start(0))
+                .await
+                .map_err(|e| Error::tool("read", format!("Failed to seek: {e}")))?;
         }
 
         let mut total_lines = 1; // Start at line 1
         // Simplified approach: Stream and collect "relevant" bytes.
-        // If we collect > 2x limit, stop collecting but keep scanning for line count? 
+        // If we collect > 2x limit, stop collecting but keep scanning for line count?
         // Or just stop? Legacy stopped reading if content > 2*MAX_BYTES.
-        // Let's stick to the legacy "stop reading" safety check for now to be safe, 
+        // Let's stick to the legacy "stop reading" safety check for now to be safe,
         // but optimized to not load everything if we don't need it.
-        
+
         // Actually, legacy `read` read the WHOLE file, then sliced.
         // We want to avoid reading the whole file into RAM.
-        
-        let mut buf = [0u8; 64 * 1024]; // 64KB chunks
-        let mut stop_collecting = false;
-        
+
+        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice(); // 64KB chunks
+
         // If no range specified, we default to reading the start (and potentially tail).
         // Handling tail optimization in a single pass is tricky without a circular buffer.
         // Let's just implement the "read all until limit" optimization first.
-        
-        let mut raw_content = Vec::new();
-        // Pre-allocate to avoid reallocations
-        raw_content.reserve(initial_read.min(DEFAULT_MAX_BYTES * 2));
-        
+
+        let mut raw_content = Vec::with_capacity(initial_read.min(DEFAULT_MAX_BYTES * 2));
+
         loop {
             let n = read_some(&mut file, &mut buf)
                 .await
                 .map_err(|e| Error::tool("read", e.to_string()))?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             let chunk = &buf[..n];
-            
+
             // Count lines
             total_lines += memchr::memchr_iter(b'\n', chunk).count();
-            
+
             // Collect content logic
-            if !stop_collecting {
-                if raw_content.len() + n > DEFAULT_MAX_BYTES * 4 {
-                    // Safety break: if we exceed 4x the default limit (200KB), stop collecting
-                    // to prevent OOM. We continue scanning for line counts if needed? 
-                    // Legacy behavior: "Safety break: if we've accumulated significantly more than the truncation limit... break"
-                    // So we should just break.
-                    stop_collecting = true;
-                    // If we stop collecting, we also stop scanning, because legacy did that.
-                    // This means `total_lines` will be truncated count. That's acceptable behavior match.
-                    break;
-                }
-                raw_content.extend_from_slice(chunk);
+            if raw_content.len() + n > DEFAULT_MAX_BYTES * 4 {
+                // Safety break: if we exceed 4x the default limit (200KB), stop collecting
+                // to prevent OOM. We continue scanning for line counts if needed?
+                // Legacy behavior: "Safety break: if we've accumulated significantly more than the truncation limit... break"
+                // So we should just break.
+                // If we stop collecting, we also stop scanning, because legacy did that.
+                // This means `total_lines` will be truncated count. That's acceptable behavior match.
+                break;
             }
+            raw_content.extend_from_slice(chunk);
         }
-        
+
         // Correct line count for trailing newline
         if raw_content.last() == Some(&b'\n') {
             total_lines = total_lines.saturating_sub(1);
         }
-        
+
         let text_content = String::from_utf8_lossy(&raw_content).into_owned();
-        
+
         // Handle empty file
         if text_content.is_empty() {
             return Ok(ToolOutput {
@@ -1332,7 +1332,7 @@ impl Tool for ReadTool {
         // We can reuse the existing logic for offset/limit/formatting since it operates on `String`.
         // This optimization avoids loading 100MB files, but still loads ~200KB.
         // This solves the OOM risk for massive files.
-        
+
         // Reuse existing logic
         let start_line: usize = match input.offset {
             Some(n) if n > 0 => n.saturating_sub(1).try_into().unwrap_or(usize::MAX),
@@ -1440,8 +1440,7 @@ impl Tool for ReadTool {
             details = Some(serde_json::json!({ "truncation": truncation }));
         } else if let Some(user_limited) = user_limited_lines {
             if start_line.saturating_add(user_limited) < total_lines {
-                let remaining =
-                    total_lines.saturating_sub(start_line.saturating_add(user_limited));
+                let remaining = total_lines.saturating_sub(start_line.saturating_add(user_limited));
                 let next_offset = start_line.saturating_add(user_limited).saturating_add(1);
                 let _ = write!(
                     output_text,
@@ -1455,7 +1454,6 @@ impl Tool for ReadTool {
             details,
             is_error: false,
         })
-
     }
 }
 
