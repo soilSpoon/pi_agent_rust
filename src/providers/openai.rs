@@ -560,7 +560,7 @@ where
     #[allow(clippy::too_many_lines)]
     fn process_choice(&mut self, choice: OpenAIChoice) {
         let delta = choice.delta;
-        if delta.content.is_some() || delta.tool_calls.is_some() {
+        if delta.content.is_some() || delta.tool_calls.is_some() || delta.reasoning_content.is_some() {
             self.ensure_started();
         }
 
@@ -568,6 +568,39 @@ where
         // Ensure we emit Start before processing finish_reason
         if choice.finish_reason.is_some() {
             self.ensure_started();
+        }
+
+        // Handle reasoning content (e.g. DeepSeek R1)
+        if let Some(reasoning) = delta.reasoning_content {
+            // Update partial content
+            let last_is_thinking =
+                matches!(self.partial.content.last(), Some(ContentBlock::Thinking(_)));
+
+            let content_index = if last_is_thinking {
+                self.partial.content.len() - 1
+            } else {
+                let idx = self.partial.content.len();
+                self.partial
+                    .content
+                    .push(ContentBlock::Thinking(ThinkingContent {
+                        thinking: String::new(),
+                        thinking_signature: None,
+                    }));
+
+                self.pending_events
+                    .push_back(StreamEvent::ThinkingStart { content_index: idx });
+
+                idx
+            };
+
+            if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(content_index) {
+                t.thinking.push_str(&reasoning);
+            }
+
+            self.pending_events.push_back(StreamEvent::ThinkingDelta {
+                content_index,
+                delta: reasoning,
+            });
         }
 
         // Handle text content
@@ -713,16 +746,19 @@ where
                 _ => StopReason::Stop,
             };
 
-            // Emit TextEnd for all open text blocks (not just the last one,
-
-            // since text may precede tool calls).
+            // Emit TextEnd/ThinkingEnd for all open text/thinking blocks (not just the last one,
+            // since text/thinking may precede tool calls).
 
             for (content_index, block) in self.partial.content.iter().enumerate() {
                 if let ContentBlock::Text(t) = block {
                     self.pending_events.push_back(StreamEvent::TextEnd {
                         content_index,
-
                         content: t.text.clone(),
+                    });
+                } else if let ContentBlock::Thinking(t) = block {
+                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                        content_index,
+                        content: t.thinking.clone(),
                     });
                 }
             }
@@ -856,6 +892,8 @@ struct OpenAIChoice {
 struct OpenAIDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
 }

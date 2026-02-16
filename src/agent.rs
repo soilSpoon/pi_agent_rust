@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::FutureExt;
 use futures::StreamExt;
+use futures::stream;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -49,6 +50,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+const MAX_CONCURRENT_TOOLS: usize = 8;
 
 // ============================================================================
 // Agent Configuration
@@ -1404,19 +1407,21 @@ impl Agent {
             });
         }
 
-        // Phase 2: Execute all tools concurrently.
-        // Reborrow self immutably to create futures, then join_all to run in parallel.
+        // Phase 2: Execute all tools concurrently (with concurrency limit).
+        // Reborrow self immutably to create futures, then buffer_unordered to run in parallel.
         let tool_outputs: Vec<(ToolOutput, bool)> = {
             let self_ref = &*self;
-            let futures: Vec<_> = tool_calls
+            let futures = tool_calls
                 .iter()
-                .map(|tc| self_ref.execute_tool(tc, on_event))
-                .collect();
+                .map(|tc| self_ref.execute_tool(tc, on_event));
 
             if let Some(signal) = abort.as_ref() {
                 use futures::future::{Either, select};
 
-                let all_fut = futures::future::join_all(futures).fuse();
+                let all_fut = stream::iter(futures)
+                    .buffered(MAX_CONCURRENT_TOOLS)
+                    .collect::<Vec<_>>()
+                    .fuse();
                 let abort_fut = signal.wait().fuse();
                 futures::pin_mut!(all_fut, abort_fut);
 
@@ -1440,7 +1445,10 @@ impl Agent {
                     }
                 }
             } else {
-                futures::future::join_all(futures).await
+                stream::iter(futures)
+                    .buffered(MAX_CONCURRENT_TOOLS)
+                    .collect()
+                    .await
             }
         };
 
@@ -4432,8 +4440,7 @@ impl AgentSession {
         // Either use the pre-warmed JS runtime (booted concurrently with startup)
         // or create a fresh one inline.
         let (manager, _tools) = if let Some(pre) = pre_warmed {
-            pre.manager
-                .set_js_runtime(pre.js_runtime);
+            pre.manager.set_js_runtime(pre.js_runtime);
             (pre.manager, pre.tools)
         } else {
             let manager = ExtensionManager::new();
@@ -4467,8 +4474,7 @@ impl AgentSession {
                     cwd: cwd.display().to_string(),
                     limits: crate::extensions_js::PiJsRuntimeLimits {
                         memory_limit_bytes: Some(
-                            (resolved_policy.max_memory_mb as usize)
-                                .saturating_mul(1024 * 1024),
+                            (resolved_policy.max_memory_mb as usize).saturating_mul(1024 * 1024),
                         ),
                         ..Default::default()
                     },
