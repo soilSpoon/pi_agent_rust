@@ -541,4 +541,224 @@ mod tests {
         let changed_hash = normalized_manifest_hash_from_value(&changed).unwrap();
         assert_ne!(baseline_hash, changed_hash);
     }
+
+    mod proptest_extension_inclusion {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Known registration type strings.
+        const REG_TYPES: &[&str] = &[
+            "registerTool",
+            "registerCommand",
+            "registerSlashCommand",
+            "registerProvider",
+            "registerEvent",
+            "registerEventHook",
+            "registerMessageRenderer",
+            "registerFlag",
+            "registerShortcut",
+        ];
+
+        proptest! {
+            /// `classify_registrations` never panics on arbitrary strings.
+            #[test]
+            fn classify_never_panics(
+                n in 0..10usize,
+                seed in prop::collection::vec("[a-zA-Z]{1,20}", 0..10)
+            ) {
+                let _ = classify_registrations(&seed[..n.min(seed.len())]);
+            }
+
+            /// Empty registrations always return General.
+            #[test]
+            fn empty_registrations_is_general(_dummy in 0..1u8) {
+                assert_eq!(classify_registrations(&[]), ExtensionCategory::General);
+            }
+
+            /// Single known registration type returns its specific category.
+            #[test]
+            fn single_registration_specific(idx in 0..REG_TYPES.len()) {
+                let regs = vec![REG_TYPES[idx].to_string()];
+                let cat = classify_registrations(&regs);
+                assert_ne!(cat, ExtensionCategory::Multi);
+                assert_ne!(cat, ExtensionCategory::General);
+            }
+
+            /// Two distinct registration categories return Multi.
+            #[test]
+            fn two_distinct_returns_multi(
+                idx_a in 0..1usize,   // tool
+                idx_b in 3..4usize    // provider
+            ) {
+                let regs = vec![
+                    REG_TYPES[idx_a].to_string(),
+                    REG_TYPES[idx_b].to_string(),
+                ];
+                assert_eq!(classify_registrations(&regs), ExtensionCategory::Multi);
+            }
+
+            /// Unknown registration strings return General.
+            #[test]
+            fn unknown_registrations_general(s in "[a-z]{5,15}") {
+                // Avoid accidentally matching known types
+                if !REG_TYPES.contains(&s.as_str()) {
+                    assert_eq!(
+                        classify_registrations(&[s]),
+                        ExtensionCategory::General
+                    );
+                }
+            }
+
+            /// Duplicate registrations don't change the result.
+            #[test]
+            fn duplicates_idempotent(idx in 0..REG_TYPES.len()) {
+                let single = vec![REG_TYPES[idx].to_string()];
+                let doubled = vec![REG_TYPES[idx].to_string(), REG_TYPES[idx].to_string()];
+                assert_eq!(
+                    classify_registrations(&single),
+                    classify_registrations(&doubled)
+                );
+            }
+
+            /// `ExtensionCategory` serde roundtrip.
+            #[test]
+            fn category_serde_roundtrip(idx in 0..8usize) {
+                let cats = [
+                    ExtensionCategory::Tool,
+                    ExtensionCategory::Command,
+                    ExtensionCategory::Provider,
+                    ExtensionCategory::EventHook,
+                    ExtensionCategory::UiComponent,
+                    ExtensionCategory::Configuration,
+                    ExtensionCategory::Multi,
+                    ExtensionCategory::General,
+                ];
+                let cat = &cats[idx];
+                let json = serde_json::to_string(cat).unwrap();
+                let back: ExtensionCategory = serde_json::from_str(&json).unwrap();
+                assert_eq!(*cat, back);
+            }
+
+            /// `build_rationale` never panics and produces non-empty output.
+            #[test]
+            fn rationale_never_panics(
+                tier_idx in 0..4usize,
+                score in 0.0f64..100.0,
+                cat_idx in 0..8usize,
+                source in "[a-z-]{1,20}"
+            ) {
+                let tiers = ["tier-0", "tier-1", "tier-2", "unknown"];
+                let cats = [
+                    ExtensionCategory::Tool,
+                    ExtensionCategory::Command,
+                    ExtensionCategory::Provider,
+                    ExtensionCategory::EventHook,
+                    ExtensionCategory::UiComponent,
+                    ExtensionCategory::Configuration,
+                    ExtensionCategory::Multi,
+                    ExtensionCategory::General,
+                ];
+                let result = build_rationale(tiers[tier_idx], score, &cats[cat_idx], &source);
+                assert!(!result.is_empty());
+                assert!(result.ends_with('.'));
+            }
+
+            /// `canonicalize_json_value` is idempotent.
+            #[test]
+            fn canonicalize_idempotent(
+                key1 in "[a-z]{1,5}",
+                key2 in "[a-z]{1,5}",
+                val1 in 0i64..100,
+                val2 in 0i64..100
+            ) {
+                let obj = serde_json::json!({ &key2: val2, &key1: val1 });
+                let once = canonicalize_json_value(&obj);
+                let twice = canonicalize_json_value(&once);
+                assert_eq!(once, twice);
+            }
+
+            /// `canonicalize_json_value` sorts object keys.
+            #[test]
+            fn canonicalize_sorts_keys(
+                key1 in "[a-z]{1,5}",
+                key2 in "[a-z]{1,5}"
+            ) {
+                let obj = serde_json::json!({ &key2: 1, &key1: 2 });
+                let canonical = canonicalize_json_value(&obj);
+                let keys: Vec<&String> = canonical.as_object().unwrap().keys().collect();
+                for w in keys.windows(2) {
+                    assert!(w[0] <= w[1], "keys not sorted: {:?}", keys);
+                }
+            }
+
+            /// Primitives pass through `canonicalize_json_value` unchanged.
+            #[test]
+            fn canonicalize_preserves_primitives(n in -1000i64..1000) {
+                let val = serde_json::Value::from(n);
+                assert_eq!(canonicalize_json_value(&val), val);
+            }
+
+            /// `normalize_manifest_value` removes `generated_at`.
+            #[test]
+            fn normalize_removes_generated_at(ts in "[0-9]{4}-[0-9]{2}-[0-9]{2}") {
+                let obj = serde_json::json!({
+                    "schema": "test",
+                    "generated_at": ts,
+                    "data": 42
+                });
+                let norm = normalize_manifest_value(&obj);
+                assert!(norm.get("generated_at").is_none());
+                assert!(norm.get("data").is_some());
+            }
+
+            /// `normalized_manifest_hash` produces 64-char hex string.
+            #[test]
+            fn hash_is_64_hex(key in "[a-z]{1,10}", val in 0i64..1000) {
+                let json = serde_json::json!({ &key: val }).to_string();
+                let hash = normalized_manifest_hash(&json).unwrap();
+                assert_eq!(hash.len(), 64);
+                assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+            }
+
+            /// Hash is deterministic — same input always produces same hash.
+            #[test]
+            fn hash_deterministic(key in "[a-z]{1,5}", val in 0i64..100) {
+                let json = serde_json::json!({ &key: val }).to_string();
+                let h1 = normalized_manifest_hash(&json).unwrap();
+                let h2 = normalized_manifest_hash(&json).unwrap();
+                assert_eq!(h1, h2);
+            }
+
+            /// Hash ignores key order (canonicalized).
+            #[test]
+            fn hash_ignores_key_order(
+                k1 in "[a-m]{1,3}",
+                k2 in "[n-z]{1,3}"
+            ) {
+                let a = format!(r##"{{"{k1}":1,"{k2}":2}}"##);
+                let b = format!(r##"{{"{k2}":2,"{k1}":1}}"##);
+                assert_eq!(
+                    normalized_manifest_hash(&a).unwrap(),
+                    normalized_manifest_hash(&b).unwrap()
+                );
+            }
+
+            /// Hash ignores `generated_at` field differences.
+            #[test]
+            fn hash_ignores_generated_at(ts1 in "[0-9]{10}", ts2 in "[0-9]{10}") {
+                let a = serde_json::json!({"generated_at": ts1, "x": 1});
+                let b = serde_json::json!({"generated_at": ts2, "x": 1});
+                assert_eq!(
+                    normalized_manifest_hash_from_value(&a).unwrap(),
+                    normalized_manifest_hash_from_value(&b).unwrap()
+                );
+            }
+
+            /// Invalid JSON returns Err from `normalized_manifest_hash`.
+            #[test]
+            fn hash_invalid_json_errs(s in "[a-z]{5,20}") {
+                assert!(normalized_manifest_hash(&s).is_err());
+            }
+        }
+    }
 }

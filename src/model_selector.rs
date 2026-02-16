@@ -572,4 +572,182 @@ mod tests {
         s.select_next(); // index 2 → scroll_offset should be 1
         assert_eq!(s.scroll_offset(), 1);
     }
+
+    mod proptest_model_selector {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// `full_id` always has format `provider/id`.
+            #[test]
+            fn full_id_format(
+                provider in "[a-z]{1,15}",
+                id in "[a-z0-9-]{1,20}"
+            ) {
+                let key = ModelKey { provider: provider.clone(), id: id.clone() };
+                let full = key.full_id();
+                assert_eq!(full, format!("{provider}/{id}"));
+                assert!(full.contains('/'));
+            }
+
+            /// `fuzzy_match` never panics on arbitrary input.
+            #[test]
+            fn fuzzy_match_never_panics(
+                pattern in ".{0,50}",
+                value in ".{0,50}"
+            ) {
+                let _ = fuzzy_match(&pattern, &value);
+            }
+
+            /// Empty pattern always matches any value.
+            #[test]
+            fn fuzzy_match_empty_pattern_matches(value in ".{0,50}") {
+                assert!(fuzzy_match("", &value));
+            }
+
+            /// `fuzzy_match` is case-insensitive.
+            #[test]
+            fn fuzzy_match_case_insensitive(
+                pattern in "[a-z]{1,10}",
+                value in "[a-z]{1,30}"
+            ) {
+                let lower = fuzzy_match(&pattern, &value);
+                let upper = fuzzy_match(&pattern.to_uppercase(), &value);
+                assert_eq!(lower, upper, "case mismatch for pattern={pattern} value={value}");
+            }
+
+            /// Exact match always returns true (case-insensitive).
+            #[test]
+            fn fuzzy_match_exact_always_matches(s in "[a-zA-Z0-9]{1,20}") {
+                assert!(fuzzy_match(&s, &s));
+                assert!(fuzzy_match(&s.to_lowercase(), &s.to_uppercase()));
+            }
+
+            /// `matches_query` never panics.
+            #[test]
+            fn matches_query_never_panics(
+                query in ".{0,30}",
+                provider in "[a-z]{1,10}",
+                id in "[a-z0-9-]{1,15}"
+            ) {
+                let key = ModelKey { provider, id };
+                let _ = matches_query(&query, &key);
+            }
+
+            /// Empty/whitespace query matches everything.
+            #[test]
+            fn empty_query_matches_all(
+                ws in "[ \\t]{0,5}",
+                provider in "[a-z]{1,10}",
+                id in "[a-z0-9]{1,10}"
+            ) {
+                let key = ModelKey { provider, id };
+                assert!(matches_query(&ws, &key));
+            }
+
+            /// `set_max_visible(0)` clamps to 1.
+            #[test]
+            fn max_visible_clamps_to_one(n in 0..100usize) {
+                let mut s = ModelSelectorOverlay::new_from_keys(vec![]);
+                s.set_max_visible(n);
+                assert!(s.max_visible() >= 1);
+                if n > 0 {
+                    assert_eq!(s.max_visible(), n);
+                }
+            }
+
+            /// `scroll_offset` is always <= selected.
+            #[test]
+            fn scroll_offset_bounded(
+                n_items in 1..20usize,
+                max_vis in 1..10usize,
+                n_next in 0..30usize
+            ) {
+                let keys: Vec<ModelKey> = (0..n_items)
+                    .map(|i| ModelKey {
+                        provider: "p".to_string(),
+                        id: format!("m{i}"),
+                    })
+                    .collect();
+                let mut s = ModelSelectorOverlay::new_from_keys(keys);
+                s.set_max_visible(max_vis);
+                for _ in 0..n_next {
+                    s.select_next();
+                }
+                assert!(s.scroll_offset() <= s.selected_index());
+            }
+
+            /// `select_next` wraps around at the end.
+            #[test]
+            fn select_next_wraps(n_items in 1..10usize) {
+                let keys: Vec<ModelKey> = (0..n_items)
+                    .map(|i| ModelKey {
+                        provider: "p".to_string(),
+                        id: format!("m{i}"),
+                    })
+                    .collect();
+                let mut s = ModelSelectorOverlay::new_from_keys(keys);
+                for _ in 0..n_items {
+                    s.select_next();
+                }
+                // After n_items next calls, should wrap back to 0
+                assert_eq!(s.selected_index(), 0);
+            }
+
+            /// `select_prev` wraps around at the beginning.
+            #[test]
+            fn select_prev_wraps(n_items in 1..10usize) {
+                let keys: Vec<ModelKey> = (0..n_items)
+                    .map(|i| ModelKey {
+                        provider: "p".to_string(),
+                        id: format!("m{i}"),
+                    })
+                    .collect();
+                let mut s = ModelSelectorOverlay::new_from_keys(keys);
+                // From 0, prev wraps to last
+                s.select_prev();
+                assert_eq!(s.selected_index(), n_items - 1);
+            }
+
+            /// `select_next` then `select_prev` returns to original index.
+            #[test]
+            fn next_prev_roundtrip(
+                n_items in 1..10usize,
+                n_next in 0..20usize
+            ) {
+                let keys: Vec<ModelKey> = (0..n_items)
+                    .map(|i| ModelKey {
+                        provider: "p".to_string(),
+                        id: format!("m{i}"),
+                    })
+                    .collect();
+                let mut s = ModelSelectorOverlay::new_from_keys(keys);
+                for _ in 0..n_next {
+                    s.select_next();
+                }
+                let idx_after_next = s.selected_index();
+                s.select_prev();
+                s.select_next();
+                assert_eq!(s.selected_index(), idx_after_next);
+            }
+
+            /// Filtering by exact provider name includes that provider's models.
+            #[test]
+            fn query_by_provider_filters(
+                p1 in "[a-z]{3,8}",
+                p2 in "[a-z]{3,8}"
+            ) {
+                // Only test when providers differ
+                if p1 != p2 {
+                    let mut s = ModelSelectorOverlay::new_from_keys(vec![
+                        ModelKey { provider: p1.clone(), id: "m1".to_string() },
+                        ModelKey { provider: p2.clone(), id: "m2".to_string() },
+                    ]);
+                    s.push_chars(p1.chars());
+                    // The filtered set should include at least the p1 model
+                    assert!(s.filtered_len() >= 1);
+                }
+            }
+        }
+    }
 }
