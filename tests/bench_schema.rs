@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -933,6 +933,11 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             matrix_cells.len()
         ));
     }
+    let expected_required_stage_keys = ["open_ms", "append_ms", "save_ms", "index_ms"];
+    let mut observed_stage_coverage: HashMap<&'static str, u64> = HashMap::new();
+    for key in expected_required_stage_keys {
+        observed_stage_coverage.insert(key, 0);
+    }
     let mut seen_partition_size_cells = HashSet::new();
     for cell in matrix_cells {
         let cell_obj = cell
@@ -999,6 +1004,11 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                 return Err(format!("matrix cell stage_attribution missing {field}"));
             }
         }
+        for key in expected_required_stage_keys {
+            if stage.get(key).is_some_and(|value| !value.is_null()) {
+                *observed_stage_coverage.entry(key).or_insert(0) += 1;
+            }
+        }
 
         let primary = cell_obj
             .get("primary_e2e")
@@ -1047,7 +1057,6 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let expected_required_stage_keys = vec!["open_ms", "append_ms", "save_ms", "index_ms"];
     if parsed_required_stage_keys != expected_required_stage_keys {
         return Err(format!(
             "stage_summary.required_stage_keys must equal {:?}, got {:?}",
@@ -1059,12 +1068,18 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         .and_then(Value::as_object)
         .ok_or_else(|| "stage_summary.operation_stage_coverage must be an object".to_string())?;
     for key in &expected_required_stage_keys {
-        operation_stage_coverage
+        let reported = operation_stage_coverage
             .get(*key)
             .and_then(Value::as_u64)
             .ok_or_else(|| {
                 format!("stage_summary.operation_stage_coverage.{key} must be an integer count")
             })?;
+        let observed = observed_stage_coverage.get(*key).copied().unwrap_or(0);
+        if reported != observed {
+            return Err(format!(
+                "stage_summary.operation_stage_coverage.{key} ({reported}) must equal observed non-null stage_attribution count ({observed}) across matrix_cells"
+            ));
+        }
     }
     let unexpected_stage_coverage_keys = operation_stage_coverage
         .keys()
@@ -2488,6 +2503,38 @@ fn phase1_matrix_validator_rejects_unexpected_stage_coverage_key() {
     assert!(
         err.contains("unexpected keys"),
         "expected unexpected stage coverage key failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_deflated_stage_coverage_count() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["stage_summary"]["operation_stage_coverage"]["index_ms"] = json!(1);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("operation_stage_coverage.index_ms"),
+        "expected index_ms stage coverage mismatch failure, got: {err}"
+    );
+    assert!(
+        err.contains("observed non-null stage_attribution count"),
+        "expected observed stage attribution count mismatch detail, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_inflated_stage_coverage_count() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["stage_summary"]["operation_stage_coverage"]["open_ms"] = json!(99);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("operation_stage_coverage.open_ms"),
+        "expected open_ms stage coverage mismatch failure, got: {err}"
+    );
+    assert!(
+        err.contains("observed non-null stage_attribution count"),
+        "expected observed stage attribution count mismatch detail, got: {err}"
     );
 }
 
