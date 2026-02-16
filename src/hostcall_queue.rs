@@ -6,7 +6,7 @@
 
 pub use crate::hostcall_s3_fifo::S3FifoFallbackReason;
 use crossbeam_queue::ArrayQueue;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -375,6 +375,7 @@ struct S3FifoState {
     mode: S3FifoMode,
     fallback_reason: Option<S3FifoFallbackReason>,
     ghost: VecDeque<String>,
+    ghost_set: BTreeSet<String>,
     tenant_backlog: BTreeMap<String, usize>,
     ghost_hits_total: u64,
     fairness_rejected_total: u64,
@@ -392,6 +393,7 @@ impl S3FifoState {
             mode: S3FifoMode::Active,
             fallback_reason: None,
             ghost: VecDeque::new(),
+            ghost_set: BTreeSet::new(),
             tenant_backlog: BTreeMap::new(),
             ghost_hits_total: 0,
             fairness_rejected_total: 0,
@@ -494,12 +496,17 @@ impl S3FifoState {
         self.fallback_reason = Some(reason);
         self.fallback_transitions = self.fallback_transitions.saturating_add(1);
         self.ghost.clear();
+        self.ghost_set.clear();
         self.tenant_backlog.clear();
     }
 
     fn consume_ghost_hit(&mut self, tenant_key: &str) -> bool {
+        if !self.ghost_set.remove(tenant_key) {
+            return false;
+        }
         let position = self.ghost.iter().position(|entry| entry == tenant_key);
         let Some(position) = position else {
+            // Should be unreachable if set and deque are consistent.
             return false;
         };
         self.ghost.remove(position);
@@ -511,12 +518,18 @@ impl S3FifoState {
         if tenant_key.is_empty() {
             return;
         }
-        if let Some(position) = self.ghost.iter().position(|entry| entry == tenant_key) {
-            self.ghost.remove(position);
+        if self.ghost_set.contains(tenant_key) {
+            if let Some(position) = self.ghost.iter().position(|entry| entry == tenant_key) {
+                self.ghost.remove(position);
+            }
+        } else {
+            self.ghost_set.insert(tenant_key.to_string());
         }
         self.ghost.push_back(tenant_key.to_string());
         while self.ghost.len() > self.config.ghost_capacity {
-            let _ = self.ghost.pop_front();
+            if let Some(popped) = self.ghost.pop_front() {
+                self.ghost_set.remove(&popped);
+            }
         }
     }
 
