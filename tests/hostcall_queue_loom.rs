@@ -6,7 +6,7 @@ use pi::hostcall_queue::{HostcallQueueMode, HostcallRequestQueue};
 #[test]
 fn loom_epoch_pin_blocks_reclamation_until_release() {
     loom::model(|| {
-        let queue = Arc::new(Mutex::new(HostcallRequestQueue::with_mode(
+        let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
             1,
             2,
             HostcallQueueMode::Ebr,
@@ -63,7 +63,7 @@ fn loom_epoch_pin_blocks_reclamation_until_release() {
 #[test]
 fn loom_concurrent_enqueue_dequeue_keeps_values_unique() {
     loom::model(|| {
-        let queue = Arc::new(Mutex::new(HostcallRequestQueue::with_mode(
+        let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
             2,
             2,
             HostcallQueueMode::SafeFallback,
@@ -90,5 +90,35 @@ fn loom_concurrent_enqueue_dequeue_keeps_values_unique() {
         let mut values = drained.into_iter().collect::<Vec<_>>();
         values.sort_unstable();
         assert_eq!(values, vec![10, 11]);
+    });
+}
+
+#[test]
+fn loom_repeated_safe_fallback_switch_is_idempotent() {
+    loom::model(|| {
+        let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
+            2,
+            2,
+            HostcallQueueMode::Ebr,
+        )));
+
+        let queue_a = Arc::clone(&queue);
+        let switcher_a = thread::spawn(move || {
+            let mut queue = queue_a.lock().expect("lock queue");
+            queue.force_safe_fallback();
+        });
+
+        let queue_b = Arc::clone(&queue);
+        let switcher_b = thread::spawn(move || {
+            let mut queue = queue_b.lock().expect("lock queue");
+            queue.force_safe_fallback();
+        });
+
+        switcher_a.join().expect("switcher_a join");
+        switcher_b.join().expect("switcher_b join");
+
+        let snapshot = queue.lock().expect("lock queue").snapshot();
+        assert_eq!(snapshot.reclamation_mode, HostcallQueueMode::SafeFallback);
+        assert_eq!(snapshot.fallback_transitions, 1);
     });
 }
