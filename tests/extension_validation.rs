@@ -1010,7 +1010,9 @@ proptest! {
 
         let normalized = normalize_github_repo(&input);
         let expected = format!("{}/{}", owner.to_lowercase(), repo.to_lowercase());
-        let has_dot_git_suffix = normalized.ends_with(".git");
+        let has_dot_git_suffix = std::path::Path::new(&normalized)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("git"));
         prop_assert_eq!(normalized, expected);
         prop_assert!(!has_dot_git_suffix);
     }

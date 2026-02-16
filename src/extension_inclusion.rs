@@ -687,7 +687,7 @@ mod tests {
                 let canonical = canonicalize_json_value(&obj);
                 let keys: Vec<&String> = canonical.as_object().unwrap().keys().collect();
                 for w in keys.windows(2) {
-                    assert!(w[0] <= w[1], "keys not sorted: {:?}", keys);
+                    assert!(w[0] <= w[1], "keys not sorted: {keys:?}");
                 }
             }
 
@@ -735,8 +735,8 @@ mod tests {
                 k1 in "[a-m]{1,3}",
                 k2 in "[n-z]{1,3}"
             ) {
-                let a = format!(r##"{{"{k1}":1,"{k2}":2}}"##);
-                let b = format!(r##"{{"{k2}":2,"{k1}":1}}"##);
+                let a = format!(r#"{{"{k1}":1,"{k2}":2}}"#);
+                let b = format!(r#"{{"{k2}":2,"{k1}":1}}"#);
                 assert_eq!(
                     normalized_manifest_hash(&a).unwrap(),
                     normalized_manifest_hash(&b).unwrap()

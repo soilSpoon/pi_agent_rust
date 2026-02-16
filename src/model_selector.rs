@@ -741,7 +741,7 @@ mod tests {
                 if p1 != p2 {
                     let mut s = ModelSelectorOverlay::new_from_keys(vec![
                         ModelKey { provider: p1.clone(), id: "m1".to_string() },
-                        ModelKey { provider: p2.clone(), id: "m2".to_string() },
+                        ModelKey { provider: p2, id: "m2".to_string() },
                     ]);
                     s.push_chars(p1.chars());
                     // The filtered set should include at least the p1 model
