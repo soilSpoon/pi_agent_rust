@@ -4,6 +4,7 @@
 //! exceeds ring capacity, requests spill into a bounded overflow deque to
 //! preserve FIFO ordering across the two lanes.
 
+use crate::hostcall_s3_fifo::S3FifoFallbackReason;
 use crossbeam_queue::ArrayQueue;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -325,13 +326,6 @@ pub enum S3FifoMode {
     ConservativeFifo,
 }
 
-/// Explicit fallback reason when S3-FIFO admission is disabled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum S3FifoFallbackReason {
-    InsufficientSignalQuality,
-    UnstableAdmissionFeedback,
-}
-
 /// Deterministic admission configuration for S3-FIFO-inspired behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct S3FifoConfig {
@@ -420,7 +414,7 @@ impl S3FifoState {
             if self.signalless_streak >= self.config.max_signalless_streak
                 && self.signal_samples < self.config.min_signal_samples
             {
-                self.transition_to_fallback(S3FifoFallbackReason::InsufficientSignalQuality);
+                self.transition_to_fallback(S3FifoFallbackReason::SignalQualityInsufficient);
             }
         }
     }
@@ -445,7 +439,7 @@ impl S3FifoState {
         self.unstable_rejection_streak = self.unstable_rejection_streak.saturating_add(1);
         self.record_ghost(tenant_key);
         if self.unstable_rejection_streak >= self.config.unstable_rejection_streak {
-            self.transition_to_fallback(S3FifoFallbackReason::UnstableAdmissionFeedback);
+            self.transition_to_fallback(S3FifoFallbackReason::FairnessInstability);
         }
         false
     }
@@ -488,7 +482,7 @@ impl S3FifoState {
         }
         self.unstable_rejection_streak = self.unstable_rejection_streak.saturating_add(1);
         if self.unstable_rejection_streak >= self.config.unstable_rejection_streak {
-            self.transition_to_fallback(S3FifoFallbackReason::UnstableAdmissionFeedback);
+            self.transition_to_fallback(S3FifoFallbackReason::FairnessInstability);
         }
     }
 
@@ -1273,9 +1267,99 @@ mod tests {
         assert_eq!(snapshot.s3fifo_mode, S3FifoMode::ConservativeFifo);
         assert_eq!(
             snapshot.s3fifo_fallback_reason,
-            Some(S3FifoFallbackReason::InsufficientSignalQuality)
+            Some(S3FifoFallbackReason::SignalQualityInsufficient)
         );
         assert!(snapshot.s3fifo_fallback_transitions >= 1);
+    }
+
+    #[test]
+    fn s3fifo_fairness_fallback_reason_and_transition_count_stay_stable() {
+        let mut queue = HostcallRequestQueue::with_mode(1, 1, HostcallQueueMode::SafeFallback);
+
+        assert!(matches!(
+            queue.push_back(0_u8),
+            HostcallQueueEnqueueResult::FastPath { .. }
+        ));
+        assert!(matches!(
+            queue.push_back(1_u8),
+            HostcallQueueEnqueueResult::OverflowPath { .. }
+        ));
+
+        for value in 2_u8..40_u8 {
+            let _ = queue.push_back(value);
+        }
+
+        let fallback = queue.snapshot();
+        assert_eq!(fallback.s3fifo_mode, S3FifoMode::ConservativeFifo);
+        assert_eq!(
+            fallback.s3fifo_fallback_reason,
+            Some(S3FifoFallbackReason::FairnessInstability)
+        );
+        assert_eq!(fallback.s3fifo_fallback_transitions, 1);
+        let fairness_rejections_before = fallback.s3fifo_fairness_rejected_total;
+
+        for value in 40_u8..80_u8 {
+            let _ = queue.push_back(value);
+            let _ = queue.drain_all();
+        }
+
+        let stable = queue.snapshot();
+        assert_eq!(stable.s3fifo_mode, S3FifoMode::ConservativeFifo);
+        assert_eq!(
+            stable.s3fifo_fallback_reason,
+            Some(S3FifoFallbackReason::FairnessInstability)
+        );
+        assert_eq!(stable.s3fifo_fallback_transitions, 1);
+        assert_eq!(
+            stable.s3fifo_fairness_rejected_total,
+            fairness_rejections_before
+        );
+    }
+
+    #[test]
+    fn s3fifo_signal_quality_fallback_reason_does_not_flip_under_later_pressure() {
+        let mut queue = HostcallRequestQueue::with_mode(1, 2, HostcallQueueMode::SafeFallback);
+
+        for value in 0..96_u8 {
+            let _ = queue.push_back(TenantRequest {
+                tenant: None,
+                value,
+            });
+            let _ = queue.drain_all();
+        }
+
+        let fallback = queue.snapshot();
+        assert_eq!(fallback.s3fifo_mode, S3FifoMode::ConservativeFifo);
+        assert_eq!(
+            fallback.s3fifo_fallback_reason,
+            Some(S3FifoFallbackReason::SignalQualityInsufficient)
+        );
+        assert_eq!(fallback.s3fifo_fallback_transitions, 1);
+        let fairness_rejections_before = fallback.s3fifo_fairness_rejected_total;
+
+        for value in 0_u8..32_u8 {
+            let _ = queue.push_back(TenantRequest {
+                tenant: Some("ext.noisy"),
+                value,
+            });
+            let _ = queue.push_back(TenantRequest {
+                tenant: Some("ext.noisy"),
+                value: value.saturating_add(1),
+            });
+            let _ = queue.drain_all();
+        }
+
+        let stable = queue.snapshot();
+        assert_eq!(stable.s3fifo_mode, S3FifoMode::ConservativeFifo);
+        assert_eq!(
+            stable.s3fifo_fallback_reason,
+            Some(S3FifoFallbackReason::SignalQualityInsufficient)
+        );
+        assert_eq!(stable.s3fifo_fallback_transitions, 1);
+        assert_eq!(
+            stable.s3fifo_fairness_rejected_total,
+            fairness_rejections_before
+        );
     }
 
     #[test]
