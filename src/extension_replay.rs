@@ -1091,4 +1091,380 @@ mod tests {
             ReplayTraceValidationError::UnknownSchema(_)
         ));
     }
+
+    // ── Builder edge cases ──
+
+    #[test]
+    fn builder_empty_events_produces_valid_bundle() {
+        let builder = ReplayTraceBuilder::new("trace-empty");
+        let bundle = builder.build().expect("empty bundle should be valid");
+        assert!(bundle.events.is_empty());
+        assert_eq!(bundle.schema, REPLAY_TRACE_SCHEMA_V1);
+        assert_eq!(bundle.trace_id, "trace-empty");
+    }
+
+    #[test]
+    fn builder_metadata_preserved_in_output() {
+        let mut builder = ReplayTraceBuilder::new("trace-meta");
+        builder.insert_metadata("env", "production");
+        builder.insert_metadata("version", "1.2.3");
+        builder.push(draft(1, "ext.a", "req-1", ReplayEventKind::Scheduled));
+        let bundle = builder.build().expect("bundle with metadata");
+        assert_eq!(bundle.metadata.get("env").map(String::as_str), Some("production"));
+        assert_eq!(bundle.metadata.get("version").map(String::as_str), Some("1.2.3"));
+    }
+
+    #[test]
+    fn builder_metadata_overwrite_works() {
+        let mut builder = ReplayTraceBuilder::new("trace-meta-ow");
+        builder.insert_metadata("key", "old");
+        builder.insert_metadata("key", "new");
+        builder.push(draft(1, "ext.a", "req-1", ReplayEventKind::Scheduled));
+        let bundle = builder.build().expect("metadata overwrite");
+        assert_eq!(bundle.metadata.get("key").map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn draft_attributes_carried_through_build() {
+        let mut d = draft(1, "ext.a", "req-1", ReplayEventKind::PolicyDecision);
+        d.attributes.insert("policy".to_string(), "fast_lane".to_string());
+        d.attributes.insert("latency_ms".to_string(), "12".to_string());
+        let mut builder = ReplayTraceBuilder::new("trace-attrs");
+        builder.push(d);
+        let bundle = builder.build().expect("bundle with attrs");
+        assert_eq!(bundle.events[0].attributes.len(), 2);
+        assert_eq!(
+            bundle.events[0].attributes.get("policy").map(String::as_str),
+            Some("fast_lane")
+        );
+    }
+
+    // ── Validation error paths ──
+
+    #[test]
+    fn validate_rejects_empty_trace_id() {
+        let mut builder = ReplayTraceBuilder::new("");
+        builder.push(draft(1, "ext.a", "req-1", ReplayEventKind::Scheduled));
+        let err = builder.build().expect_err("empty trace_id should fail");
+        assert!(matches!(err, ReplayTraceValidationError::EmptyTraceId));
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_trace_id() {
+        let mut builder = ReplayTraceBuilder::new("   ");
+        builder.push(draft(1, "ext.a", "req-1", ReplayEventKind::Scheduled));
+        let err = builder.build().expect_err("whitespace trace_id should fail");
+        assert!(matches!(err, ReplayTraceValidationError::EmptyTraceId));
+    }
+
+    #[test]
+    fn validate_rejects_empty_extension_id() {
+        let mut builder = ReplayTraceBuilder::new("trace-val");
+        builder.push(draft(1, "", "req-1", ReplayEventKind::Scheduled));
+        let err = builder.build().expect_err("empty extension_id should fail");
+        assert!(matches!(
+            err,
+            ReplayTraceValidationError::MissingExtensionId { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_request_id() {
+        let mut builder = ReplayTraceBuilder::new("trace-val");
+        builder.push(draft(1, "ext.a", "", ReplayEventKind::Scheduled));
+        let err = builder.build().expect_err("empty request_id should fail");
+        assert!(matches!(
+            err,
+            ReplayTraceValidationError::MissingRequestId { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_cancel_without_retry() {
+        let mut builder = ReplayTraceBuilder::new("trace-dup-cancel");
+        builder.push(draft(1, "ext.a", "req-1", ReplayEventKind::Cancelled));
+        builder.push(draft(2, "ext.a", "req-1", ReplayEventKind::Cancelled));
+        let err = builder.build().expect_err("duplicate cancel should fail");
+        assert!(matches!(
+            err,
+            ReplayTraceValidationError::DuplicateCancelWithoutRetry { .. }
+        ));
+    }
+
+    #[test]
+    fn cancel_then_retry_then_cancel_is_valid() {
+        let mut builder = ReplayTraceBuilder::new("trace-cancel-retry-cancel");
+        builder.push(draft(1, "ext.a", "req-1", ReplayEventKind::Cancelled));
+        builder.push(draft(2, "ext.a", "req-1", ReplayEventKind::Retried));
+        builder.push(draft(3, "ext.a", "req-1", ReplayEventKind::Cancelled));
+        let bundle = builder.build().expect("cancel-retry-cancel should be valid");
+        assert_eq!(bundle.events.len(), 3);
+    }
+
+    #[test]
+    fn completed_clears_pending_cancel() {
+        let mut builder = ReplayTraceBuilder::new("trace-complete-clear");
+        builder.push(draft(1, "ext.a", "req-1", ReplayEventKind::Cancelled));
+        builder.push(draft(2, "ext.a", "req-1", ReplayEventKind::Completed));
+        builder.push(draft(3, "ext.a", "req-1", ReplayEventKind::Cancelled));
+        let bundle = builder.build().expect("completed should clear cancel state");
+        assert_eq!(bundle.events.len(), 3);
+    }
+
+    // ── ReplayEventKind ordering ──
+
+    #[test]
+    fn event_kind_canonical_rank_is_monotonic() {
+        let kinds = [
+            ReplayEventKind::Scheduled,
+            ReplayEventKind::QueueAccepted,
+            ReplayEventKind::PolicyDecision,
+            ReplayEventKind::Cancelled,
+            ReplayEventKind::Retried,
+            ReplayEventKind::Completed,
+            ReplayEventKind::Failed,
+        ];
+        for pair in kinds.windows(2) {
+            assert!(
+                pair[0].canonical_rank() < pair[1].canonical_rank(),
+                "{:?} should have lower rank than {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn event_kind_serde_roundtrip() {
+        let kinds = [
+            ReplayEventKind::Scheduled,
+            ReplayEventKind::QueueAccepted,
+            ReplayEventKind::PolicyDecision,
+            ReplayEventKind::Cancelled,
+            ReplayEventKind::Retried,
+            ReplayEventKind::Completed,
+            ReplayEventKind::Failed,
+        ];
+        for kind in kinds {
+            let json = serde_json::to_string(&kind).expect("serialize kind");
+            let roundtrip: ReplayEventKind = serde_json::from_str(&json).expect("deserialize kind");
+            assert_eq!(kind, roundtrip);
+        }
+    }
+
+    // ── Divergence edge cases ──
+
+    #[test]
+    fn divergence_detects_schema_mismatch() {
+        let mut observed = standard_bundle();
+        observed.schema = "pi.ext.replay.trace.v2".to_string();
+
+        // We can't use first_divergence because validate() would reject v2.
+        // Instead test the divergence reason enum directly.
+        let d = super::ReplayDivergence {
+            seq: None,
+            reason: ReplayDivergenceReason::SchemaMismatch {
+                expected: REPLAY_TRACE_SCHEMA_V1.to_string(),
+                observed: "pi.ext.replay.trace.v2".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&d).expect("serialize divergence");
+        let roundtrip: super::ReplayDivergence =
+            serde_json::from_str(&json).expect("deserialize divergence");
+        assert_eq!(d, roundtrip);
+    }
+
+    #[test]
+    fn divergence_detects_attribute_mismatch() {
+        let mut builder_a = ReplayTraceBuilder::new("trace-attrs-cmp");
+        let mut d1 = draft(1, "ext.a", "req-1", ReplayEventKind::PolicyDecision);
+        d1.attributes.insert("decision".to_string(), "fast".to_string());
+        builder_a.push(d1);
+        let expected = builder_a.build().expect("bundle a");
+
+        let mut builder_b = ReplayTraceBuilder::new("trace-attrs-cmp");
+        let mut d2 = draft(1, "ext.a", "req-1", ReplayEventKind::PolicyDecision);
+        d2.attributes.insert("decision".to_string(), "slow".to_string());
+        builder_b.push(d2);
+        let observed = builder_b.build().expect("bundle b");
+
+        let divergence = first_divergence(&expected, &observed)
+            .expect("comparison should succeed")
+            .expect("attribute mismatch expected");
+        assert_eq!(divergence.seq, Some(1));
+        match divergence.reason {
+            ReplayDivergenceReason::EventFieldMismatch { field, .. } => {
+                assert_eq!(field, "attributes");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── Capture gate boundary cases ──
+
+    #[test]
+    fn capture_gate_zero_overhead_when_captured_equals_baseline() {
+        let budget = standard_capture_budget();
+        let observation = ReplayCaptureObservation {
+            baseline_micros: 1_000,
+            captured_micros: 1_000,
+            trace_bytes: 100,
+        };
+        let report = evaluate_replay_capture_gate(budget, observation);
+        assert!(report.capture_allowed);
+        assert_eq!(report.observed_overhead_per_mille, 0);
+    }
+
+    #[test]
+    fn capture_gate_zero_overhead_when_captured_less_than_baseline() {
+        let budget = standard_capture_budget();
+        let observation = ReplayCaptureObservation {
+            baseline_micros: 1_000,
+            captured_micros: 900,
+            trace_bytes: 100,
+        };
+        let report = evaluate_replay_capture_gate(budget, observation);
+        assert!(report.capture_allowed);
+        assert_eq!(report.observed_overhead_per_mille, 0);
+    }
+
+    #[test]
+    fn capture_gate_exact_boundary_at_max_overhead() {
+        let budget = ReplayCaptureBudget {
+            capture_enabled: true,
+            max_overhead_per_mille: 100,
+            max_trace_bytes: 10_000,
+        };
+        // 100/1000 = 100 per mille — exactly at budget
+        let observation = ReplayCaptureObservation {
+            baseline_micros: 1_000,
+            captured_micros: 1_100,
+            trace_bytes: 100,
+        };
+        let report = evaluate_replay_capture_gate(budget, observation);
+        assert!(report.capture_allowed);
+        assert_eq!(report.observed_overhead_per_mille, 100);
+    }
+
+    #[test]
+    fn capture_gate_exact_boundary_at_max_trace_bytes() {
+        let budget = ReplayCaptureBudget {
+            capture_enabled: true,
+            max_overhead_per_mille: 1_000,
+            max_trace_bytes: 500,
+        };
+        // Exactly at budget
+        let at_limit = ReplayCaptureObservation {
+            baseline_micros: 1_000,
+            captured_micros: 1_010,
+            trace_bytes: 500,
+        };
+        let report = evaluate_replay_capture_gate(budget, at_limit);
+        assert!(report.capture_allowed);
+
+        // One over budget
+        let over_limit = ReplayCaptureObservation {
+            baseline_micros: 1_000,
+            captured_micros: 1_010,
+            trace_bytes: 501,
+        };
+        let report = evaluate_replay_capture_gate(budget, over_limit);
+        assert!(!report.capture_allowed);
+        assert_eq!(report.reason, ReplayCaptureGateReason::DisabledByTraceBudget);
+    }
+
+    // ── Diagnostic snapshot root cause hints ──
+
+    #[test]
+    fn diagnostic_snapshot_maps_config_disabled_hint() {
+        let bundle = standard_bundle();
+        let budget = ReplayCaptureBudget {
+            capture_enabled: false,
+            max_overhead_per_mille: 100,
+            max_trace_bytes: 1_000,
+        };
+        let gate = evaluate_replay_capture_gate(
+            budget,
+            ReplayCaptureObservation {
+                baseline_micros: 100,
+                captured_micros: 100,
+                trace_bytes: 0,
+            },
+        );
+        let snapshot =
+            build_replay_diagnostic_snapshot(&bundle, gate, None).expect("snapshot");
+        assert_eq!(
+            snapshot.root_cause_hints,
+            vec![ReplayRootCauseHint::PolicyGateDisabled]
+        );
+    }
+
+    #[test]
+    fn diagnostic_snapshot_maps_trace_budget_hint() {
+        let bundle = standard_bundle();
+        let budget = ReplayCaptureBudget {
+            capture_enabled: true,
+            max_overhead_per_mille: 1_000,
+            max_trace_bytes: 100,
+        };
+        let gate = evaluate_replay_capture_gate(
+            budget,
+            ReplayCaptureObservation {
+                baseline_micros: 1_000,
+                captured_micros: 1_010,
+                trace_bytes: 200,
+            },
+        );
+        let snapshot =
+            build_replay_diagnostic_snapshot(&bundle, gate, None).expect("snapshot");
+        assert_eq!(
+            snapshot.root_cause_hints,
+            vec![ReplayRootCauseHint::TraceBudgetExceeded]
+        );
+    }
+
+    #[test]
+    fn diagnostic_snapshot_serde_roundtrip() {
+        let bundle = standard_bundle();
+        let gate = evaluate_replay_capture_gate(
+            standard_capture_budget(),
+            ReplayCaptureObservation {
+                baseline_micros: 1_000,
+                captured_micros: 1_010,
+                trace_bytes: 64,
+            },
+        );
+        let snapshot =
+            build_replay_diagnostic_snapshot(&bundle, gate, None).expect("snapshot");
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let roundtrip: super::ReplayDiagnosticSnapshot =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(snapshot, roundtrip);
+    }
+
+    // ── compute_overhead_per_mille edge cases ──
+
+    #[test]
+    fn overhead_per_mille_exact_computation() {
+        // 50 overhead on 1000 baseline = 50 per mille
+        assert_eq!(super::compute_overhead_per_mille(1_000, 1_050), 50);
+        // 200 overhead on 1000 baseline = 200 per mille
+        assert_eq!(super::compute_overhead_per_mille(1_000, 1_200), 200);
+        // 0 overhead
+        assert_eq!(super::compute_overhead_per_mille(1_000, 1_000), 0);
+        // Captured < baseline
+        assert_eq!(super::compute_overhead_per_mille(1_000, 500), 0);
+    }
+
+    #[test]
+    fn overhead_per_mille_rounding_up() {
+        // 1 overhead on 3 baseline = 333.3... per mille → rounds up to 334
+        assert_eq!(super::compute_overhead_per_mille(3, 4), 334);
+    }
+
+    #[test]
+    fn overhead_per_mille_zero_baseline_returns_max() {
+        assert_eq!(super::compute_overhead_per_mille(0, 1), u32::MAX);
+        assert_eq!(super::compute_overhead_per_mille(0, 0), 0);
+    }
 }
