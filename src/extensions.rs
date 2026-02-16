@@ -907,12 +907,16 @@ fn import_side_effect_regex() -> &'static Regex {
 
 fn import_dynamic_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"\bimport\s*\(\s*["']([^"']+)["']\s*\)"#).expect("import()"))
+    RE.get_or_init(|| {
+        Regex::new(r#"\bimport\s*\(\s*["'`]((?:[^"'`]+))["'`]\s*\)"#).expect("import()")
+    })
 }
 
 fn require_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"\brequire\s*\(\s*["']([^"']+)["']\s*\)"#).expect("require"))
+    RE.get_or_init(|| {
+        Regex::new(r#"\brequire\s*\(\s*["'`]((?:[^"'`]+))["'`]\s*\)"#).expect("require")
+    })
 }
 
 fn new_function_regex() -> &'static Regex {
@@ -927,7 +931,7 @@ fn eval_regex() -> &'static Regex {
 
 fn pi_tool_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"\bpi\.tool\s*\(\s*["']([^"']+)["']"#).expect("pi.tool"))
+    RE.get_or_init(|| Regex::new(r#"\bpi\.tool\s*\(\s*["'`]((?:[^"'`]+))["'`]"#).expect("pi.tool"))
 }
 
 fn pi_exec_regex() -> &'static Regex {
@@ -1283,6 +1287,7 @@ fn looks_like_node_builtin(module_root: &str) -> bool {
 /// respecting string literals (double/single/backtick) and regex literals.
 ///
 /// `state` carries block-comment and template-literal state across lines.
+#[allow(clippy::too_many_lines)]
 fn strip_js_comments(line: &str, state: &mut ScannerState) -> String {
     let mut result = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -1385,30 +1390,32 @@ fn strip_js_comments(line: &str, state: &mut ScannerState) -> String {
                 }
 
                 // Disambiguate regex start vs division.
-                let is_regex_start = match state.last_significant_char {
-                    None => true, // Start of line
-                    Some(c) => matches!(
-                        c,
-                        '=' | '('
-                            | ','
-                            | ':'
-                            | ';'
-                            | '!'
-                            | '&'
-                            | '|'
-                            | '?'
-                            | '['
-                            | '{'
-                            | '}'
-                            | '^'
-                            | '~'
-                            | '*'
-                            | '+'
-                            | '-'
-                            | '<'
-                            | '>'
-                    ),
-                };
+                let is_regex_start = state.last_significant_char.map_or(
+                    true, // Start of line
+                    |c| {
+                        matches!(
+                            c,
+                            '=' | '('
+                                | ','
+                                | ':'
+                                | ';'
+                                | '!'
+                                | '&'
+                                | '|'
+                                | '?'
+                                | '['
+                                | '{'
+                                | '}'
+                                | '^'
+                                | '~'
+                                | '*'
+                                | '+'
+                                | '-'
+                                | '<'
+                                | '>'
+                        )
+                    },
+                );
 
                 if is_regex_start {
                     in_regex = true;
@@ -25377,6 +25384,8 @@ mod tests {
             let host = JsRuntimeHost {
                 tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
                 manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
                 http: Arc::new(HttpConnector::with_defaults()),
                 policy: ExtensionPolicy {
                     mode: ExtensionPolicyMode::Prompt,
@@ -25554,6 +25563,8 @@ mod tests {
             let host = JsRuntimeHost {
                 tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
                 manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
                 http: Arc::new(HttpConnector::with_defaults()),
                 policy: ExtensionPolicy {
                     mode: ExtensionPolicyMode::Permissive,
@@ -25658,6 +25669,8 @@ mod tests {
             let host = JsRuntimeHost {
                 tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
                 manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
                 http: Arc::new(HttpConnector::with_defaults()),
                 policy: ExtensionPolicy {
                     mode: ExtensionPolicyMode::Permissive,
@@ -25750,6 +25763,8 @@ mod tests {
             let host = JsRuntimeHost {
                 tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
                 manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
                 http: Arc::new(HttpConnector::with_defaults()),
                 policy: ExtensionPolicy {
                     mode: ExtensionPolicyMode::Permissive,
@@ -25843,6 +25858,8 @@ mod tests {
             let host = JsRuntimeHost {
                 tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
                 manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
                 http: Arc::new(HttpConnector::with_defaults()),
                 policy: ExtensionPolicy {
                     mode: ExtensionPolicyMode::Permissive,
@@ -25928,6 +25945,8 @@ mod tests {
             let host = JsRuntimeHost {
                 tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
                 manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
                 http: Arc::new(HttpConnector::with_defaults()),
                 policy: ExtensionPolicy {
                     mode: ExtensionPolicyMode::Permissive,
@@ -26669,6 +26688,8 @@ mod tests {
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
             manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Prompt,
@@ -26810,6 +26831,8 @@ mod tests {
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
             manager_ref: Arc::downgrade(&mgr.inner),
+            manager_snapshot: Arc::clone(&mgr.snapshot),
+            manager_snapshot_version: Arc::clone(&mgr.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Strict,
@@ -26930,6 +26953,8 @@ mod tests {
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
             manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Strict,
@@ -26968,6 +26993,8 @@ mod tests {
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
             manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Strict,
@@ -27088,6 +27115,8 @@ mod tests {
         let host_strict = JsRuntimeHost {
             tools: Arc::clone(&tools),
             manager_ref: Arc::downgrade(&mgr_strict.inner),
+            manager_snapshot: Arc::clone(&mgr_strict.snapshot),
+            manager_snapshot_version: Arc::clone(&mgr_strict.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Strict,
@@ -27177,6 +27206,8 @@ mod tests {
         let host_prompt = JsRuntimeHost {
             tools: Arc::clone(&tools),
             manager_ref: Arc::downgrade(&manager_prompt.inner),
+            manager_snapshot: Arc::clone(&manager_prompt.snapshot),
+            manager_snapshot_version: Arc::clone(&manager_prompt.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Prompt,
@@ -27269,6 +27300,8 @@ mod tests {
         let host_perm = JsRuntimeHost {
             tools,
             manager_ref: Arc::downgrade(&mgr_perm.inner),
+            manager_snapshot: Arc::clone(&mgr_perm.snapshot),
+            manager_snapshot_version: Arc::clone(&mgr_perm.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Permissive,
@@ -27316,6 +27349,8 @@ mod tests {
                 None,
             )),
             manager_ref: Arc::downgrade(&mgr2.inner),
+            manager_snapshot: Arc::clone(&mgr2.snapshot),
+            manager_snapshot_version: Arc::clone(&mgr2.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Strict,
@@ -36739,6 +36774,8 @@ mod tests {
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
             manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Permissive,
@@ -36784,6 +36821,8 @@ mod tests {
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
             manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Permissive,
@@ -36831,6 +36870,8 @@ mod tests {
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)),
             manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Permissive,
@@ -36880,6 +36921,8 @@ mod tests {
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)),
             manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Permissive,
@@ -36936,15 +36979,21 @@ mod tests {
         let http = Arc::new(crate::connectors::http::HttpConnector::with_defaults());
 
         // Create a manager we intentionally don't hold, so the Weak ref is dead.
-        let dead_manager_ref = {
+        let (dead_manager_ref, dead_snapshot, dead_version) = {
             let manager = extension_manager_no_persisted_permissions();
-            Arc::downgrade(&manager.inner)
+            (
+                Arc::downgrade(&manager.inner),
+                Arc::clone(&manager.snapshot),
+                Arc::clone(&manager.snapshot_version),
+            )
             // manager dropped here → Weak upgrades fail
         };
 
         let host = JsRuntimeHost {
             tools,
             manager_ref: dead_manager_ref,
+            manager_snapshot: dead_snapshot,
+            manager_snapshot_version: dead_version,
             http,
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Permissive,
@@ -36992,6 +37041,8 @@ mod tests {
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&["read"], &cwd, None)),
             manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
             policy: ExtensionPolicy {
                 mode: ExtensionPolicyMode::Strict,
