@@ -1,7 +1,7 @@
 {
   "schema": "pi.ci.certification_lane.v1",
   "lane": "full",
-  "generated_at": "2026-02-16T13:32:34.104Z",
+  "generated_at": "2026-02-16T14:37:39.236Z",
   "verdict": "fail",
   "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
   "gates": [
@@ -121,6 +121,16 @@
       "reproduce_command": "cargo test --test sec_compatibility_conformance -- --nocapture"
     },
     {
+      "id": "perf3x_bead_coverage",
+      "name": "PERF-3X bead-to-artifact coverage audit",
+      "bead": "bd-3ar8v.6.11",
+      "status": "pass",
+      "blocking": false,
+      "artifact_path": "tests/full_suite_gate/certification_events.jsonl",
+      "detail": "Validated 7 PERF-3X bead coverage row(s) with complete unit/e2e/log evidence paths",
+      "reproduce_command": "cargo test --test ci_full_suite_gate -- perf3x_bead_coverage_contract_is_well_formed --nocapture --exact"
+    },
+    {
       "id": "waiver_lifecycle",
       "name": "Waiver lifecycle compliance",
       "bead": "bd-1f42.8.8.1",
@@ -132,7 +142,7 @@
   ],
   "waiver_audit": {
     "schema": "pi.ci.waiver_audit.v1",
-    "generated_at": "2026-02-16T13:32:34.103Z",
+    "generated_at": "2026-02-16T14:37:39.231Z",
     "total_waivers": 0,
     "active": 0,
     "expired": 0,
@@ -143,8 +153,8 @@
   },
   "waivers_applied": [],
   "summary": {
-    "total_gates": 14,
-    "passed": 13,
+    "total_gates": 15,
+    "passed": 14,
     "failed": 0,
     "warned": 0,
     "skipped": 1,
