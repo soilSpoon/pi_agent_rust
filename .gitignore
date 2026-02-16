@@ -25,13 +25,15 @@ tests/ext_conformance/reports/*
 !tests/ext_conformance/reports/conformance_summary.json
 !tests/ext_conformance/reports/COMPATIBILITY_SUMMARY.md
 
-# sqlite WAL/SHM artifacts
+# sqlite databases and WAL/SHM artifacts
+storage.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
 *.sqlite3-journal
 
 # Agent probe/scratch files and temp directories
 .codex_space_probe
+.space_probe_bytes
 .tmp-*/
 .tmp-*
 .tmp_*
@@ -62,6 +64,7 @@ fuzz/reports/
 
 # Proptest regression artifacts
 proptest-regressions/
+*.proptest-regressions
 
 # Recovery backup files (from crash recovery)
 *.root_full_recovery
@@ -76,6 +79,11 @@ pi-session-*.html
 
 # E2E test run results (timestamped, ephemeral)
 tests/e2e_results/
+tests/evidence_bundle/
+tests/edit_repro.rs
+
+# Build artifacts (concurrent agent output)
+artifacts/
 
 # Python bytecode caches
 __pycache__/
