@@ -63,7 +63,7 @@
       ],
       "coverage": {
         "line_pct": 79.57,
-        "branch_pct": null,
+        "branch_pct": 0.0,
         "function_pct": 74.76,
         "line_count": 3094,
         "covered_line_count": 2462,
@@ -71,11 +71,11 @@
         "function_count": 317,
         "covered_function_count": 237,
         "uncovered_function_count": 80,
-        "branch_count": null,
-        "covered_branch_count": null
+        "branch_count": 0,
+        "covered_branch_count": 0
       },
       "status": "baseline_captured_branch_sigsegv",
-      "branch_note": "src/agent.rs triggers SIGSEGV in llvm-cov export; branch metrics unavailable"
+      "branch_note": "src/agent.rs triggers SIGSEGV in llvm-cov export; branch metrics unavailable (numeric fallback values emitted as 0)"
     },
     {
       "area": "tools",
@@ -84,7 +84,7 @@
       ],
       "coverage": {
         "line_pct": 78.99,
-        "branch_pct": null,
+        "branch_pct": 0.0,
         "function_pct": 76.90,
         "line_count": 3032,
         "covered_line_count": 2395,
@@ -92,11 +92,11 @@
         "function_count": 407,
         "covered_function_count": 313,
         "uncovered_function_count": 94,
-        "branch_count": null,
-        "covered_branch_count": null
+        "branch_count": 0,
+        "covered_branch_count": 0
       },
       "status": "baseline_captured_branch_sigsegv",
-      "branch_note": "src/tools.rs triggers SIGSEGV in llvm-cov export; branch metrics unavailable"
+      "branch_note": "src/tools.rs triggers SIGSEGV in llvm-cov export; branch metrics unavailable (numeric fallback values emitted as 0)"
     },
     {
       "area": "providers",
@@ -128,7 +128,7 @@
       ],
       "coverage": {
         "line_pct": 80.50,
-        "branch_pct": null,
+        "branch_pct": 0.0,
         "function_pct": 77.88,
         "line_count": 2882,
         "covered_line_count": 2320,
@@ -136,11 +136,11 @@
         "function_count": 330,
         "covered_function_count": 257,
         "uncovered_function_count": 73,
-        "branch_count": null,
-        "covered_branch_count": null
+        "branch_count": 0,
+        "covered_branch_count": 0
       },
       "status": "baseline_captured_branch_sigsegv",
-      "branch_note": "src/session.rs triggers SIGSEGV in llvm-cov export; branch metrics unavailable"
+      "branch_note": "src/session.rs triggers SIGSEGV in llvm-cov export; branch metrics unavailable (numeric fallback values emitted as 0)"
     },
     {
       "area": "extensions",
