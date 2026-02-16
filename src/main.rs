@@ -3022,7 +3022,16 @@ async fn run_rpc_mode(
     auth: AuthStorage,
     runtime_handle: RuntimeHandle,
 ) -> Result<()> {
-    pi::rpc::run_stdio(
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    let abort_listener = abort_handle.clone();
+    if let Err(err) = ctrlc::set_handler(move || {
+        abort_listener.abort();
+    }) {
+        eprintln!("Warning: Failed to install Ctrl+C handler for RPC mode: {err}");
+    }
+
+    use futures::FutureExt;
+    let rpc_task = pi::rpc::run_stdio(
         session,
         pi::rpc::RpcOptions {
             config,
@@ -3033,8 +3042,19 @@ async fn run_rpc_mode(
             runtime_handle,
         },
     )
-    .await
-    .map_err(anyhow::Error::new)
+    .fuse();
+
+    let signal_task = abort_signal.wait().fuse();
+
+    futures::pin_mut!(rpc_task, signal_task);
+
+    match futures::future::select(rpc_task, signal_task).await {
+        futures::future::Either::Left((result, _)) => result.map_err(anyhow::Error::new),
+        futures::future::Either::Right(((), _)) => {
+            // Signal received, return Ok to trigger main_impl's shutdown flush
+            Ok(())
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
