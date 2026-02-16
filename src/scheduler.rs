@@ -3251,6 +3251,74 @@ mod tests {
     }
 
     #[test]
+    fn zero_footprint_config_rejects_external_status_override() {
+        let topology = ReactorTopologySnapshot::from_core_node_pairs(&[(0, 0)]);
+        let manifest = ReactorPlacementManifest::plan(1, Some(&topology));
+        let config = NumaSlabConfig {
+            slab_capacity: 0,
+            entry_size_bytes: 1024,
+            hugepage: HugepageConfig {
+                page_size_bytes: 2048,
+                enabled: true,
+            },
+        };
+        assert_eq!(config.slab_footprint_bytes(), Some(0));
+
+        let mut pool = NumaSlabPool::from_manifest(&manifest, config);
+        let forced = HugepageStatus {
+            total_pages: 128,
+            free_pages: 64,
+            page_size_bytes: 2048,
+            active: true,
+            fallback_reason: None,
+        };
+        pool.set_hugepage_status(forced);
+
+        let telemetry = pool.telemetry();
+        assert!(!telemetry.hugepage_status.active);
+        assert_eq!(
+            telemetry.hugepage_status.fallback_reason,
+            Some(HugepageFallbackReason::AlignmentMismatch)
+        );
+        assert_eq!(telemetry.hugepage_status.total_pages, 0);
+        assert_eq!(telemetry.hugepage_status.free_pages, 0);
+    }
+
+    #[test]
+    fn checked_mul_overflow_config_rejects_external_status_override() {
+        let topology = ReactorTopologySnapshot::from_core_node_pairs(&[(0, 0)]);
+        let manifest = ReactorPlacementManifest::plan(1, Some(&topology));
+        let config = NumaSlabConfig {
+            slab_capacity: 2,
+            entry_size_bytes: usize::MAX,
+            hugepage: HugepageConfig {
+                page_size_bytes: 4096,
+                enabled: true,
+            },
+        };
+        assert!(config.slab_footprint_bytes().is_none());
+
+        let mut pool = NumaSlabPool::from_manifest(&manifest, config);
+        let forced = HugepageStatus {
+            total_pages: 512,
+            free_pages: 256,
+            page_size_bytes: 4096,
+            active: true,
+            fallback_reason: None,
+        };
+        pool.set_hugepage_status(forced);
+
+        let telemetry = pool.telemetry();
+        assert!(!telemetry.hugepage_status.active);
+        assert_eq!(
+            telemetry.hugepage_status.fallback_reason,
+            Some(HugepageFallbackReason::AlignmentMismatch)
+        );
+        assert_eq!(telemetry.hugepage_status.total_pages, 0);
+        assert_eq!(telemetry.hugepage_status.free_pages, 0);
+    }
+
+    #[test]
     fn hugepage_status_json_is_stable() {
         let config = HugepageConfig::default();
         let status = HugepageStatus::evaluate(&config, 1024, 128);
