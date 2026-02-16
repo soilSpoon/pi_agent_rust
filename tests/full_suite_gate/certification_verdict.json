@@ -1,7 +1,7 @@
 {
   "schema": "pi.ci.certification_lane.v1",
   "lane": "full",
-  "generated_at": "2026-02-16T20:45:33.597Z",
+  "generated_at": "2026-02-16T23:05:57.682Z",
   "verdict": "fail",
   "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
   "gates": [
@@ -142,7 +142,7 @@
   ],
   "waiver_audit": {
     "schema": "pi.ci.waiver_audit.v1",
-    "generated_at": "2026-02-16T20:45:33.553Z",
+    "generated_at": "2026-02-16T23:05:57.664Z",
     "total_waivers": 0,
     "active": 0,
     "expired": 0,
