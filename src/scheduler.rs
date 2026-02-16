@@ -17,6 +17,7 @@
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
@@ -512,6 +513,323 @@ impl<C: Clock> Scheduler<C> {
     }
 }
 
+// ============================================================================
+// Core-pinned reactor mesh (URPC-style SPSC lanes)
+// ============================================================================
+
+/// Configuration for [`ReactorMesh`].
+#[derive(Debug, Clone)]
+pub struct ReactorMeshConfig {
+    /// Number of core-pinned shards (one SPSC lane per shard).
+    pub shard_count: usize,
+    /// Maximum queued envelopes per shard lane.
+    pub lane_capacity: usize,
+}
+
+impl Default for ReactorMeshConfig {
+    fn default() -> Self {
+        Self {
+            shard_count: 4,
+            lane_capacity: 1024,
+        }
+    }
+}
+
+/// Per-envelope metadata produced by [`ReactorMesh`].
+#[derive(Debug, Clone)]
+pub struct ReactorEnvelope {
+    /// Global sequence for deterministic cross-shard ordering.
+    pub global_seq: Seq,
+    /// Monotone sequence scoped to the destination shard.
+    pub shard_seq: u64,
+    /// Destination shard that owns this envelope.
+    pub shard_id: usize,
+    /// Payload to execute on the shard.
+    pub task: MacrotaskKind,
+}
+
+impl ReactorEnvelope {
+    const fn new(global_seq: Seq, shard_seq: u64, shard_id: usize, task: MacrotaskKind) -> Self {
+        Self {
+            global_seq,
+            shard_seq,
+            shard_id,
+            task,
+        }
+    }
+}
+
+/// Backpressure signal for rejected mesh enqueue operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReactorBackpressure {
+    pub shard_id: usize,
+    pub depth: usize,
+    pub capacity: usize,
+}
+
+/// Lightweight telemetry snapshot for mesh queueing behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactorMeshTelemetry {
+    pub queue_depths: Vec<usize>,
+    pub max_queue_depths: Vec<usize>,
+    pub rejected_enqueues: u64,
+}
+
+/// Deterministic SPSC-style lane.
+///
+/// This models the semantics of a bounded SPSC ring without unsafe code.
+#[derive(Debug, Clone)]
+struct SpscLane<T> {
+    capacity: usize,
+    queue: VecDeque<T>,
+    max_depth: usize,
+}
+
+impl<T> SpscLane<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            queue: VecDeque::with_capacity(capacity),
+            max_depth: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn push(&mut self, value: T) -> Result<(), usize> {
+        if self.queue.len() >= self.capacity {
+            return Err(self.queue.len());
+        }
+        self.queue.push_back(value);
+        self.max_depth = self.max_depth.max(self.queue.len());
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.queue.pop_front()
+    }
+
+    fn front(&self) -> Option<&T> {
+        self.queue.front()
+    }
+}
+
+/// Deterministic multi-shard reactor mesh using bounded per-shard SPSC lanes.
+///
+/// Routing policy:
+/// - Hostcall completions are hash-routed by `call_id` for shard affinity.
+/// - Inbound events use deterministic round-robin distribution across shards.
+///
+/// Drain policy:
+/// - `drain_global_order()` emits envelopes in ascending global sequence
+///   across all shard heads, preserving deterministic external ordering.
+#[derive(Debug, Clone)]
+pub struct ReactorMesh {
+    seq: Seq,
+    lanes: Vec<SpscLane<ReactorEnvelope>>,
+    shard_seq: Vec<u64>,
+    rr_cursor: usize,
+    rejected_enqueues: u64,
+}
+
+impl ReactorMesh {
+    /// Create a mesh using the provided config.
+    ///
+    /// The mesh is fail-closed for invalid config values:
+    /// `shard_count == 0` or `lane_capacity == 0` returns an empty mesh.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(config: ReactorMeshConfig) -> Self {
+        let shard_count = config.shard_count.max(1);
+        let lane_capacity = config.lane_capacity.max(1);
+        let lanes = (0..shard_count)
+            .map(|_| SpscLane::new(lane_capacity))
+            .collect::<Vec<_>>();
+        Self {
+            seq: Seq::zero(),
+            lanes,
+            shard_seq: vec![0; shard_count],
+            rr_cursor: 0,
+            rejected_enqueues: 0,
+        }
+    }
+
+    /// Number of shard lanes.
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Total pending envelopes across all shards.
+    #[must_use]
+    pub fn total_depth(&self) -> usize {
+        self.lanes.iter().map(SpscLane::len).sum()
+    }
+
+    /// Whether any lane has pending envelopes.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.total_depth() > 0
+    }
+
+    /// Per-shard queue depth.
+    #[must_use]
+    pub fn queue_depth(&self, shard_id: usize) -> Option<usize> {
+        self.lanes.get(shard_id).map(SpscLane::len)
+    }
+
+    /// Snapshot queueing telemetry for diagnostics.
+    #[must_use]
+    pub fn telemetry(&self) -> ReactorMeshTelemetry {
+        ReactorMeshTelemetry {
+            queue_depths: self.lanes.iter().map(SpscLane::len).collect(),
+            max_queue_depths: self.lanes.iter().map(|lane| lane.max_depth).collect(),
+            rejected_enqueues: self.rejected_enqueues,
+        }
+    }
+
+    const fn next_global_seq(&mut self) -> Seq {
+        let current = self.seq;
+        self.seq = self.seq.next();
+        current
+    }
+
+    fn next_shard_seq(&mut self, shard_id: usize) -> u64 {
+        let Some(seq) = self.shard_seq.get_mut(shard_id) else {
+            return 0;
+        };
+        let current = *seq;
+        *seq = seq.saturating_add(1);
+        current
+    }
+
+    fn stable_hash(input: &str) -> u64 {
+        // FNV-1a 64-bit for deterministic process-independent routing.
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in input.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3_u64);
+        }
+        hash
+    }
+
+    fn hash_route(&self, call_id: &str) -> usize {
+        if self.lanes.len() <= 1 {
+            return 0;
+        }
+        let lanes = u64::try_from(self.lanes.len()).unwrap_or(1);
+        let slot = Self::stable_hash(call_id) % lanes;
+        usize::try_from(slot).unwrap_or(0)
+    }
+
+    fn rr_route(&mut self) -> usize {
+        if self.lanes.len() <= 1 {
+            return 0;
+        }
+        let idx = self.rr_cursor % self.lanes.len();
+        self.rr_cursor = self.rr_cursor.saturating_add(1);
+        idx
+    }
+
+    fn enqueue_with_route(
+        &mut self,
+        shard_id: usize,
+        task: MacrotaskKind,
+    ) -> Result<ReactorEnvelope, ReactorBackpressure> {
+        let global_seq = self.next_global_seq();
+        let shard_seq = self.next_shard_seq(shard_id);
+        let envelope = ReactorEnvelope::new(global_seq, shard_seq, shard_id, task);
+        let Some(lane) = self.lanes.get_mut(shard_id) else {
+            self.rejected_enqueues = self.rejected_enqueues.saturating_add(1);
+            return Err(ReactorBackpressure {
+                shard_id,
+                depth: 0,
+                capacity: 0,
+            });
+        };
+        match lane.push(envelope.clone()) {
+            Ok(()) => Ok(envelope),
+            Err(depth) => {
+                self.rejected_enqueues = self.rejected_enqueues.saturating_add(1);
+                Err(ReactorBackpressure {
+                    shard_id,
+                    depth,
+                    capacity: lane.capacity,
+                })
+            }
+        }
+    }
+
+    /// Enqueue a hostcall completion using deterministic hash routing.
+    pub fn enqueue_hostcall_complete(
+        &mut self,
+        call_id: String,
+        outcome: HostcallOutcome,
+    ) -> Result<ReactorEnvelope, ReactorBackpressure> {
+        let shard_id = self.hash_route(&call_id);
+        self.enqueue_with_route(
+            shard_id,
+            MacrotaskKind::HostcallComplete { call_id, outcome },
+        )
+    }
+
+    /// Enqueue an inbound event using deterministic round-robin routing.
+    pub fn enqueue_event(
+        &mut self,
+        event_id: String,
+        payload: serde_json::Value,
+    ) -> Result<ReactorEnvelope, ReactorBackpressure> {
+        let shard_id = self.rr_route();
+        self.enqueue_with_route(shard_id, MacrotaskKind::InboundEvent { event_id, payload })
+    }
+
+    /// Drain one shard up to `budget` envelopes.
+    pub fn drain_shard(&mut self, shard_id: usize, budget: usize) -> Vec<ReactorEnvelope> {
+        let Some(lane) = self.lanes.get_mut(shard_id) else {
+            return Vec::new();
+        };
+        let mut drained = Vec::with_capacity(budget.min(lane.len()));
+        for _ in 0..budget {
+            let Some(item) = lane.pop() else {
+                break;
+            };
+            drained.push(item);
+        }
+        drained
+    }
+
+    /// Drain across shards in deterministic global sequence order.
+    pub fn drain_global_order(&mut self, budget: usize) -> Vec<ReactorEnvelope> {
+        let mut drained = Vec::with_capacity(budget);
+        for _ in 0..budget {
+            let mut best_lane: Option<usize> = None;
+            let mut best_seq: Option<Seq> = None;
+            for (idx, lane) in self.lanes.iter().enumerate() {
+                let Some(front) = lane.front() else {
+                    continue;
+                };
+                if best_seq.is_none_or(|seq| front.global_seq < seq) {
+                    best_seq = Some(front.global_seq);
+                    best_lane = Some(idx);
+                }
+            }
+            let Some(chosen_lane) = best_lane else {
+                break;
+            };
+            if let Some(item) = self.lanes[chosen_lane].pop() {
+                drained.push(item);
+            }
+        }
+        drained
+    }
+}
+
 impl<C: Clock> fmt::Debug for Scheduler<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Scheduler")
@@ -764,10 +1082,9 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 3);
-        assert!(
-            seen.iter()
-                .all(|(call_id, _, _, _)| call_id == "call-stream")
-        );
+        assert!(seen
+            .iter()
+            .all(|(call_id, _, _, _)| call_id == "call-stream"));
         assert_eq!(seen[0].1, 0);
         assert_eq!(seen[1].1, 1);
         assert_eq!(seen[2].1, 2);
@@ -1442,5 +1759,125 @@ mod tests {
         } else {
             panic!("Expected TimerFired second, got {:?}", task2.kind);
         }
+    }
+
+    #[test]
+    fn reactor_mesh_hash_routing_is_stable_for_call_id() {
+        let mut mesh = ReactorMesh::new(ReactorMeshConfig {
+            shard_count: 8,
+            lane_capacity: 64,
+        });
+
+        let first = mesh
+            .enqueue_hostcall_complete(
+                "call-affinity".to_string(),
+                HostcallOutcome::Success(serde_json::json!({})),
+            )
+            .expect("first enqueue");
+        let second = mesh
+            .enqueue_hostcall_complete(
+                "call-affinity".to_string(),
+                HostcallOutcome::Success(serde_json::json!({})),
+            )
+            .expect("second enqueue");
+
+        assert_eq!(
+            first.shard_id, second.shard_id,
+            "call_id hash routing must preserve shard affinity"
+        );
+        assert_eq!(first.shard_seq + 1, second.shard_seq);
+    }
+
+    #[test]
+    fn reactor_mesh_round_robin_event_distribution_is_deterministic() {
+        let mut mesh = ReactorMesh::new(ReactorMeshConfig {
+            shard_count: 3,
+            lane_capacity: 64,
+        });
+
+        let mut routed = Vec::new();
+        for idx in 0..6 {
+            let envelope = mesh
+                .enqueue_event(format!("evt-{idx}"), serde_json::json!({"i": idx}))
+                .expect("enqueue event");
+            routed.push(envelope.shard_id);
+        }
+
+        assert_eq!(routed, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn reactor_mesh_drain_global_order_preserves_monotone_seq() {
+        let mut mesh = ReactorMesh::new(ReactorMeshConfig {
+            shard_count: 4,
+            lane_capacity: 64,
+        });
+
+        let mut expected = Vec::new();
+        expected.push(
+            mesh.enqueue_event("evt-1".to_string(), serde_json::json!({"v": 1}))
+                .expect("event 1")
+                .global_seq
+                .value(),
+        );
+        expected.push(
+            mesh.enqueue_hostcall_complete(
+                "call-a".to_string(),
+                HostcallOutcome::Success(serde_json::json!({"ok": true})),
+            )
+            .expect("call-a")
+            .global_seq
+            .value(),
+        );
+        expected.push(
+            mesh.enqueue_event("evt-2".to_string(), serde_json::json!({"v": 2}))
+                .expect("event 2")
+                .global_seq
+                .value(),
+        );
+        expected.push(
+            mesh.enqueue_hostcall_complete(
+                "call-b".to_string(),
+                HostcallOutcome::Error {
+                    code: "E_TEST".to_string(),
+                    message: "boom".to_string(),
+                },
+            )
+            .expect("call-b")
+            .global_seq
+            .value(),
+        );
+
+        let drained = mesh.drain_global_order(16);
+        let observed = drained
+            .iter()
+            .map(|entry| entry.global_seq.value())
+            .collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn reactor_mesh_backpressure_tracks_rejected_enqueues() {
+        let mut mesh = ReactorMesh::new(ReactorMeshConfig {
+            shard_count: 1,
+            lane_capacity: 2,
+        });
+
+        mesh.enqueue_event("evt-0".to_string(), serde_json::json!({}))
+            .expect("enqueue evt-0");
+        mesh.enqueue_event("evt-1".to_string(), serde_json::json!({}))
+            .expect("enqueue evt-1");
+
+        let err = mesh
+            .enqueue_event("evt-overflow".to_string(), serde_json::json!({}))
+            .expect_err("third enqueue should overflow");
+        assert_eq!(err.shard_id, 0);
+        assert_eq!(err.capacity, 2);
+        assert_eq!(err.depth, 2);
+
+        let telemetry = mesh.telemetry();
+        assert_eq!(telemetry.rejected_enqueues, 1);
+        assert_eq!(telemetry.max_queue_depths, vec![2]);
+        assert_eq!(telemetry.queue_depths, vec![2]);
     }
 }

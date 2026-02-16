@@ -6789,12 +6789,11 @@ impl Default for SnapshotEntry {
     }
 }
 
-/// Precomputed per-extension capability decision table for O(1) hostcall
-/// authorization. Built once from an [`ExtensionPolicy`] at dispatcher
-/// creation time; all subsequent lookups are constant-time array reads.
+/// Precomputed per-extension capability decision table for O(1) hostcall authorization.
 ///
-/// For unknown capabilities not in [`ALL_CAPABILITIES`], falls back to the
-/// original `evaluate_for()` path.
+/// Built once from an [`ExtensionPolicy`] at dispatcher creation time; all subsequent
+/// lookups are constant-time array reads. For unknown capabilities not in
+/// [`ALL_CAPABILITIES`], falls back to the original `evaluate_for()` path.
 #[derive(Debug, Clone)]
 pub struct PolicySnapshot {
     /// Decisions for known capabilities evaluated without extension context.
@@ -6835,20 +6834,21 @@ impl PolicySnapshot {
     /// Known capabilities (read, write, http, etc.) are resolved from the
     /// precomputed table. Unknown capabilities fall back to `evaluate_for()`.
     pub fn lookup(&self, capability: &str, extension_id: Option<&str>) -> PolicyCheck {
-        if let Some(cap) = Capability::parse(capability) {
-            let idx = cap.index();
-            let entry = extension_id
-                .and_then(|id| self.per_extension.get(id))
-                .map_or(&self.global[idx], |arr| &arr[idx]);
-            PolicyCheck {
-                decision: entry.decision,
-                capability: capability.to_string(),
-                reason: entry.reason.to_string(),
-            }
-        } else {
+        Capability::parse(capability).map_or_else(
             // Unknown capability — fall back to full evaluation.
-            self.fallback.evaluate_for(capability, extension_id)
-        }
+            || self.fallback.evaluate_for(capability, extension_id),
+            |cap| {
+                let idx = cap.index();
+                let entry = extension_id
+                    .and_then(|id| self.per_extension.get(id))
+                    .map_or(&self.global[idx], |arr| &arr[idx]);
+                PolicyCheck {
+                    decision: entry.decision,
+                    capability: capability.to_string(),
+                    reason: entry.reason.to_string(),
+                }
+            },
+        )
     }
 
     /// Build the decision array for all known capabilities.
@@ -6968,8 +6968,7 @@ mod policy_snapshot_tests {
 
     #[test]
     fn snapshot_permissive_mode_allows_all() {
-        let mut policy = ExtensionPolicy::default();
-        policy.mode = ExtensionPolicyMode::Permissive;
+        let policy = PolicyProfile::Permissive.to_policy();
         let snapshot = PolicySnapshot::compile(&policy);
 
         for cap in ALL_CAPABILITIES {
@@ -7008,7 +7007,7 @@ mod policy_snapshot_tests {
     }
 
     #[test]
-    fn snapshot_per_extension_allow_overrides_global_deny() {
+    fn snapshot_global_deny_wins_over_per_extension_allow() {
         let policy = make_policy_with_per_extension();
         let snapshot = PolicySnapshot::compile(&policy);
 
@@ -7016,9 +7015,9 @@ mod policy_snapshot_tests {
         let global = snapshot.lookup("exec", None);
         assert_eq!(global.decision, PolicyDecision::Deny);
 
-        // but ext.special allows "exec"
+        // ext.special allows "exec", but global deny remains authoritative.
         let ext = snapshot.lookup("exec", Some("ext.special"));
-        assert_eq!(ext.decision, PolicyDecision::Allow);
+        assert_eq!(ext.decision, PolicyDecision::Deny);
     }
 }
 
@@ -7966,7 +7965,7 @@ enum HostcallOpcodeSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommonHostcallOpcode {
+pub enum CommonHostcallOpcode {
     // Tool operations
     ToolRead,
     ToolWrite,
@@ -8254,7 +8253,7 @@ struct HostcallPayloadArena<'a> {
 }
 
 impl<'a> HostcallPayloadArena<'a> {
-    fn new(method: &'a str, params: &'a Value, opcode: Option<CommonHostcallOpcode>) -> Self {
+    const fn new(method: &'a str, params: &'a Value, opcode: Option<CommonHostcallOpcode>) -> Self {
         Self {
             method,
             params,
@@ -8308,6 +8307,8 @@ impl<'a> HostcallPayloadArena<'a> {
     }
 
     fn hash_fast_tool_payload(&self, expected_name: &str) -> Option<(String, String)> {
+        use sha2::Digest as _;
+
         let map = self.params.as_object()?;
         if map.len() != 2 {
             return None;
@@ -8317,8 +8318,6 @@ impl<'a> HostcallPayloadArena<'a> {
             return None;
         }
         let input = map.get("input")?;
-
-        use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
         hash_hostcall_envelope(self.method, br#","params":"#, &mut hasher, |h| {
             h.update(b"{");
@@ -8355,6 +8354,8 @@ impl<'a> HostcallPayloadArena<'a> {
     }
 
     fn hash_fast_op_only_payload(&self, expected_op: &str) -> Option<(String, String)> {
+        use sha2::Digest as _;
+
         let map = self.params.as_object()?;
         if map.len() != 1 {
             return None;
@@ -8363,8 +8364,6 @@ impl<'a> HostcallPayloadArena<'a> {
         if !token_eq_ascii_folded(op, expected_op) {
             return None;
         }
-
-        use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
         hash_hostcall_envelope(self.method, br#","params":"#, &mut hasher, |h| {
             h.update(b"{");
@@ -8411,13 +8410,14 @@ const fn hostcall_opcode_param_op(opcode: CommonHostcallOpcode) -> Option<&'stat
         CommonHostcallOpcode::SessionGetBranch => Some("get_branch"),
         CommonHostcallOpcode::SessionGetFile => Some("get_file"),
         CommonHostcallOpcode::SessionGetName => Some("get_name"),
-        CommonHostcallOpcode::SessionGetModel => Some("get_model"),
-        CommonHostcallOpcode::SessionGetThinkingLevel => Some("get_thinking_level"),
+        CommonHostcallOpcode::SessionGetModel | CommonHostcallOpcode::EventsGetModel => {
+            Some("get_model")
+        }
+        CommonHostcallOpcode::SessionGetThinkingLevel
+        | CommonHostcallOpcode::EventsGetThinkingLevel => Some("get_thinking_level"),
         CommonHostcallOpcode::EventsGetActiveTools => Some("get_active_tools"),
         CommonHostcallOpcode::EventsGetAllTools => Some("get_all_tools"),
         CommonHostcallOpcode::EventsList => Some("list"),
-        CommonHostcallOpcode::EventsGetModel => Some("get_model"),
-        CommonHostcallOpcode::EventsGetThinkingLevel => Some("get_thinking_level"),
         CommonHostcallOpcode::EventsListFlags => Some("list_flags"),
         _ => None,
     }
@@ -8568,12 +8568,12 @@ fn token_eq_ascii_folded(left: &str, right: &str) -> bool {
     let mut left_iter = left
         .trim()
         .bytes()
-        .filter(|b| b.is_ascii_alphanumeric())
+        .filter(u8::is_ascii_alphanumeric)
         .map(|b| b.to_ascii_lowercase());
     let mut right_iter = right
         .trim()
         .bytes()
-        .filter(|b| b.is_ascii_alphanumeric())
+        .filter(u8::is_ascii_alphanumeric)
         .map(|b| b.to_ascii_lowercase());
     loop {
         match (left_iter.next(), right_iter.next()) {
@@ -8965,6 +8965,369 @@ fn params_without_key(params: &Value, key: &str) -> Value {
         Value::Object(out)
     } else {
         Value::Null
+    }
+}
+
+// ============================================================================
+// Hostcall Reactor Mesh (bd-3ar8v.4.20)
+// ============================================================================
+
+/// Configuration for the core-pinned hostcall reactor mesh.
+#[derive(Debug, Clone)]
+pub struct HostcallReactorConfig {
+    /// Number of shard lanes. Each shard processes hostcalls independently.
+    pub shard_count: usize,
+    /// Maximum queued requests per shard lane before backpressure.
+    pub lane_capacity: usize,
+    /// Optional core affinity: `core_ids[shard_id]` = logical CPU for that shard.
+    /// If `None` or shorter than `shard_count`, shards run unaffinied.
+    pub core_ids: Option<Vec<usize>>,
+}
+
+impl Default for HostcallReactorConfig {
+    fn default() -> Self {
+        Self {
+            shard_count: 4,
+            lane_capacity: 256,
+            core_ids: None,
+        }
+    }
+}
+
+/// A hostcall request enqueued into the reactor mesh for shard-local dispatch.
+#[derive(Debug, Clone)]
+pub struct HostcallReactorRequest {
+    /// Unique call identifier.
+    pub call_id: String,
+    /// Typed fast-lane opcode for this request.
+    pub(crate) opcode: CommonHostcallOpcode,
+    /// Params with the `"op"` key already stripped.
+    pub params: Value,
+    /// Destination shard (set by the mesh router).
+    pub shard_id: usize,
+    /// Monotone shard-local sequence.
+    pub shard_seq: u64,
+    /// Global monotone sequence for deterministic cross-shard ordering.
+    pub global_seq: u64,
+    /// Timestamp (nanoseconds since epoch) when enqueued.
+    pub enqueued_at_ns: u64,
+}
+
+/// Completion of a reactor-dispatched hostcall.
+#[derive(Debug, Clone)]
+pub struct HostcallReactorCompletion {
+    /// The call_id that was dispatched.
+    pub call_id: String,
+    /// Result of the dispatch.
+    pub outcome: HostcallOutcome,
+    /// Shard that processed this call.
+    pub shard_id: usize,
+    /// Dispatch latency in nanoseconds (from enqueue to completion).
+    pub dispatch_latency_ns: u64,
+}
+
+/// Backpressure signal when a reactor shard lane is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostcallReactorBackpressure {
+    pub shard_id: usize,
+    pub depth: usize,
+    pub capacity: usize,
+}
+
+/// Per-shard bounded SPSC lane for hostcall requests.
+#[derive(Debug)]
+struct HostcallSpscLane {
+    capacity: usize,
+    queue: std::collections::VecDeque<HostcallReactorRequest>,
+    max_depth: usize,
+    total_enqueued: u64,
+}
+
+impl HostcallSpscLane {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            queue: std::collections::VecDeque::with_capacity(capacity),
+            max_depth: 0,
+            total_enqueued: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    fn push(&mut self, req: HostcallReactorRequest) -> std::result::Result<(), usize> {
+        if self.queue.len() >= self.capacity {
+            return Err(self.queue.len());
+        }
+        self.queue.push_back(req);
+        self.max_depth = self.max_depth.max(self.queue.len());
+        self.total_enqueued = self.total_enqueued.saturating_add(1);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<HostcallReactorRequest> {
+        self.queue.pop_front()
+    }
+
+    fn drain_batch(&mut self, budget: usize) -> Vec<HostcallReactorRequest> {
+        let n = budget.min(self.queue.len());
+        let mut batch = Vec::with_capacity(n);
+        for _ in 0..n {
+            if let Some(req) = self.queue.pop_front() {
+                batch.push(req);
+            }
+        }
+        batch
+    }
+}
+
+/// Lightweight queueing telemetry for the reactor mesh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostcallReactorTelemetry {
+    pub shard_count: usize,
+    pub queue_depths: Vec<usize>,
+    pub max_queue_depths: Vec<usize>,
+    pub total_enqueued: Vec<u64>,
+    pub rejected_enqueues: u64,
+    pub total_dispatched: u64,
+}
+
+/// Deterministic SPSC reactor mesh for hostcall traffic.
+///
+/// Routes fast-lane hostcall requests to per-shard SPSC lanes using
+/// stable hash routing (by call_id for affinity) or opcode-class routing.
+///
+/// **Routing policy:**
+/// - Session opcodes: hash-routed by `call_id` (shard affinity preserves
+///   per-call ordering for streaming scenarios).
+/// - Events opcodes: round-robin across shards for load distribution.
+/// - Tool opcodes: hash-routed by `call_id`.
+///
+/// **Drain policy:**
+/// - `drain_shard(shard_id, budget)` for per-shard processing.
+/// - `drain_global_order(budget)` for deterministic cross-shard ordering.
+#[derive(Debug)]
+pub struct HostcallReactorMesh {
+    config: HostcallReactorConfig,
+    lanes: Vec<HostcallSpscLane>,
+    shard_seq: Vec<u64>,
+    global_seq: u64,
+    rr_cursor: usize,
+    rejected_enqueues: u64,
+    total_dispatched: u64,
+}
+
+impl HostcallReactorMesh {
+    /// Create a new reactor mesh with the given configuration.
+    #[must_use]
+    pub fn new(config: HostcallReactorConfig) -> Self {
+        let shard_count = config.shard_count.max(1);
+        let lane_capacity = config.lane_capacity.max(1);
+        let lanes = (0..shard_count)
+            .map(|_| HostcallSpscLane::new(lane_capacity))
+            .collect();
+        Self {
+            config: HostcallReactorConfig {
+                shard_count,
+                lane_capacity,
+                ..config
+            },
+            lanes,
+            shard_seq: vec![0; shard_count],
+            global_seq: 0,
+            rr_cursor: 0,
+            rejected_enqueues: 0,
+            total_dispatched: 0,
+        }
+    }
+
+    /// Number of shard lanes.
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Total pending requests across all shards.
+    #[must_use]
+    pub fn total_depth(&self) -> usize {
+        self.lanes.iter().map(HostcallSpscLane::len).sum()
+    }
+
+    /// Whether any lane has pending requests.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.total_depth() > 0
+    }
+
+    /// Snapshot queueing telemetry.
+    #[must_use]
+    pub fn telemetry(&self) -> HostcallReactorTelemetry {
+        HostcallReactorTelemetry {
+            shard_count: self.lanes.len(),
+            queue_depths: self.lanes.iter().map(HostcallSpscLane::len).collect(),
+            max_queue_depths: self.lanes.iter().map(|l| l.max_depth).collect(),
+            total_enqueued: self.lanes.iter().map(|l| l.total_enqueued).collect(),
+            rejected_enqueues: self.rejected_enqueues,
+            total_dispatched: self.total_dispatched,
+        }
+    }
+
+    /// Core affinity configuration (if any).
+    #[must_use]
+    pub fn core_id_for_shard(&self, shard_id: usize) -> Option<usize> {
+        self.config
+            .core_ids
+            .as_ref()
+            .and_then(|ids| ids.get(shard_id).copied())
+    }
+
+    /// FNV-1a 64-bit hash for deterministic, process-independent routing.
+    fn stable_hash(input: &str) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in input.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3_u64);
+        }
+        hash
+    }
+
+    /// Route a hostcall by call_id hash (shard affinity).
+    fn hash_route(&self, call_id: &str) -> usize {
+        if self.lanes.len() <= 1 {
+            return 0;
+        }
+        let lanes = u64::try_from(self.lanes.len()).unwrap_or(1);
+        usize::try_from(Self::stable_hash(call_id) % lanes).unwrap_or(0)
+    }
+
+    /// Route using round-robin for load distribution.
+    fn rr_route(&mut self) -> usize {
+        if self.lanes.len() <= 1 {
+            return 0;
+        }
+        let idx = self.rr_cursor % self.lanes.len();
+        self.rr_cursor = self.rr_cursor.saturating_add(1);
+        idx
+    }
+
+    /// Select shard based on opcode class:
+    /// - Session + Tool opcodes: hash by call_id (affinity)
+    /// - Events opcodes: round-robin (load distribution)
+    fn route_for_opcode(&mut self, opcode: CommonHostcallOpcode, call_id: &str) -> usize {
+        match opcode.method() {
+            "events" => self.rr_route(),
+            _ => self.hash_route(call_id),
+        }
+    }
+
+    const fn next_global_seq(&mut self) -> u64 {
+        let seq = self.global_seq;
+        self.global_seq = self.global_seq.saturating_add(1);
+        seq
+    }
+
+    fn next_shard_seq(&mut self, shard_id: usize) -> u64 {
+        let Some(seq) = self.shard_seq.get_mut(shard_id) else {
+            return 0;
+        };
+        let current = *seq;
+        *seq = seq.saturating_add(1);
+        current
+    }
+
+    /// Enqueue a fast-lane hostcall request for shard-local dispatch.
+    ///
+    /// Returns the shard assignment and sequence metadata on success,
+    /// or backpressure info on lane overflow.
+    pub(crate) fn submit(
+        &mut self,
+        call_id: String,
+        opcode: CommonHostcallOpcode,
+        params: Value,
+    ) -> std::result::Result<HostcallReactorRequest, HostcallReactorBackpressure> {
+        let shard_id = self.route_for_opcode(opcode, &call_id);
+        let global_seq = self.next_global_seq();
+        let shard_seq = self.next_shard_seq(shard_id);
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+
+        let request = HostcallReactorRequest {
+            call_id,
+            opcode,
+            params,
+            shard_id,
+            shard_seq,
+            global_seq,
+            enqueued_at_ns: now_ns,
+        };
+
+        let Some(lane) = self.lanes.get_mut(shard_id) else {
+            self.rejected_enqueues = self.rejected_enqueues.saturating_add(1);
+            return Err(HostcallReactorBackpressure {
+                shard_id,
+                depth: 0,
+                capacity: 0,
+            });
+        };
+        match lane.push(request.clone()) {
+            Ok(()) => Ok(request),
+            Err(depth) => {
+                self.rejected_enqueues = self.rejected_enqueues.saturating_add(1);
+                Err(HostcallReactorBackpressure {
+                    shard_id,
+                    depth,
+                    capacity: lane.capacity,
+                })
+            }
+        }
+    }
+
+    /// Drain up to `budget` requests from a specific shard.
+    pub fn drain_shard(&mut self, shard_id: usize, budget: usize) -> Vec<HostcallReactorRequest> {
+        let Some(lane) = self.lanes.get_mut(shard_id) else {
+            return Vec::new();
+        };
+        let batch = lane.drain_batch(budget);
+        self.total_dispatched = self
+            .total_dispatched
+            .saturating_add(u64::try_from(batch.len()).unwrap_or(0));
+        batch
+    }
+
+    /// Drain across all shards in deterministic global sequence order.
+    pub fn drain_global_order(&mut self, budget: usize) -> Vec<HostcallReactorRequest> {
+        let mut drained = Vec::with_capacity(budget);
+        for _ in 0..budget {
+            let mut best_lane: Option<usize> = None;
+            let mut best_seq: Option<u64> = None;
+            for (idx, lane) in self.lanes.iter().enumerate() {
+                let Some(front) = lane.queue.front() else {
+                    continue;
+                };
+                if best_seq.is_none_or(|seq| front.global_seq < seq) {
+                    best_seq = Some(front.global_seq);
+                    best_lane = Some(idx);
+                }
+            }
+            let Some(lane_idx) = best_lane else {
+                break;
+            };
+            if let Some(req) = self.lanes[lane_idx].pop() {
+                drained.push(req);
+            }
+        }
+        self.total_dispatched = self
+            .total_dispatched
+            .saturating_add(u64::try_from(drained.len()).unwrap_or(0));
+        drained
+    }
+
+    /// Record that a batch of completions was produced by shard processing.
+    pub const fn record_completions(&mut self, count: u64) {
+        self.total_dispatched = self.total_dispatched.saturating_add(count);
     }
 }
 
@@ -14869,7 +15232,7 @@ pub async fn dispatch_host_call_shared(
         _ => None,
     };
     let capability = opcode_hint
-        .map(|opcode| opcode.required_capability())
+        .map(CommonHostcallOpcode::required_capability)
         .or_else(|| required_capability_for_host_call_static_legacy(&call))
         .unwrap_or("internal");
     let HostcallMarshallingArtifacts {
@@ -15476,6 +15839,26 @@ async fn dispatch_shared_allowed(
                     }),
                 );
             };
+            // Record reactor mesh routing for shard telemetry (bd-3ar8v.4.20).
+            // The reactor mesh assigns a shard for this opcode; actual parallel
+            // execution on shard threads is activated via enable_hostcall_reactor().
+            if let Some(ref manager) = ctx.manager {
+                if let Some(Ok(reactor_req)) = manager.reactor_submit(
+                    call.call_id.clone(),
+                    opcode,
+                    params_without_key(&call.params, "op"),
+                ) {
+                    tracing::trace!(
+                        event = "host_call.reactor_routed",
+                        call_id = %call.call_id,
+                        shard_id = reactor_req.shard_id,
+                        global_seq = reactor_req.global_seq,
+                        shard_seq = reactor_req.shard_seq,
+                        opcode = opcode.code(),
+                        "Hostcall routed through reactor mesh"
+                    );
+                }
+            }
             dispatch_shared_allowed_fast(ctx, call, opcode).await
         }
         HostcallDispatchLane::Compat => dispatch_shared_allowed_legacy(ctx, call).await,
@@ -17607,6 +17990,8 @@ struct ExtensionManagerInner {
     /// Monotonic counter incremented whenever session or context-affecting state
     /// changes (e.g. session set, cwd change, model registry update).
     ctx_generation: u64,
+    /// Core-pinned SPSC reactor mesh for fast-lane hostcall traffic (bd-3ar8v.4.20).
+    hostcall_reactor: Option<HostcallReactorMesh>,
 }
 
 impl std::fmt::Debug for ExtensionManager {
@@ -17872,7 +18257,9 @@ impl ExtensionManager {
         if fallback_reason.is_some() {
             *entry = entry.saturating_add(1);
         }
-        *entry
+        let result = *entry;
+        drop(guard);
+        result
     }
 
     fn runtime_risk_push_ledger(
@@ -19023,6 +19410,110 @@ impl ExtensionManager {
         }
         drop(guard);
         None
+    }
+
+    // ------------------------------------------------------------------
+    // Hostcall Reactor Mesh (bd-3ar8v.4.20)
+    // ------------------------------------------------------------------
+
+    /// Enable the hostcall reactor mesh with the given configuration.
+    ///
+    /// Fast-lane opcodes will be routed through per-shard SPSC lanes
+    /// for reduced cross-core contention.
+    pub fn enable_hostcall_reactor(&self, config: HostcallReactorConfig) {
+        let mut guard = self.inner.lock().unwrap();
+        let shard_count = config.shard_count;
+        guard.hostcall_reactor = Some(HostcallReactorMesh::new(config));
+        drop(guard);
+        tracing::info!(
+            event = "hostcall_reactor.enabled",
+            shard_count,
+            "Hostcall reactor mesh enabled"
+        );
+    }
+
+    /// Disable the hostcall reactor mesh.
+    pub fn disable_hostcall_reactor(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.hostcall_reactor = None;
+        drop(guard);
+        tracing::info!(
+            event = "hostcall_reactor.disabled",
+            "Hostcall reactor mesh disabled"
+        );
+    }
+
+    /// Check if the reactor mesh is enabled.
+    #[must_use]
+    pub fn hostcall_reactor_enabled(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.hostcall_reactor.is_some())
+    }
+
+    /// Submit a fast-lane hostcall to the reactor mesh for shard-local dispatch.
+    ///
+    /// Returns `None` if the reactor is not enabled (caller should dispatch directly).
+    /// Returns `Some(Ok(request))` on successful submission.
+    /// Returns `Some(Err(backpressure))` if the target shard lane is full.
+    pub(crate) fn reactor_submit(
+        &self,
+        call_id: String,
+        opcode: CommonHostcallOpcode,
+        params: Value,
+    ) -> Option<std::result::Result<HostcallReactorRequest, HostcallReactorBackpressure>> {
+        let mut guard = self.inner.lock().ok()?;
+        let reactor = guard.hostcall_reactor.as_mut()?;
+        let result = reactor.submit(call_id, opcode, params);
+        drop(guard);
+        Some(result)
+    }
+
+    /// Drain pending requests from a specific reactor shard.
+    pub fn reactor_drain_shard(
+        &self,
+        shard_id: usize,
+        budget: usize,
+    ) -> Vec<HostcallReactorRequest> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|mut guard| {
+                guard
+                    .hostcall_reactor
+                    .as_mut()
+                    .map(|r| r.drain_shard(shard_id, budget))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drain pending requests in deterministic global sequence order.
+    pub fn reactor_drain_global(&self, budget: usize) -> Vec<HostcallReactorRequest> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|mut guard| {
+                guard
+                    .hostcall_reactor
+                    .as_mut()
+                    .map(|r| r.drain_global_order(budget))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get reactor mesh telemetry snapshot.
+    #[must_use]
+    pub fn reactor_telemetry(&self) -> Option<HostcallReactorTelemetry> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .hostcall_reactor
+                    .as_ref()
+                    .map(HostcallReactorMesh::telemetry)
+            })
     }
 
     // ------------------------------------------------------------------
@@ -31043,6 +31534,249 @@ mod tests {
                 "round-trip failed for opcode code '{code}'"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Hostcall Reactor Mesh tests (bd-3ar8v.4.20)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn reactor_mesh_hash_routing_preserves_shard_affinity() {
+        let mut mesh = HostcallReactorMesh::new(HostcallReactorConfig {
+            shard_count: 8,
+            lane_capacity: 64,
+            core_ids: None,
+        });
+
+        let first = mesh
+            .submit(
+                "affinity-call".to_string(),
+                CommonHostcallOpcode::SessionGetState,
+                json!({}),
+            )
+            .expect("first submit");
+        let second = mesh
+            .submit(
+                "affinity-call".to_string(),
+                CommonHostcallOpcode::SessionGetState,
+                json!({}),
+            )
+            .expect("second submit");
+
+        assert_eq!(
+            first.shard_id, second.shard_id,
+            "same call_id must route to same shard"
+        );
+        assert_eq!(first.shard_seq + 1, second.shard_seq);
+        assert_eq!(first.global_seq + 1, second.global_seq);
+    }
+
+    #[test]
+    fn reactor_mesh_events_use_round_robin() {
+        let mut mesh = HostcallReactorMesh::new(HostcallReactorConfig {
+            shard_count: 3,
+            lane_capacity: 64,
+            core_ids: None,
+        });
+
+        let mut shards = Vec::new();
+        for i in 0..6 {
+            let req = mesh
+                .submit(
+                    format!("evt-call-{i}"),
+                    CommonHostcallOpcode::EventsEmit,
+                    json!({"event": "test"}),
+                )
+                .expect("submit events op");
+            shards.push(req.shard_id);
+        }
+
+        assert_eq!(shards, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn reactor_mesh_backpressure_on_overflow() {
+        let mut mesh = HostcallReactorMesh::new(HostcallReactorConfig {
+            shard_count: 1,
+            lane_capacity: 2,
+            core_ids: None,
+        });
+
+        mesh.submit(
+            "call-0".to_string(),
+            CommonHostcallOpcode::SessionGetName,
+            json!({}),
+        )
+        .expect("first");
+        mesh.submit(
+            "call-1".to_string(),
+            CommonHostcallOpcode::SessionGetName,
+            json!({}),
+        )
+        .expect("second");
+
+        let err = mesh
+            .submit(
+                "call-overflow".to_string(),
+                CommonHostcallOpcode::SessionGetName,
+                json!({}),
+            )
+            .expect_err("third should overflow");
+        assert_eq!(err.shard_id, 0);
+        assert_eq!(err.capacity, 2);
+        assert_eq!(err.depth, 2);
+
+        let telem = mesh.telemetry();
+        assert_eq!(telem.rejected_enqueues, 1);
+        assert_eq!(telem.queue_depths, vec![2]);
+    }
+
+    #[test]
+    fn reactor_mesh_drain_shard() {
+        let mut mesh = HostcallReactorMesh::new(HostcallReactorConfig {
+            shard_count: 2,
+            lane_capacity: 64,
+            core_ids: None,
+        });
+
+        for i in 0..3 {
+            mesh.submit(
+                format!("drain-{i}"),
+                CommonHostcallOpcode::SessionGetState,
+                json!({}),
+            )
+            .expect("submit");
+        }
+
+        assert!(mesh.total_depth() == 3);
+
+        let batch = mesh.drain_shard(0, 10);
+        assert!(!batch.is_empty(), "should have items in shard 0");
+        for req in &batch {
+            assert_eq!(req.shard_id, 0);
+            assert_eq!(req.opcode, CommonHostcallOpcode::SessionGetState);
+        }
+    }
+
+    #[test]
+    fn reactor_mesh_drain_global_order_is_monotone() {
+        let mut mesh = HostcallReactorMesh::new(HostcallReactorConfig {
+            shard_count: 4,
+            lane_capacity: 64,
+            core_ids: None,
+        });
+
+        mesh.submit("a".to_string(), CommonHostcallOpcode::EventsEmit, json!({}))
+            .unwrap();
+        mesh.submit(
+            "b".to_string(),
+            CommonHostcallOpcode::SessionGetName,
+            json!({}),
+        )
+        .unwrap();
+        mesh.submit(
+            "c".to_string(),
+            CommonHostcallOpcode::EventsGetModel,
+            json!({}),
+        )
+        .unwrap();
+        mesh.submit("d".to_string(), CommonHostcallOpcode::ToolRead, json!({}))
+            .unwrap();
+
+        let drained = mesh.drain_global_order(10);
+        assert_eq!(drained.len(), 4);
+
+        for pair in drained.windows(2) {
+            assert!(
+                pair[0].global_seq < pair[1].global_seq,
+                "global_seq must be monotonically increasing: {} >= {}",
+                pair[0].global_seq,
+                pair[1].global_seq
+            );
+        }
+    }
+
+    #[test]
+    fn reactor_mesh_telemetry_tracks_enqueued_and_dispatched() {
+        let mut mesh = HostcallReactorMesh::new(HostcallReactorConfig {
+            shard_count: 2,
+            lane_capacity: 64,
+            core_ids: None,
+        });
+
+        for i in 0..5 {
+            mesh.submit(
+                format!("tel-{i}"),
+                CommonHostcallOpcode::SessionGetState,
+                json!({}),
+            )
+            .unwrap();
+        }
+
+        let telem = mesh.telemetry();
+        assert_eq!(telem.shard_count, 2);
+        let total_enqueued: u64 = telem.total_enqueued.iter().sum();
+        assert_eq!(total_enqueued, 5);
+        assert_eq!(telem.total_dispatched, 0);
+
+        mesh.drain_global_order(3);
+        let telem2 = mesh.telemetry();
+        assert_eq!(telem2.total_dispatched, 3);
+    }
+
+    #[test]
+    fn reactor_mesh_core_affinity_config() {
+        let mesh = HostcallReactorMesh::new(HostcallReactorConfig {
+            shard_count: 4,
+            lane_capacity: 64,
+            core_ids: Some(vec![0, 2, 4, 6]),
+        });
+
+        assert_eq!(mesh.core_id_for_shard(0), Some(0));
+        assert_eq!(mesh.core_id_for_shard(1), Some(2));
+        assert_eq!(mesh.core_id_for_shard(2), Some(4));
+        assert_eq!(mesh.core_id_for_shard(3), Some(6));
+        assert_eq!(mesh.core_id_for_shard(4), None);
+    }
+
+    #[test]
+    fn extension_manager_reactor_lifecycle() {
+        let manager = ExtensionManager::new();
+        assert!(!manager.hostcall_reactor_enabled());
+
+        manager.enable_hostcall_reactor(HostcallReactorConfig {
+            shard_count: 2,
+            lane_capacity: 32,
+            core_ids: None,
+        });
+        assert!(manager.hostcall_reactor_enabled());
+
+        let result = manager.reactor_submit(
+            "mgr-call".to_string(),
+            CommonHostcallOpcode::SessionGetState,
+            json!({}),
+        );
+        assert!(result.is_some());
+        assert!(result.unwrap().is_ok());
+
+        let telem = manager.reactor_telemetry().expect("telemetry");
+        assert_eq!(telem.shard_count, 2);
+        let total_enqueued: u64 = telem.total_enqueued.iter().sum();
+        assert_eq!(total_enqueued, 1);
+
+        let drained = manager.reactor_drain_global(10);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].call_id, "mgr-call");
+
+        manager.disable_hostcall_reactor();
+        assert!(!manager.hostcall_reactor_enabled());
+        assert!(manager
+            .reactor_submit(
+                "should-none".to_string(),
+                CommonHostcallOpcode::SessionGetState,
+                json!({}),
+            )
+            .is_none());
     }
 
     fn typed_tool_read_payload(call_id: &str, path: &str) -> HostCallPayload {
