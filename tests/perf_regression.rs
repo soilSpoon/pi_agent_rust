@@ -105,13 +105,14 @@ fn build_pi_binary_candidates(
     detected_profile: &str,
 ) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    let normalized_profile = detected_profile.trim();
 
     if let Some(path) = cargo_bin_override {
         candidates.push(path);
     }
 
-    if !detected_profile.is_empty() {
-        candidates.push(target_dir.join(detected_profile).join("pi"));
+    if !normalized_profile.is_empty() {
+        candidates.push(target_dir.join(normalized_profile).join("pi"));
     }
 
     candidates.push(target_dir.join("release/pi"));
@@ -137,9 +138,10 @@ fn pi_binary() -> Option<PathBuf> {
 
 fn build_binary_size_candidates(target_dir: &Path, detected_profile: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    let normalized_profile = detected_profile.trim();
     candidates.push(target_dir.join("release/pi"));
-    if !detected_profile.is_empty() && !detected_profile.eq_ignore_ascii_case("debug") {
-        candidates.push(target_dir.join(detected_profile).join("pi"));
+    if !normalized_profile.is_empty() && !normalized_profile.eq_ignore_ascii_case("debug") {
+        candidates.push(target_dir.join(normalized_profile).join("pi"));
     }
 
     let mut dedup = HashSet::new();
@@ -1262,6 +1264,30 @@ fn pi_binary_candidate_builder_includes_profile_before_release() {
 }
 
 #[test]
+fn pi_binary_candidate_builder_trims_detected_profile() {
+    let root = Path::new("/tmp/pi-agent-target");
+    let candidates = build_pi_binary_candidates(root, None, "  bench-profile  ");
+    assert_eq!(candidates[0], root.join("bench-profile/pi"));
+    assert_eq!(candidates[1], root.join("release/pi"));
+    assert_eq!(candidates[2], root.join("perf/pi"));
+    assert_eq!(candidates[3], root.join("debug/pi"));
+}
+
+#[test]
+fn pi_binary_candidate_builder_ignores_whitespace_only_profile() {
+    let root = Path::new("/tmp/pi-agent-target");
+    let candidates = build_pi_binary_candidates(root, None, " \t ");
+    assert_eq!(
+        candidates,
+        vec![
+            root.join("release/pi"),
+            root.join("perf/pi"),
+            root.join("debug/pi"),
+        ]
+    );
+}
+
+#[test]
 fn pi_binary_candidate_builder_env_override_wins_and_dedups() {
     let root = Path::new("/tmp/pi-agent-target");
     let override_path = root.join("release/pi");
@@ -1299,9 +1325,30 @@ fn binary_size_candidate_builder_dedups_release_profile() {
 }
 
 #[test]
+fn binary_size_candidate_builder_dedups_padded_release_profile() {
+    let root = Path::new("/tmp/pi-agent-target");
+    let candidates = build_binary_size_candidates(root, "  release  ");
+    assert_eq!(candidates, vec![root.join("release/pi")]);
+}
+
+#[test]
 fn binary_size_candidate_builder_ignores_debug_profile() {
     let root = Path::new("/tmp/pi-agent-target");
     let candidates = build_binary_size_candidates(root, "debug");
+    assert_eq!(candidates, vec![root.join("release/pi")]);
+}
+
+#[test]
+fn binary_size_candidate_builder_ignores_padded_debug_profile() {
+    let root = Path::new("/tmp/pi-agent-target");
+    let candidates = build_binary_size_candidates(root, "  debug  ");
+    assert_eq!(candidates, vec![root.join("release/pi")]);
+}
+
+#[test]
+fn binary_size_candidate_builder_ignores_whitespace_only_profile() {
+    let root = Path::new("/tmp/pi-agent-target");
+    let candidates = build_binary_size_candidates(root, "  \t  ");
     assert_eq!(candidates, vec![root.join("release/pi")]);
 }
 
@@ -1331,5 +1378,19 @@ fn binary_size_candidate_selector_falls_back_when_release_missing() {
     std::fs::write(&profile, b"profile").expect("write profile binary");
 
     let selected = first_existing_candidate(build_binary_size_candidates(root, "bench-profile"));
+    assert_eq!(selected.as_deref(), Some(profile.as_path()));
+}
+
+#[test]
+fn binary_size_candidate_selector_falls_back_with_padded_profile() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let root = temp.path();
+    let profile = root.join("bench-profile/pi");
+
+    std::fs::create_dir_all(profile.parent().expect("profile parent")).expect("mkdir profile");
+    std::fs::write(&profile, b"profile").expect("write profile binary");
+
+    let selected =
+        first_existing_candidate(build_binary_size_candidates(root, " \tbench-profile  "));
     assert_eq!(selected.as_deref(), Some(profile.as_path()));
 }

@@ -333,9 +333,10 @@ fn budget_artifact_candidates(root: &Path, budget_name: &str) -> Vec<PathBuf> {
 }
 
 fn build_binary_size_candidate_paths(target_dir: &Path, detected_profile: &str) -> Vec<PathBuf> {
+    let normalized_profile = detected_profile.trim();
     let mut paths = vec![target_dir.join("release/pi")];
-    if !detected_profile.is_empty() && !detected_profile.eq_ignore_ascii_case("debug") {
-        paths.push(target_dir.join(detected_profile).join("pi"));
+    if !normalized_profile.is_empty() && !normalized_profile.eq_ignore_ascii_case("debug") {
+        paths.push(target_dir.join(normalized_profile).join("pi"));
     }
     paths.push(target_dir.join("perf/pi"));
 
@@ -1476,6 +1477,16 @@ fn binary_size_candidate_builder_ignores_debug_profile_case_insensitive() {
 }
 
 #[test]
+fn binary_size_candidate_builder_ignores_padded_debug_profile_case_insensitive() {
+    let target_dir = Path::new("/tmp/pi-agent-target");
+    let candidates = build_binary_size_candidate_paths(target_dir, "  DeBuG\t");
+    assert_eq!(
+        candidates,
+        vec![target_dir.join("release/pi"), target_dir.join("perf/pi")]
+    );
+}
+
+#[test]
 fn binary_size_candidate_builder_dedups_perf_profile() {
     let target_dir = Path::new("/tmp/pi-agent-target");
     let candidates = build_binary_size_candidate_paths(target_dir, "perf");
@@ -1489,6 +1500,26 @@ fn binary_size_candidate_builder_dedups_perf_profile() {
 fn binary_size_candidate_builder_dedups_release_profile() {
     let target_dir = Path::new("/tmp/pi-agent-target");
     let candidates = build_binary_size_candidate_paths(target_dir, "release");
+    assert_eq!(
+        candidates,
+        vec![target_dir.join("release/pi"), target_dir.join("perf/pi")]
+    );
+}
+
+#[test]
+fn binary_size_candidate_builder_ignores_whitespace_only_profile() {
+    let target_dir = Path::new("/tmp/pi-agent-target");
+    let candidates = build_binary_size_candidate_paths(target_dir, " \t ");
+    assert_eq!(
+        candidates,
+        vec![target_dir.join("release/pi"), target_dir.join("perf/pi")]
+    );
+}
+
+#[test]
+fn binary_size_candidate_builder_trims_profile_before_dedup() {
+    let target_dir = Path::new("/tmp/pi-agent-target");
+    let candidates = build_binary_size_candidate_paths(target_dir, " release ");
     assert_eq!(
         candidates,
         vec![target_dir.join("release/pi"), target_dir.join("perf/pi")]
