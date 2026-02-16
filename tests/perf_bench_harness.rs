@@ -24,9 +24,11 @@
 mod common;
 
 use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
@@ -907,4 +909,302 @@ fn bench_jsonl_schema_valid() {
         line_count,
         jsonl_path.display()
     );
+}
+
+#[cfg(unix)]
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("pi-{prefix}-{nanos}"))
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, content: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, content).expect("write executable stub");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .expect("set executable permission");
+}
+
+#[cfg(unix)]
+fn install_fake_bench_toolchain(bin_dir: &Path) {
+    let cargo_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+target_dir="${CARGO_TARGET_DIR:-target}"
+profile="debug"
+for ((i=1; i<=$#; i++)); do
+  if [[ "${!i}" == "--profile" ]]; then
+    j=$((i+1))
+    if [[ $j -le $# ]]; then
+      profile="${!j}"
+    fi
+  fi
+done
+bin="$target_dir/$profile/pijs_workload"
+mkdir -p "$(dirname "$bin")"
+cat >"$bin" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+iterations=0
+tool_calls=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --iterations)
+      iterations="$2"
+      shift 2
+      ;;
+    --tool-calls)
+      tool_calls="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '{"schema":"pi.perf.synthetic_workload.v1","iterations":%s,"tool_calls":%s}\n' "$iterations" "$tool_calls"
+EOS
+chmod +x "$bin"
+"#;
+    write_executable(&bin_dir.join("cargo"), cargo_stub);
+
+    let hyperfine_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+export_json=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --export-json)
+      export_json="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -z "$export_json" ]]; then
+  echo "missing --export-json path" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$export_json")"
+cat >"$export_json" <<'JSON'
+{"results":[{"mean":1.0}]}
+JSON
+"#;
+    write_executable(&bin_dir.join("hyperfine"), hyperfine_stub);
+}
+
+#[cfg(unix)]
+fn run_bench_workloads_with_mode(
+    profile_state: &str,
+    allow_fallback: bool,
+    pgo_mode: &str,
+) -> (std::process::Output, PathBuf, PathBuf) {
+    let temp_root = unique_temp_dir("pgo-fallback");
+    let bin_dir = temp_root.join("bin");
+    let target_dir = temp_root.join("target");
+    let out_dir = temp_root.join("out");
+    let profile_dir = temp_root.join("profiles");
+    let profile_data = profile_dir.join("pijs_workload.profdata");
+    let events_path = out_dir.join("pgo_events.jsonl");
+
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    fs::create_dir_all(&target_dir).expect("create target dir");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    match profile_state {
+        "corrupt" => {
+            fs::write(&profile_data, b"").expect("create empty profile data");
+        }
+        "present" => {
+            fs::write(&profile_data, b"not-real-profdata").expect("create synthetic profile data");
+        }
+        _ => {}
+    }
+
+    install_fake_bench_toolchain(&bin_dir);
+
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = Command::new("bash")
+        .arg("scripts/bench_extension_workloads.sh")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("OUT_DIR", &out_dir)
+        .env("JSONL_OUT", out_dir.join("bench.jsonl"))
+        .env("BENCH_CARGO_PROFILE", "perf")
+        .env("BENCH_CARGO_RUNNER", "local")
+        .env("BENCH_ALLOCATORS_CSV", "system")
+        .env("BENCH_PGO_MODE", pgo_mode)
+        .env(
+            "BENCH_PGO_ALLOW_FALLBACK",
+            if allow_fallback { "1" } else { "0" },
+        )
+        .env("BENCH_PGO_PROFILE_DIR", &profile_dir)
+        .env("BENCH_PGO_PROFILE_DATA", &profile_data)
+        .env("BENCH_PGO_EVENTS_JSONL", &events_path)
+        .env("ITERATIONS", "1")
+        .env("TOOL_CALLS_CSV", "1")
+        .env("HYPERFINE_WARMUP", "0")
+        .env("HYPERFINE_RUNS", "1")
+        .output()
+        .expect("run bench_extension_workloads.sh");
+
+    (output, temp_root, events_path)
+}
+
+#[cfg(unix)]
+fn load_jsonl(path: &Path) -> Vec<Value> {
+    let content = fs::read_to_string(path).expect("read jsonl");
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse jsonl row"))
+        .collect()
+}
+
+#[cfg(unix)]
+fn first_build_event(events: &[Value]) -> &Value {
+    events
+        .iter()
+        .find(|event| event.get("phase").and_then(Value::as_str) == Some("build"))
+        .expect("build event must exist")
+}
+
+#[cfg(unix)]
+#[test]
+fn pgo_use_mode_missing_profile_falls_back_with_explicit_reason() {
+    let (output, temp_root, events_path) = run_bench_workloads_with_mode("missing", true, "use");
+    assert!(
+        output.status.success(),
+        "script should succeed when fallback is enabled. stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = load_jsonl(&events_path);
+    let build_event = first_build_event(&events);
+    assert_eq!(
+        build_event
+            .get("profile_data_state")
+            .and_then(Value::as_str),
+        Some("missing")
+    );
+    assert_eq!(
+        build_event
+            .get("pgo_mode_effective")
+            .and_then(Value::as_str),
+        Some("baseline_fallback")
+    );
+    assert_eq!(
+        build_event.get("fallback_reason").and_then(Value::as_str),
+        Some("missing_profile_data")
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn pgo_use_mode_corrupt_profile_falls_back_with_explicit_reason() {
+    let (output, temp_root, events_path) = run_bench_workloads_with_mode("corrupt", true, "use");
+    assert!(
+        output.status.success(),
+        "script should succeed when fallback is enabled. stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = load_jsonl(&events_path);
+    let build_event = first_build_event(&events);
+    assert_eq!(
+        build_event
+            .get("profile_data_state")
+            .and_then(Value::as_str),
+        Some("corrupt")
+    );
+    assert_eq!(
+        build_event
+            .get("pgo_mode_effective")
+            .and_then(Value::as_str),
+        Some("baseline_fallback")
+    );
+    assert_eq!(
+        build_event.get("fallback_reason").and_then(Value::as_str),
+        Some("corrupt_profile_data")
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn pgo_use_mode_missing_profile_fails_when_fallback_disabled() {
+    let (output, temp_root, _events_path) = run_bench_workloads_with_mode("missing", false, "use");
+    assert!(
+        !output.status.success(),
+        "script must fail when fallback is disabled and profile data is missing"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fallback disabled"),
+        "failure should mention fallback policy. stderr={stderr}"
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn pgo_compare_mode_emits_delta_artifact_and_comparison_event() {
+    let (output, temp_root, events_path) =
+        run_bench_workloads_with_mode("missing", true, "compare");
+    assert!(
+        output.status.success(),
+        "script should succeed in compare mode with fallback enabled. stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out_dir = temp_root.join("out");
+    let delta_path = fs::read_dir(&out_dir)
+        .expect("read out dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pgo_delta_") && name.ends_with(".json"))
+        })
+        .expect("compare mode must emit pgo_delta_*.json artifact");
+
+    let delta_payload: Value =
+        serde_json::from_str(&fs::read_to_string(&delta_path).expect("read pgo delta artifact"))
+            .expect("parse pgo delta artifact json");
+    assert_eq!(
+        delta_payload.get("schema").and_then(Value::as_str),
+        Some("pi.perf.pgo_comparison.v1")
+    );
+
+    let events = load_jsonl(&events_path);
+    let comparison_event = events
+        .iter()
+        .find(|event| event.get("phase").and_then(Value::as_str) == Some("comparison"))
+        .expect("compare mode must emit a comparison phase event");
+    assert!(
+        comparison_event
+            .get("comparison_json")
+            .and_then(Value::as_str)
+            .is_some(),
+        "comparison event must include comparison_json path"
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
 }

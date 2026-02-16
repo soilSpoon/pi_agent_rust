@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── Schema Definitions ──────────────────────────────────────────────────────
 
@@ -129,6 +132,10 @@ const SCHEMAS: &[(&str, &str)] = &[
         "pi.ext.conformance_summary.v2",
         "Aggregate conformance summary with per-tier breakdowns",
     ),
+    (
+        "pi.perf.extension_benchmark_stratification.v1",
+        "Layered extension benchmark artifact linking cold-load, per-call, and full E2E evidence with claim-integrity guards",
+    ),
 ];
 
 /// Required fields for each schema (field name, description).
@@ -171,6 +178,7 @@ const EVIDENCE_CLASS_INFERRED: &str = "inferred";
 const CONFIDENCE_HIGH: &str = "high";
 const CONFIDENCE_MEDIUM: &str = "medium";
 const CONFIDENCE_LOW: &str = "low";
+const EXT_STRATIFICATION_SCHEMA: &str = "pi.perf.extension_benchmark_stratification.v1";
 const REALISTIC_SESSION_SIZES: &[u64] = &[100_000, 200_000, 500_000, 1_000_000, 5_000_000];
 const USER_PERCEIVED_SLI_IDS: &[&str] = &[
     "interactive_turn_p95_ms",
@@ -205,6 +213,71 @@ fn has_required_fields(record: &Value, fields: &[&str]) -> Vec<String> {
         }
     }
     missing
+}
+
+#[cfg(unix)]
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("pi-{prefix}-{nanos}"))
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, content: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, content).expect("write executable stub");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .expect("set executable permission");
+}
+
+#[cfg(unix)]
+fn install_fake_orchestrate_toolchain(bin_dir: &Path) {
+    let cargo_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+target_dir="${CARGO_TARGET_DIR:-target}"
+test_name=""
+for ((i=1; i<=$#; i++)); do
+  if [[ "${!i}" == "--test" ]]; then
+    j=$((i+1))
+    if [[ $j -le $# ]]; then
+      test_name="${!j}"
+    fi
+  fi
+done
+
+mkdir -p "$target_dir/perf"
+
+case "$test_name" in
+  bench_scenario_runner)
+    cat >"$target_dir/perf/scenario_runner.jsonl" <<'JSON'
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"cold_start","extension":"hello","stats":{"p95_ms":18.0},"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","partition":"matched-state","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/cold_start","replay_input":{"runs":5}}}
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"tool_call","extension":"hello","per_call_us":33.0,"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","partition":"matched-state","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/tool_call","replay_input":{"iterations":500}}}
+JSON
+    cat >"$target_dir/perf/legacy_extension_workloads.jsonl" <<'JSON'
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","summary":{"p50_ms":10.0}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","per_call_us":20.0}
+JSON
+    ;;
+  ext_bench_harness)
+    cat >"$target_dir/perf/ext_bench_harness.jsonl" <<'JSON'
+{"schema":"pi.ext.rust_bench.v1","scenario":"cold_load","extension":"hello","success":true,"stats":{"p95_us":18000}}
+JSON
+    cat >"$target_dir/perf/ext_bench_harness_report.json" <<'JSON'
+{"schema":"pi.bench.harness_report.v1","summary":{"total_scenarios":1}}
+JSON
+    ;;
+  perf_bench_harness)
+    cat >"$target_dir/perf/pijs_workload.jsonl" <<'JSON'
+{"schema":"pi.perf.workload.v1","scenario":"200x10","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":1200,"per_call_us":45,"calls_per_sec":1666}
+JSON
+    ;;
+esac
+exit 0
+"#;
+    write_executable(&bin_dir.join("cargo"), cargo_stub);
 }
 
 fn canonical_protocol_contract() -> Value {
@@ -517,6 +590,161 @@ fn validate_protocol_record(record: &Value) -> Result<(), String> {
                 "matched-state partition requires canonical scenario_id, got: {scenario_id}"
             ));
         }
+    }
+
+    Ok(())
+}
+
+fn validate_extension_stratification_record(record: &Value) -> Result<(), String> {
+    let required_top_level = [
+        "schema",
+        "run_id",
+        "correlation_id",
+        "layers",
+        "claim_integrity",
+        "lineage",
+    ];
+    let missing = has_required_fields(record, &required_top_level);
+    if !missing.is_empty() {
+        return Err(format!("missing required fields: {missing:?}"));
+    }
+
+    let schema = record
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if schema != EXT_STRATIFICATION_SCHEMA {
+        return Err(format!("unexpected schema: {schema}"));
+    }
+
+    let layers = record
+        .get("layers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "layers must be an array".to_string())?;
+    if layers.len() < 3 {
+        return Err("layers must include cold-load, per-call, and full-e2e entries".to_string());
+    }
+
+    let mut layer_ids = HashSet::new();
+    for layer in layers {
+        let layer_obj = layer
+            .as_object()
+            .ok_or_else(|| "layer must be an object".to_string())?;
+        for field in &[
+            "layer_id",
+            "display_name",
+            "scenario_tags",
+            "absolute_metrics",
+            "relative_metrics",
+            "confidence",
+            "evidence_state",
+            "lineage",
+        ] {
+            if !layer_obj.contains_key(*field) {
+                return Err(format!("layer missing {field}"));
+            }
+        }
+        let layer_id = layer_obj
+            .get("layer_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if layer_id.trim().is_empty() {
+            return Err("layer_id must be non-empty".to_string());
+        }
+        layer_ids.insert(layer_id.to_string());
+
+        let scenario_tags = layer_obj
+            .get("scenario_tags")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "scenario_tags must be an array".to_string())?;
+        if scenario_tags.is_empty() {
+            return Err(format!("layer {layer_id} must include scenario_tags"));
+        }
+
+        let absolute_metrics = layer_obj
+            .get("absolute_metrics")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("layer {layer_id} absolute_metrics must be object"))?;
+        for field in &["metric_name", "unit"] {
+            if !absolute_metrics.contains_key(*field) {
+                return Err(format!("layer {layer_id} absolute_metrics missing {field}"));
+            }
+        }
+
+        let relative_metrics = layer_obj
+            .get("relative_metrics")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("layer {layer_id} relative_metrics must be object"))?;
+        for field in &[
+            "rust_vs_node_ratio",
+            "rust_vs_node_ratio_basis",
+            "rust_vs_bun_ratio",
+            "rust_vs_bun_ratio_basis",
+        ] {
+            if !relative_metrics.contains_key(*field) {
+                return Err(format!("layer {layer_id} relative_metrics missing {field}"));
+            }
+        }
+
+        let lineage = layer_obj
+            .get("lineage")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("layer {layer_id} lineage must be object"))?;
+        let run_id_lineage = lineage
+            .get("run_id_lineage")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("layer {layer_id} lineage.run_id_lineage must be array"))?;
+        if run_id_lineage.len() < 2 {
+            return Err(format!(
+                "layer {layer_id} lineage.run_id_lineage must include run_id + correlation_id"
+            ));
+        }
+    }
+
+    for expected in &[
+        "cold_load_init",
+        "per_call_dispatch_micro",
+        "full_e2e_long_session",
+    ] {
+        if !layer_ids.contains(*expected) {
+            return Err(format!("missing required layer_id: {expected}"));
+        }
+    }
+
+    let claim_integrity = record
+        .get("claim_integrity")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "claim_integrity must be an object".to_string())?;
+    for field in &["anti_conflation", "cherry_pick_guard", "partition_coverage"] {
+        if !claim_integrity.contains_key(*field) {
+            return Err(format!("claim_integrity missing {field}"));
+        }
+    }
+    let cherry_pick_guard = claim_integrity
+        .get("cherry_pick_guard")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "claim_integrity.cherry_pick_guard must be object".to_string())?;
+    for field in &[
+        "requires_all_layers_for_global_claim",
+        "layer_coverage",
+        "global_claim_valid",
+        "invalidity_reasons",
+    ] {
+        if !cherry_pick_guard.contains_key(*field) {
+            return Err(format!("claim_integrity.cherry_pick_guard missing {field}"));
+        }
+    }
+
+    let lineage = record
+        .get("lineage")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "lineage must be an object".to_string())?;
+    let top_level_run_id_lineage = lineage
+        .get("run_id_lineage")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "lineage.run_id_lineage must be an array".to_string())?;
+    if top_level_run_id_lineage.len() < 2 {
+        return Err("lineage.run_id_lineage must include run_id + correlation_id".to_string());
     }
 
     Ok(())
@@ -931,6 +1159,121 @@ fn protocol_record_validator_rejects_invalid_partition_or_size() {
 }
 
 #[test]
+fn extension_stratification_validator_accepts_golden_fixture() {
+    let golden = json!({
+        "schema": EXT_STRATIFICATION_SCHEMA,
+        "run_id": "20260216T010101Z",
+        "correlation_id": "abc123def456",
+        "layers": [
+            {
+                "layer_id": "cold_load_init",
+                "display_name": "Cold-load and initialization",
+                "scenario_tags": ["cold-load", "init", "microbench"],
+                "absolute_metrics": {"metric_name": "cold_load_p95", "value": 12.4, "unit": "ms"},
+                "relative_metrics": {
+                    "rust_vs_node_ratio": 1.8,
+                    "rust_vs_node_ratio_basis": "direct_or_derived",
+                    "rust_vs_bun_ratio": 1.8,
+                    "rust_vs_bun_ratio_basis": "node_proxy"
+                },
+                "confidence": CONFIDENCE_MEDIUM,
+                "evidence_state": EVIDENCE_CLASS_INFERRED,
+                "lineage": {
+                    "run_id_lineage": ["20260216T010101Z", "abc123def456"],
+                    "source_artifacts": ["target/perf/ext_bench_harness.jsonl"],
+                    "suite_logs": {},
+                    "source_manifest_path": "target/perf/runs/20260216T010101Z/manifest.json"
+                }
+            },
+            {
+                "layer_id": "per_call_dispatch_micro",
+                "display_name": "Per-call dispatch microbench",
+                "scenario_tags": ["per-call", "dispatch", "microbench"],
+                "absolute_metrics": {"metric_name": "dispatch_per_call", "value": 42.0, "unit": "us"},
+                "relative_metrics": {
+                    "rust_vs_node_ratio": 1.2,
+                    "rust_vs_node_ratio_basis": "direct_or_derived",
+                    "rust_vs_bun_ratio": 1.2,
+                    "rust_vs_bun_ratio_basis": "node_proxy"
+                },
+                "confidence": CONFIDENCE_HIGH,
+                "evidence_state": EVIDENCE_CLASS_MEASURED,
+                "lineage": {
+                    "run_id_lineage": ["20260216T010101Z", "abc123def456"],
+                    "source_artifacts": ["target/perf/scenario_runner.jsonl"],
+                    "suite_logs": {},
+                    "source_manifest_path": "target/perf/runs/20260216T010101Z/manifest.json"
+                }
+            },
+            {
+                "layer_id": "full_e2e_long_session",
+                "display_name": "Full end-to-end long-session workload",
+                "scenario_tags": ["full-e2e", "long-session", "release-facing"],
+                "absolute_metrics": {"metric_name": "long_session_elapsed", "value": 950.0, "unit": "ms"},
+                "relative_metrics": {
+                    "rust_vs_node_ratio": null,
+                    "rust_vs_node_ratio_basis": "missing",
+                    "rust_vs_bun_ratio": null,
+                    "rust_vs_bun_ratio_basis": "missing"
+                },
+                "confidence": CONFIDENCE_LOW,
+                "evidence_state": "absolute_only",
+                "lineage": {
+                    "run_id_lineage": ["20260216T010101Z", "abc123def456"],
+                    "source_artifacts": ["target/perf/pijs_workload.jsonl"],
+                    "suite_logs": {},
+                    "source_manifest_path": "target/perf/runs/20260216T010101Z/manifest.json"
+                }
+            }
+        ],
+        "claim_integrity": {
+            "anti_conflation": {
+                "cold_load_wins_do_not_imply_per_call_or_e2e": true,
+                "per_call_wins_do_not_imply_full_e2e": true,
+                "full_e2e_is_release_facing_primary_signal": true
+            },
+            "cherry_pick_guard": {
+                "requires_all_layers_for_global_claim": true,
+                "layer_coverage": {
+                    "cold_load_init": true,
+                    "per_call_dispatch_micro": true,
+                    "full_e2e_long_session": false
+                },
+                "global_claim_valid": false,
+                "invalidity_reasons": ["missing_layer_coverage:full_e2e_long_session"]
+            },
+            "partition_coverage": {"matched-state": true, "realistic": false}
+        },
+        "lineage": {
+            "run_id_lineage": ["20260216T010101Z", "abc123def456"],
+            "source_manifest_path": "target/perf/runs/20260216T010101Z/manifest.json"
+        }
+    });
+
+    assert!(
+        validate_extension_stratification_record(&golden).is_ok(),
+        "golden extension stratification fixture should pass validation"
+    );
+}
+
+#[test]
+fn extension_stratification_validator_rejects_missing_claim_integrity() {
+    let malformed = json!({
+        "schema": EXT_STRATIFICATION_SCHEMA,
+        "run_id": "20260216T010101Z",
+        "correlation_id": "abc123def456",
+        "layers": [],
+        "lineage": { "run_id_lineage": ["20260216T010101Z", "abc123def456"] }
+    });
+
+    let err = validate_extension_stratification_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("claim_integrity"),
+        "expected missing claim_integrity failure, got: {err}"
+    );
+}
+
+#[test]
 fn evidence_contract_schema_includes_benchmark_protocol_definition() {
     let schema_path = project_root().join("docs/evidence-contract-schema.json");
     let content = std::fs::read_to_string(&schema_path)
@@ -1017,6 +1360,141 @@ fn protocol_is_referenced_by_benchmark_and_conformance_harnesses() {
             "{rel_path} must reference marker `{marker}`"
         );
     }
+}
+
+#[test]
+fn orchestrate_script_emits_extension_stratification_contract() {
+    let script_path = project_root().join("scripts/perf/orchestrate.sh");
+    let content = fs::read_to_string(&script_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", script_path.display()));
+
+    for token in &[
+        "extension_benchmark_stratification.json",
+        EXT_STRATIFICATION_SCHEMA,
+        "\"cold_load_init\"",
+        "\"per_call_dispatch_micro\"",
+        "\"full_e2e_long_session\"",
+        "microbench_only_claim",
+        "global_claim_missing_partition_coverage",
+    ] {
+        assert!(
+            content.contains(token),
+            "orchestrate stratification phase must include token: {token}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn run_orchestrate_with_fake_toolchain() -> (std::process::Output, PathBuf) {
+    let temp_root = unique_temp_dir("orchestrate-stratification");
+    let bin_dir = temp_root.join("bin");
+    let target_dir = temp_root.join("target");
+    let output_dir = temp_root.join("run");
+
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    fs::create_dir_all(&target_dir).expect("create target dir");
+    fs::create_dir_all(&output_dir).expect("create output dir");
+    install_fake_orchestrate_toolchain(&bin_dir);
+
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = Command::new("bash")
+        .arg("scripts/perf/orchestrate.sh")
+        .arg("--profile")
+        .arg("full")
+        .arg("--skip-build")
+        .arg("--skip-env-check")
+        .current_dir(project_root())
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("PERF_OUTPUT_DIR", &output_dir)
+        .env("PERF_SKIP_CRITERION", "1")
+        .output()
+        .expect("run orchestrate.sh");
+
+    (output, temp_root)
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_generates_extension_stratification_artifact() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain();
+    assert!(
+        output.status.success(),
+        "orchestrate.sh should succeed with stub toolchain. stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_dir = temp_root.join("run");
+    let manifest_path = output_dir.join("manifest.json");
+    let stratification_path = output_dir
+        .join("results")
+        .join("extension_benchmark_stratification.json");
+
+    assert!(
+        stratification_path.exists(),
+        "stratification artifact must be written: {}",
+        stratification_path.display()
+    );
+    let manifest: Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest.json"))
+            .expect("parse manifest.json");
+    let stratification: Value = serde_json::from_str(
+        &fs::read_to_string(&stratification_path)
+            .expect("read extension_benchmark_stratification.json"),
+    )
+    .expect("parse extension_benchmark_stratification.json");
+
+    if let Err(err) = validate_extension_stratification_record(&stratification) {
+        panic!("stratification artifact violates schema contract: {err}");
+    }
+
+    assert_eq!(
+        stratification.get("schema").and_then(Value::as_str),
+        Some(EXT_STRATIFICATION_SCHEMA)
+    );
+    assert_eq!(
+        stratification.get("run_id").and_then(Value::as_str),
+        manifest.get("timestamp").and_then(Value::as_str),
+        "stratification run_id must match manifest timestamp"
+    );
+    assert_eq!(
+        stratification.get("correlation_id").and_then(Value::as_str),
+        manifest.get("correlation_id").and_then(Value::as_str),
+        "stratification correlation_id must match manifest"
+    );
+    let run_id_lineage = stratification["lineage"]["run_id_lineage"]
+        .as_array()
+        .expect("lineage.run_id_lineage array");
+    assert_eq!(
+        run_id_lineage[0].as_str(),
+        manifest.get("timestamp").and_then(Value::as_str),
+        "lineage[0] must be manifest timestamp"
+    );
+    assert_eq!(
+        run_id_lineage[1].as_str(),
+        manifest.get("correlation_id").and_then(Value::as_str),
+        "lineage[1] must be manifest correlation_id"
+    );
+
+    assert_eq!(
+        manifest["extension_benchmark_stratification"]["schema"].as_str(),
+        Some(EXT_STRATIFICATION_SCHEMA),
+        "manifest must reference stratification schema"
+    );
+    assert!(
+        stratification["claim_integrity"]["anti_conflation"]
+            ["cold_load_wins_do_not_imply_per_call_or_e2e"]
+            .as_bool()
+            .is_some_and(|v| v),
+        "anti-conflation guardrail must be explicit in claim_integrity"
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
 }
 
 #[test]
