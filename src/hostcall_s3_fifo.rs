@@ -335,10 +335,10 @@ impl<K: Ord + Clone> S3FifoPolicy<K> {
 
     fn enforce_live_capacity(&mut self) {
         while self.live_depth() > self.cfg.live_capacity {
-            if self.main.is_empty() {
-                self.evict_small_front_to_ghost();
-            } else {
+            if self.small.is_empty() {
                 self.evict_main_front_to_ghost();
+            } else {
+                self.evict_small_front_to_ghost();
             }
         }
     }

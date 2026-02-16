@@ -1745,6 +1745,20 @@ struct ToolExecutionOutcome {
     steering_messages: Option<Vec<Message>>,
 }
 
+/// Pre-created JS extension runtime state for overlapping startup I/O.
+///
+/// By spawning the JS runtime boot as a background task *before* session
+/// creation and model selection, the expensive QuickJS init (~50-500ms)
+/// runs concurrently with other startup work.
+pub struct PreWarmedJsRuntime {
+    /// The extension manager (already has `cwd` and risk config set).
+    pub manager: ExtensionManager,
+    /// The booted JS runtime handle.
+    pub js_runtime: JsExtensionRuntimeHandle,
+    /// The tool registry passed to the runtime during boot.
+    pub tools: Arc<ToolRegistry>,
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
@@ -4089,7 +4103,7 @@ mod turn_event_tests {
 }
 
 impl AgentSession {
-    const fn runtime_repair_mode_from_policy_mode(mode: RepairPolicyMode) -> RepairMode {
+    pub const fn runtime_repair_mode_from_policy_mode(mode: RepairPolicyMode) -> RepairMode {
         match mode {
             RepairPolicyMode::Off => RepairMode::Off,
             RepairPolicyMode::Suggest => RepairMode::Suggest,

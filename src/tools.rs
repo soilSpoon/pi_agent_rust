@@ -1520,6 +1520,8 @@ pub(crate) async fn run_bash_command(
         truncation.truncated = true;
         truncation.truncated_by = Some(TruncatedBy::Bytes);
         truncation.total_bytes = bash_output.total_bytes;
+        // bash_output.line_count counts newlines; add 1 for the line count.
+        truncation.total_lines = bash_output.line_count.saturating_add(1);
     }
 
     let mut output_text = if truncation.content.is_empty() {
