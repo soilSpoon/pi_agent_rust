@@ -1527,134 +1527,135 @@ impl Session {
                     let header_snapshot = self.header.clone();
                     let entries_to_save = std::mem::take(&mut self.entries);
 
-                                            let path_for_thread = path_clone.clone();
-                                            let handle = thread::spawn(move || {
-                                                let entries = entries_to_save;
-                                                let res = || -> Result<()> {
-                                                    let parent = path_for_thread.parent().unwrap_or_else(|| Path::new("."));
-                                                    let temp_file = tempfile::NamedTempFile::new_in(parent)?;
-                                                    {
-                                                        let mut writer =
-                                                            std::io::BufWriter::with_capacity(1 << 20, temp_file.as_file());
-                                                        serde_json::to_writer(&mut writer, &header_snapshot)?;
-                                                        writer.write_all(b"\n")?;
-                                                        for entry in &entries {
-                                                            serde_json::to_writer(&mut writer, entry)?;
-                                                            writer.write_all(b"\n")?;
-                                                        }
-                                                        writer.flush()?;
-                                                    }
-                                                    temp_file
-                                                        .persist(&path_for_thread)
-                                                        .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
-                    
-                                                    enqueue_session_index_snapshot_update(
-                                                        sessions_root.clone(),
-                                                        path_for_thread.clone(),
-                                                        header_snapshot.clone(),
-                                                        message_count,
-                                                        session_name.clone(),
-                                                    );
-                                                    Ok(())
-                                                }();
-                                                let cx = AgentCx::for_request();
-                                                let _ = tx.send(
-                                                    cx.cx(),
-                                                    match res {
-                                                        Ok(()) => Ok(entries),
-                                                        Err(err) => Err((err, entries)),
-                                                    },
-                                                );
-                                            });
-                    
-                                            let cx = AgentCx::for_request();
-                                            let result = rx
-                                                .recv(cx.cx())
-                                                .await
-                                                .map_err(|_| crate::Error::session("Save task cancelled"))?;
-                    
-                                            // Ensure background thread cleans up
-                                            if let Err(e) = handle.join() {
-                                                std::panic::resume_unwind(e); // Propagate panic if child panicked
-                                            }
-                    
-                                            match result {
-                                                Ok(entries) => {
-                                                    self.entries = entries;
-                                                    self.rebuild_all_caches();
-                                                    self.persisted_entry_count.store(self.entries.len(), Ordering::SeqCst);
-                                                    self.header_dirty = false;
-                                                    self.appends_since_checkpoint = 0;
-                                                    Ok(())
-                                                }
-                                                Err((err, entries)) => {
-                                                    self.entries = entries;
-                                                    self.rebuild_all_caches();
-                                                    Err(err)
-                                                }
-                                            }?;
-                                        } else {
-                                            // === Incremental append path ===
-                                            let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
-                                            if new_start < self.entries.len() {
-                                                // Pre-serialize new entries on the main thread (typically 1-3 entries).
-                                                let mut serialized_bytes = Vec::new();
-                                                for entry in &self.entries[new_start..] {
-                                                    let mut line = serde_json::to_vec(entry)?;
-                                                    line.push(b'\n');
-                                                    serialized_bytes.push(line);
-                                                }
-                                                let new_count = self.entries.len();
-                    
-                                                let (tx, rx) = oneshot::channel::<Result<()>>();
-                                                let header_snapshot = self.header.clone();
-                    
-                                                let path_for_thread = path_clone.clone();
-                                                let handle = thread::spawn(move || {
-                                                    let res = || -> Result<()> {
-                                                        let file = std::fs::OpenOptions::new()
-                                                            .append(true)
-                                                            .open(&path_for_thread)
-                                                            .map_err(|e| crate::Error::Io(Box::new(e)))?;
-                                                        let mut writer = std::io::BufWriter::new(file);
-                                                        for chunk in &serialized_bytes {
-                                                            writer.write_all(chunk)?;
-                                                        }
-                                                        writer.flush()?;
-                    
-                                                        enqueue_session_index_snapshot_update(
-                                                            sessions_root.clone(),
-                                                            path_for_thread.clone(),
-                                                            header_snapshot.clone(),
-                                                            message_count,
-                                                            session_name.clone(),
-                                                        );
-                                                        Ok(())
-                                                    }();
-                                                    let cx = AgentCx::for_request();
-                                                    let _ = tx.send(cx.cx(), res);
-                                                });
-                    
-                                                let cx = AgentCx::for_request();
-                                                let result = rx
-                                                    .recv(cx.cx())
-                                                    .await
-                                                    .map_err(|_| crate::Error::session("Append task cancelled"))?;
-                    
-                                                // Ensure background thread cleans up
-                                                if let Err(e) = handle.join() {
-                                                    std::panic::resume_unwind(e); // Propagate panic if child panicked
-                                                }
-                    
-                                                if result.is_ok() {
-                                                    self.persisted_entry_count.store(new_count, Ordering::SeqCst);
-                                                    self.appends_since_checkpoint += 1;
-                                                }
-                                                result?;
-                                            }
-                                            // No new entries → no-op, nothing to write.
-                                        }
-                                    }            #[cfg(feature = "sqlite-sessions")]
+                    let path_for_thread = path_clone.clone();
+                    let handle = thread::spawn(move || {
+                        let entries = entries_to_save;
+                        let res = || -> Result<()> {
+                            let parent = path_for_thread.parent().unwrap_or_else(|| Path::new("."));
+                            let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+                            {
+                                let mut writer =
+                                    std::io::BufWriter::with_capacity(1 << 20, temp_file.as_file());
+                                serde_json::to_writer(&mut writer, &header_snapshot)?;
+                                writer.write_all(b"\n")?;
+                                for entry in &entries {
+                                    serde_json::to_writer(&mut writer, entry)?;
+                                    writer.write_all(b"\n")?;
+                                }
+                                writer.flush()?;
+                            }
+                            temp_file
+                                .persist(&path_for_thread)
+                                .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
+
+                            enqueue_session_index_snapshot_update(
+                                sessions_root.clone(),
+                                path_for_thread.clone(),
+                                header_snapshot.clone(),
+                                message_count,
+                                session_name.clone(),
+                            );
+                            Ok(())
+                        }();
+                        let cx = AgentCx::for_request();
+                        let _ = tx.send(
+                            cx.cx(),
+                            match res {
+                                Ok(()) => Ok(entries),
+                                Err(err) => Err((err, entries)),
+                            },
+                        );
+                    });
+
+                    let cx = AgentCx::for_request();
+                    let result = rx
+                        .recv(cx.cx())
+                        .await
+                        .map_err(|_| crate::Error::session("Save task cancelled"))?;
+
+                    // Ensure background thread cleans up
+                    if let Err(e) = handle.join() {
+                        std::panic::resume_unwind(e); // Propagate panic if child panicked
+                    }
+
+                    match result {
+                        Ok(entries) => {
+                            self.entries = entries;
+                            self.rebuild_all_caches();
+                            self.persisted_entry_count.store(self.entries.len(), Ordering::SeqCst);
+                            self.header_dirty = false;
+                            self.appends_since_checkpoint = 0;
+                            Ok(())
+                        }
+                        Err((err, entries)) => {
+                            self.entries = entries;
+                            self.rebuild_all_caches();
+                            Err(err)
+                        }
+                    }?;
+                } else {
+                    // === Incremental append path ===
+                    let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
+                    if new_start < self.entries.len() {
+                        // Pre-serialize new entries on the main thread (typically 1-3 entries).
+                        let mut serialized_bytes = Vec::new();
+                        for entry in &self.entries[new_start..] {
+                            let mut line = serde_json::to_vec(entry)?;
+                            line.push(b'\n');
+                            serialized_bytes.push(line);
+                        }
+                        let new_count = self.entries.len();
+
+                        let (tx, rx) = oneshot::channel::<Result<()>>();
+                        let header_snapshot = self.header.clone();
+
+                        let path_for_thread = path_clone.clone();
+                        let handle = thread::spawn(move || {
+                            let res = || -> Result<()> {
+                                let file = std::fs::OpenOptions::new()
+                                    .append(true)
+                                    .open(&path_for_thread)
+                                    .map_err(|e| crate::Error::Io(Box::new(e)))?;
+                                let mut writer = std::io::BufWriter::new(file);
+                                for chunk in &serialized_bytes {
+                                    writer.write_all(chunk)?;
+                                }
+                                writer.flush()?;
+
+                                enqueue_session_index_snapshot_update(
+                                    sessions_root.clone(),
+                                    path_for_thread.clone(),
+                                    header_snapshot.clone(),
+                                    message_count,
+                                    session_name.clone(),
+                                );
+                                Ok(())
+                            }();
+                            let cx = AgentCx::for_request();
+                            let _ = tx.send(cx.cx(), res);
+                        });
+
+                        let cx = AgentCx::for_request();
+                        let result = rx
+                            .recv(cx.cx())
+                            .await
+                            .map_err(|_| crate::Error::session("Append task cancelled"))?;
+
+                        // Ensure background thread cleans up
+                        if let Err(e) = handle.join() {
+                            std::panic::resume_unwind(e); // Propagate panic if child panicked
+                        }
+
+                        if result.is_ok() {
+                            self.persisted_entry_count.store(new_count, Ordering::SeqCst);
+                            self.appends_since_checkpoint += 1;
+                        }
+                        result?;
+                    }
+                    // No new entries → no-op, nothing to write.
+                }
+            }
+            #[cfg(feature = "sqlite-sessions")]
             SessionStoreKind::Sqlite => {
                 let message_count = self.cached_message_count;
                 let session_name = self.cached_name.clone();
