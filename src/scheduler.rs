@@ -1384,6 +1384,7 @@ pub struct NumaSlabPool {
     config: NumaSlabConfig,
     hugepage_status: HugepageStatus,
     cross_node_allocs: u64,
+    hugepage_backed_allocs: u64,
 }
 
 impl NumaSlabPool {
@@ -1420,6 +1421,7 @@ impl NumaSlabPool {
             config,
             hugepage_status,
             cross_node_allocs: 0,
+            hugepage_backed_allocs: 0,
         }
     }
 
@@ -1451,6 +1453,9 @@ impl NumaSlabPool {
         // Try preferred node first.
         if let Some(slab) = self.slabs.iter_mut().find(|s| s.node_id == preferred_node) {
             if let Some(handle) = slab.allocate() {
+                if self.hugepage_status.active {
+                    self.hugepage_backed_allocs = self.hugepage_backed_allocs.saturating_add(1);
+                }
                 return Some((handle, None));
             }
         }
@@ -1461,6 +1466,9 @@ impl NumaSlabPool {
             }
             if let Some(handle) = slab.allocate() {
                 self.cross_node_allocs = self.cross_node_allocs.saturating_add(1);
+                if self.hugepage_status.active {
+                    self.hugepage_backed_allocs = self.hugepage_backed_allocs.saturating_add(1);
+                }
                 return Some((handle, Some(CrossNodeReason::LocalExhausted)));
             }
         }
@@ -1497,6 +1505,7 @@ impl NumaSlabPool {
         NumaSlabTelemetry {
             per_node,
             cross_node_allocs: self.cross_node_allocs,
+            hugepage_backed_allocs: self.hugepage_backed_allocs,
             hugepage_status: self.hugepage_status,
             config: self.config,
         }
@@ -1519,6 +1528,7 @@ pub struct NumaSlabNodeTelemetry {
 pub struct NumaSlabTelemetry {
     pub per_node: Vec<NumaSlabNodeTelemetry>,
     pub cross_node_allocs: u64,
+    pub hugepage_backed_allocs: u64,
     pub hugepage_status: HugepageStatus,
     pub config: NumaSlabConfig,
 }
@@ -1542,22 +1552,45 @@ impl NumaSlabTelemetry {
         let total_allocs: u64 = self.per_node.iter().map(|n| n.total_allocs).sum();
         let total_frees: u64 = self.per_node.iter().map(|n| n.total_frees).sum();
         let total_in_use: usize = self.per_node.iter().map(|n| n.in_use).sum();
+        let total_capacity: usize = self.per_node.iter().map(|n| n.capacity).sum();
+        let total_high_water: usize = self.per_node.iter().map(|n| n.high_water_mark).sum();
         let remote_allocs = self.cross_node_allocs.min(total_allocs);
         let local_allocs = total_allocs.saturating_sub(remote_allocs);
         let local_ratio_bps = Self::ratio_basis_points(local_allocs, total_allocs);
         let remote_ratio_bps = Self::ratio_basis_points(remote_allocs, total_allocs);
+        let hugepage_backed_allocs = self.hugepage_backed_allocs.min(total_allocs);
+        let hugepage_hit_rate_bps = Self::ratio_basis_points(hugepage_backed_allocs, total_allocs);
+        let total_capacity_u64 = u64::try_from(total_capacity).unwrap_or(u64::MAX);
+        let total_in_use_u64 = u64::try_from(total_in_use).unwrap_or(u64::MAX);
+        let total_high_water_u64 = u64::try_from(total_high_water).unwrap_or(u64::MAX);
+        let occupancy_pressure_bps = Self::ratio_basis_points(total_in_use_u64, total_capacity_u64);
+        let cache_miss_pressure_bps =
+            Self::ratio_basis_points(total_high_water_u64, total_capacity_u64);
+        // Remote allocations are a practical proxy for TLB/cache pressure from cross-node traffic.
+        let tlb_miss_pressure_bps = remote_ratio_bps;
         serde_json::json!({
             "node_count": self.per_node.len(),
             "total_allocs": total_allocs,
             "total_frees": total_frees,
             "total_in_use": total_in_use,
             "cross_node_allocs": self.cross_node_allocs,
+            "hugepage_backed_allocs": hugepage_backed_allocs,
             "local_allocs": local_allocs,
             "remote_allocs": remote_allocs,
             "allocation_ratio_bps": {
                 "scale": Self::RATIO_SCALE_BPS,
                 "local": local_ratio_bps,
                 "remote": remote_ratio_bps,
+            },
+            "hugepage_hit_rate_bps": {
+                "scale": Self::RATIO_SCALE_BPS,
+                "value": hugepage_hit_rate_bps,
+            },
+            "latency_proxies_bps": {
+                "scale": Self::RATIO_SCALE_BPS,
+                "tlb_miss_pressure": tlb_miss_pressure_bps,
+                "cache_miss_pressure": cache_miss_pressure_bps,
+                "occupancy_pressure": occupancy_pressure_bps,
             },
             "config": {
                 "slab_capacity": self.config.slab_capacity,
@@ -1942,10 +1975,9 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 3);
-        assert!(
-            seen.iter()
-                .all(|(call_id, _, _, _)| call_id == "call-stream")
-        );
+        assert!(seen
+            .iter()
+            .all(|(call_id, _, _, _)| call_id == "call-stream"));
         assert_eq!(seen[0].1, 0);
         assert_eq!(seen[1].1, 1);
         assert_eq!(seen[2].1, 2);
@@ -3014,6 +3046,7 @@ mod tests {
         assert_eq!(telemetry.cross_node_allocs, 1);
         let json = telemetry.as_json();
         assert_eq!(json["total_allocs"], serde_json::json!(2));
+        assert_eq!(json["hugepage_backed_allocs"], serde_json::json!(0));
         assert_eq!(json["local_allocs"], serde_json::json!(1));
         assert_eq!(json["remote_allocs"], serde_json::json!(1));
         assert_eq!(
@@ -3026,6 +3059,19 @@ mod tests {
         );
         assert_eq!(
             json["allocation_ratio_bps"]["scale"],
+            serde_json::json!(10_000)
+        );
+        assert_eq!(json["hugepage_hit_rate_bps"]["value"], serde_json::json!(0));
+        assert_eq!(
+            json["latency_proxies_bps"]["tlb_miss_pressure"],
+            serde_json::json!(5000)
+        );
+        assert_eq!(
+            json["latency_proxies_bps"]["cache_miss_pressure"],
+            serde_json::json!(10_000)
+        );
+        assert_eq!(
+            json["latency_proxies_bps"]["occupancy_pressure"],
             serde_json::json!(10_000)
         );
     }
@@ -3102,6 +3148,45 @@ mod tests {
         assert!(status.active);
         assert!(status.fallback_reason.is_none());
         assert_eq!(status.free_pages, 512);
+    }
+
+    #[test]
+    fn numa_slab_pool_tracks_hugepage_hit_rate_when_active() {
+        let topology = ReactorTopologySnapshot::from_core_node_pairs(&[(0, 0)]);
+        let manifest = ReactorPlacementManifest::plan(1, Some(&topology));
+        let config = NumaSlabConfig {
+            slab_capacity: 4,
+            entry_size_bytes: 1024,
+            hugepage: HugepageConfig {
+                page_size_bytes: 4096,
+                enabled: true,
+            },
+        };
+        let mut pool = NumaSlabPool::from_manifest(&manifest, config);
+        pool.set_hugepage_status(HugepageStatus {
+            total_pages: 128,
+            free_pages: 64,
+            page_size_bytes: 4096,
+            active: true,
+            fallback_reason: None,
+        });
+
+        let _ = pool.allocate(0).expect("first hugepage-backed alloc");
+        let _ = pool.allocate(0).expect("second hugepage-backed alloc");
+
+        let telemetry = pool.telemetry();
+        let json = telemetry.as_json();
+        assert_eq!(json["total_allocs"], serde_json::json!(2));
+        assert_eq!(json["hugepage_backed_allocs"], serde_json::json!(2));
+        assert_eq!(
+            json["hugepage_hit_rate_bps"]["value"],
+            serde_json::json!(10_000)
+        );
+        assert_eq!(
+            json["hugepage_hit_rate_bps"]["scale"],
+            serde_json::json!(10_000)
+        );
+        assert_eq!(json["hugepage"]["active"], serde_json::json!(true));
     }
 
     #[test]
@@ -3444,6 +3529,7 @@ mod tests {
         assert_eq!(json["total_allocs"], serde_json::json!(3));
         assert_eq!(json["total_in_use"], serde_json::json!(3));
         assert_eq!(json["cross_node_allocs"], serde_json::json!(0));
+        assert_eq!(json["hugepage_backed_allocs"], serde_json::json!(0));
         assert_eq!(json["local_allocs"], serde_json::json!(3));
         assert_eq!(json["remote_allocs"], serde_json::json!(0));
         assert_eq!(
@@ -3453,6 +3539,23 @@ mod tests {
         assert_eq!(json["allocation_ratio_bps"]["remote"], serde_json::json!(0));
         assert_eq!(
             json["allocation_ratio_bps"]["scale"],
+            serde_json::json!(10_000)
+        );
+        assert_eq!(json["hugepage_hit_rate_bps"]["value"], serde_json::json!(0));
+        assert_eq!(
+            json["latency_proxies_bps"]["tlb_miss_pressure"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            json["latency_proxies_bps"]["cache_miss_pressure"],
+            serde_json::json!(937)
+        );
+        assert_eq!(
+            json["latency_proxies_bps"]["occupancy_pressure"],
+            serde_json::json!(937)
+        );
+        assert_eq!(
+            json["latency_proxies_bps"]["scale"],
             serde_json::json!(10_000)
         );
         assert_eq!(json["config"]["slab_capacity"], serde_json::json!(16));
