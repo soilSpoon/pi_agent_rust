@@ -1059,8 +1059,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         .collect::<Result<Vec<_>, _>>()?;
     if parsed_required_stage_keys != expected_required_stage_keys {
         return Err(format!(
-            "stage_summary.required_stage_keys must equal {:?}, got {:?}",
-            expected_required_stage_keys, parsed_required_stage_keys
+            "stage_summary.required_stage_keys must equal {expected_required_stage_keys:?}, got {parsed_required_stage_keys:?}"
         ));
     }
     let operation_stage_coverage = stage_summary
@@ -1088,8 +1087,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         .collect::<Vec<_>>();
     if !unexpected_stage_coverage_keys.is_empty() {
         return Err(format!(
-            "stage_summary.operation_stage_coverage has unexpected keys: {:?}",
-            unexpected_stage_coverage_keys
+            "stage_summary.operation_stage_coverage has unexpected keys: {unexpected_stage_coverage_keys:?}"
         ));
     }
     let covered_cells = stage_summary
