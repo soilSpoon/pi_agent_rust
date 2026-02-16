@@ -401,4 +401,216 @@ mod tests {
         let result = classify_failure(output);
         assert!(result.is_retriable());
     }
+
+    mod proptest_flake_classifier {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generates a string guaranteed to trigger a specific `FlakeCategory`.
+        fn arb_transient_line() -> impl Strategy<Value = (String, FlakeCategory)> {
+            prop_oneof![
+                Just((
+                    "oracle process timed out".to_string(),
+                    FlakeCategory::OracleTimeout
+                )),
+                Just((
+                    "bun timed out waiting".to_string(),
+                    FlakeCategory::OracleTimeout
+                )),
+                Just((
+                    "fatal: out of memory".to_string(),
+                    FlakeCategory::ResourceExhaustion
+                )),
+                Just(("error: ENOMEM".to_string(), FlakeCategory::ResourceExhaustion)),
+                Just((
+                    "cannot allocate 4 GB".to_string(),
+                    FlakeCategory::ResourceExhaustion
+                )),
+                Just((
+                    "quickjs runtime: allocation failed, out of memory".to_string(),
+                    FlakeCategory::JsGcPressure
+                )),
+                Just((
+                    "EBUSY: resource busy".to_string(),
+                    FlakeCategory::FsContention
+                )),
+                Just(("ETXTBSY".to_string(), FlakeCategory::FsContention)),
+                Just((
+                    "resource busy or locked".to_string(),
+                    FlakeCategory::FsContention
+                )),
+                Just((
+                    "EADDRINUSE on port 8080".to_string(),
+                    FlakeCategory::PortConflict
+                )),
+                Just((
+                    "address already in use".to_string(),
+                    FlakeCategory::PortConflict
+                )),
+                Just((
+                    "ENOENT: no such file or directory /tmp/pi-test".to_string(),
+                    FlakeCategory::TmpdirRace
+                )),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn classify_failure_never_panics(s in ".*") {
+                let _ = classify_failure(&s);
+            }
+
+            #[test]
+            fn deterministic_is_not_retriable(s in "[a-zA-Z0-9 ]{0,200}") {
+                let result = classify_failure(&s);
+                if result == FlakeClassification::Deterministic {
+                    assert!(!result.is_retriable());
+                }
+            }
+
+            #[test]
+            fn transient_is_always_retriable(s in ".*") {
+                let result = classify_failure(&s);
+                if let FlakeClassification::Transient { .. } = &result {
+                    assert!(result.is_retriable());
+                }
+            }
+
+            #[test]
+            fn known_transient_lines_classify_correctly(
+                (line, expected_cat) in arb_transient_line()
+            ) {
+                let result = classify_failure(&line);
+                match result {
+                    FlakeClassification::Transient { category, .. } => {
+                        assert_eq!(
+                            category, expected_cat,
+                            "line {line:?} got {category:?} expected {expected_cat:?}"
+                        );
+                    }
+                    FlakeClassification::Deterministic => {
+                        panic!("expected Transient for {line:?}, got Deterministic");
+                    }
+                }
+            }
+
+            #[test]
+            fn classify_is_case_insensitive(
+                (line, expected_cat) in arb_transient_line()
+            ) {
+                let upper = classify_failure(&line.to_uppercase());
+                let lower = classify_failure(&line.to_lowercase());
+                match (&upper, &lower) {
+                    (
+                        FlakeClassification::Transient { category: cu, .. },
+                        FlakeClassification::Transient { category: cl, .. },
+                    ) => {
+                        assert_eq!(*cu, expected_cat);
+                        assert_eq!(*cl, expected_cat);
+                    }
+                    _ => panic!("expected both Transient for line {line:?}"),
+                }
+            }
+
+            #[test]
+            fn noise_prefix_preserves_classification(
+                noise in "[a-zA-Z0-9 ]{0,50}",
+                (line, expected_cat) in arb_transient_line(),
+            ) {
+                let input = format!("{noise}\n{line}");
+                let result = classify_failure(&input);
+                match result {
+                    FlakeClassification::Transient { category, .. } => {
+                        assert_eq!(category, expected_cat);
+                    }
+                    FlakeClassification::Deterministic => {
+                        panic!("expected Transient for input with line {line:?}");
+                    }
+                }
+            }
+
+            #[test]
+            fn whitespace_only_is_deterministic(s in "[ \\t\\n]{0,100}") {
+                assert_eq!(classify_failure(&s), FlakeClassification::Deterministic);
+            }
+
+            #[test]
+            fn serde_roundtrip_transient((line, _cat) in arb_transient_line()) {
+                let result = classify_failure(&line);
+                let json = serde_json::to_string(&result).unwrap();
+                let back: FlakeClassification = serde_json::from_str(&json).unwrap();
+                assert_eq!(result, back);
+            }
+
+            #[test]
+            fn serde_roundtrip_category(idx in 0..6usize) {
+                let cat = FlakeCategory::all()[idx];
+                let json = serde_json::to_string(&cat).unwrap();
+                let back: FlakeCategory = serde_json::from_str(&json).unwrap();
+                assert_eq!(cat, back);
+            }
+
+            #[test]
+            fn all_categories_have_nonempty_labels(idx in 0..6usize) {
+                let cat = FlakeCategory::all()[idx];
+                assert!(!cat.label().is_empty());
+                assert!(!cat.to_string().is_empty());
+                assert_eq!(cat.label(), cat.to_string());
+            }
+
+            #[test]
+            fn retry_policy_respects_attempt_bound(
+                max_retries in 0..10u32,
+                attempt in 0..20u32,
+            ) {
+                let policy = RetryPolicy {
+                    max_retries,
+                    retry_delay_secs: 1,
+                    flake_budget: 3,
+                };
+                let transient = FlakeClassification::Transient {
+                    category: FlakeCategory::OracleTimeout,
+                    matched_line: "x".into(),
+                };
+                let should = policy.should_retry(&transient, attempt);
+                assert_eq!(should, attempt < max_retries);
+            }
+
+            #[test]
+            fn retry_policy_never_retries_deterministic(
+                max_retries in 0..10u32,
+                attempt in 0..20u32,
+            ) {
+                let policy = RetryPolicy {
+                    max_retries,
+                    retry_delay_secs: 1,
+                    flake_budget: 3,
+                };
+                assert!(!policy.should_retry(&FlakeClassification::Deterministic, attempt));
+            }
+
+            #[test]
+            fn flake_event_serde_roundtrip_prop(
+                target in "[a-z_]{1,20}",
+                attempt in 0..100u32,
+                idx in 0..6usize,
+            ) {
+                let cat = FlakeCategory::all()[idx];
+                let event = FlakeEvent {
+                    target: target.clone(),
+                    classification: FlakeClassification::Transient {
+                        category: cat,
+                        matched_line: "matched".into(),
+                    },
+                    attempt,
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                };
+                let json = serde_json::to_string(&event).unwrap();
+                let back: FlakeEvent = serde_json::from_str(&json).unwrap();
+                assert_eq!(back.target, target);
+                assert_eq!(back.attempt, attempt);
+                assert!(back.classification.is_retriable());
+            }
+        }
+    }
 }

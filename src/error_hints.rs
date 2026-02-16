@@ -1021,4 +1021,173 @@ mod tests {
         assert!(formatted.contains("not found"));
         assert!(formatted.contains("Verify the path"));
     }
+
+    // -----------------------------------------------------------------------
+    // Property-based tests
+    // -----------------------------------------------------------------------
+
+    mod proptest_error_hints {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Build an Error from an index + message (avoids Clone requirement).
+        fn make_error(variant: usize, msg: &str) -> Error {
+            match variant % 9 {
+                0 => Error::config(msg),
+                1 => Error::session(msg),
+                2 => Error::auth(msg),
+                3 => Error::validation(msg),
+                4 => Error::extension(msg),
+                5 => Error::api(msg),
+                6 => Error::provider("test", msg),
+                7 => Error::tool("test", msg),
+                _ => Error::Aborted,
+            }
+        }
+
+        proptest! {
+            /// `hints_for_error` never panics on any error variant.
+            #[test]
+            fn hints_for_error_never_panics(variant in 0..9usize, msg in "[\\w\\s./]{0,80}") {
+                let error = make_error(variant, &msg);
+                let hint = hints_for_error(&error);
+                assert!(!hint.summary.is_empty());
+                assert!(hint.hints.len() <= 2);
+                assert!(hint.context_fields.len() <= 3);
+            }
+
+            /// `format_error_with_hints` never panics and always starts with "Error:".
+            #[test]
+            fn format_error_never_panics(variant in 0..9usize, msg in "[\\w\\s./]{0,80}") {
+                let error = make_error(variant, &msg);
+                let formatted = format_error_with_hints(&error);
+                assert!(formatted.starts_with("Error:"));
+            }
+
+            /// Summary is always non-empty and contains no control characters.
+            #[test]
+            fn summary_is_clean(variant in 0..9usize, msg in "[\\w\\s./]{0,80}") {
+                let error = make_error(variant, &msg);
+                let hint = hints_for_error(&error);
+                assert!(!hint.summary.is_empty());
+                assert!(!hint.summary.contains('\n'));
+                assert!(!hint.summary.contains('\r'));
+            }
+
+            /// Each hint line is non-empty.
+            #[test]
+            fn hints_are_nonempty(variant in 0..9usize, msg in "[\\w\\s./]{0,80}") {
+                let error = make_error(variant, &msg);
+                let hint = hints_for_error(&error);
+                for &h in hint.hints {
+                    assert!(!h.is_empty());
+                }
+            }
+
+            /// Each context field is a valid identifier-like string.
+            #[test]
+            fn context_fields_are_identifiers(variant in 0..9usize, msg in "[\\w\\s./]{0,80}") {
+                let error = make_error(variant, &msg);
+                let hint = hints_for_error(&error);
+                for &field in hint.context_fields {
+                    assert!(!field.is_empty());
+                    assert!(field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+                }
+            }
+
+            /// Config error with "cassette" always maps to VCR hint.
+            #[test]
+            fn config_cassette_keyword_triggers_vcr(prefix in "[a-zA-Z ]{0,30}") {
+                let msg = format!("{prefix} cassette missing");
+                let error = Error::config(msg);
+                let hint = hints_for_error(&error);
+                assert_eq!(hint.summary, "VCR cassette missing or invalid");
+            }
+
+            /// Config error with "settings.json" always maps to settings hint.
+            #[test]
+            fn config_settings_keyword_triggers_settings(prefix in "[a-zA-Z ]{0,30}") {
+                let msg = format!("{prefix} settings.json not found");
+                let error = Error::config(msg);
+                let hint = hints_for_error(&error);
+                assert!(hint.summary.contains("configuration"));
+            }
+
+            /// Config error with "models.json" always maps to models hint.
+            #[test]
+            fn config_models_keyword_triggers_models(prefix in "[a-zA-Z ]{0,30}") {
+                let msg = format!("{prefix} models.json parse error");
+                let error = Error::config(msg);
+                let hint = hints_for_error(&error);
+                assert_eq!(hint.summary, "Invalid models configuration");
+            }
+
+            /// Auth error with "API key" always mentions API key setup.
+            #[test]
+            fn auth_api_key_keyword(suffix in "[a-zA-Z ]{0,30}") {
+                let msg = format!("API key {suffix}");
+                let error = Error::auth(msg);
+                let hint = hints_for_error(&error);
+                assert!(hint.summary.contains("API key"));
+                assert!(hint.hints.iter().any(|h| h.contains("ANTHROPIC_API_KEY")));
+            }
+
+            /// Provider error with "429" always triggers rate limit hint.
+            #[test]
+            fn provider_429_triggers_rate_limit(provider in "[a-z]{1,10}", suffix in "[a-zA-Z ]{0,30}") {
+                let msg = format!("429 {suffix}");
+                let error = Error::provider(provider, msg);
+                let hint = hints_for_error(&error);
+                assert_eq!(hint.summary, "Rate limit exceeded");
+            }
+
+            /// Provider error with "timeout" always triggers timeout hint.
+            #[test]
+            fn provider_timeout_triggers_timeout_hint(provider in "[a-z]{1,10}", prefix in "[a-zA-Z ]{0,30}") {
+                let msg = format!("{prefix} timeout");
+                let error = Error::provider(provider, msg);
+                let hint = hints_for_error(&error);
+                assert!(!hint.summary.is_empty());
+            }
+
+            /// Aborted error always has empty hints.
+            #[test]
+            fn aborted_always_empty_hints(_dummy in 0..10u32) {
+                let hint = hints_for_error(&Error::Aborted);
+                assert!(hint.hints.is_empty());
+                assert!(hint.context_fields.is_empty());
+                assert_eq!(hint.summary, "Operation cancelled by user");
+            }
+
+            /// `format_error_with_hints` includes "Suggestions:" iff hints are non-empty.
+            #[test]
+            fn format_includes_suggestions_iff_hints(variant in 0..9usize, msg in "[\\w\\s./]{0,80}") {
+                let error = make_error(variant, &msg);
+                let hint = hints_for_error(&error);
+                let formatted = format_error_with_hints(&error);
+                if hint.hints.is_empty() {
+                    assert!(!formatted.contains("Suggestions:"));
+                } else {
+                    assert!(formatted.contains("Suggestions:"));
+                }
+            }
+
+            /// Tool error category detection: "read" + "not found" → File not found.
+            #[test]
+            fn tool_read_not_found_hint(suffix in "[a-zA-Z /]{0,40}") {
+                let msg = format!("not found {suffix}");
+                let error = Error::tool("read", msg);
+                let hint = hints_for_error(&error);
+                assert_eq!(hint.summary, "File not found");
+            }
+
+            /// Tool error: unknown tool always gets generic hint.
+            #[test]
+            fn tool_unknown_gets_generic(tool in "[a-z]{5,10}", msg in "[a-zA-Z ]{0,40}") {
+                let error = Error::tool(tool, msg);
+                let hint = hints_for_error(&error);
+                assert_eq!(hint.summary, "Tool execution error");
+            }
+        }
+    }
 }
