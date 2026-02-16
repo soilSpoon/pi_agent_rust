@@ -11,6 +11,7 @@ use crate::session::SessionEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -242,7 +243,45 @@ impl SessionStoreV2 {
             last_entry_id: None,
             last_crc32c: "00000000".to_string(),
         };
-        store.bootstrap_from_disk()?;
+        if let Err(err) = store.bootstrap_from_disk() {
+            if is_recoverable_index_error(&err) {
+                tracing::warn!(
+                    root = %store.root.display(),
+                    error = %err,
+                    "SessionStoreV2 bootstrap failed with recoverable index error; attempting index rebuild"
+                );
+                store.rebuild_index()?;
+                store.bootstrap_from_disk()?;
+            } else {
+                return Err(err);
+            }
+        }
+
+        // Recovery path: segments exist but index file is missing or empty.
+        // Rebuild from segment frames so resume does not appear as an empty session.
+        if store.entry_count() == 0 && store.segments_exist_with_data()? {
+            tracing::warn!(
+                root = %store.root.display(),
+                "SessionStoreV2 detected segment data with empty index; rebuilding index"
+            );
+            store.rebuild_index()?;
+            store.bootstrap_from_disk()?;
+        }
+
+        if let Err(err) = store.validate_integrity() {
+            if is_recoverable_index_error(&err) {
+                tracing::warn!(
+                    root = %store.root.display(),
+                    error = %err,
+                    "SessionStoreV2 integrity validation failed with recoverable error; rebuilding index"
+                );
+                store.rebuild_index()?;
+                store.bootstrap_from_disk()?;
+                store.validate_integrity()?;
+            } else {
+                return Err(err);
+            }
+        }
         Ok(store)
     }
 
@@ -262,6 +301,40 @@ impl SessionStoreV2 {
 
     fn migration_ledger_path(&self) -> PathBuf {
         self.root.join("migrations").join("ledger.jsonl")
+    }
+
+    fn list_segment_files(&self) -> Result<Vec<(u64, PathBuf)>> {
+        let segments_dir = self.root.join("segments");
+        if !segments_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut segment_files = Vec::new();
+        for entry in fs::read_dir(segments_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("seg") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(segment_seq) = stem.parse::<u64>() else {
+                continue;
+            };
+            segment_files.push((segment_seq, path));
+        }
+        segment_files.sort_by_key(|(segment_seq, _)| *segment_seq);
+        Ok(segment_files)
+    }
+
+    fn segments_exist_with_data(&self) -> Result<bool> {
+        for (_, path) in self.list_segment_files()? {
+            if fs::metadata(path)?.len() > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn append_entry(
@@ -742,11 +815,14 @@ impl SessionStoreV2 {
             entry_seq: 0,
             entry_id: String::new(),
         });
-        let segment_count = index_rows
-            .iter()
-            .map(|row| row.segment_seq)
-            .max()
-            .unwrap_or(0);
+        let segment_count = u64::try_from(
+            index_rows
+                .iter()
+                .map(|row| row.segment_seq)
+                .collect::<BTreeSet<_>>()
+                .len(),
+        )
+        .map_err(|_| Error::session("segment count exceeds u64"))?;
 
         let mut manifest = Manifest {
             schema: MANIFEST_SCHEMA.to_string(),
@@ -840,12 +916,8 @@ impl SessionStoreV2 {
         self.last_entry_id = None;
         self.last_crc32c = "00000000".to_string();
 
-        let mut seg_seq = 1u64;
-        loop {
-            let seg_path = self.segment_file_path(seg_seq);
-            if !seg_path.exists() {
-                break;
-            }
+        let segment_files = self.list_segment_files()?;
+        for (_seg_seq, seg_path) in segment_files {
             let file = File::open(&seg_path)?;
             let reader = BufReader::new(file);
             let mut byte_offset = 0u64;
@@ -888,7 +960,6 @@ impl SessionStoreV2 {
                 byte_offset = byte_offset.saturating_add(line_len);
                 rebuilt_count = rebuilt_count.saturating_add(1);
             }
-            seg_seq = seg_seq.saturating_add(1);
         }
 
         self.next_segment_seq = 1;
@@ -1043,6 +1114,22 @@ fn classify_rollback_error(error: &Error) -> &'static str {
             }
         }
         _ => error.category_code(),
+    }
+}
+
+fn is_recoverable_index_error(error: &Error) -> bool {
+    match error {
+        Error::Json(_) => true,
+        Error::Session(message) => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("checksum mismatch")
+                || lower.contains("index out of bounds")
+                || lower.contains("index/frame mismatch")
+                || lower.contains("payload integrity mismatch")
+                || lower.contains("entry sequence is not strictly increasing")
+                || lower.contains("index byte range overflow")
+        }
+        _ => false,
     }
 }
 

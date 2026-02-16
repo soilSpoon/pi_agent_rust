@@ -186,6 +186,38 @@ fn bootstrap_fails_if_index_points_to_missing_segment() -> PiResult<()> {
     Ok(())
 }
 
+#[test]
+fn create_recovers_when_index_file_is_missing_but_segments_exist() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    let expected_ids = append_linear_entries(&mut store, 4)?;
+
+    let index_path = store.index_file_path();
+    fs::remove_file(&index_path)?;
+
+    let recovered = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    recovered.validate_integrity()?;
+    assert_eq!(recovered.entry_count(), 4);
+    assert_eq!(frame_ids(&recovered.read_all_entries()?), expected_ids);
+    Ok(())
+}
+
+#[test]
+fn create_recovers_when_index_json_is_corrupt() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    let expected_ids = append_linear_entries(&mut store, 5)?;
+
+    let index_path = store.index_file_path();
+    fs::write(&index_path, "{ definitely-not-json }\n")?;
+
+    let recovered = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    recovered.validate_integrity()?;
+    assert_eq!(recovered.entry_count(), 5);
+    assert_eq!(frame_ids(&recovered.read_all_entries()?), expected_ids);
+    Ok(())
+}
+
 // ── O(index+tail) resume path tests ──────────────────────────────────
 
 /// Helper: build a `SessionEntry::Custom` with the given id and parent.
@@ -1264,7 +1296,7 @@ fn migration_status_partial_when_sidecar_incomplete() {
 }
 
 #[test]
-fn migration_status_corrupt_when_index_damaged() -> PiResult<()> {
+fn migration_status_self_heals_when_index_damaged() -> PiResult<()> {
     let dir = tempdir()?;
     let entries = vec![
         make_message_entry("c1", None, "one"),
@@ -1278,10 +1310,19 @@ fn migration_status_corrupt_when_index_damaged() -> PiResult<()> {
     let index_path = v2_root.join("index").join("offsets.jsonl");
     fs::write(&index_path, "not valid json\n")?;
 
-    match pi::session::migration_status(&jsonl) {
-        MigrationState::Corrupt { .. } => {} // expected
-        other => panic!("Expected Corrupt, got {other:?}"),
-    }
+    // Recoverable index corruption should be rebuilt automatically.
+    assert_eq!(
+        pi::session::migration_status(&jsonl),
+        MigrationState::Migrated
+    );
+
+    let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+    store.validate_integrity()?;
+    assert_eq!(store.entry_count(), 2);
+    assert_eq!(
+        frame_ids(&store.read_all_entries()?),
+        vec!["c1".to_string(), "c2".to_string()]
+    );
 
     Ok(())
 }
@@ -1705,11 +1746,15 @@ fn e2e_corrupt_migration_recovery_cleanup_only() -> PiResult<()> {
     let entries = vec![make_message_entry("c1", None, "data")];
     let jsonl = build_test_jsonl(dir.path(), &entries);
 
-    // Create a valid V2 sidecar then corrupt it.
+    // Create a valid V2 sidecar then corrupt a segment (not recoverable by index rebuild).
     pi::session::migrate_jsonl_to_v2(&jsonl, "pre-corrupt")?;
     let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
-    let index_path = v2_root.join("index").join("offsets.jsonl");
-    fs::write(&index_path, "totally invalid json garbage\n")?;
+    let seg_path = v2_root.join("segments").join("0000000000000001.seg");
+    assert!(
+        seg_path.exists(),
+        "expected segment file to exist before corruption"
+    );
+    fs::write(&seg_path, "corrupted segment data\n")?;
 
     // Status should be Corrupt.
     match pi::session::migration_status(&jsonl) {
