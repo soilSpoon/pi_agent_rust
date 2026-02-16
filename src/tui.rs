@@ -580,7 +580,11 @@ fn strip_markup(text: &str) -> String {
                 // Heuristic: rich_rust tags usually contain alpha, space, slash, comma.
                 // If we see digits or other symbols, assume it's not a tag (e.g. array[0]).
                 if !next_c.is_ascii_alphanumeric()
-                    && !matches!(next_c, ' ' | '/' | ',' | '#' | '=' | '.' | ':' | '-' | '_')
+                    && !matches!(
+                        next_c,
+                        ' ' | '/' | ',' | '#' | '=' | '.' | ':' | '-' | '_' | '?' | '&' | '%' | '+'
+                            | '~' | ';' | '!' | '*' | '\'' | '(' | ')'
+                    )
                 {
                     is_tag = false;
                 }

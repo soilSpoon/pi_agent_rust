@@ -3022,6 +3022,8 @@ async fn run_rpc_mode(
     auth: AuthStorage,
     runtime_handle: RuntimeHandle,
 ) -> Result<()> {
+    use futures::FutureExt;
+
     let (abort_handle, abort_signal) = AbortHandle::new();
     let abort_listener = abort_handle.clone();
     if let Err(err) = ctrlc::set_handler(move || {
@@ -3029,8 +3031,6 @@ async fn run_rpc_mode(
     }) {
         eprintln!("Warning: Failed to install Ctrl+C handler for RPC mode: {err}");
     }
-
-    use futures::FutureExt;
     let rpc_task = pi::rpc::run_stdio(
         session,
         pi::rpc::RpcOptions {
