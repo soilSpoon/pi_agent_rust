@@ -2180,7 +2180,7 @@ mod tests {
                 }
                 let bundle1 = builder1.build().expect("build1");
 
-                let mut reversed = drafts.clone();
+                let mut reversed = drafts;
                 reversed.reverse();
                 let mut builder2 = ReplayTraceBuilder::new("trace-det");
                 for d in &reversed {

@@ -14343,13 +14343,18 @@ impl JsRuntimeHost {
     /// `ExtensionManager` has already been dropped (shutdown in progress).
     fn manager(&self) -> Option<ExtensionManager> {
         self.manager_ref.upgrade().map(|inner| {
-            let snapshot = Arc::new(RwLock::new(Arc::new(RegistrySnapshot::default())));
-            let snapshot_version = Arc::new(AtomicU64::new(0));
-            ExtensionManager {
+            let mgr = ExtensionManager {
                 inner,
-                snapshot,
-                snapshot_version,
-            }
+                snapshot: Arc::new(RwLock::new(Arc::new(RegistrySnapshot::default()))),
+                snapshot_version: Arc::new(AtomicU64::new(0)),
+            };
+            // Refresh snapshot from the shared inner state so the
+            // reconstructed manager sees the session handle and all
+            // registered extensions.
+            let guard = mgr.inner.lock().unwrap();
+            mgr.refresh_snapshot_locked(&guard);
+            drop(guard);
+            mgr
         })
     }
 }

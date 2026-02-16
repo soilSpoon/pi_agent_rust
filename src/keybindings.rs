@@ -2530,6 +2530,7 @@ mod tests {
             fn single_letters_always_valid(
                 idx in 0..26usize,
             ) {
+                #[allow(clippy::cast_possible_truncation)]
                 let c = (b'a' + idx as u8) as char;
                 let s = c.to_string();
                 assert!(
