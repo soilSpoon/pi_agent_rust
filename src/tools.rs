@@ -1054,6 +1054,7 @@ struct ReadInput {
 
 pub struct ReadTool {
     cwd: PathBuf,
+    /// Whether to auto-resize images to fit token limits.
     auto_resize: bool,
     block_images: bool,
 }
