@@ -58,6 +58,10 @@ pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     snapshot: PolicySnapshot,
     /// Deterministic policy snapshot version hash for provenance/telemetry.
     snapshot_version: String,
+    /// Configuration for sampled shadow dual execution.
+    dual_exec_config: DualExecOracleConfig,
+    /// Runtime state for sampled dual execution and rollback guards.
+    dual_exec_state: RefCell<DualExecOracleState>,
     /// Adaptive regime detector for hostcall workload shifts.
     regime_detector: RefCell<RegimeShiftDetector>,
     /// AMAC batch executor for interleaved hostcall dispatch.
@@ -290,6 +294,411 @@ fn hostcall_outcome_to_protocol_result_with_trace(
             }
         }
     }
+}
+
+const DUAL_EXEC_SAMPLE_MODULUS_PPM: u32 = 1_000_000;
+const DUAL_EXEC_DEFAULT_SAMPLE_PPM: u32 = 25_000;
+const DUAL_EXEC_DEFAULT_DIVERGENCE_WINDOW: usize = 64;
+const DUAL_EXEC_DEFAULT_DIVERGENCE_BUDGET: usize = 3;
+const DUAL_EXEC_DEFAULT_ROLLBACK_REQUESTS: usize = 128;
+const DUAL_EXEC_DEFAULT_OVERHEAD_BUDGET_US: u64 = 1_500;
+const DUAL_EXEC_DEFAULT_OVERHEAD_BACKOFF_REQUESTS: usize = 32;
+
+#[derive(Debug, Clone, Copy)]
+struct DualExecOracleConfig {
+    sample_ppm: u32,
+    divergence_window: usize,
+    divergence_budget: usize,
+    rollback_requests: usize,
+    overhead_budget_us: u64,
+    overhead_backoff_requests: usize,
+}
+
+impl Default for DualExecOracleConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl DualExecOracleConfig {
+    fn from_env() -> Self {
+        let sample_ppm = std::env::var("PI_EXT_DUAL_EXEC_SAMPLE_PPM")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .unwrap_or(DUAL_EXEC_DEFAULT_SAMPLE_PPM)
+            .min(DUAL_EXEC_SAMPLE_MODULUS_PPM);
+        let divergence_window = std::env::var("PI_EXT_DUAL_EXEC_DIVERGENCE_WINDOW")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(DUAL_EXEC_DEFAULT_DIVERGENCE_WINDOW)
+            .max(1);
+        let divergence_budget = std::env::var("PI_EXT_DUAL_EXEC_DIVERGENCE_BUDGET")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(DUAL_EXEC_DEFAULT_DIVERGENCE_BUDGET)
+            .max(1);
+        let rollback_requests = std::env::var("PI_EXT_DUAL_EXEC_ROLLBACK_REQUESTS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(DUAL_EXEC_DEFAULT_ROLLBACK_REQUESTS)
+            .max(1);
+        let overhead_budget_us = std::env::var("PI_EXT_DUAL_EXEC_OVERHEAD_BUDGET_US")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DUAL_EXEC_DEFAULT_OVERHEAD_BUDGET_US)
+            .max(1);
+        let overhead_backoff_requests = std::env::var("PI_EXT_DUAL_EXEC_OVERHEAD_BACKOFF_REQUESTS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(DUAL_EXEC_DEFAULT_OVERHEAD_BACKOFF_REQUESTS)
+            .max(1);
+
+        Self {
+            sample_ppm,
+            divergence_window,
+            divergence_budget,
+            rollback_requests,
+            overhead_budget_us,
+            overhead_backoff_requests,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DualExecOracleState {
+    sampled_total: u64,
+    matched_total: u64,
+    divergence_total: u64,
+    skipped_unsupported_total: u64,
+    skipped_overhead_total: u64,
+    divergence_window: VecDeque<bool>,
+    rollback_remaining: usize,
+    rollback_reason: Option<String>,
+    overhead_backoff_remaining: usize,
+}
+
+impl DualExecOracleState {
+    fn begin_request(&mut self) {
+        if self.rollback_remaining > 0 {
+            self.rollback_remaining = self.rollback_remaining.saturating_sub(1);
+            if self.rollback_remaining == 0 {
+                self.rollback_reason = None;
+            }
+        }
+        if self.overhead_backoff_remaining > 0 {
+            self.overhead_backoff_remaining = self.overhead_backoff_remaining.saturating_sub(1);
+        }
+    }
+
+    const fn rollback_active(&self) -> bool {
+        self.rollback_remaining > 0
+    }
+
+    const fn record_overhead_budget_exceeded(&mut self, config: DualExecOracleConfig) {
+        self.skipped_overhead_total = self.skipped_overhead_total.saturating_add(1);
+        self.overhead_backoff_remaining = config.overhead_backoff_requests;
+    }
+
+    fn record_sample(
+        &mut self,
+        divergent: bool,
+        config: DualExecOracleConfig,
+        extension_id: Option<&str>,
+    ) -> Option<String> {
+        self.sampled_total = self.sampled_total.saturating_add(1);
+        if divergent {
+            self.divergence_total = self.divergence_total.saturating_add(1);
+        } else {
+            self.matched_total = self.matched_total.saturating_add(1);
+        }
+        self.divergence_window.push_back(divergent);
+        while self.divergence_window.len() > config.divergence_window {
+            let _ = self.divergence_window.pop_front();
+        }
+        let divergence_count = self.divergence_window.iter().filter(|&&flag| flag).count();
+        if divergence_count >= config.divergence_budget {
+            self.rollback_remaining = config.rollback_requests;
+            let reason = format!(
+                "dual_exec_divergence_budget_exceeded:{divergence_count}/{window}:{scope}",
+                window = self.divergence_window.len(),
+                scope = extension_id.unwrap_or("global")
+            );
+            self.rollback_reason = Some(reason.clone());
+            return Some(reason);
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DualExecOutcomeDiff {
+    reason: &'static str,
+    fast_fingerprint: String,
+    compat_fingerprint: String,
+}
+
+fn hostcall_value_fingerprint(value: &Value) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hash_canonical_json(value, &mut hasher);
+    format!("{:x}", hasher.finalize())
+}
+
+fn hostcall_outcome_fingerprint(outcome: &HostcallOutcome) -> String {
+    match outcome {
+        HostcallOutcome::Success(output) => {
+            let hash = hostcall_value_fingerprint(output);
+            format!("success:{hash}")
+        }
+        HostcallOutcome::Error { code, message } => {
+            let hash = hostcall_value_fingerprint(&serde_json::json!({
+                "code": code,
+                "message": message,
+            }));
+            format!("error:{hash}")
+        }
+        HostcallOutcome::StreamChunk {
+            sequence,
+            chunk,
+            is_final,
+        } => {
+            let hash = hostcall_value_fingerprint(&serde_json::json!({
+                "sequence": sequence,
+                "chunk": chunk,
+                "isFinal": is_final,
+            }));
+            format!("stream:{hash}")
+        }
+    }
+}
+
+fn diff_hostcall_outcomes(
+    fast: &HostcallOutcome,
+    compat: &HostcallOutcome,
+) -> Option<DualExecOutcomeDiff> {
+    match (fast, compat) {
+        (HostcallOutcome::Success(a), HostcallOutcome::Success(b)) => {
+            let a_hash = hostcall_value_fingerprint(a);
+            let b_hash = hostcall_value_fingerprint(b);
+            if a_hash == b_hash {
+                None
+            } else {
+                Some(DualExecOutcomeDiff {
+                    reason: "success_output_mismatch",
+                    fast_fingerprint: format!("success:{a_hash}"),
+                    compat_fingerprint: format!("success:{b_hash}"),
+                })
+            }
+        }
+        (
+            HostcallOutcome::Error {
+                code: a_code,
+                message: a_message,
+            },
+            HostcallOutcome::Error {
+                code: b_code,
+                message: b_message,
+            },
+        ) => {
+            if a_code == b_code && a_message == b_message {
+                None
+            } else if a_code != b_code {
+                Some(DualExecOutcomeDiff {
+                    reason: "error_code_mismatch",
+                    fast_fingerprint: hostcall_outcome_fingerprint(fast),
+                    compat_fingerprint: hostcall_outcome_fingerprint(compat),
+                })
+            } else {
+                Some(DualExecOutcomeDiff {
+                    reason: "error_message_mismatch",
+                    fast_fingerprint: hostcall_outcome_fingerprint(fast),
+                    compat_fingerprint: hostcall_outcome_fingerprint(compat),
+                })
+            }
+        }
+        (
+            HostcallOutcome::StreamChunk {
+                sequence: a_seq,
+                chunk: a_chunk,
+                is_final: a_final,
+            },
+            HostcallOutcome::StreamChunk {
+                sequence: b_seq,
+                chunk: b_chunk,
+                is_final: b_final,
+            },
+        ) => {
+            if a_seq == b_seq && a_chunk == b_chunk && a_final == b_final {
+                None
+            } else if a_seq != b_seq {
+                Some(DualExecOutcomeDiff {
+                    reason: "stream_sequence_mismatch",
+                    fast_fingerprint: hostcall_outcome_fingerprint(fast),
+                    compat_fingerprint: hostcall_outcome_fingerprint(compat),
+                })
+            } else if a_final != b_final {
+                Some(DualExecOutcomeDiff {
+                    reason: "stream_finality_mismatch",
+                    fast_fingerprint: hostcall_outcome_fingerprint(fast),
+                    compat_fingerprint: hostcall_outcome_fingerprint(compat),
+                })
+            } else {
+                Some(DualExecOutcomeDiff {
+                    reason: "stream_chunk_mismatch",
+                    fast_fingerprint: hostcall_outcome_fingerprint(fast),
+                    compat_fingerprint: hostcall_outcome_fingerprint(compat),
+                })
+            }
+        }
+        _ => Some(DualExecOutcomeDiff {
+            reason: "outcome_variant_mismatch",
+            fast_fingerprint: hostcall_outcome_fingerprint(fast),
+            compat_fingerprint: hostcall_outcome_fingerprint(compat),
+        }),
+    }
+}
+
+fn should_sample_shadow_dual_exec(request: &HostcallRequest, sample_ppm: u32) -> bool {
+    if sample_ppm == 0 {
+        return false;
+    }
+    if sample_ppm >= DUAL_EXEC_SAMPLE_MODULUS_PPM {
+        return true;
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(request.call_id.as_bytes());
+    hasher.update(request.trace_id.to_le_bytes());
+    if let Some(extension_id) = request.extension_id.as_deref() {
+        hasher.update(extension_id.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let bucket = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
+        % DUAL_EXEC_SAMPLE_MODULUS_PPM;
+    bucket < sample_ppm
+}
+
+fn normalized_shadow_op(op: &str) -> String {
+    op.trim().to_ascii_lowercase().replace('_', "")
+}
+
+fn shadow_safe_session_op(op: &str) -> bool {
+    let normalized = normalized_shadow_op(op);
+    matches!(
+        normalized.as_str(),
+        "getstate"
+            | "getmessages"
+            | "getentries"
+            | "getbranch"
+            | "getfile"
+            | "getname"
+            | "getmodel"
+            | "getthinkinglevel"
+            | "getlabel"
+            | "getlabels"
+            | "getallsessions"
+    )
+}
+
+fn shadow_safe_events_op(op: &str) -> bool {
+    let normalized = normalized_shadow_op(op);
+    matches!(
+        normalized.as_str(),
+        "getactivetools"
+            | "getalltools"
+            | "getmodel"
+            | "getthinkinglevel"
+            | "getflag"
+            | "listflags"
+    )
+}
+
+fn shadow_safe_tool(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "read" | "grep" | "find" | "ls"
+    )
+}
+
+fn is_shadow_safe_request(request: &HostcallRequest) -> bool {
+    match &request.kind {
+        HostcallKind::Session { op } => shadow_safe_session_op(op),
+        HostcallKind::Events { op } => shadow_safe_events_op(op),
+        HostcallKind::Tool { name } => shadow_safe_tool(name),
+        HostcallKind::Http
+        | HostcallKind::Exec { .. }
+        | HostcallKind::Ui { .. }
+        | HostcallKind::Log => false,
+    }
+}
+
+fn protocol_params_from_request(request: &HostcallRequest) -> Value {
+    match &request.kind {
+        HostcallKind::Tool { name } => {
+            serde_json::json!({ "name": name, "input": request.payload.clone() })
+        }
+        HostcallKind::Exec { cmd } => {
+            let mut object = match &request.payload {
+                Value::Object(map) => {
+                    let mut out = map.clone();
+                    out.remove("command");
+                    out
+                }
+                Value::Null => serde_json::Map::new(),
+                other => {
+                    let mut out = serde_json::Map::new();
+                    out.insert("payload".to_string(), other.clone());
+                    out
+                }
+            };
+            object.insert("cmd".to_string(), Value::String(cmd.clone()));
+            Value::Object(object)
+        }
+        HostcallKind::Http | HostcallKind::Log => request.payload.clone(),
+        HostcallKind::Session { op } | HostcallKind::Ui { op } | HostcallKind::Events { op } => {
+            let mut object = match &request.payload {
+                Value::Object(map) => map.clone(),
+                Value::Null => serde_json::Map::new(),
+                other => {
+                    let mut out = serde_json::Map::new();
+                    out.insert("payload".to_string(), other.clone());
+                    out
+                }
+            };
+            object.insert("op".to_string(), Value::String(op.clone()));
+            Value::Object(object)
+        }
+    }
+}
+
+fn dual_exec_forensic_bundle(
+    request: &HostcallRequest,
+    diff: &DualExecOutcomeDiff,
+    rollback_reason: Option<&str>,
+    shadow_elapsed_us: f64,
+) -> Value {
+    serde_json::json!({
+        "call_trace": {
+            "call_id": request.call_id,
+            "trace_id": request.trace_id,
+            "extension_id": request.extension_id,
+            "method": request.method(),
+            "params_hash": request.params_hash(),
+            "capability": request.required_capability(),
+        },
+        "lane_decision": {
+            "fast_lane": "fast",
+            "compat_lane": "compat_shadow",
+        },
+        "diff": {
+            "reason": diff.reason,
+            "fast_fingerprint": diff.fast_fingerprint,
+            "compat_fingerprint": diff.compat_fingerprint,
+            "shadow_elapsed_us": shadow_elapsed_us,
+        },
+        "rollback": {
+            "triggered": rollback_reason.is_some(),
+            "reason": rollback_reason,
+        }
+    })
 }
 
 const REGIME_MIN_SAMPLES: usize = 24;
@@ -633,6 +1042,29 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         cwd: PathBuf,
         policy: ExtensionPolicy,
     ) -> Self {
+        Self::new_with_policy_and_oracle_config(
+            runtime,
+            tool_registry,
+            http_connector,
+            session,
+            ui_handler,
+            cwd,
+            policy,
+            DualExecOracleConfig::from_env(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_policy_and_oracle_config(
+        runtime: Rc<PiJsRuntime<C>>,
+        tool_registry: Arc<ToolRegistry>,
+        http_connector: Arc<HttpConnector>,
+        session: Arc<dyn ExtensionSession + Send + Sync>,
+        ui_handler: Arc<dyn ExtensionUiHandler + Send + Sync>,
+        cwd: PathBuf,
+        policy: ExtensionPolicy,
+        dual_exec_config: DualExecOracleConfig,
+    ) -> Self {
         let snapshot_version = policy_snapshot_version(&policy);
         let snapshot = PolicySnapshot::compile(&policy);
         Self {
@@ -645,6 +1077,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             policy,
             snapshot,
             snapshot_version,
+            dual_exec_config,
+            dual_exec_state: RefCell::new(DualExecOracleState::default()),
             regime_detector: RefCell::new(RegimeShiftDetector::default()),
             amac_executor: RefCell::new(
                 AmacBatchExecutor::new(AmacBatchExecutorConfig::from_env()),
@@ -729,6 +1163,147 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         self.runtime.drain_hostcall_requests()
     }
 
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_hostcall_fast(&self, request: &HostcallRequest) -> HostcallOutcome {
+        match &request.kind {
+            HostcallKind::Tool { name } => {
+                self.dispatch_tool(&request.call_id, name, request.payload.clone())
+                    .await
+            }
+            HostcallKind::Exec { cmd } => {
+                self.dispatch_exec(&request.call_id, cmd, request.payload.clone())
+                    .await
+            }
+            HostcallKind::Http => {
+                self.dispatch_http(&request.call_id, request.payload.clone())
+                    .await
+            }
+            HostcallKind::Session { op } => {
+                self.dispatch_session(&request.call_id, op, request.payload.clone())
+                    .await
+            }
+            HostcallKind::Ui { op } => {
+                self.dispatch_ui(
+                    &request.call_id,
+                    op,
+                    request.payload.clone(),
+                    request.extension_id.as_deref(),
+                )
+                .await
+            }
+            HostcallKind::Events { op } => {
+                self.dispatch_events(
+                    &request.call_id,
+                    request.extension_id.as_deref(),
+                    op,
+                    request.payload.clone(),
+                )
+                .await
+            }
+            HostcallKind::Log => {
+                // Log hostcalls are handled by the shared dispatcher path.
+                // Return success here for the legacy dispatcher fallback.
+                HostcallOutcome::Success(serde_json::json!({ "logged": true }))
+            }
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_hostcall_compat_shadow(&self, request: &HostcallRequest) -> HostcallOutcome {
+        let payload = HostCallPayload {
+            call_id: request.call_id.clone(),
+            capability: request.required_capability(),
+            method: request.method().to_string(),
+            params: protocol_params_from_request(request),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+        self.dispatch_protocol_host_call(&payload).await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn run_shadow_dual_exec(
+        &self,
+        request: &HostcallRequest,
+        fast_outcome: &HostcallOutcome,
+    ) {
+        let config = self.dual_exec_config;
+        if config.sample_ppm == 0 {
+            return;
+        }
+
+        {
+            let mut state = self.dual_exec_state.borrow_mut();
+            state.begin_request();
+            if state.overhead_backoff_remaining > 0 {
+                return;
+            }
+            if !is_shadow_safe_request(request) {
+                state.skipped_unsupported_total = state.skipped_unsupported_total.saturating_add(1);
+                return;
+            }
+        }
+
+        if !should_sample_shadow_dual_exec(request, config.sample_ppm) {
+            return;
+        }
+
+        let shadow_started_at = Instant::now();
+        let compat_outcome = self.dispatch_hostcall_compat_shadow(request).await;
+        let shadow_elapsed_us = shadow_started_at.elapsed().as_secs_f64() * 1_000_000.0;
+
+        let diff = diff_hostcall_outcomes(fast_outcome, &compat_outcome);
+        let rollback_reason = {
+            let mut state = self.dual_exec_state.borrow_mut();
+            #[allow(clippy::cast_precision_loss)]
+            if shadow_elapsed_us > config.overhead_budget_us as f64 {
+                state.record_overhead_budget_exceeded(config);
+                tracing::warn!(
+                    target: "pi.extensions.dual_exec",
+                    call_id = request.call_id,
+                    extension_id = %request.extension_id.as_deref().unwrap_or("<none>"),
+                    method = request.method(),
+                    shadow_elapsed_us,
+                    overhead_budget_us = config.overhead_budget_us,
+                    backoff_requests = state.overhead_backoff_remaining,
+                    "Shadow dual execution exceeded overhead budget; backoff enabled"
+                );
+            }
+
+            let divergent = diff.is_some();
+            state.record_sample(divergent, config, request.extension_id.as_deref())
+        };
+
+        if let Some(diff) = diff {
+            let forensic_bundle = dual_exec_forensic_bundle(
+                request,
+                &diff,
+                rollback_reason.as_deref(),
+                shadow_elapsed_us,
+            );
+            tracing::warn!(
+                target: "pi.extensions.dual_exec",
+                call_id = request.call_id,
+                extension_id = %request.extension_id.as_deref().unwrap_or("<none>"),
+                method = request.method(),
+                rollback_triggered = rollback_reason.is_some(),
+                rollback_reason = %rollback_reason.as_deref().unwrap_or("none"),
+                forensic_bundle = %forensic_bundle,
+                "Shadow dual execution divergence detected"
+            );
+        } else {
+            tracing::trace!(
+                target: "pi.extensions.dual_exec",
+                call_id = request.call_id,
+                extension_id = %request.extension_id.as_deref().unwrap_or("<none>"),
+                method = request.method(),
+                shadow_elapsed_us,
+                "Shadow dual execution matched"
+            );
+        }
+    }
+
     /// Dispatch a hostcall and enqueue its completion into the JS scheduler.
     #[allow(clippy::future_not_send)]
     pub fn dispatch_and_complete(
@@ -758,35 +1333,9 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             let overflow_depth = queue_snapshot.overflow_depth;
             let overflow_rejected_total = queue_snapshot.overflow_rejected_total;
             let dispatch_started_at = Instant::now();
-
-            let HostcallRequest {
-                call_id,
-                kind,
-                payload,
-                extension_id,
-                ..
-            } = request;
-
-            let opcode_entropy = hostcall_opcode_entropy(&kind, &payload);
-            let outcome = match kind {
-                HostcallKind::Tool { name } => self.dispatch_tool(&call_id, &name, payload).await,
-                HostcallKind::Exec { cmd } => self.dispatch_exec(&call_id, &cmd, payload).await,
-                HostcallKind::Http => self.dispatch_http(&call_id, payload).await,
-                HostcallKind::Session { op } => self.dispatch_session(&call_id, &op, payload).await,
-                HostcallKind::Ui { op } => {
-                    self.dispatch_ui(&call_id, &op, payload, extension_id.as_deref())
-                        .await
-                }
-                HostcallKind::Events { op } => {
-                    self.dispatch_events(&call_id, extension_id.as_deref(), &op, payload)
-                        .await
-                }
-                HostcallKind::Log => {
-                    // Log hostcalls are handled by the shared dispatcher path.
-                    // Return success here for the legacy dispatcher fallback.
-                    HostcallOutcome::Success(serde_json::json!({ "logged": true }))
-                }
-            };
+            let opcode_entropy = hostcall_opcode_entropy(&request.kind, &request.payload);
+            let outcome = self.dispatch_hostcall_fast(&request).await;
+            self.run_shadow_dual_exec(&request, &outcome).await;
 
             let service_time_us = dispatch_started_at.elapsed().as_secs_f64() * 1_000_000.0;
             let llc_miss_rate =
@@ -802,7 +1351,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 detector.observe(regime_signal)
             };
             Self::emit_regime_observation_telemetry(
-                &call_id,
+                &request.call_id,
                 observation,
                 queue_depth,
                 overflow_depth,
@@ -810,7 +1359,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 service_time_us,
             );
 
-            self.runtime.complete_hostcall(call_id, outcome);
+            self.runtime.complete_hostcall(request.call_id, outcome);
         })
     }
 
@@ -830,9 +1379,29 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 return;
             }
 
+            let (rollback_active, rollback_remaining, rollback_reason) = {
+                let state = self.dual_exec_state.borrow();
+                (
+                    state.rollback_active(),
+                    state.rollback_remaining,
+                    state
+                        .rollback_reason
+                        .clone()
+                        .unwrap_or_else(|| "dual_exec_rollback_active".to_string()),
+                )
+            };
+
             // Check if AMAC is enabled before consuming requests.
             let amac_enabled = self.amac_executor.borrow().enabled();
-            if !amac_enabled {
+            if !amac_enabled || rollback_active {
+                if rollback_active {
+                    tracing::warn!(
+                        target: "pi.extensions.dual_exec",
+                        rollback_remaining,
+                        rollback_reason = %rollback_reason,
+                        "Dual-exec rollback forcing sequential dispatcher mode"
+                    );
+                }
                 // Dispatch sequentially without AMAC overhead.
                 while let Some(req) = requests.pop_front() {
                     self.dispatch_and_complete(req).await;
@@ -9660,5 +10229,290 @@ mod tests {
             detector.current_mode(),
             RegimeAdaptationMode::SequentialFastPath
         );
+    }
+
+    #[test]
+    fn dual_exec_sampling_is_deterministic_for_same_request() {
+        let request = HostcallRequest {
+            call_id: "sample-deterministic".to_string(),
+            kind: HostcallKind::Session {
+                op: "get_state".to_string(),
+            },
+            payload: serde_json::json!({}),
+            trace_id: 77,
+            extension_id: Some("ext.det".to_string()),
+        };
+        let first = should_sample_shadow_dual_exec(&request, 100_000);
+        for _ in 0..16 {
+            assert_eq!(should_sample_shadow_dual_exec(&request, 100_000), first);
+        }
+    }
+
+    #[test]
+    fn dual_exec_diff_engine_detects_success_output_mismatch() {
+        let fast = HostcallOutcome::Success(serde_json::json!({ "value": 1 }));
+        let compat = HostcallOutcome::Success(serde_json::json!({ "value": 2 }));
+        let diff = diff_hostcall_outcomes(&fast, &compat).expect("expected diff");
+        assert_eq!(diff.reason, "success_output_mismatch");
+        assert_ne!(diff.fast_fingerprint, diff.compat_fingerprint);
+    }
+
+    #[test]
+    fn dual_exec_forensic_bundle_includes_trace_lane_diff_and_rollback_fields() {
+        let request = HostcallRequest {
+            call_id: "forensic-1".to_string(),
+            kind: HostcallKind::Session {
+                op: "get_state".to_string(),
+            },
+            payload: serde_json::json!({ "op": "get_state" }),
+            trace_id: 9,
+            extension_id: Some("ext.forensic".to_string()),
+        };
+        let diff = DualExecOutcomeDiff {
+            reason: "success_output_mismatch",
+            fast_fingerprint: "success:aaa".to_string(),
+            compat_fingerprint: "success:bbb".to_string(),
+        };
+        let bundle = dual_exec_forensic_bundle(
+            &request,
+            &diff,
+            Some("forced_compat_budget_controller"),
+            42.0,
+        );
+        assert_eq!(
+            bundle["call_trace"]["call_id"],
+            Value::String("forensic-1".to_string())
+        );
+        assert_eq!(
+            bundle["lane_decision"]["fast_lane"],
+            Value::String("fast".to_string())
+        );
+        assert_eq!(
+            bundle["lane_decision"]["compat_lane"],
+            Value::String("compat_shadow".to_string())
+        );
+        assert_eq!(
+            bundle["diff"]["reason"],
+            Value::String("success_output_mismatch".to_string())
+        );
+        assert_eq!(
+            bundle["rollback"]["reason"],
+            Value::String("forced_compat_budget_controller".to_string())
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dual_exec_divergence_auto_triggers_rollback_kill_switch_state() {
+        futures::executor::block_on(async {
+            struct DivergentReadSession {
+                counter: Arc<Mutex<u64>>,
+            }
+
+            #[async_trait]
+            impl ExtensionSession for DivergentReadSession {
+                async fn get_state(&self) -> Value {
+                    let mut guard = self.counter.lock().expect("counter lock");
+                    let value = *guard;
+                    *guard = guard.saturating_add(1);
+                    drop(guard);
+                    serde_json::json!({ "seq": value })
+                }
+
+                async fn get_messages(&self) -> Vec<SessionMessage> {
+                    Vec::new()
+                }
+
+                async fn get_entries(&self) -> Vec<Value> {
+                    Vec::new()
+                }
+
+                async fn get_branch(&self) -> Vec<Value> {
+                    Vec::new()
+                }
+
+                async fn set_name(&self, _name: String) -> Result<()> {
+                    Ok(())
+                }
+
+                async fn append_message(&self, _message: SessionMessage) -> Result<()> {
+                    Ok(())
+                }
+
+                async fn append_custom_entry(
+                    &self,
+                    _custom_type: String,
+                    _data: Option<Value>,
+                ) -> Result<()> {
+                    Ok(())
+                }
+
+                async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
+                    Ok(())
+                }
+
+                async fn get_model(&self) -> (Option<String>, Option<String>) {
+                    (None, None)
+                }
+
+                async fn set_thinking_level(&self, _level: String) -> Result<()> {
+                    Ok(())
+                }
+
+                async fn get_thinking_level(&self) -> Option<String> {
+                    None
+                }
+
+                async fn set_label(
+                    &self,
+                    _target_id: String,
+                    _label: Option<String>,
+                ) -> Result<()> {
+                    Ok(())
+                }
+            }
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            let session = Arc::new(DivergentReadSession {
+                counter: Arc::new(Mutex::new(0)),
+            });
+            let oracle_config = DualExecOracleConfig {
+                sample_ppm: DUAL_EXEC_SAMPLE_MODULUS_PPM,
+                divergence_window: 4,
+                divergence_budget: 2,
+                rollback_requests: 24,
+                overhead_budget_us: u64::MAX,
+                overhead_backoff_requests: 1,
+            };
+            let dispatcher = ExtensionDispatcher::new_with_policy_and_oracle_config(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+                ExtensionPolicy::from_profile(PolicyProfile::Permissive),
+                oracle_config,
+            );
+
+            for idx in 0..3_u64 {
+                let request = HostcallRequest {
+                    call_id: format!("dual-divergence-{idx}"),
+                    kind: HostcallKind::Session {
+                        op: "get_state".to_string(),
+                    },
+                    payload: serde_json::json!({}),
+                    trace_id: idx,
+                    extension_id: Some("ext.shadow.rollback".to_string()),
+                };
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            let state = dispatcher.dual_exec_state.borrow();
+            assert!(
+                state.divergence_total >= 2,
+                "expected enough divergence samples to trip rollback"
+            );
+            assert!(state.rollback_active(), "rollback should be active");
+            assert!(
+                state
+                    .rollback_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("ext.shadow.rollback")),
+                "rollback reason should include extension scope"
+            );
+        });
+    }
+
+    #[test]
+    fn dual_exec_rollback_forces_dispatch_batch_amac_to_skip_planning() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            let oracle_config = DualExecOracleConfig {
+                sample_ppm: 0,
+                divergence_window: 8,
+                divergence_budget: 2,
+                rollback_requests: 16,
+                overhead_budget_us: 1_500,
+                overhead_backoff_requests: 8,
+            };
+            let dispatcher = ExtensionDispatcher::new_with_policy_and_oracle_config(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+                ExtensionPolicy::from_profile(PolicyProfile::Permissive),
+                oracle_config,
+            );
+
+            {
+                let mut amac = dispatcher.amac_executor.borrow_mut();
+                *amac = AmacBatchExecutor::new(AmacBatchExecutorConfig::new(true, 2, 8));
+            }
+
+            let mut baseline = VecDeque::new();
+            for idx in 0..4_u64 {
+                baseline.push_back(HostcallRequest {
+                    call_id: format!("baseline-{idx}"),
+                    kind: HostcallKind::Session {
+                        op: "get_state".to_string(),
+                    },
+                    payload: serde_json::json!({}),
+                    trace_id: idx,
+                    extension_id: Some("ext.roll".to_string()),
+                });
+            }
+            dispatcher.dispatch_batch_amac(baseline).await;
+            let baseline_decisions = dispatcher
+                .amac_executor
+                .borrow()
+                .telemetry()
+                .toggle_decisions;
+            assert!(
+                baseline_decisions > 0,
+                "expected AMAC planner to run before rollback activation"
+            );
+
+            {
+                let mut state = dispatcher.dual_exec_state.borrow_mut();
+                state.rollback_remaining = 16;
+                state.rollback_reason =
+                    Some("dual_exec_divergence_budget_exceeded:test".to_string());
+            }
+
+            let mut rollback_batch = VecDeque::new();
+            for idx in 0..4_u64 {
+                rollback_batch.push_back(HostcallRequest {
+                    call_id: format!("rollback-{idx}"),
+                    kind: HostcallKind::Session {
+                        op: "get_state".to_string(),
+                    },
+                    payload: serde_json::json!({}),
+                    trace_id: idx + 100,
+                    extension_id: Some("ext.roll".to_string()),
+                });
+            }
+            dispatcher.dispatch_batch_amac(rollback_batch).await;
+
+            let after_rollback = dispatcher
+                .amac_executor
+                .borrow()
+                .telemetry()
+                .toggle_decisions;
+            assert_eq!(
+                after_rollback, baseline_decisions,
+                "rollback path should bypass AMAC planning and keep toggle decisions unchanged"
+            );
+        });
     }
 }
