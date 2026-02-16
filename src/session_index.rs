@@ -79,7 +79,7 @@ impl PendingIndexUpdate {
 
 #[derive(Debug)]
 enum IndexUpdateCommand {
-    Enqueue(Box<PendingIndexUpdate>),
+    Enqueue(PendingIndexUpdate),
     FlushRoot {
         sessions_root: PathBuf,
         ack: mpsc::Sender<()>,
@@ -191,8 +191,7 @@ fn run_index_update_dispatcher(rx: mpsc::Receiver<IndexUpdateCommand>) {
 
     loop {
         match rx.recv_timeout(INDEX_UPDATE_FLUSH_INTERVAL) {
-            Ok(IndexUpdateCommand::Enqueue(boxed_update)) => {
-                let update = *boxed_update;
+            Ok(IndexUpdateCommand::Enqueue(update)) => {
                 let key = update.key();
                 if pending.insert(key, update).is_some() {
                     tracing::debug!("Coalesced pending session index update");
@@ -224,7 +223,7 @@ pub(crate) fn enqueue_session_index_snapshot_update(
 
     let send_result = index_update_dispatcher()
         .tx
-        .send(IndexUpdateCommand::Enqueue(Box::new(update)));
+        .send(IndexUpdateCommand::Enqueue(update));
 
     let Err(mpsc::SendError(IndexUpdateCommand::Enqueue(update))) = send_result else {
         return;

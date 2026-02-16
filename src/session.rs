@@ -1375,8 +1375,10 @@ impl Session {
             return Ok(());
         };
 
-        let pending_start = self.persisted_entry_count.load(Ordering::SeqCst).min(self.entries.len());
-        let pending_entries = self.entries[pending_start..].to_vec();
+        let pending_start = self
+            .persisted_entry_count
+            .load(Ordering::SeqCst)
+            .min(self.entries.len());
         let previous_mode = self.v2_resume_mode;
 
         let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
@@ -1390,6 +1392,15 @@ impl Session {
                 "full V2 rehydration before save emitted diagnostics"
             );
         }
+
+        // Extract pending in-memory entries by moving them out of `self.entries`
+        // only after full hydration succeeds, preserving fail-safe behavior on
+        // early-return errors and avoiding per-entry clone cost.
+        let pending_entries = if pending_start >= self.entries.len() {
+            Vec::new()
+        } else {
+            self.entries.split_off(pending_start)
+        };
 
         let persisted_entry_count = fully_hydrated.entries.len();
         let mut merged_entries = fully_hydrated.entries;
