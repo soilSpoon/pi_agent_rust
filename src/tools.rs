@@ -23,6 +23,7 @@ use std::process::{Command, Stdio};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 // ============================================================================
@@ -2220,7 +2221,6 @@ impl Tool for EditTool {
         //
         // Note: normalized_content is already LF-normalized but preserves Unicode form
         // (from String::from_utf8).
-        use unicode_normalization::UnicodeNormalization;
 
         let mut variants = Vec::with_capacity(3);
         variants.push(normalized_old_text.clone());
@@ -2256,17 +2256,14 @@ impl Tool for EditTool {
             }
         }
 
-        let (match_result, normalized_pair) = match best_match {
-            Some(res) => res,
-            None => {
-                return Err(Error::tool(
-                    "edit",
-                    format!(
-                        "Could not find the exact text in {}. The old text must match exactly including all whitespace and newlines.",
-                        input.path
-                    ),
-                ));
-            }
+        let Some((match_result, normalized_pair)) = best_match else {
+            return Err(Error::tool(
+                "edit",
+                format!(
+                    "Could not find the exact text in {}. The old text must match exactly including all whitespace and newlines.",
+                    input.path
+                ),
+            ));
         };
 
         // Count occurrences reusing pre-computed normalized versions.
