@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 /// Approximate characters per token for English text with GPT-family tokenizers.
 /// Intentionally conservative (overestimates tokens) to avoid exceeding context windows.
-const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+/// Set to 3 to safely account for code/symbol-heavy content which is denser than prose.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 3;
 
 /// Estimated tokens for an image content block (~1200 tokens).
 const IMAGE_TOKEN_ESTIMATE: usize = 1200;
@@ -47,7 +48,9 @@ fn json_byte_len(value: &Value) -> usize {
         }
     }
     let mut c = Counter(0);
-    let _ = serde_json::to_writer(&mut c, value);
+    if let Err(_) = serde_json::to_writer(&mut c, value) {
+        // Fallback or partial count on error (e.g. recursion limit)
+    }
     c.0
 }
 
