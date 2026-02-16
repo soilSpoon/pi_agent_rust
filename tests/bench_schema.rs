@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -941,6 +941,8 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
     let mut observed_complete_stage_breakdown_cells = 0_u64;
     let mut observed_missing_stage_breakdown_cells = 0_u64;
     let mut observed_missing_stage_cell_keys: HashSet<(String, u64)> = HashSet::new();
+    let mut observed_missing_stage_reasons_by_key: HashMap<(String, u64), BTreeSet<String>> =
+        HashMap::new();
     let mut seen_partition_size_cells = HashSet::new();
     for cell in matrix_cells {
         let cell_obj = cell
@@ -1019,7 +1021,47 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             observed_complete_stage_breakdown_cells += 1;
         } else {
             observed_missing_stage_breakdown_cells += 1;
-            observed_missing_stage_cell_keys.insert(partition_size_key);
+            observed_missing_stage_cell_keys.insert(partition_size_key.clone());
+            let missing_reasons = cell_obj
+                .get("missing_reasons")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "matrix cell ({workload_partition}, {session_messages}) missing missing_reasons array despite incomplete stage attribution"
+                    )
+                })?;
+            if missing_reasons.is_empty() {
+                return Err(format!(
+                    "matrix cell ({workload_partition}, {session_messages}) missing_reasons must not be empty when stage attribution is incomplete"
+                ));
+            }
+            let mut missing_reason_set = BTreeSet::new();
+            for reason in missing_reasons {
+                let reason = reason.as_str().ok_or_else(|| {
+                    format!(
+                        "matrix cell ({workload_partition}, {session_messages}) missing_reasons entries must be strings"
+                    )
+                })?;
+                if reason.trim().is_empty() {
+                    return Err(format!(
+                        "matrix cell ({workload_partition}, {session_messages}) missing_reasons entries must be non-empty strings"
+                    ));
+                }
+                if !missing_reason_set.insert(reason.to_string()) {
+                    return Err(format!(
+                        "matrix cell ({workload_partition}, {session_messages}) missing_reasons must not contain duplicates: {reason}"
+                    ));
+                }
+            }
+            if !missing_reason_set
+                .iter()
+                .any(|reason| reason.starts_with("missing_stage_metrics:"))
+            {
+                return Err(format!(
+                    "matrix cell ({workload_partition}, {session_messages}) missing_reasons must include at least one missing_stage_metrics:* reason when stage attribution is incomplete"
+                ));
+            }
+            observed_missing_stage_reasons_by_key.insert(partition_size_key, missing_reason_set);
         }
 
         let primary = cell_obj
@@ -1179,6 +1221,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                 "stage_summary.missing_cells entries must include at least one reason".to_string(),
             );
         }
+        let mut reason_set = BTreeSet::new();
         for reason in reasons {
             let reason = reason.as_str().ok_or_else(|| {
                 "stage_summary.missing_cells reasons entries must be strings".to_string()
@@ -1189,6 +1232,19 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                         .to_string(),
                 );
             }
+            if !reason_set.insert(reason.to_string()) {
+                return Err(format!(
+                    "stage_summary.missing_cells reasons must not contain duplicates: {reason}"
+                ));
+            }
+        }
+        if !reason_set
+            .iter()
+            .any(|reason| reason.starts_with("missing_stage_metrics:"))
+        {
+            return Err(format!(
+                "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) reasons must include at least one missing_stage_metrics:* token"
+            ));
         }
         let missing_key = (workload_partition.to_string(), session_messages);
         if !reported_missing_stage_cell_keys.insert(missing_key.clone()) {
@@ -1199,6 +1255,19 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         if !observed_missing_stage_cell_keys.contains(&missing_key) {
             return Err(format!(
                 "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) does not match any matrix cell with missing stage metrics"
+            ));
+        }
+        let observed_reason_set = observed_missing_stage_reasons_by_key
+            .get(&missing_key)
+            .ok_or_else(|| {
+                format!(
+                    "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) is missing observed matrix-cell reason linkage"
+                )
+            })?;
+        if &reason_set != observed_reason_set {
+            return Err(format!(
+                "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) reasons {:?} must equal matrix cell missing_reasons {:?}",
+                reason_set, observed_reason_set
             ));
         }
     }
@@ -2611,6 +2680,59 @@ fn phase1_matrix_validator_rejects_missing_cells_identity_mismatch() {
     assert!(
         err.contains("missing stage metrics"),
         "expected observed missing-stage parity detail, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_missing_cells_reason_mismatch_vs_matrix_cell() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_cells"][1]["stage_attribution"]["index_ms"] = Value::Null;
+    malformed["matrix_cells"][1]["missing_reasons"] = json!([
+        "missing_stage_metrics:index_ms",
+        "missing_matrix_source_record"
+    ]);
+    malformed["stage_summary"]["operation_stage_coverage"]["index_ms"] = json!(1);
+    malformed["stage_summary"]["cells_with_complete_stage_breakdown"] = json!(1);
+    malformed["stage_summary"]["cells_missing_stage_breakdown"] = json!(1);
+    malformed["stage_summary"]["covered_cells"] = json!(1);
+    malformed["stage_summary"]["missing_cells"] = json!([
+        {
+            "workload_partition": "realistic",
+            "session_messages": 100_000,
+            "reasons": ["missing_stage_metrics:index_ms"]
+        }
+    ]);
+    malformed["consumption_contract"]["artifact_ready_for_phase5"] = json!(false);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("must equal matrix cell missing_reasons"),
+        "expected missing_cells reason mismatch failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_missing_stage_cell_without_missing_stage_reason_token() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_cells"][1]["stage_attribution"]["index_ms"] = Value::Null;
+    malformed["matrix_cells"][1]["missing_reasons"] = json!(["missing_matrix_source_record"]);
+    malformed["stage_summary"]["operation_stage_coverage"]["index_ms"] = json!(1);
+    malformed["stage_summary"]["cells_with_complete_stage_breakdown"] = json!(1);
+    malformed["stage_summary"]["cells_missing_stage_breakdown"] = json!(1);
+    malformed["stage_summary"]["covered_cells"] = json!(1);
+    malformed["stage_summary"]["missing_cells"] = json!([
+        {
+            "workload_partition": "realistic",
+            "session_messages": 100_000,
+            "reasons": ["missing_matrix_source_record"]
+        }
+    ]);
+    malformed["consumption_contract"]["artifact_ready_for_phase5"] = json!(false);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("missing_reasons must include at least one missing_stage_metrics:* reason"),
+        "expected missing-stage reason-token enforcement failure, got: {err}"
     );
 }
 
