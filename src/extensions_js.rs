@@ -24,6 +24,10 @@
 //! ```
 
 use crate::error::{Error, Result};
+use crate::hostcall_queue::{
+    HOSTCALL_FAST_RING_CAPACITY, HOSTCALL_OVERFLOW_CAPACITY, HostcallQueueEnqueueResult,
+    HostcallQueueTelemetry, HostcallRequestQueue,
+};
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, Scheduler, WallClock};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -401,158 +405,7 @@ pub(crate) fn js_to_json(value: &Value<'_>) -> rquickjs::Result<serde_json::Valu
     Ok(serde_json::Value::Null)
 }
 
-const HOSTCALL_FAST_RING_CAPACITY: usize = 256;
-const HOSTCALL_OVERFLOW_CAPACITY: usize = 2_048;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostcallQueueEnqueueResult {
-    FastPath { depth: usize },
-    OverflowPath { depth: usize, overflow_depth: usize },
-    Rejected { depth: usize, overflow_depth: usize },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct HostcallQueueTelemetry {
-    pub fast_depth: usize,
-    pub overflow_depth: usize,
-    pub total_depth: usize,
-    pub max_depth_seen: usize,
-    pub overflow_enqueued_total: u64,
-    pub overflow_rejected_total: u64,
-    pub fast_capacity: usize,
-    pub overflow_capacity: usize,
-}
-
-/// Queue of hostcall requests waiting to be processed by the host.
-///
-/// Fast path is a lock-free fixed-capacity ring. If the ring is saturated,
-/// requests spill into a bounded overflow deque. When both are saturated, new
-/// requests are rejected and completed with an overload error.
-#[derive(Debug)]
-pub struct HostcallRequestQueue {
-    fast_slots: Vec<Option<HostcallRequest>>,
-    fast_head: usize,
-    fast_tail: usize,
-    fast_len: usize,
-    overflow: VecDeque<HostcallRequest>,
-    overflow_enqueued_total: u64,
-    overflow_rejected_total: u64,
-    max_depth_seen: usize,
-    overflow_capacity: usize,
-}
-
-impl HostcallRequestQueue {
-    pub fn with_capacities(fast_capacity: usize, overflow_capacity: usize) -> Self {
-        let fast_capacity = fast_capacity.max(1);
-        let overflow_capacity = overflow_capacity.max(1);
-        Self {
-            fast_slots: std::iter::repeat_with(|| None)
-                .take(fast_capacity)
-                .collect(),
-            fast_head: 0,
-            fast_tail: 0,
-            fast_len: 0,
-            overflow: VecDeque::new(),
-            overflow_enqueued_total: 0,
-            overflow_rejected_total: 0,
-            max_depth_seen: 0,
-            overflow_capacity,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.fast_len + self.overflow.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.fast_len == 0 && self.overflow.is_empty()
-    }
-
-    pub fn clear(&mut self) {
-        for slot in &mut self.fast_slots {
-            *slot = None;
-        }
-        self.fast_head = 0;
-        self.fast_tail = 0;
-        self.fast_len = 0;
-        self.overflow.clear();
-        self.overflow_enqueued_total = 0;
-        self.overflow_rejected_total = 0;
-        self.max_depth_seen = 0;
-    }
-
-    pub fn push_back(&mut self, request: HostcallRequest) -> HostcallQueueEnqueueResult {
-        let fast_capacity = self.fast_slots.len();
-
-        // Preserve FIFO across lanes by pinning to overflow once spill begins.
-        if self.overflow.is_empty() && self.fast_len < fast_capacity {
-            self.fast_slots[self.fast_tail] = Some(request);
-            self.fast_tail = (self.fast_tail + 1) % fast_capacity;
-            self.fast_len += 1;
-            let depth = self.len();
-            self.max_depth_seen = self.max_depth_seen.max(depth);
-            return HostcallQueueEnqueueResult::FastPath { depth };
-        }
-
-        if self.overflow.len() < self.overflow_capacity {
-            self.overflow.push_back(request);
-            self.overflow_enqueued_total = self.overflow_enqueued_total.saturating_add(1);
-            let depth = self.len();
-            let overflow_depth = self.overflow.len();
-            self.max_depth_seen = self.max_depth_seen.max(depth);
-            return HostcallQueueEnqueueResult::OverflowPath {
-                depth,
-                overflow_depth,
-            };
-        }
-
-        self.overflow_rejected_total = self.overflow_rejected_total.saturating_add(1);
-        HostcallQueueEnqueueResult::Rejected {
-            depth: self.len(),
-            overflow_depth: self.overflow.len(),
-        }
-    }
-
-    fn pop_front(&mut self) -> Option<HostcallRequest> {
-        if self.fast_len > 0 {
-            let slot = &mut self.fast_slots[self.fast_head];
-            let request = slot.take();
-            self.fast_head = (self.fast_head + 1) % self.fast_slots.len();
-            self.fast_len -= 1;
-            return request;
-        }
-        self.overflow.pop_front()
-    }
-
-    pub fn drain_all(&mut self) -> VecDeque<HostcallRequest> {
-        let mut drained = VecDeque::with_capacity(self.len());
-        while let Some(request) = self.pop_front() {
-            drained.push_back(request);
-        }
-        drained
-    }
-
-    pub fn snapshot(&self) -> HostcallQueueTelemetry {
-        HostcallQueueTelemetry {
-            fast_depth: self.fast_len,
-            overflow_depth: self.overflow.len(),
-            total_depth: self.len(),
-            max_depth_seen: self.max_depth_seen,
-            overflow_enqueued_total: self.overflow_enqueued_total,
-            overflow_rejected_total: self.overflow_rejected_total,
-            fast_capacity: self.fast_slots.len(),
-            overflow_capacity: self.overflow_capacity,
-        }
-    }
-}
-
-impl Default for HostcallRequestQueue {
-    fn default() -> Self {
-        Self::with_capacities(HOSTCALL_FAST_RING_CAPACITY, HOSTCALL_OVERFLOW_CAPACITY)
-    }
-}
-
-pub type HostcallQueue = Rc<RefCell<HostcallRequestQueue>>;
+pub type HostcallQueue = Rc<RefCell<HostcallRequestQueue<HostcallRequest>>>;
 
 // ============================================================================
 // Deterministic PiJS Event Loop Scheduler (bd-8mm)
