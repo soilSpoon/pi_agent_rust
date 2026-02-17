@@ -100,6 +100,24 @@ fn get_str<'a>(v: &'a V, pointer: &str) -> &'a str {
     v.pointer(pointer).and_then(V::as_str).unwrap_or("unknown")
 }
 
+fn parse_must_pass_gate_verdict(v: &V) -> (String, u64, u64) {
+    let status = match get_str(v, "/status") {
+        "unknown" => get_str(v, "/verdict").to_string(),
+        value => value.to_string(),
+    };
+
+    let total = match get_u64(v, "/observed/must_pass_total") {
+        0 => get_u64(v, "/total"),
+        value => value,
+    };
+    let passed = match get_u64(v, "/observed/must_pass_passed") {
+        0 => get_u64(v, "/passed"),
+        value => value,
+    };
+
+    (status, passed, total)
+}
+
 // ── Evidence collectors ─────────────────────────────────────────────────────
 
 fn repo_root() -> PathBuf {
@@ -636,21 +654,20 @@ fn generate_certification() -> FinalCertification {
         "bd-1f42.4",
         "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
         |v| {
-            let total = get_u64(v, "/total");
-            let passed = get_u64(v, "/passed");
-            let verdict = get_str(v, "/verdict");
+            let (verdict, passed, total) = parse_must_pass_gate_verdict(v);
             if verdict == "pass" && passed >= 208 {
                 (Signal::Pass, format!("{passed}/{total} must-pass: PASS"))
-            } else if passed >= 200 {
-                (
-                    Signal::Warn,
-                    format!("{passed}/{total} must-pass ({verdict})"),
-                )
-            } else {
+            } else if verdict == "unknown" {
                 (
                     Signal::Fail,
-                    format!("{passed}/{total} must-pass ({verdict})"),
+                    format!(
+                        "Must-pass gate verdict missing status/verdict field ({passed}/{total} passed)"
+                    ),
                 )
+            } else if passed >= 200 {
+                (Signal::Warn, format!("{passed}/{total} must-pass ({verdict})"))
+            } else {
+                (Signal::Fail, format!("{passed}/{total} must-pass ({verdict})"))
             }
         },
     ));
@@ -993,4 +1010,34 @@ fn certification_report_schema_valid() {
             .and_then(V::as_str)
             .is_some()
     );
+}
+
+#[test]
+fn parse_must_pass_gate_verdict_reads_current_schema() {
+    let gate = serde_json::json!({
+        "status": "pass",
+        "observed": {
+            "must_pass_total": 208,
+            "must_pass_passed": 208
+        }
+    });
+
+    let (status, passed, total) = parse_must_pass_gate_verdict(&gate);
+    assert_eq!(status, "pass");
+    assert_eq!(passed, 208);
+    assert_eq!(total, 208);
+}
+
+#[test]
+fn parse_must_pass_gate_verdict_falls_back_to_legacy_schema() {
+    let gate = serde_json::json!({
+        "verdict": "warn",
+        "total": 208,
+        "passed": 203
+    });
+
+    let (status, passed, total) = parse_must_pass_gate_verdict(&gate);
+    assert_eq!(status, "warn");
+    assert_eq!(passed, 203);
+    assert_eq!(total, 208);
 }
