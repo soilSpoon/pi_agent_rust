@@ -354,6 +354,28 @@ fn ci_operator_runbook_retains_franken_node_kernel_boundary_drift_signature_toke
     }
 }
 
+#[test]
+fn ci_operator_runbook_retains_node_runtime_availability_signature_tokens() {
+    let runbook = load_text(CI_OPERATOR_RUNBOOK_PATH);
+    for token in [
+        "### FrankenNode compat harness signature: `node_runtime_unavailable_or_shimmed`",
+        "Node.js not found",
+        "SKIP: generate_compatibility_matrix requires both Node.js and Bun",
+        "tests/franken_node_compat_harness.rs",
+        "rch exec -- cargo test --test franken_node_compat_harness --",
+        "node_detection_rejects_bun_node_shim_when_present -- --nocapture",
+        "generate_compatibility_matrix -- --nocapture",
+        "find_node()",
+        "is_real_node()",
+        "/home/ubuntu/.bun/bin/node",
+    ] {
+        assert!(
+            runbook.contains(token),
+            "CI operator runbook must retain node-runtime-availability token: {token}"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Section 5: Full suite gate has blocking gates
 // ═══════════════════════════════════════════════════════════════════════════

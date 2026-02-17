@@ -1,10 +1,15 @@
 {
   "schema": "pi.frankennode.semantic_compatibility_matrix_contract.v1",
-  "contract_version": "1.1.0",
+  "contract_version": "1.2.0",
   "bead_id": "bd-3ar8v.7.3",
   "support_bead_id": "bd-3ar8v.7.3.1",
+  "support_bead_ids": [
+    "bd-3ar8v.7.3.1",
+    "bd-3ar8v.7.3.7",
+    "bd-3ar8v.7.4.5"
+  ],
   "status": "active_blocking_policy",
-  "effective_date_utc": "2026-02-17T07:26:30Z",
+  "effective_date_utc": "2026-02-17T08:10:00Z",
   "mission_statement": "FrankenNode semantic compatibility claims must be based on an executable matrix with fail-closed verdict policy and evidence lineage for every scenario row.",
   "scope": {
     "target_project_root": "/dp/franken_node",
@@ -58,6 +63,19 @@
       ]
     },
     {
+      "scenario_id": "SCN-package-interop-cjs-esm-npm",
+      "domain": "package-interop",
+      "criticality": "medium",
+      "required_surfaces": [
+        "cjs-entrypoints",
+        "esm-entrypoints",
+        "package-json-main",
+        "package-json-type-module",
+        "conditional-exports",
+        "fallback-diagnostics"
+      ]
+    },
+    {
       "scenario_id": "SCN-error-and-diagnostics-parity",
       "domain": "errors-diagnostics",
       "criticality": "medium",
@@ -73,17 +91,77 @@
       "EXACT_PARITY",
       "ACCEPTABLE_SUPERSET",
       "PARTIAL_PARITY",
+      "UNSUPPORTED",
       "INCOMPATIBLE"
     ],
     "release_blockers": [
       "INCOMPATIBLE verdict in any high-criticality scenario",
       "Missing evidence lineage for any declared scenario",
+      "Implicitly unsupported out-of-tier scenarios (missing explicit UNSUPPORTED rows)",
+      "Missing required package interop scenario rows for claim tiers",
       "Summary claim language exceeding matrix-derived verdict envelope"
     ],
     "global_claim_rules": {
       "forbid_full_replacement_when_any_high_row_non_exact": true,
       "forbid_global_claim_when_lineage_missing": true,
-      "require_explicit_scope_for_partial_parity": true
+      "require_explicit_scope_for_partial_parity": true,
+      "require_package_interop_policy_coverage": true
+    }
+  },
+  "package_interop_policy": {
+    "required_for_claim_tiers": [
+      "ecosystem_compatibility",
+      "full_runtime_replacement"
+    ],
+    "required_scenario_ids": [
+      "SCN-package-interop-cjs-esm-npm",
+      "SCN-tooling-and-package-workflows"
+    ],
+    "required_diagnostic_fields": [
+      "fallback_diagnostics_signature",
+      "fallback_reason_code",
+      "fallback_remediation_tag"
+    ],
+    "require_deterministic_fallback_diagnostics": true,
+    "missing_policy_behavior": "hard_fail"
+  },
+  "incremental_tiering_policy": {
+    "enabled": true,
+    "active_tier": "tier0-core",
+    "tier_definitions": [
+      {
+        "tier_id": "tier0-core",
+        "description": "Core scenarios required for claim-gating checkpoints.",
+        "supported_scenario_ids": [
+          "SCN-module-resolution-esm-cjs",
+          "SCN-node-builtin-apis",
+          "SCN-event-loop-io-ordering"
+        ]
+      },
+      {
+        "tier_id": "tier1-expanded",
+        "description": "Secondary compatibility surface for workflow/tooling parity.",
+        "supported_scenario_ids": [
+          "SCN-tooling-and-package-workflows",
+          "SCN-package-interop-cjs-esm-npm"
+        ]
+      },
+      {
+        "tier_id": "tier2-longtail",
+        "description": "Long-tail diagnostics and ergonomics parity checks.",
+        "supported_scenario_ids": [
+          "SCN-error-and-diagnostics-parity"
+        ]
+      }
+    ],
+    "unsupported_class_policy": {
+      "explicit_unsupported_required_for_out_of_tier": true,
+      "unsupported_verdict": "UNSUPPORTED",
+      "required_metadata_fields": [
+        "unsupported_reason_code",
+        "remediation_tag"
+      ],
+      "silent_omission_policy": "hard_fail"
     }
   },
   "evidence_lineage_contract": {
@@ -135,7 +213,8 @@
       "bd-3ar8v.7.14"
     ],
     "integration_contracts": [
-      "docs/franken-node-claim-gating-contract.json"
+      "docs/franken-node-claim-gating-contract.json",
+      "docs/franken-node-package-interop-contract.json"
     ]
   }
 }

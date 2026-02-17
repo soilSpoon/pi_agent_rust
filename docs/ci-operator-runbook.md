@@ -467,6 +467,36 @@ rch exec -- cargo test --test qa_docs_policy_validation -- \
    `tests/full_suite_gate/franken_node_kernel_boundary_drift_report.json`.
 3. Re-run the replay commands and attach refreshed artifacts before clearing the incident.
 
+### FrankenNode compat harness signature: `node_runtime_unavailable_or_shimmed`
+
+**Signature:** semantic compatibility harness fails or hard-skips because a real
+Node runtime is unavailable, or Bun's `node` shim is incorrectly treated as
+Node. Typical signals include `Node.js not found` and
+`SKIP: generate_compatibility_matrix requires both Node.js and Bun`.
+
+**Artifacts:**
+- `tests/franken_node_compat_harness.rs`
+- `tests/franken_node_compat/fixtures/`
+- `tests/full_suite_gate/full_suite_verdict.json`
+
+**Replay:**
+```bash
+rch exec -- cargo test --test franken_node_compat_harness -- \
+  node_detection_rejects_bun_node_shim_when_present -- --nocapture
+rch exec -- cargo test --test franken_node_compat_harness -- \
+  generate_compatibility_matrix -- --nocapture
+```
+
+**Remediation:**
+1. Keep `find_node()` and `is_real_node()` aligned with fail-closed detection:
+   Bun's `/home/ubuntu/.bun/bin/node` shim must not pass as real Node.
+2. Preserve deterministic skip diagnostics when Node/Bun are unavailable:
+   `SKIP: Node.js not found on this machine`,
+   `SKIP: Bun not found on this machine`, and
+   `SKIP: generate_compatibility_matrix requires both Node.js and Bun`.
+3. After runtime availability is corrected, re-run harness replay commands and
+   attach refreshed verdict artifacts before clearing the incident.
+
 ---
 
 ## Evidence Artifact Interpretation

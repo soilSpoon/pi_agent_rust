@@ -10430,12 +10430,15 @@ if isinstance(franken_node_mission_contract, dict):
             in strict_required_checks
             and "claim_integrity.franken_node_phase6_runtime_beads_declared"
             in strict_required_checks
+            and "claim_integrity.franken_node_strict_tier_required_evidence"
+            in strict_required_checks
         ),
         ok_msg="FrankenNode full_runtime_replacement required_check_ids include strict gates",
         fail_msg=(
             "FrankenNode full_runtime_replacement required_check_ids must include "
             "claim_integrity.franken_node_strict_replacement_dropin_certified and "
-            "claim_integrity.franken_node_phase6_runtime_beads_declared"
+            "claim_integrity.franken_node_phase6_runtime_beads_declared and "
+            "claim_integrity.franken_node_strict_tier_required_evidence"
         ),
         strict=True,
     )
@@ -10461,6 +10464,39 @@ if isinstance(franken_node_mission_contract, dict):
         ok_msg="FrankenNode strict tier declares required phase-6 runtime beads",
         fail_msg=f"FrankenNode strict tier missing required beads: {missing_phase6_beads}",
         strict=True,
+    )
+
+    strict_required_artifacts_raw = (
+        tier_by_id.get(franken_node_strict_tier, {}).get("required_evidence_artifacts", [])
+        if franken_node_strict_tier in tier_by_id
+        else []
+    )
+    strict_required_artifacts = [
+        str(artifact).strip()
+        for artifact in strict_required_artifacts_raw
+        if str(artifact).strip()
+    ]
+    missing_strict_required_artifacts = sorted(
+        artifact
+        for artifact in strict_required_artifacts
+        if not (project_root / artifact).exists()
+    )
+    strict_tier_required_evidence_ready = not missing_strict_required_artifacts
+    if missing_strict_required_artifacts:
+        strict_replacement_blocking_reasons.append(
+            "strict tier required evidence artifacts missing: "
+            f"{missing_strict_required_artifacts}"
+        )
+    require_condition(
+        "claim_integrity.franken_node_strict_tier_required_evidence",
+        path=franken_node_mission_contract_path,
+        ok=strict_tier_required_evidence_ready,
+        ok_msg="FrankenNode strict tier required evidence artifacts are present",
+        fail_msg=(
+            "FrankenNode strict tier missing required evidence artifacts: "
+            f"{missing_strict_required_artifacts}"
+        ),
+        strict=claim_integrity_required,
     )
 
     forbidden_claims_raw = franken_node_mission_contract.get("forbidden_claims")
@@ -10603,7 +10639,10 @@ if isinstance(franken_node_mission_contract, dict):
     )
     strict_replacement_blocking_reasons = sorted(set(strict_replacement_blocking_reasons))
     strict_replacement_tier_ready = (
-        extension_host_tier_ready and strict_verdict_ready and not missing_phase6_beads
+        extension_host_tier_ready
+        and strict_verdict_ready
+        and not missing_phase6_beads
+        and strict_tier_required_evidence_ready
     )
     require_condition(
         "claim_integrity.franken_node_strict_replacement_dropin_certified",

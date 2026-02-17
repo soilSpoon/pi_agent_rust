@@ -3,6 +3,10 @@
   "contract_version": "1.0.0",
   "bead_id": "bd-3ar8v.7.1",
   "support_bead_id": "bd-3ar8v.7.1.1",
+  "support_bead_ids": [
+    "bd-3ar8v.7.1.1",
+    "bd-3ar8v.7.4.3"
+  ],
   "status": "active_blocking_policy",
   "effective_date_utc": "2026-02-17T07:18:00Z",
   "mission_statement": "FrankenNode must use machine-verifiable claim tiers and hard release gates so extension-host parity progress cannot be overstated as full Node/Bun replacement.",
@@ -44,6 +48,7 @@
       ],
       "required_evidence": [
         "compatibility matrix with executable conformance harness",
+        "package/ecosystem interoperability contract evidence (CJS/ESM/npm)",
         "resource-budget benchmark evidence",
         "security and replay reliability evidence"
       ],
@@ -59,6 +64,7 @@
       ],
       "required_evidence": [
         "unified certification stack pass across unit/e2e/conformance/security/perf",
+        "package/ecosystem interoperability strict-tier evidence and claim-tier linkage",
         "benchmark and resource gate pass with confidence-tagged evidence",
         "migration assistant and shadow-canary rollback safeguards",
         "crate reintegration evidence into pi_agent_rust"

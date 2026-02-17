@@ -1413,6 +1413,7 @@ fn franken_node_mission_contract_tier_mapping_declares_required_checks_and_phase
     for check in [
         "claim_integrity.franken_node_strict_replacement_dropin_certified",
         "claim_integrity.franken_node_phase6_runtime_beads_declared",
+        "claim_integrity.franken_node_strict_tier_required_evidence",
     ] {
         assert!(
             strict_checks.contains(check),
@@ -1442,6 +1443,7 @@ fn franken_node_mission_contract_tier_mapping_declares_required_checks_and_phase
     for artifact in [
         "docs/dropin-certification-verdict.json",
         "docs/franken-node-kernel-extraction-boundary-manifest.json",
+        "docs/franken-node-package-interop-contract.json",
         "tests/full_suite_gate/franken_node_kernel_boundary_drift_report.json",
     ] {
         assert!(
@@ -1834,6 +1836,7 @@ fn run_all_claim_integrity_gate_wires_fail_closed_conditions() {
         "claim_integrity.franken_node_extension_host_tier_evidence",
         "claim_integrity.franken_node_phase6_runtime_beads_declared",
         "claim_integrity.franken_node_strict_replacement_dropin_certified",
+        "claim_integrity.franken_node_strict_tier_required_evidence",
         "claim_integrity.franken_node_requested_claim_tier_known",
         "claim_integrity.franken_node_requested_claim_tier_allowed",
         "claim_integrity.franken_node_claim_gate_status_json",

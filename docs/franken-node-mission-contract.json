@@ -58,11 +58,13 @@
       "required_evidence_artifacts": [
         "docs/dropin-certification-verdict.json",
         "docs/franken-node-kernel-extraction-boundary-manifest.json",
+        "docs/franken-node-package-interop-contract.json",
         "tests/full_suite_gate/franken_node_kernel_boundary_drift_report.json"
       ],
       "required_check_ids": [
         "claim_integrity.franken_node_strict_replacement_dropin_certified",
-        "claim_integrity.franken_node_phase6_runtime_beads_declared"
+        "claim_integrity.franken_node_phase6_runtime_beads_declared",
+        "claim_integrity.franken_node_strict_tier_required_evidence"
       ],
       "blocking_reason": "Strict runtime-replacement claims remain blocked until drop-in verdict is CERTIFIED and phase-6 runtime interoperability beads are complete."
     }

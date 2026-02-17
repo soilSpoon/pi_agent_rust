@@ -518,6 +518,98 @@ fn resolve_extension_sources_directory_uses_package_json_pi_manifest_entries() {
 }
 
 #[test]
+fn resolve_extension_sources_manifest_missing_entries_fail_closed_without_fallback() {
+    let harness = TestHarness::new(
+        "resolve_extension_sources_manifest_missing_entries_fail_closed_without_fallback",
+    );
+
+    let cwd = harness.create_dir("cwd");
+    let manager = PackageManager::new(cwd.clone());
+
+    let package_root = cwd.join("pkg_missing_manifest_targets");
+    let extensions_dir = package_root.join("extensions");
+    std::fs::create_dir_all(&extensions_dir).expect("create extensions dir");
+
+    // If manifest resolution were fail-open, this fallback would be selected.
+    let index_js = package_root.join("index.js");
+    std::fs::write(&index_js, "export const fallback = true;\n").expect("write index.js");
+
+    write_json(
+        &package_root.join("package.json"),
+        &serde_json::json!({
+            "name": "pkg_missing_manifest_targets",
+            "private": true,
+            "pi": {
+                "extensions": ["extensions/does-not-exist.js"]
+            }
+        }),
+    );
+
+    let sources = vec![package_root.display().to_string()];
+    let resolved = run_async(manager.resolve_extension_sources(
+        &sources,
+        ResolveExtensionSourcesOptions {
+            local: false,
+            temporary: true,
+        },
+    ))
+    .expect("resolve_extension_sources");
+
+    log_resolved(&harness, "extensions", &resolved.extensions);
+    assert!(
+        resolved.extensions.is_empty(),
+        "missing manifest targets must fail closed without index.js/directory fallback"
+    );
+}
+
+#[test]
+fn resolve_extension_sources_manifest_empty_extensions_fail_closed_without_fallback() {
+    let harness = TestHarness::new(
+        "resolve_extension_sources_manifest_empty_extensions_fail_closed_without_fallback",
+    );
+
+    let cwd = harness.create_dir("cwd");
+    let manager = PackageManager::new(cwd.clone());
+
+    let package_root = cwd.join("pkg_empty_manifest_extensions");
+    let extensions_dir = package_root.join("extensions");
+    std::fs::create_dir_all(&extensions_dir).expect("create extensions dir");
+    let ext_file = extensions_dir.join("extension.js");
+    std::fs::write(&ext_file, "export const explicit = true;\n").expect("write extension.js");
+
+    // If manifest resolution were fail-open, this fallback would be selected.
+    let index_js = package_root.join("index.js");
+    std::fs::write(&index_js, "export const fallback = true;\n").expect("write index.js");
+
+    write_json(
+        &package_root.join("package.json"),
+        &serde_json::json!({
+            "name": "pkg_empty_manifest_extensions",
+            "private": true,
+            "pi": {
+                "extensions": []
+            }
+        }),
+    );
+
+    let sources = vec![package_root.display().to_string()];
+    let resolved = run_async(manager.resolve_extension_sources(
+        &sources,
+        ResolveExtensionSourcesOptions {
+            local: false,
+            temporary: true,
+        },
+    ))
+    .expect("resolve_extension_sources");
+
+    log_resolved(&harness, "extensions", &resolved.extensions);
+    assert!(
+        resolved.extensions.is_empty(),
+        "empty manifest extensions list must fail closed without implicit fallback"
+    );
+}
+
+#[test]
 fn resolve_extension_sources_directory_without_resources_falls_back_to_dir_entry() {
     let harness = TestHarness::new(
         "resolve_extension_sources_directory_without_resources_falls_back_to_dir_entry",

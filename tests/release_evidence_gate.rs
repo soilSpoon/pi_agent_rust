@@ -52,6 +52,14 @@ const FRANKEN_NODE_REQUIRED_LOG_FIELDS: &[&str] = &[
     "evidence_refs",
     "timestamp_utc",
 ];
+const FRANKEN_NODE_TIER2_REQUIRED_EVIDENCE_TOKENS: &[&str] = &[
+    "compatibility matrix with executable conformance harness",
+    "package/ecosystem interoperability contract evidence (cjs/esm/npm)",
+];
+const FRANKEN_NODE_TIER3_REQUIRED_EVIDENCE_TOKENS: &[&str] = &[
+    "package/ecosystem interoperability strict-tier evidence and claim-tier linkage",
+    "crate reintegration evidence into pi_agent_rust",
+];
 
 fn collect_non_empty_string_array(
     value: &Value,
@@ -160,6 +168,24 @@ fn validate_franken_node_claim_contract(contract: &Value) -> Result<(), String> 
             errors.push(format!(
                 "claim_tiers[{index}] must include required_evidence entries"
             ));
+        }
+        let required_evidence_tokens: &[&str] = match tier_id {
+            "TIER-2-TARGETED-RUNTIME-PARITY" => FRANKEN_NODE_TIER2_REQUIRED_EVIDENCE_TOKENS,
+            "TIER-3-FULL-NODE-BUN-REPLACEMENT" => FRANKEN_NODE_TIER3_REQUIRED_EVIDENCE_TOKENS,
+            _ => &[],
+        };
+        if !required_evidence_tokens.is_empty() {
+            let evidence_set = required_evidence
+                .iter()
+                .map(|entry| entry.to_ascii_lowercase())
+                .collect::<HashSet<_>>();
+            for required_token in required_evidence_tokens {
+                if !evidence_set.contains(&required_token.to_ascii_lowercase()) {
+                    errors.push(format!(
+                        "claim_tiers[{index}] ({tier_id}) required_evidence missing token: {required_token}"
+                    ));
+                }
+            }
         }
 
         if !allowed.is_empty() && !forbidden.is_empty() {
@@ -1626,6 +1652,41 @@ fn franken_node_claim_contract_fails_closed_on_empty_required_evidence_list() {
         err.contains("must include required_evidence entries")
             || err.contains("required_evidence must be non-empty"),
         "error should explain required_evidence contract failure, got: {err}"
+    );
+}
+
+#[test]
+fn franken_node_claim_contract_fails_closed_on_missing_package_interop_evidence_token() {
+    let mut contract = require_json(FRANKEN_NODE_CLAIM_CONTRACT_PATH);
+    let tiers = contract
+        .get_mut("claim_tiers")
+        .and_then(Value::as_array_mut)
+        .expect("claim_tiers must be an array");
+    let tier2 = tiers
+        .iter_mut()
+        .find(|tier| {
+            tier.get("tier_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|tier_id| tier_id == "TIER-2-TARGETED-RUNTIME-PARITY")
+        })
+        .expect("TIER-2-TARGETED-RUNTIME-PARITY must exist");
+    let evidence = tier2
+        .get_mut("required_evidence")
+        .and_then(Value::as_array_mut)
+        .expect("TIER-2 required_evidence must be an array");
+    evidence.retain(|entry| {
+        !entry.as_str().map_or("", str::trim).eq_ignore_ascii_case(
+            "package/ecosystem interoperability contract evidence (CJS/ESM/npm)",
+        )
+    });
+
+    let err = validate_franken_node_claim_contract(&contract)
+        .expect_err("missing package interop evidence token must fail closed");
+    assert!(
+        err.contains("required_evidence missing token")
+            && err.contains("package/ecosystem interoperability contract evidence"),
+        "error should identify missing package interop token, got: {err}"
     );
 }
 
