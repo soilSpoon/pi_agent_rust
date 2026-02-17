@@ -1057,9 +1057,16 @@ fn error_followed_by_success() {
     let harness = common::TestHarness::new("reliability_error_then_success");
 
     // Load both throwing and good extensions on same manager.
+    // Each extension must be in its own directory to prevent sibling discovery
+    // (discover_related_extension_entries would otherwise find both .mjs files
+    // in the same directory and load good.mjs during throw_spec processing,
+    // causing a tool name collision when good_spec is loaded separately).
     let cwd = harness.temp_dir().to_path_buf();
-    let throw_path = harness.create_file("extensions/throw.mjs", THROWING_EVENT_EXT.as_bytes());
-    let good_path = harness.create_file("extensions/good.mjs", COUNTER_EXT.as_bytes());
+    let throw_path = harness.create_file(
+        "extensions/throw-ext/throw.mjs",
+        THROWING_EVENT_EXT.as_bytes(),
+    );
+    let good_path = harness.create_file("extensions/good-ext/good.mjs", COUNTER_EXT.as_bytes());
     let throw_spec = JsExtensionLoadSpec::from_entry_path(&throw_path).expect("throw spec");
     let good_spec = JsExtensionLoadSpec::from_entry_path(&good_path).expect("good spec");
 
