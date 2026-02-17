@@ -150,8 +150,7 @@ fn collect_tier_ids(contract: &Value) -> ValidationResult<HashSet<String>> {
         let tier_id = row
             .get("tier_id")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("<missing>");
+            .map_or("<missing>", str::trim);
 
         for target in row
             .get("promotion_targets")

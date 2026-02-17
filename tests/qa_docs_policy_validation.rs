@@ -1433,6 +1433,7 @@ fn franken_node_mission_contract_tier_mapping_declares_required_checks_and_phase
         "bd-3ar8v.7.4",
         "bd-3ar8v.7.5",
         "bd-3ar8v.7.6",
+        "bd-3ar8v.7.15",
     ] {
         assert!(
             strict_beads.contains(bead),
