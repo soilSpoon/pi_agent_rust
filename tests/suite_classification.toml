@@ -30,6 +30,7 @@ files = [
     "e2e_artifact_retention_triage",
     "e2e_replay_bundle_validation",
     "error_types",
+    "franken_node_benchmark_resource_gate_contract",
     "franken_node_claim_contract",
     "franken_node_compat_harness",
     "franken_node_compatibility_doctor_contract",
