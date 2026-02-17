@@ -332,6 +332,40 @@ Interpretation:
 - Latency: Rust still slower in realistic E2E.
 - Memory: Rust remains much smaller (`~7.9x` to `~11.5x` lower RSS in these realistic runs).
 
+## 6.4 Session Save Hotpath Optimization Update (2026-02-17)
+
+Applied optimization:
+- Changed `Session::should_full_rewrite` in `src/session.rs` so compaction entries no longer unconditionally force full-file rewrite.
+- Full rewrite triggers retained: first save, header dirty, checkpoint interval, and defensive persisted-count mismatch.
+- Updated save-path unit test to assert compaction path uses incremental append:
+  - `session::tests::test_compaction_entry_uses_incremental_append`
+
+Why this lever:
+- Realistic workloads include compaction events.
+- Previous policy converted those workloads into repeated O(file-size) rewrites.
+
+Measured before/after (same realistic benchmark parameters, release build):
+
+| Token level | Metric | Before | After | Delta | Speedup |
+|---|---|---:|---:|---:|---:|
+| 1M | `save_ms` | 26.42 | 31.31 | +4.89 | 0.84x |
+| 1M | `total_ms` | 275.59 | 264.00 | -11.59 | 1.04x |
+| 5M | `save_ms` | 359.63 | 114.46 | -245.17 | 3.14x |
+| 5M | `total_ms` | 1,636.38 | 1,412.39 | -223.99 | 1.16x |
+
+Resource counters (`/usr/bin/time`):
+
+| Token level | Metric | Before | After | Delta |
+|---|---|---:|---:|---:|
+| 1M | `elapsed_s` | 0.36 | 0.27 | -0.09 |
+| 1M | `rss_kb` | 68,800 | 67,852 | -948 |
+| 5M | `elapsed_s` | 1.76 | 1.43 | -0.33 |
+| 5M | `rss_kb` | 268,692 | 268,788 | +96 |
+
+Interpretation:
+- This materially cuts the large-session save bottleneck (especially at 5M tokens).
+- Aggregate runtime is still dominated by append/operation phase at high token counts, so this is a substantial but not final optimization.
+
 ---
 
 ## 7) Extension Runtime Design and Compatibility Status
