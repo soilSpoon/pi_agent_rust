@@ -780,6 +780,94 @@ fn check_artifact_status(
     }
 }
 
+const MUST_PASS_LINEAGE_MAX_AGE_DAYS: i64 = 7;
+const MUST_PASS_LINEAGE_MAX_FUTURE_SKEW_MINUTES: i64 = 5;
+
+fn validate_must_pass_lineage_metadata(
+    verdict: &Value,
+    artifact_rel: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let run_id = verdict
+        .get("run_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if run_id.is_empty() {
+        return Err(format!(
+            "{artifact_rel} missing non-empty lineage field 'run_id'"
+        ));
+    }
+
+    let correlation_id = verdict
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if correlation_id.is_empty() {
+        return Err(format!(
+            "{artifact_rel} missing non-empty lineage field 'correlation_id'"
+        ));
+    }
+    if !correlation_id.contains(run_id) {
+        return Err(format!(
+            "{artifact_rel} correlation_id '{correlation_id}' must include run_id '{run_id}'"
+        ));
+    }
+
+    let generated_at = verdict
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if generated_at.is_empty() {
+        return Err(format!(
+            "{artifact_rel} missing non-empty freshness field 'generated_at'"
+        ));
+    }
+    let parsed_generated_at = chrono::DateTime::parse_from_rfc3339(generated_at)
+        .map_err(|err| format!("{artifact_rel} has invalid generated_at '{generated_at}': {err}"))?
+        .with_timezone(&chrono::Utc);
+
+    let oldest_allowed = now - chrono::Duration::days(MUST_PASS_LINEAGE_MAX_AGE_DAYS);
+    let newest_allowed = now + chrono::Duration::minutes(MUST_PASS_LINEAGE_MAX_FUTURE_SKEW_MINUTES);
+    if parsed_generated_at < oldest_allowed {
+        return Err(format!(
+            "{artifact_rel} generated_at '{generated_at}' is stale (older than {MUST_PASS_LINEAGE_MAX_AGE_DAYS} days)"
+        ));
+    }
+    if parsed_generated_at > newest_allowed {
+        return Err(format!(
+            "{artifact_rel} generated_at '{generated_at}' is too far in the future"
+        ));
+    }
+
+    Ok(())
+}
+
+fn check_must_pass_gate_artifact(root: &Path, artifact_rel: &str) -> (String, Option<String>) {
+    let (status, detail) = check_artifact_status(root, artifact_rel, &["status"], &["pass"]);
+    if status != "pass" {
+        return (status, detail);
+    }
+
+    let full = root.join(artifact_rel);
+    let Some(verdict) = load_json(&full) else {
+        return (
+            "skip".to_string(),
+            Some(format!("Artifact not found: {artifact_rel}")),
+        );
+    };
+
+    if let Err(detail) =
+        validate_must_pass_lineage_metadata(&verdict, artifact_rel, chrono::Utc::now())
+    {
+        return ("fail".to_string(), Some(detail));
+    }
+
+    ("pass".to_string(), None)
+}
+
 /// Check that a file exists and is non-empty.
 fn check_artifact_present(root: &Path, artifact_rel: &str) -> (String, Option<String>) {
     let full = root.join(artifact_rel);
@@ -853,11 +941,9 @@ fn collect_gates(root: &Path) -> Vec<SubGate> {
     });
 
     // Gate 3: Extension must-pass gate (208 extensions).
-    let (status, detail) = check_artifact_status(
+    let (status, detail) = check_must_pass_gate_artifact(
         root,
         "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
-        &["status"],
-        &["pass"],
     );
     gates.push(SubGate {
         id: "ext_must_pass".to_string(),
@@ -2733,6 +2819,65 @@ fn fail_close_blocking_skips_only_converts_blocking_skip_statuses() {
     );
     assert_eq!(gates[1].status, "skip");
     assert_eq!(gates[2].status, "pass");
+}
+
+fn fixed_utc(ts: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .unwrap_or_else(|err| panic!("invalid fixed RFC3339 timestamp {ts}: {err}"))
+        .with_timezone(&chrono::Utc)
+}
+
+fn must_pass_lineage_fixture(generated_at: &str) -> Value {
+    serde_json::json!({
+        "status": "pass",
+        "run_id": "run-123",
+        "correlation_id": "must-pass-gate-run-123",
+        "generated_at": generated_at
+    })
+}
+
+#[test]
+fn must_pass_lineage_validator_accepts_fresh_linked_metadata() {
+    let now = fixed_utc("2026-02-17T00:00:00Z");
+    let verdict = must_pass_lineage_fixture("2026-02-16T23:59:00Z");
+    let result =
+        validate_must_pass_lineage_metadata(&verdict, "must_pass_gate_verdict.json", now);
+    assert!(result.is_ok(), "fresh linked metadata should pass: {result:?}");
+}
+
+#[test]
+fn must_pass_lineage_validator_fails_when_run_id_missing() {
+    let now = fixed_utc("2026-02-17T00:00:00Z");
+    let mut verdict = must_pass_lineage_fixture("2026-02-16T23:59:00Z");
+    verdict["run_id"] = serde_json::json!(" ");
+    let err = validate_must_pass_lineage_metadata(&verdict, "must_pass_gate_verdict.json", now)
+        .expect_err("missing run_id must fail closed");
+    assert!(err.contains("run_id"), "expected run_id failure detail: {err}");
+}
+
+#[test]
+fn must_pass_lineage_validator_fails_when_correlation_does_not_include_run_id() {
+    let now = fixed_utc("2026-02-17T00:00:00Z");
+    let mut verdict = must_pass_lineage_fixture("2026-02-16T23:59:00Z");
+    verdict["correlation_id"] = serde_json::json!("corr-xyz");
+    let err = validate_must_pass_lineage_metadata(&verdict, "must_pass_gate_verdict.json", now)
+        .expect_err("correlation/run mismatch must fail closed");
+    assert!(
+        err.contains("must include run_id"),
+        "expected correlation/run_id linkage detail: {err}"
+    );
+}
+
+#[test]
+fn must_pass_lineage_validator_fails_when_generated_at_stale() {
+    let now = fixed_utc("2026-02-17T00:00:00Z");
+    let verdict = must_pass_lineage_fixture("2026-02-09T23:59:59Z");
+    let err = validate_must_pass_lineage_metadata(&verdict, "must_pass_gate_verdict.json", now)
+        .expect_err("stale generated_at must fail closed");
+    assert!(
+        err.contains("stale"),
+        "expected stale freshness detail in error: {err}"
+    );
 }
 
 #[test]

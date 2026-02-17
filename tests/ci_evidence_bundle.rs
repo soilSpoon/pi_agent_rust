@@ -151,9 +151,18 @@ const ARTIFACT_SOURCES: &[ArtifactSource] = &[
         id: "must_pass_gate",
         label: "Must-pass gate verdict (208 extensions)",
         category: "diagnostics",
-        path: "tests/ext_conformance/reports/gate",
+        path: "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
+        expected_schema: Some("pi.ext.must_pass_gate"),
+        is_directory: false,
+        required: true,
+    },
+    ArtifactSource {
+        id: "must_pass_gate_events",
+        label: "Must-pass gate event log",
+        category: "diagnostics",
+        path: "tests/ext_conformance/reports/gate/must_pass_events.jsonl",
         expected_schema: None,
-        is_directory: true,
+        is_directory: false,
         required: false,
     },
     ArtifactSource {
@@ -328,6 +337,73 @@ fn dir_stats(path: &Path) -> (usize, u64) {
     (count, bytes)
 }
 
+fn validate_must_pass_gate_payload(val: &Value) -> Result<Value, String> {
+    let status = val
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "must_pass_gate: missing status".to_string())?;
+    if !matches!(status, "pass" | "warn" | "fail") {
+        return Err(format!("must_pass_gate: unexpected status '{status}'"));
+    }
+
+    let generated_at = val
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "must_pass_gate: missing generated_at".to_string())?;
+    if generated_at.trim().is_empty() {
+        return Err("must_pass_gate: generated_at is empty".to_string());
+    }
+
+    let run_id = val
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "must_pass_gate: missing run_id".to_string())?;
+    if run_id.trim().is_empty() {
+        return Err("must_pass_gate: run_id is empty".to_string());
+    }
+
+    let correlation_id = val
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "must_pass_gate: missing correlation_id".to_string())?;
+    if correlation_id.trim().is_empty() {
+        return Err("must_pass_gate: correlation_id is empty".to_string());
+    }
+
+    let observed = val
+        .get("observed")
+        .ok_or_else(|| "must_pass_gate: missing observed object".to_string())?;
+    let must_pass_total = observed
+        .get("must_pass_total")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "must_pass_gate: missing observed.must_pass_total".to_string())?;
+    let must_pass_passed = observed
+        .get("must_pass_passed")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "must_pass_gate: missing observed.must_pass_passed".to_string())?;
+
+    if must_pass_total == 0 {
+        return Err("must_pass_gate: observed.must_pass_total must be > 0".to_string());
+    }
+    if must_pass_passed > must_pass_total {
+        return Err(format!(
+            "must_pass_gate: observed.must_pass_passed ({must_pass_passed}) exceeds total ({must_pass_total})"
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "status": status,
+        "must_pass_total": must_pass_total,
+        "must_pass_passed": must_pass_passed,
+        "must_pass_failed": observed.get("must_pass_failed"),
+        "must_pass_skipped": observed.get("must_pass_skipped"),
+        "must_pass_pass_rate_pct": observed.get("must_pass_pass_rate_pct"),
+        "run_id": run_id,
+        "correlation_id": correlation_id,
+        "generated_at": generated_at,
+    }))
+}
+
 /// Collect a section from an artifact source.
 fn collect_section(root: &Path, source: &ArtifactSource) -> BundleSection {
     let full_path = root.join(source.path);
@@ -373,6 +449,7 @@ fn collect_section(root: &Path, source: &ArtifactSource) -> BundleSection {
         let mut schema_found = None;
         let mut summary = None;
         let mut status = "present".to_string();
+        let mut diagnostics: Option<String> = None;
 
         // Try to validate JSON files.
         if std::path::Path::new(source.path)
@@ -388,15 +465,36 @@ fn collect_section(root: &Path, source: &ArtifactSource) -> BundleSection {
                         if let Some(ref actual) = schema_found {
                             if !actual.starts_with(expected) {
                                 status = "invalid".to_string();
+                                diagnostics = Some(format!(
+                                    "Schema mismatch: expected prefix '{expected}', found '{actual}'"
+                                ));
                             }
+                        } else {
+                            status = "invalid".to_string();
+                            diagnostics = Some(format!(
+                                "Missing schema field (expected prefix '{expected}')"
+                            ));
                         }
                     }
 
                     // Extract lightweight summary for index.
-                    summary = extract_summary(&val, source.id);
+                    if source.id == "must_pass_gate" {
+                        match validate_must_pass_gate_payload(&val) {
+                            Ok(payload) => {
+                                summary = Some(payload);
+                            }
+                            Err(err) => {
+                                status = "invalid".to_string();
+                                diagnostics = Some(err);
+                            }
+                        }
+                    } else {
+                        summary = extract_summary(&val, source.id);
+                    }
                 }
                 None => {
                     status = "invalid".to_string();
+                    diagnostics = Some("Failed to parse JSON".to_string());
                 }
             }
         }
@@ -409,7 +507,7 @@ fn collect_section(root: &Path, source: &ArtifactSource) -> BundleSection {
             artifact_path: Some(source.path.to_string()),
             schema: schema_found,
             summary,
-            diagnostics: None,
+            diagnostics,
             file_count: 1,
             total_bytes: file_size,
         }
@@ -783,6 +881,70 @@ fn evidence_bundle_failures_have_paths() {
             );
         }
     }
+}
+
+#[test]
+fn must_pass_gate_source_is_required_json_verdict_file() {
+    let source = ARTIFACT_SOURCES
+        .iter()
+        .find(|source| source.id == "must_pass_gate")
+        .expect("must_pass_gate source must exist");
+    assert!(
+        !source.is_directory,
+        "must_pass_gate must target a JSON verdict artifact, not a directory"
+    );
+    assert!(
+        source.path.ends_with("must_pass_gate_verdict.json"),
+        "must_pass_gate path must target must_pass_gate_verdict.json"
+    );
+    assert!(
+        source.required,
+        "must_pass_gate should be required for complete evidence bundles"
+    );
+}
+
+#[test]
+fn validate_must_pass_gate_payload_accepts_current_shape() {
+    let payload = serde_json::json!({
+        "schema": "pi.ext.must_pass_gate.v1",
+        "generated_at": "2026-02-17T03:00:00.000Z",
+        "run_id": "ci-123",
+        "correlation_id": "corr-123",
+        "status": "pass",
+        "observed": {
+            "must_pass_total": 208,
+            "must_pass_passed": 208,
+            "must_pass_failed": 0,
+            "must_pass_skipped": 0,
+            "must_pass_pass_rate_pct": 100.0
+        }
+    });
+
+    let summary = validate_must_pass_gate_payload(&payload)
+        .expect("current must-pass payload shape should validate");
+    assert_eq!(summary["status"], "pass");
+    assert_eq!(summary["must_pass_total"], 208);
+    assert_eq!(summary["must_pass_passed"], 208);
+}
+
+#[test]
+fn validate_must_pass_gate_payload_rejects_missing_lineage() {
+    let payload = serde_json::json!({
+        "schema": "pi.ext.must_pass_gate.v1",
+        "generated_at": "2026-02-17T03:00:00.000Z",
+        "status": "pass",
+        "observed": {
+            "must_pass_total": 208,
+            "must_pass_passed": 208
+        }
+    });
+
+    let err = validate_must_pass_gate_payload(&payload)
+        .expect_err("payload without run/correlation lineage must fail closed");
+    assert!(
+        err.contains("run_id"),
+        "expected run_id validation error, got: {err}"
+    );
 }
 
 /// Capitalize the first letter of a string.

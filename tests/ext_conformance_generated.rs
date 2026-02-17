@@ -1979,6 +1979,8 @@ fn conformance_failure_dossiers() {
 struct MustPassGateVerdict {
     schema: String,
     generated_at: String,
+    run_id: String,
+    correlation_id: String,
     mode: String,
     status: String, // "pass", "fail", "warn"
     thresholds: MustPassThresholds,
@@ -2009,6 +2011,79 @@ struct MustPassObserved {
     stretch_skipped: usize,
 }
 
+fn normalize_optional_env(value: Option<String>) -> Option<String> {
+    value
+        .map(|candidate| candidate.trim().to_string())
+        .filter(|candidate| !candidate.is_empty())
+}
+
+fn resolve_must_pass_gate_lineage(
+    github_run_id: Option<String>,
+    ci_run_id: Option<String>,
+    ci_correlation_id: Option<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (String, String) {
+    let run_id = normalize_optional_env(github_run_id)
+        .or_else(|| normalize_optional_env(ci_run_id))
+        .unwrap_or_else(|| format!("local-{}", now.format("%Y%m%dT%H%M%S%3fZ")));
+    let correlation_id = normalize_optional_env(ci_correlation_id)
+        .unwrap_or_else(|| format!("must-pass-gate-{run_id}"));
+    (run_id, correlation_id)
+}
+
+fn current_must_pass_gate_lineage(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
+    resolve_must_pass_gate_lineage(
+        std::env::var("GITHUB_RUN_ID").ok(),
+        std::env::var("CI_RUN_ID").ok(),
+        std::env::var("CI_CORRELATION_ID").ok(),
+        now,
+    )
+}
+
+#[test]
+fn must_pass_lineage_prefers_github_run_and_explicit_correlation() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-02-17T00:00:00Z")
+        .expect("parse fixed RFC3339 timestamp")
+        .with_timezone(&chrono::Utc);
+    let (run_id, correlation_id) = resolve_must_pass_gate_lineage(
+        Some(" 12345 ".to_string()),
+        Some("fallback-run".to_string()),
+        Some(" corr-abc ".to_string()),
+        now,
+    );
+    assert_eq!(run_id, "12345");
+    assert_eq!(correlation_id, "corr-abc");
+}
+
+#[test]
+fn must_pass_lineage_uses_ci_run_id_when_github_run_id_missing() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-02-17T00:00:00Z")
+        .expect("parse fixed RFC3339 timestamp")
+        .with_timezone(&chrono::Utc);
+    let (run_id, correlation_id) =
+        resolve_must_pass_gate_lineage(None, Some("ci-777".to_string()), None, now);
+    assert_eq!(run_id, "ci-777");
+    assert_eq!(correlation_id, "must-pass-gate-ci-777");
+}
+
+#[test]
+fn must_pass_lineage_falls_back_to_local_run_id_when_env_missing() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-02-17T01:02:03Z")
+        .expect("parse fixed RFC3339 timestamp")
+        .with_timezone(&chrono::Utc);
+    let (run_id, correlation_id) = resolve_must_pass_gate_lineage(
+        Some("   ".to_string()),
+        Some(String::new()),
+        Some("   ".to_string()),
+        now,
+    );
+    assert!(
+        run_id.starts_with("local-20260217T010203"),
+        "unexpected local run_id format: {run_id}"
+    );
+    assert_eq!(correlation_id, format!("must-pass-gate-{run_id}"));
+}
+
 /// CI gate test that blocks merge if must-pass extensions (tier 1-2) fail.
 ///
 /// Run with:
@@ -2037,6 +2112,9 @@ fn conformance_must_pass_gate() {
     let mode = std::env::var("PI_EXT_GATE_MODE")
         .unwrap_or_else(|_| "strict".to_string())
         .to_lowercase();
+    let now = Utc::now();
+    let generated_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let (run_id, correlation_id) = current_must_pass_gate_lineage(now);
 
     let report_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -2059,6 +2137,8 @@ fn conformance_must_pass_gate() {
 
     eprintln!("\n=== Must-Pass Extension CI Gate (bd-1f42.4.4) ===");
     eprintln!("  Mode:            {mode}");
+    eprintln!("  Run ID:          {run_id}");
+    eprintln!("  Correlation ID:  {correlation_id}");
     eprintln!(
         "  Must-pass set:   {} extensions (tier 1-2)",
         must_pass.len()
@@ -2206,7 +2286,9 @@ fn conformance_must_pass_gate() {
 
     let verdict = MustPassGateVerdict {
         schema: "pi.ext.must_pass_gate.v1".to_string(),
-        generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        generated_at: generated_at.clone(),
+        run_id: run_id.clone(),
+        correlation_id: correlation_id.clone(),
         mode: mode.clone(),
         status: status.clone(),
         thresholds: MustPassThresholds {
@@ -2240,10 +2322,13 @@ fn conformance_must_pass_gate() {
 
     // ── Write gate verdict JSON ──
     let verdict_path = report_dir.join("must_pass_gate_verdict.json");
-    let _ = std::fs::write(
-        &verdict_path,
-        serde_json::to_string_pretty(&verdict).unwrap_or_default(),
+    let verdict_json =
+        serde_json::to_string_pretty(&verdict).expect("serialize must-pass gate verdict JSON");
+    assert!(
+        !verdict_json.trim().is_empty(),
+        "must-pass gate verdict serialization unexpectedly empty"
     );
+    std::fs::write(&verdict_path, verdict_json).expect("write must-pass gate verdict JSON");
 
     // ── Write JSONL events for each must-pass result ──
     let events_path = report_dir.join("must_pass_events.jsonl");
@@ -2252,6 +2337,8 @@ fn conformance_must_pass_gate() {
         let line = serde_json::json!({
             "schema": "pi.ext.gate_event.v1",
             "set": "must_pass",
+            "run_id": run_id.clone(),
+            "correlation_id": correlation_id.clone(),
             "id": r.id,
             "tier": r.tier,
             "status": r.status,
@@ -2265,6 +2352,8 @@ fn conformance_must_pass_gate() {
         let line = serde_json::json!({
             "schema": "pi.ext.gate_event.v1",
             "set": "stretch",
+            "run_id": run_id.clone(),
+            "correlation_id": correlation_id.clone(),
             "id": r.id,
             "tier": r.tier,
             "status": r.status,
@@ -2274,7 +2363,12 @@ fn conformance_must_pass_gate() {
         });
         event_lines.push(serde_json::to_string(&line).unwrap_or_default());
     }
-    let _ = std::fs::write(&events_path, event_lines.join("\n") + "\n");
+    let events_payload = event_lines.join("\n") + "\n";
+    assert!(
+        !events_payload.trim().is_empty(),
+        "must-pass gate event payload unexpectedly empty"
+    );
+    std::fs::write(&events_path, events_payload).expect("write must-pass gate events JSONL");
 
     // ── Write Markdown gate report ──
     let mut md = String::new();
@@ -2284,6 +2378,8 @@ fn conformance_must_pass_gate() {
         "> Generated: {}",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     );
+    let _ = writeln!(md, "> Run ID: {run_id}");
+    let _ = writeln!(md, "> Correlation ID: {correlation_id}");
     let _ = writeln!(md, "> Mode: {mode}\n");
 
     md.push_str("## Gate Verdict\n\n");
@@ -2350,7 +2446,29 @@ fn conformance_must_pass_gate() {
     md.push('\n');
 
     let md_path = report_dir.join("must_pass_gate_report.md");
-    let _ = std::fs::write(&md_path, &md);
+    std::fs::write(&md_path, &md).expect("write must-pass gate report Markdown");
+
+    let verdict_len = std::fs::metadata(&verdict_path)
+        .expect("stat must-pass gate verdict JSON")
+        .len();
+    let events_len = std::fs::metadata(&events_path)
+        .expect("stat must-pass gate events JSONL")
+        .len();
+    let md_len = std::fs::metadata(&md_path)
+        .expect("stat must-pass gate report Markdown")
+        .len();
+    assert!(
+        verdict_len > 0,
+        "must-pass gate verdict JSON is empty after write"
+    );
+    assert!(
+        events_len > 0,
+        "must-pass gate events JSONL is empty after write"
+    );
+    assert!(
+        md_len > 0,
+        "must-pass gate report Markdown is empty after write"
+    );
 
     // ── Print summary ──
     eprintln!("\n=== Must-Pass Gate Verdict ===");
