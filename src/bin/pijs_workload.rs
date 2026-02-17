@@ -195,7 +195,17 @@ fn run() -> Result<()> {
     let total_calls_u128 = total_calls as u128;
 
     let per_call_us = elapsed_micros.checked_div(total_calls_u128).unwrap_or(0);
-    let per_call_us_f64 = per_call_us.to_string().parse::<f64>().unwrap_or(0.0);
+    let total_calls_f64 = total_calls_u128 as f64;
+    let per_call_us_f64 = if total_calls_u128 == 0 {
+        0.0
+    } else {
+        elapsed.as_secs_f64() * 1_000_000.0 / total_calls_f64
+    };
+    let per_call_ns_f64 = if total_calls_u128 == 0 {
+        0.0
+    } else {
+        elapsed.as_secs_f64() * 1_000_000_000.0 / total_calls_f64
+    };
     let calls_per_sec = total_calls_u128
         .saturating_mul(1_000_000)
         .checked_div(elapsed_micros)
@@ -214,6 +224,7 @@ fn run() -> Result<()> {
             "elapsed_us": elapsed_micros,
             "per_call_us": per_call_us,
             "per_call_us_f64": per_call_us_f64,
+            "per_call_ns_f64": per_call_ns_f64,
             "calls_per_sec": calls_per_sec,
             "build_profile": build_profile,
             "runtime_engine": args.runtime_engine.as_str(),
