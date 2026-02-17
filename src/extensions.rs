@@ -15372,7 +15372,6 @@ mod native_runtime_experimental {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ExtensionRuntimeEngineSelection {
-        QuickJs,
         NativeRust,
     }
 
@@ -15381,17 +15380,12 @@ mod native_runtime_experimental {
 
         pub const fn as_str(self) -> &'static str {
             match self {
-                Self::QuickJs => "quickjs",
                 Self::NativeRust => "native-rust",
             }
         }
 
-        pub fn from_env_value(value: &str) -> Self {
-            if matches!(value.trim().to_ascii_lowercase().as_str(), "quickjs" | "js") {
-                Self::QuickJs
-            } else {
-                Self::NativeRust
-            }
+        pub const fn from_env_value(_value: &str) -> Self {
+            Self::NativeRust
         }
 
         #[must_use]
@@ -16708,6 +16702,12 @@ mod native_runtime_duplicate_scaffold {
     #[derive(Debug, Default)]
     struct NativeRustRuntimeState {
         extensions: Vec<NativeRustLoadedExtension>,
+        tool_extension_index: HashMap<String, usize>,
+        command_extension_index: HashMap<String, usize>,
+        shortcut_extension_index: HashMap<String, usize>,
+        provider_stream_extension_index: HashMap<String, usize>,
+        event_hook_extension_indexes: HashMap<String, Vec<usize>>,
+        registered_tools: Vec<ExtensionToolDef>,
         streams: HashMap<String, VecDeque<Value>>,
         next_stream_id: u64,
         flags: HashMap<(String, String), Value>,
@@ -16715,33 +16715,94 @@ mod native_runtime_duplicate_scaffold {
     }
 
     impl NativeRustRuntimeState {
+        fn load_extensions(
+            &mut self,
+            loaded: Vec<NativeRustLoadedExtension>,
+        ) -> Vec<JsExtensionSnapshot> {
+            let snapshots = loaded
+                .iter()
+                .map(|extension| extension.snapshot.clone())
+                .collect::<Vec<_>>();
+            self.extensions = loaded;
+            self.streams.clear();
+            self.next_stream_id = 0;
+            self.rebuild_indexes();
+            snapshots
+        }
+
+        fn rebuild_indexes(&mut self) {
+            self.tool_extension_index.clear();
+            self.command_extension_index.clear();
+            self.shortcut_extension_index.clear();
+            self.provider_stream_extension_index.clear();
+            self.event_hook_extension_indexes.clear();
+            self.registered_tools.clear();
+
+            for (extension_index, extension) in self.extensions.iter().enumerate() {
+                self.registered_tools
+                    .extend(parse_extension_tool_defs(&extension.snapshot.tools));
+
+                for tool in &extension.snapshot.tools {
+                    if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                        self.tool_extension_index
+                            .entry(name.to_string())
+                            .or_insert(extension_index);
+                    }
+                }
+
+                for command in &extension.snapshot.slash_commands {
+                    if let Some(name) = extract_slash_command_name(command) {
+                        self.command_extension_index
+                            .entry(name)
+                            .or_insert(extension_index);
+                    }
+                }
+
+                for shortcut in &extension.snapshot.shortcuts {
+                    if let Some(key_id) = shortcut.get("key_id").and_then(Value::as_str) {
+                        self.shortcut_extension_index
+                            .entry(key_id.to_string())
+                            .or_insert(extension_index);
+                    }
+                }
+
+                for provider_id in extension.provider_streams.keys() {
+                    self.provider_stream_extension_index
+                        .entry(provider_id.clone())
+                        .or_insert(extension_index);
+                }
+
+                for hook in &extension.snapshot.event_hooks {
+                    self.event_hook_extension_indexes
+                        .entry(hook.clone())
+                        .or_default()
+                        .push(extension_index);
+                }
+            }
+        }
+
         fn find_tool_extension(&self, tool_name: &str) -> Option<&NativeRustLoadedExtension> {
-            self.extensions.iter().find(|ext| {
-                ext.snapshot.tools.iter().any(|tool| {
-                    tool.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| name == tool_name)
-                })
-            })
+            let extension_index = *self.tool_extension_index.get(tool_name)?;
+            self.extensions.get(extension_index)
         }
 
         fn find_command_extension(&self, command_name: &str) -> Option<&NativeRustLoadedExtension> {
-            self.extensions.iter().find(|ext| {
-                ext.snapshot.slash_commands.iter().any(|cmd| {
-                    extract_slash_command_name(cmd).is_some_and(|name| name == command_name)
-                })
-            })
+            let extension_index = *self.command_extension_index.get(command_name)?;
+            self.extensions.get(extension_index)
         }
 
         fn find_shortcut_extension(&self, key_id: &str) -> Option<&NativeRustLoadedExtension> {
-            self.extensions.iter().find(|ext| {
-                ext.snapshot.shortcuts.iter().any(|shortcut| {
-                    shortcut
-                        .get("key_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| value == key_id)
-                })
-            })
+            let extension_index = *self.shortcut_extension_index.get(key_id)?;
+            self.extensions.get(extension_index)
+        }
+
+        fn provider_stream_chunks(&self, provider_id: &str) -> Option<Vec<Value>> {
+            let extension_index = *self.provider_stream_extension_index.get(provider_id)?;
+            self.extensions
+                .get(extension_index)?
+                .provider_streams
+                .get(provider_id)
+                .cloned()
         }
 
         fn dispatch_event(
@@ -16751,15 +16812,14 @@ mod native_runtime_duplicate_scaffold {
             ctx_payload: &Value,
         ) -> Value {
             let mut response = Value::Null;
-            for extension in &self.extensions {
-                if !extension
-                    .snapshot
-                    .event_hooks
-                    .iter()
-                    .any(|hook| hook == event_name)
-                {
+            let Some(extension_indexes) = self.event_hook_extension_indexes.get(event_name) else {
+                return response;
+            };
+
+            for extension_index in extension_indexes {
+                let Some(extension) = self.extensions.get(*extension_index) else {
                     continue;
-                }
+                };
 
                 if let Some(explicit) = extension.event_responses.get(event_name) {
                     response = explicit.clone();
@@ -16775,6 +16835,12 @@ mod native_runtime_duplicate_scaffold {
                 });
             }
             response
+        }
+
+        fn reset_transient_state(&mut self) {
+            self.streams.clear();
+            self.flags.clear();
+            self.repair_events.clear();
         }
     }
 
@@ -16850,6 +16916,7 @@ mod native_runtime_duplicate_scaffold {
     pub struct NativeRustExtensionRuntimeHandle {
         sender: mpsc::Sender<NativeRustRuntimeCommand>,
         exit_signal: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        state: Arc<Mutex<NativeRustRuntimeState>>,
     }
 
     impl NativeRustExtensionRuntimeHandle {
@@ -16858,6 +16925,8 @@ mod native_runtime_duplicate_scaffold {
             let (tx, rx) = mpsc::channel(64);
             let (init_tx, init_rx) = oneshot::channel::<Result<()>>();
             let (exit_tx, exit_rx) = oneshot::channel();
+            let state = Arc::new(Mutex::new(NativeRustRuntimeState::default()));
+            let runtime_state = Arc::clone(&state);
 
             thread::spawn(move || {
                 let runtime = RuntimeBuilder::current_thread()
@@ -16866,30 +16935,19 @@ mod native_runtime_duplicate_scaffold {
                 runtime.block_on(async move {
                 let cx = Cx::for_request();
                 let _ = init_tx.send(&cx, Ok(()));
-                let mut state = NativeRustRuntimeState::default();
                 while let Ok(command) = rx.recv(&cx).await {
+                    let Ok(mut state) = runtime_state.lock() else {
+                        break;
+                    };
                     match command {
                         NativeRustRuntimeCommand::Shutdown => break,
                         NativeRustRuntimeCommand::LoadExtensions { specs, reply } => {
-                            let result = load_native_extensions_from_specs(&specs).map(|loaded| {
-                                let snapshots = loaded
-                                    .iter()
-                                    .map(|extension| extension.snapshot.clone())
-                                    .collect::<Vec<_>>();
-                                state.extensions = loaded;
-                                state.streams.clear();
-                                state.next_stream_id = 0;
-                                snapshots
-                            });
+                            let result = load_native_extensions_from_specs(&specs)
+                                .map(|loaded| state.load_extensions(loaded));
                             let _ = reply.send(&cx, result);
                         }
                         NativeRustRuntimeCommand::GetRegisteredTools { reply } => {
-                            let defs = state
-                                .extensions
-                                .iter()
-                                .flat_map(|extension| parse_extension_tool_defs(&extension.snapshot.tools))
-                                .collect::<Vec<_>>();
-                            let _ = reply.send(&cx, Ok(defs));
+                            let _ = reply.send(&cx, Ok(state.registered_tools.clone()));
                         }
                         NativeRustRuntimeCommand::PumpOnce { reply } => {
                             let _ = reply.send(&cx, Ok(false));
@@ -17002,15 +17060,7 @@ mod native_runtime_duplicate_scaffold {
                             options,
                             reply,
                         } => {
-                            let mut chunks = None;
-                            for extension in &state.extensions {
-                                if let Some(stream) = extension.provider_streams.get(&provider_id) {
-                                    chunks = Some(stream.clone());
-                                    break;
-                                }
-                            }
-
-                            let Some(stream_chunks) = chunks else {
+                            let Some(stream_chunks) = state.provider_stream_chunks(&provider_id) else {
                                 let _ = reply.send(
                                     &cx,
                                     Err(Error::extension(format!(
@@ -17065,9 +17115,7 @@ mod native_runtime_duplicate_scaffold {
                             let _ = reply.send(&cx, drained);
                         }
                         NativeRustRuntimeCommand::ResetTransientState { reply } => {
-                            state.streams.clear();
-                            state.flags.clear();
-                            state.repair_events.clear();
+                            state.reset_transient_state();
                             let _ = reply.send(&cx, Ok(()));
                         }
                     }
@@ -17090,6 +17138,7 @@ mod native_runtime_duplicate_scaffold {
             Ok(Self {
                 sender: tx,
                 exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
+                state,
             })
         }
 
@@ -17119,22 +17168,27 @@ mod native_runtime_duplicate_scaffold {
             command_builder: impl FnOnce(oneshot::Sender<Result<T>>) -> NativeRustRuntimeCommand,
             timeout_label: &str,
         ) -> Result<T> {
-            let cx = cx_with_deadline(timeout_ms);
+            let _ = timeout_label;
             let (reply_tx, reply_rx) = oneshot::channel();
             let command = command_builder(reply_tx);
-            let fut = async move {
-                self.sender.send(&cx, command).await.map_err(|_| {
-                    Error::extension("native-rust extension runtime channel closed")
-                })?;
+            let send_cx = Cx::for_request();
+            self.sender
+                .send(&send_cx, command)
+                .await
+                .map_err(|_| Error::extension("native-rust extension runtime channel closed"))?;
+
+            if timeout_ms == 0 {
                 reply_rx
-                    .recv(&cx)
+                    .recv(&send_cx)
                     .await
                     .map_err(|_| Error::extension("native-rust extension runtime task cancelled"))?
-            };
-
-            timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-                .await
-                .unwrap_or_else(|_| Err(Error::extension(timeout_label.to_string())))
+            } else {
+                let recv_cx = cx_with_deadline(timeout_ms);
+                reply_rx
+                    .recv(&recv_cx)
+                    .await
+                    .map_err(|_| Error::extension("native-rust extension runtime task cancelled"))?
+            }
         }
 
         async fn load_extensions_snapshots(
@@ -17212,6 +17266,7 @@ mod native_runtime_duplicate_scaffold {
             .await
         }
 
+        #[allow(clippy::option_if_let_else)]
         pub async fn execute_tool(
             &self,
             tool_name: String,
@@ -17219,17 +17274,37 @@ mod native_runtime_duplicate_scaffold {
             input: Value,
             timeout_ms: u64,
         ) -> Result<Value> {
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::ExecuteTool {
-                    tool_name,
-                    tool_call_id,
-                    input,
-                    reply,
-                },
-                &format!("native-rust extension runtime tool timed out after {timeout_ms}ms"),
-            )
-            .await
+            let _ = timeout_ms;
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+                if let Some(extension) = state.find_tool_extension(&tool_name) {
+                    if let Some(value) = extension.tool_outputs.get(&tool_name) {
+                        Ok(value.clone())
+                    } else {
+                        Ok(json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": format!("native-rust tool `{tool_name}` executed")
+                                }
+                            ],
+                            "details": {
+                                "runtime": "native-rust",
+                                "toolName": tool_name,
+                                "toolCallId": tool_call_id,
+                                "input": input
+                            }
+                        }))
+                    }
+                } else {
+                    Err(Error::extension(format!(
+                        "native-rust tool `{tool_name}` is not registered"
+                    )))
+                }
+            }
         }
 
         pub async fn execute_command(
@@ -17726,7 +17801,6 @@ mod native_runtime_duplicate_scaffold {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ExtensionRuntimeEngineSelection {
-        QuickJs,
         NativeRust,
     }
 
@@ -17735,17 +17809,12 @@ mod native_runtime_duplicate_scaffold {
 
         pub const fn as_str(self) -> &'static str {
             match self {
-                Self::QuickJs => "quickjs",
                 Self::NativeRust => "native-rust",
             }
         }
 
-        pub fn from_env_value(value: &str) -> Self {
-            if matches!(value.trim().to_ascii_lowercase().as_str(), "quickjs" | "js") {
-                Self::QuickJs
-            } else {
-                Self::NativeRust
-            }
+        pub const fn from_env_value(_value: &str) -> Self {
+            Self::NativeRust
         }
 
         #[must_use]
@@ -18363,9 +18432,22 @@ async fn load_one_extension(
     // bundled assets (HTML templates, markdown docs, etc.) within the
     // extension's own directory tree, and so the resolver can detect
     // monorepo escape patterns (Pattern 3).
+    let mut registered_roots = BTreeSet::new();
     for entry_path in &entry_paths {
+        let mut candidate_roots = Vec::new();
         if let Some(ext_dir) = entry_path.parent() {
-            if let Ok(canonical) = std::fs::canonicalize(ext_dir).map(strip_unc_prefix) {
+            candidate_roots.push(ext_dir.to_path_buf());
+        }
+        for package_json in find_package_json_ancestors(entry_path.parent()) {
+            if let Some(package_dir) = package_json.parent() {
+                candidate_roots.push(package_dir.to_path_buf());
+            }
+        }
+
+        for root in candidate_roots {
+            if let Ok(canonical) = std::fs::canonicalize(&root).map(strip_unc_prefix)
+                && registered_roots.insert(canonical.clone())
+            {
                 runtime.add_extension_root_with_id(canonical, Some(spec.extension_id.as_str()));
             }
         }
@@ -46646,7 +46728,7 @@ mod tests {
         );
         assert_eq!(
             ExtensionRuntimeEngineSelection::from_env_value("quickjs"),
-            ExtensionRuntimeEngineSelection::QuickJs
+            ExtensionRuntimeEngineSelection::NativeRust
         );
         assert_eq!(
             ExtensionRuntimeEngineSelection::from_env_value(""),

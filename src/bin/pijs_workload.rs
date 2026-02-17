@@ -4,15 +4,24 @@
 use clap::{Parser, ValueEnum};
 use futures::executor::block_on;
 use pi::error::{Error, Result};
+use pi::extensions::{
+    ExtensionManager, ExtensionRuntimeHandle, NativeRustExtensionLoadSpec,
+    NativeRustExtensionRuntimeHandle,
+};
 use pi::extensions_js::PiJsRuntime;
 use pi::perf_build;
 use pi::scheduler::HostcallOutcome;
 use serde_json::json;
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::fs;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const BENCH_BEGIN_FN: &str = "__bench_begin_roundtrip";
 const BENCH_ASSERT_FN: &str = "__bench_assert_roundtrip";
+const NATIVE_RUNTIME_DESCRIPTOR_PATH: &str =
+    "/tmp/pi_agent_rust_native_bench_descriptor.native.json";
+const NATIVE_RUNTIME_TOOL_NAME: &str = "bench_tool";
 
 const BENCH_TOOL_SETUP: &str = r#"
 __pi_begin_extension("ext.bench", { name: "Bench" });
@@ -37,6 +46,36 @@ globalThis.__bench_assert_roundtrip = () => {
 __pi_end_extension();
 "#;
 
+const NATIVE_RUNTIME_DESCRIPTOR: &str = r#"
+{
+  "id": "ext.native.bench",
+  "name": "Native Bench",
+  "version": "0.0.0",
+  "apiVersion": "1.0.0",
+  "tools": [
+    {
+      "name": "bench_tool",
+      "description": "Benchmark tool",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "value": { "type": "number" }
+        }
+      }
+    }
+  ],
+  "toolOutputs": {
+    "bench_tool": {
+      "content": [
+        { "type": "text", "text": "ok" }
+      ],
+      "details": { "ok": true, "runtime": "native-rust-runtime" },
+      "is_error": false
+    }
+  }
+}
+"#;
+
 #[derive(Parser, Debug)]
 #[command(name = "pijs_workload")]
 #[command(about = "Deterministic PiJS workload runner for perf baselines")]
@@ -56,6 +95,7 @@ struct Args {
 enum WorkloadRuntimeEngine {
     Quickjs,
     NativeRustPreview,
+    NativeRustRuntime,
 }
 
 impl WorkloadRuntimeEngine {
@@ -63,6 +103,7 @@ impl WorkloadRuntimeEngine {
         match self {
             Self::Quickjs => "quickjs",
             Self::NativeRustPreview => "native_rust_preview",
+            Self::NativeRustRuntime => "native_rust_runtime",
         }
     }
 }
@@ -141,6 +182,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<()> {
     let args = Args::parse();
     let build_profile = perf_build::detect_build_profile();
@@ -158,6 +200,11 @@ fn run() -> Result<()> {
     };
     let mut native_runtime = if args.runtime_engine == WorkloadRuntimeEngine::NativeRustPreview {
         Some(NativeBenchRuntime::default())
+    } else {
+        None
+    };
+    let native_runtime_handle = if args.runtime_engine == WorkloadRuntimeEngine::NativeRustRuntime {
+        Some(setup_native_runtime_bench_handle()?)
     } else {
         None
     };
@@ -184,6 +231,15 @@ fn run() -> Result<()> {
                         ));
                     }
                 }
+                WorkloadRuntimeEngine::NativeRustRuntime => {
+                    if let Some(runtime) = native_runtime_handle.as_ref() {
+                        run_tool_roundtrip_native_runtime(runtime)?;
+                    } else {
+                        return Err(Error::extension(
+                            "native runtime handle unexpectedly unavailable".to_string(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -195,16 +251,17 @@ fn run() -> Result<()> {
     let total_calls_u128 = total_calls as u128;
 
     let per_call_us = elapsed_micros.checked_div(total_calls_u128).unwrap_or(0);
-    let total_calls_f64 = total_calls_u128 as f64;
-    let per_call_us_f64 = if total_calls_u128 == 0 {
+    let calls_count_u32 = u32::try_from(total_calls_u128).unwrap_or(u32::MAX);
+    let calls_count_float = f64::from(calls_count_u32);
+    let per_call_micros_f64 = if total_calls_u128 == 0 {
         0.0
     } else {
-        elapsed.as_secs_f64() * 1_000_000.0 / total_calls_f64
+        elapsed.as_secs_f64() * 1_000_000.0 / calls_count_float
     };
-    let per_call_ns_f64 = if total_calls_u128 == 0 {
+    let per_call_nanos_f64 = if total_calls_u128 == 0 {
         0.0
     } else {
-        elapsed.as_secs_f64() * 1_000_000_000.0 / total_calls_f64
+        elapsed.as_secs_f64() * 1_000_000_000.0 / calls_count_float
     };
     let calls_per_sec = total_calls_u128
         .saturating_mul(1_000_000)
@@ -223,8 +280,8 @@ fn run() -> Result<()> {
             "elapsed_ms": elapsed_millis,
             "elapsed_us": elapsed_micros,
             "per_call_us": per_call_us,
-            "per_call_us_f64": per_call_us_f64,
-            "per_call_ns_f64": per_call_ns_f64,
+            "per_call_us_f64": per_call_micros_f64,
+            "per_call_ns_f64": per_call_nanos_f64,
             "calls_per_sec": calls_per_sec,
             "build_profile": build_profile,
             "runtime_engine": args.runtime_engine.as_str(),
@@ -236,7 +293,27 @@ fn run() -> Result<()> {
         })
     );
 
+    if let Some(runtime) = native_runtime_handle {
+        let _ = block_on(runtime.shutdown(Duration::from_secs(5)));
+    }
+
     Ok(())
+}
+
+fn setup_native_runtime_bench_handle() -> Result<ExtensionRuntimeHandle> {
+    fs::write(NATIVE_RUNTIME_DESCRIPTOR_PATH, NATIVE_RUNTIME_DESCRIPTOR).map_err(|err| {
+        Error::extension(format!(
+            "native workload: failed to write descriptor {NATIVE_RUNTIME_DESCRIPTOR_PATH}: {err}"
+        ))
+    })?;
+
+    let runtime = block_on(NativeRustExtensionRuntimeHandle::start())?;
+    let manager = ExtensionManager::new();
+    manager.set_runtime(ExtensionRuntimeHandle::NativeRust(runtime.clone()));
+
+    let spec = NativeRustExtensionLoadSpec::from_entry_path(NATIVE_RUNTIME_DESCRIPTOR_PATH)?;
+    block_on(manager.load_native_extensions(vec![spec]))?;
+    Ok(ExtensionRuntimeHandle::NativeRust(runtime))
 }
 
 fn run_tool_roundtrip_quickjs(runtime: &PiJsRuntime) -> Result<()> {
@@ -269,12 +346,37 @@ fn run_tool_roundtrip_native(runtime: &mut NativeBenchRuntime) -> Result<()> {
     runtime.assert_roundtrip()
 }
 
+fn run_tool_roundtrip_native_runtime(runtime: &ExtensionRuntimeHandle) -> Result<()> {
+    block_on(async {
+        let output = runtime
+            .execute_tool(
+                NATIVE_RUNTIME_TOOL_NAME.to_string(),
+                "bench-native-call".to_string(),
+                json!({ "value": 1 }),
+                Arc::new(json!({})),
+                60_000,
+            )
+            .await?;
+        if output.get("is_error").and_then(serde_json::Value::as_bool) == Some(false) {
+            Ok(())
+        } else {
+            Err(Error::extension(format!(
+                "native workload: runtime output indicates error: {output}"
+            )))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use pi::perf_build::profile_from_target_path;
     use std::path::Path;
+    use std::time::Duration;
 
-    use crate::{NativeBenchRuntime, run_tool_roundtrip_native};
+    use crate::{
+        NativeBenchRuntime, run_tool_roundtrip_native, run_tool_roundtrip_native_runtime,
+        setup_native_runtime_bench_handle,
+    };
 
     #[test]
     fn profile_from_target_path_detects_perf() {
@@ -311,5 +413,12 @@ mod tests {
     fn native_runtime_roundtrip_resolves() {
         let mut runtime = NativeBenchRuntime::default();
         run_tool_roundtrip_native(&mut runtime).expect("native runtime roundtrip");
+    }
+
+    #[test]
+    fn native_runtime_handle_roundtrip_resolves() {
+        let runtime = setup_native_runtime_bench_handle().expect("native runtime setup");
+        run_tool_roundtrip_native_runtime(&runtime).expect("native runtime handle roundtrip");
+        let _ = futures::executor::block_on(runtime.shutdown(Duration::from_secs(1)));
     }
 }
