@@ -25,7 +25,7 @@ use pi::extensions_js::{HostcallKind, PiJsRuntime, PiJsRuntimeConfig};
 use pi::scheduler::{HostcallOutcome, WallClock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -45,6 +45,7 @@ const DEFAULT_DOWNSTREAM_BEADS: &[&str] = &[
     "bd-3ar8v.4.23",
     "bd-3ar8v.4.29",
 ];
+const STAGE_DECOMPOSITION: [&str; 6] = ["marshal", "queue", "schedule", "policy", "execute", "io"];
 const DEFAULT_PMU_LLC_MISS_BUDGET_PCT: f64 = 18.0;
 const DEFAULT_PMU_BRANCH_MISS_BUDGET_PCT: f64 = 6.0;
 const DEFAULT_PMU_STALL_TOTAL_BUDGET_PCT: f64 = 65.0;
@@ -2354,7 +2355,7 @@ fn build_hotspot_matrix(
         "scenario_breakdown": scenario_breakdown,
         "downstream_consumers": DEFAULT_DOWNSTREAM_BEADS,
         "methodology": {
-            "stage_decomposition": ["marshal", "queue", "schedule", "policy", "execute", "io"],
+            "stage_decomposition": STAGE_DECOMPOSITION,
             "ev_formula": "share_pct * optimization_potential * confidence * pmu_multiplier",
             "confidence_formula": "clamp(log(sample_count+1)/8, 0.35, 0.99)",
             "notes": "Queue/schedule attribution is inferred from scenario-specific stage weights; PMU counters shape ev_score via stage multipliers when available. Before/after PMU deltas and outcome comparison (p50/p95/p99 + resource proxies) are included for regression gating."
@@ -2388,6 +2389,58 @@ fn validate_hotspot_matrix_schema(matrix: &Value) -> Result<()> {
             "unexpected hotspot matrix schema: {:?}",
             matrix.get("schema")
         )));
+    }
+    let Some(stage_totals) = matrix.get("stage_totals_us").and_then(Value::as_object) else {
+        return Err(Error::extension(
+            "stage_totals_us must be an object".to_string(),
+        ));
+    };
+    for field in STAGE_DECOMPOSITION
+        .iter()
+        .copied()
+        .chain(std::iter::once("total"))
+    {
+        let Some(value) = stage_totals.get(field).and_then(Value::as_f64) else {
+            return Err(Error::extension(format!(
+                "stage_totals_us missing numeric field: {field}"
+            )));
+        };
+        if !value.is_finite() || value < 0.0 {
+            return Err(Error::extension(format!(
+                "stage_totals_us field {field} must be finite and non-negative"
+            )));
+        }
+    }
+    let Some(methodology) = matrix.get("methodology").and_then(Value::as_object) else {
+        return Err(Error::extension(
+            "methodology must be an object".to_string(),
+        ));
+    };
+    let Some(stage_decomposition) = methodology
+        .get("stage_decomposition")
+        .and_then(Value::as_array)
+    else {
+        return Err(Error::extension(
+            "methodology.stage_decomposition must be an array".to_string(),
+        ));
+    };
+    if stage_decomposition.len() != STAGE_DECOMPOSITION.len() {
+        return Err(Error::extension(format!(
+            "methodology.stage_decomposition must contain {} entries",
+            STAGE_DECOMPOSITION.len()
+        )));
+    }
+    for (idx, expected) in STAGE_DECOMPOSITION.iter().enumerate() {
+        let Some(actual) = stage_decomposition.get(idx).and_then(Value::as_str) else {
+            return Err(Error::extension(format!(
+                "methodology.stage_decomposition index {idx} must be a string"
+            )));
+        };
+        if actual != *expected {
+            return Err(Error::extension(format!(
+                "methodology.stage_decomposition index {idx} expected {expected}, got {actual}"
+            )));
+        }
     }
 
     let Some(artifacts) = matrix.get("artifacts").and_then(Value::as_object) else {
@@ -2487,7 +2540,19 @@ fn validate_hotspot_matrix_schema(matrix: &Value) -> Result<()> {
             "hotspot_matrix must be an array".to_string(),
         ));
     };
+    if hotspots.len() != STAGE_DECOMPOSITION.len() {
+        return Err(Error::extension(format!(
+            "hotspot_matrix must contain {} entries for complete stage decomposition",
+            STAGE_DECOMPOSITION.len()
+        )));
+    }
+    let mut seen_stages = BTreeSet::new();
     for (idx, entry) in hotspots.iter().enumerate() {
+        let Some(entry_obj) = entry.as_object() else {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} must be an object"
+            )));
+        };
         for field in [
             "stage",
             "ev_score",
@@ -2498,12 +2563,92 @@ fn validate_hotspot_matrix_schema(matrix: &Value) -> Result<()> {
             "recommended_action",
             "downstream_beads",
         ] {
-            if entry.get(field).is_none() {
+            if entry_obj.get(field).is_none() {
                 return Err(Error::extension(format!(
                     "hotspot entry {idx} missing field {field}"
                 )));
             }
         }
+        let Some(stage) = entry_obj.get("stage").and_then(Value::as_str) else {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field stage must be a string"
+            )));
+        };
+        if !STAGE_DECOMPOSITION.contains(&stage) {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field stage must be one of {:?}, got {stage}",
+                STAGE_DECOMPOSITION
+            )));
+        }
+        if !seen_stages.insert(stage.to_string()) {
+            return Err(Error::extension(format!(
+                "hotspot_matrix contains duplicate stage entry: {stage}"
+            )));
+        }
+        let Some(ev_score) = entry_obj.get("ev_score").and_then(Value::as_f64) else {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field ev_score must be a number"
+            )));
+        };
+        if !ev_score.is_finite() || ev_score < 0.0 {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field ev_score must be finite and non-negative"
+            )));
+        }
+        let Some(confidence) = entry_obj.get("confidence").and_then(Value::as_f64) else {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field confidence must be a number"
+            )));
+        };
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field confidence must be finite and within [0, 1]"
+            )));
+        }
+        let Some(pmu_multiplier) = entry_obj.get("pmu_multiplier").and_then(Value::as_f64) else {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field pmu_multiplier must be a number"
+            )));
+        };
+        if !pmu_multiplier.is_finite() || pmu_multiplier <= 0.0 {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field pmu_multiplier must be finite and positive"
+            )));
+        }
+        let Some(downstream_beads) = entry_obj.get("downstream_beads").and_then(Value::as_array)
+        else {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field downstream_beads must be an array"
+            )));
+        };
+        if downstream_beads.is_empty() {
+            return Err(Error::extension(format!(
+                "hotspot entry {idx} field downstream_beads must not be empty"
+            )));
+        }
+        for (bead_idx, bead) in downstream_beads.iter().enumerate() {
+            let Some(bead_id) = bead.as_str() else {
+                return Err(Error::extension(format!(
+                    "hotspot entry {idx} downstream_beads[{bead_idx}] must be a string"
+                )));
+            };
+            if bead_id.trim().is_empty() {
+                return Err(Error::extension(format!(
+                    "hotspot entry {idx} downstream_beads[{bead_idx}] must be non-empty"
+                )));
+            }
+        }
+    }
+    if seen_stages.len() != STAGE_DECOMPOSITION.len() {
+        let missing = STAGE_DECOMPOSITION
+            .iter()
+            .filter(|stage| !seen_stages.contains(**stage))
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(Error::extension(format!(
+            "hotspot_matrix missing stage entries for {:?}",
+            missing
+        )));
     }
     let Some(voi) = matrix.get("voi_scheduler").and_then(Value::as_object) else {
         return Err(Error::extension(
@@ -3048,6 +3193,59 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("scenario_breakdown row 0 weight schedule must be a number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_missing_stage_totals_field() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        matrix
+            .pointer_mut("/stage_totals_us")
+            .and_then(Value::as_object_mut)
+            .expect("stage_totals_us object")
+            .remove("execute");
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string()
+                .contains("stage_totals_us missing numeric field: execute"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_methodology_stage_decomposition_drift() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        *matrix
+            .pointer_mut("/methodology/stage_decomposition/2")
+            .expect("stage_decomposition[2]") = json!("dispatch");
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string().contains(
+                "methodology.stage_decomposition index 2 expected schedule, got dispatch"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_duplicate_hotspot_stage_entries() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        let duplicate_stage = matrix
+            .pointer("/hotspot_matrix/0/stage")
+            .and_then(Value::as_str)
+            .expect("hotspot_matrix[0].stage")
+            .to_string();
+        *matrix
+            .pointer_mut("/hotspot_matrix/1/stage")
+            .expect("hotspot_matrix[1].stage") = json!(duplicate_stage);
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string()
+                .contains("hotspot_matrix contains duplicate stage entry"),
             "unexpected error: {err}"
         );
     }

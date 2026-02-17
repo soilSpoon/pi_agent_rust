@@ -730,6 +730,52 @@ fn run_scenario_suite_and_emit_jsonl() {
         MATRIX_SESSION_SIZES.len() * 2,
         "expected one matched-state and one realistic matrix row per required session size"
     );
+    // Fail closed on matrix-shape drift: every required (partition, size)
+    // cell must be present exactly once.
+    let mut matrix_key_counts: BTreeMap<(String, u64), usize> = BTreeMap::new();
+    for record in &records {
+        if record.get("scenario").and_then(Value::as_str) != Some(MATRIX_SCENARIO_SESSION_WORKLOAD)
+        {
+            continue;
+        }
+
+        let partition = record
+            .get("partition")
+            .and_then(Value::as_str)
+            .expect("matrix row must include partition")
+            .to_string();
+        let session_messages = record
+            .get("session_messages")
+            .and_then(Value::as_u64)
+            .expect("matrix row must include session_messages");
+        *matrix_key_counts
+            .entry((partition, session_messages))
+            .or_insert(0) += 1;
+    }
+
+    let expected_matrix_keys: std::collections::HashSet<(String, u64)> =
+        [PARTITION_MATCHED_STATE, PARTITION_REALISTIC]
+            .into_iter()
+            .flat_map(|partition| {
+                MATRIX_SESSION_SIZES
+                    .iter()
+                    .copied()
+                    .map(move |session_messages| (partition.to_string(), session_messages))
+            })
+            .collect();
+    let observed_matrix_keys: std::collections::HashSet<(String, u64)> =
+        matrix_key_counts.keys().cloned().collect();
+    assert_eq!(
+        observed_matrix_keys, expected_matrix_keys,
+        "session_workload_matrix rows must cover required partition-size cells exactly"
+    );
+    for (key, count) in matrix_key_counts {
+        assert_eq!(
+            count, 1,
+            "duplicate session_workload_matrix row for partition={} session_messages={}",
+            key.0, key.1
+        );
+    }
 
     // All records must have schema field
     for record in &records {

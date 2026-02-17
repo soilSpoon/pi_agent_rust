@@ -2680,6 +2680,12 @@ fn ci_workflow_publishes_scenario_cell_gate_artifacts() {
         "Upload scenario-cell gate artifacts [linux]",
         "scenario-cell-gate-${{ github.run_id }}-${{ github.run_attempt }}",
         "## Scenario Cell Gate Status",
+        "Generate perf claim-integrity evidence bundle [linux]",
+        "./scripts/perf/orchestrate.sh",
+        "--profile ci",
+        "PERF_BASELINE_CONFIDENCE_JSON",
+        "PERF_EXTENSION_STRATIFICATION_JSON",
+        "CLAIM_INTEGRITY_REQUIRED=1",
     ] {
         assert!(
             workflow.contains(token),

@@ -10233,6 +10233,11 @@ mod tests {
                 HostcallKind::Log,
                 serde_json::json!("raw-log-payload"),
             ),
+            test_hostcall_request(
+                "log-array-case",
+                HostcallKind::Log,
+                serde_json::json!(["raw", "log", "payload"]),
+            ),
             test_hostcall_request("log-null-case", HostcallKind::Log, Value::Null),
         ];
 
@@ -11834,10 +11839,7 @@ mod tests {
             protocol_error_code("  timeout  "),
             HostCallErrorCode::Timeout
         );
-        assert_eq!(
-            protocol_error_code("\tdenied\n"),
-            HostCallErrorCode::Denied
-        );
+        assert_eq!(protocol_error_code("\tdenied\n"), HostCallErrorCode::Denied);
     }
 
     #[test]
@@ -12052,10 +12054,7 @@ mod tests {
 
         // Verify dispatcher decision trace
         let trace = &details["dispatcherDecisionTrace"];
-        assert_eq!(
-            trace["selectedRuntime"],
-            "rust-extension-dispatcher"
-        );
+        assert_eq!(trace["selectedRuntime"], "rust-extension-dispatcher");
         assert_eq!(trace["schemaVersion"], PROTOCOL_VERSION);
         assert_eq!(trace["method"], "tool");
         assert_eq!(trace["capability"], "tool");
@@ -12180,10 +12179,7 @@ mod tests {
             "call-s2",
             HostcallOutcome::Success(serde_json::json!("plain string")),
         );
-        assert_eq!(
-            result.output,
-            serde_json::json!({"value": "plain string"})
-        );
+        assert_eq!(result.output, serde_json::json!({"value": "plain string"}));
     }
 
     #[test]

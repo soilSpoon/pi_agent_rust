@@ -1592,12 +1592,12 @@ impl Agent {
                 steering_messages = Some(steering);
                 // Handle remaining skipped tools
                 for skipped in tool_calls.iter().skip(index + 1) {
-                     results.push(self.skip_tool_call(skipped, &on_event, new_messages));
+                    results.push(self.skip_tool_call(skipped, &on_event, new_messages));
                 }
                 break;
             }
         }
-        
+
         Ok(ToolExecutionOutcome {
             tool_results: results,
             steering_messages,

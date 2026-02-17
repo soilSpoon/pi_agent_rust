@@ -560,7 +560,10 @@ where
     #[allow(clippy::too_many_lines)]
     fn process_choice(&mut self, choice: OpenAIChoice) {
         let delta = choice.delta;
-        if delta.content.is_some() || delta.tool_calls.is_some() || delta.reasoning_content.is_some() {
+        if delta.content.is_some()
+            || delta.tool_calls.is_some()
+            || delta.reasoning_content.is_some()
+        {
             self.ensure_started();
         }
 

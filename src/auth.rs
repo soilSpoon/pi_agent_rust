@@ -416,12 +416,12 @@ impl AuthStorage {
         }
 
         if !failed_providers.is_empty() {
-             // Return an error to signal that at least some refreshes failed,
-             // but only after attempting all of them.
-             return Err(Error::auth(format!(
-                 "OAuth token refresh failed for: {}",
-                 failed_providers.join(", ")
-             )));
+            // Return an error to signal that at least some refreshes failed,
+            // but only after attempting all of them.
+            return Err(Error::auth(format!(
+                "OAuth token refresh failed for: {}",
+                failed_providers.join(", ")
+            )));
         }
 
         Ok(())

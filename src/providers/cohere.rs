@@ -694,12 +694,8 @@ fn extract_text_user_content(content: &UserContent) -> String {
                     ContentBlock::Text(t) => out.push_str(&t.text),
                     ContentBlock::Image(img) => {
                         use std::fmt::Write as _;
-                        let _ = write!(
-                            out,
-                            "[Image: {} ({} bytes)]",
-                            img.mime_type,
-                            img.data.len()
-                        );
+                        let _ =
+                            write!(out, "[Image: {} ({} bytes)]", img.mime_type, img.data.len());
                     }
                     _ => {}
                 }

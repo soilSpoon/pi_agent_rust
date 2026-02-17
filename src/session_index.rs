@@ -78,6 +78,7 @@ impl PendingIndexUpdate {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Avoid per-enqueue heap allocations on the hot update path.
 enum IndexUpdateCommand {
     Enqueue(PendingIndexUpdate),
     FlushRoot {
@@ -116,27 +117,20 @@ fn process_pending_index_updates(
     force: bool,
 ) {
     let now = Instant::now();
-    let keys: Vec<(PathBuf, PathBuf)> = pending
-        .iter()
-        .filter_map(|(key, update)| {
-            let root_matches = only_root.is_none_or(|root| update.sessions_root.as_path() == root);
-            if !root_matches {
-                return None;
-            }
+    let mut deferred_updates = HashMap::with_capacity(pending.len());
+    let mut ready_updates = Vec::new();
+    for (key, update) in std::mem::take(pending) {
+        let root_matches = only_root.is_none_or(|root| update.sessions_root.as_path() == root);
+        let is_ready = force || update.next_attempt_at <= now;
+        if root_matches && is_ready {
+            ready_updates.push((key, update));
+        } else {
+            deferred_updates.insert(key, update);
+        }
+    }
+    *pending = deferred_updates;
 
-            if force || update.next_attempt_at <= now {
-                Some(key.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for key in keys {
-        let Some(mut update) = pending.remove(&key) else {
-            continue;
-        };
-
+    for (key, mut update) in ready_updates {
         let result = SessionIndex::for_sessions_root(&update.sessions_root).index_session_snapshot(
             &update.path,
             &update.header,

@@ -1546,6 +1546,17 @@ impl NumaSlabTelemetry {
         u64::try_from(scaled).unwrap_or(Self::RATIO_SCALE_BPS)
     }
 
+    #[must_use]
+    const fn pressure_band(value_bps: u64) -> &'static str {
+        if value_bps >= 7_500 {
+            "high"
+        } else if value_bps >= 2_500 {
+            "medium"
+        } else {
+            "low"
+        }
+    }
+
     /// Render as stable machine-readable JSON for diagnostics.
     #[must_use]
     pub fn as_json(&self) -> serde_json::Value {
@@ -1568,6 +1579,11 @@ impl NumaSlabTelemetry {
             Self::ratio_basis_points(total_high_water_u64, total_capacity_u64);
         // Remote allocations are a practical proxy for TLB/cache pressure from cross-node traffic.
         let tlb_miss_pressure_bps = remote_ratio_bps;
+        let cross_node_fallback_reason = if self.cross_node_allocs > 0 {
+            Some(CrossNodeReason::LocalExhausted.as_code())
+        } else {
+            None
+        };
         serde_json::json!({
             "node_count": self.per_node.len(),
             "total_allocs": total_allocs,
@@ -1591,6 +1607,15 @@ impl NumaSlabTelemetry {
                 "tlb_miss_pressure": tlb_miss_pressure_bps,
                 "cache_miss_pressure": cache_miss_pressure_bps,
                 "occupancy_pressure": occupancy_pressure_bps,
+            },
+            "pressure_bands": {
+                "tlb_miss": Self::pressure_band(tlb_miss_pressure_bps),
+                "cache_miss": Self::pressure_band(cache_miss_pressure_bps),
+                "occupancy": Self::pressure_band(occupancy_pressure_bps),
+            },
+            "fallback_reasons": {
+                "cross_node": cross_node_fallback_reason,
+                "hugepage": self.hugepage_status.fallback_reason.map(HugepageFallbackReason::as_code),
             },
             "config": {
                 "slab_capacity": self.config.slab_capacity,
@@ -1975,9 +2000,10 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 3);
-        assert!(seen
-            .iter()
-            .all(|(call_id, _, _, _)| call_id == "call-stream"));
+        assert!(
+            seen.iter()
+                .all(|(call_id, _, _, _)| call_id == "call-stream")
+        );
         assert_eq!(seen[0].1, 0);
         assert_eq!(seen[1].1, 1);
         assert_eq!(seen[2].1, 2);
@@ -3074,6 +3100,26 @@ mod tests {
             json["latency_proxies_bps"]["occupancy_pressure"],
             serde_json::json!(10_000)
         );
+        assert_eq!(
+            json["pressure_bands"]["tlb_miss"],
+            serde_json::json!("medium")
+        );
+        assert_eq!(
+            json["pressure_bands"]["cache_miss"],
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            json["pressure_bands"]["occupancy"],
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            json["fallback_reasons"]["cross_node"],
+            serde_json::json!("local_exhausted")
+        );
+        assert_eq!(
+            json["fallback_reasons"]["hugepage"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -3213,6 +3259,10 @@ mod tests {
         let json = telemetry.as_json();
         assert_eq!(
             json["hugepage"]["fallback_reason"],
+            serde_json::json!("alignment_mismatch")
+        );
+        assert_eq!(
+            json["fallback_reasons"]["hugepage"],
             serde_json::json!("alignment_mismatch")
         );
     }
@@ -3557,6 +3607,23 @@ mod tests {
         assert_eq!(
             json["latency_proxies_bps"]["scale"],
             serde_json::json!(10_000)
+        );
+        assert_eq!(json["pressure_bands"]["tlb_miss"], serde_json::json!("low"));
+        assert_eq!(
+            json["pressure_bands"]["cache_miss"],
+            serde_json::json!("low")
+        );
+        assert_eq!(
+            json["pressure_bands"]["occupancy"],
+            serde_json::json!("low")
+        );
+        assert_eq!(
+            json["fallback_reasons"]["cross_node"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            json["fallback_reasons"]["hugepage"],
+            serde_json::json!("hugepage_disabled")
         );
         assert_eq!(json["config"]["slab_capacity"], serde_json::json!(16));
         assert_eq!(json["per_node"].as_array().map(std::vec::Vec::len), Some(2));

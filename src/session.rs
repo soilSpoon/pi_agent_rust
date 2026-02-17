@@ -1430,8 +1430,10 @@ impl Session {
 
     /// Returns `true` when a full rewrite is required instead of incremental append.
     fn should_full_rewrite(&self) -> bool {
+        let persisted_count = self.persisted_entry_count.load(Ordering::SeqCst);
+
         // First save — no file exists yet.
-        if self.persisted_entry_count.load(Ordering::SeqCst) == 0 {
+        if persisted_count == 0 {
             return true;
         }
         // Header was modified since last save.
@@ -1443,11 +1445,11 @@ impl Session {
             return true;
         }
         // Defensive: if persisted count somehow exceeds entries, force full rewrite.
-        if self.persisted_entry_count.load(Ordering::SeqCst) > self.entries.len() {
+        if persisted_count > self.entries.len() {
             return true;
         }
         // Any new entry is a Compaction (dead entries before marker need rewriting).
-        self.entries[self.persisted_entry_count.load(Ordering::SeqCst)..]
+        self.entries[persisted_count..]
             .iter()
             .any(|e| matches!(e, SessionEntry::Compaction(_)))
     }
@@ -1527,21 +1529,22 @@ impl Session {
                 let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
                 // Gap C: use incrementally maintained stats instead of O(n) scan.
                 let message_count = self.cached_message_count;
-                let session_name = self.cached_name.clone();
 
                 if self.should_full_rewrite() {
+                    let session_name = self.cached_name.clone();
                     // === Full rewrite path (first save, header change, compaction, checkpoint) ===
-                    type JsonlSaveResult =
-                        std::result::Result<Vec<SessionEntry>, (Error, Vec<SessionEntry>)>;
-                    let (tx, rx) = oneshot::channel::<JsonlSaveResult>();
+                    let (tx, rx) = oneshot::channel::<
+                        std::result::Result<Vec<SessionEntry>, (Error, Vec<SessionEntry>)>,
+                    >();
 
                     let header_snapshot = self.header.clone();
+                    let header_for_index = header_snapshot.clone();
                     let entries_to_save = std::mem::take(&mut self.entries);
 
                     let path_for_thread = path_clone.clone();
                     let handle = thread::spawn(move || {
                         let entries = entries_to_save;
-                        let res = || -> Result<()> {
+                        let res = (|| -> Result<()> {
                             let parent = path_for_thread.parent().unwrap_or_else(|| Path::new("."));
                             let temp_file = tempfile::NamedTempFile::new_in(parent)?;
                             {
@@ -1560,14 +1563,14 @@ impl Session {
                                 .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
 
                             enqueue_session_index_snapshot_update(
-                                sessions_root.clone(),
-                                path_for_thread.clone(),
-                                header_snapshot.clone(),
+                                sessions_root,
+                                path_for_thread,
+                                header_for_index,
                                 message_count,
-                                session_name.clone(),
+                                session_name,
                             );
                             Ok(())
-                        }();
+                        })();
                         let cx = AgentCx::for_request();
                         let _ = tx.send(
                             cx.cx(),
@@ -1608,6 +1611,7 @@ impl Session {
                     // === Incremental append path ===
                     let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
                     if new_start < self.entries.len() {
+                        let session_name = self.cached_name.clone();
                         // Pre-serialize new entries into a single buffer (typically 1-3 entries).
                         let new_entries = &self.entries[new_start..];
                         let mut serialized_buf = Vec::with_capacity(new_entries.len() * 512);
@@ -1622,7 +1626,7 @@ impl Session {
 
                         let path_for_thread = path_clone.clone();
                         let handle = thread::spawn(move || {
-                            let res = || -> Result<()> {
+                            let res = (move || -> Result<()> {
                                 let mut file = std::fs::OpenOptions::new()
                                     .append(true)
                                     .open(&path_for_thread)
@@ -1630,14 +1634,14 @@ impl Session {
                                 file.write_all(&serialized_buf)?;
 
                                 enqueue_session_index_snapshot_update(
-                                    sessions_root.clone(),
-                                    path_for_thread.clone(),
-                                    header_snapshot.clone(),
+                                    sessions_root,
+                                    path_for_thread,
+                                    header_snapshot,
                                     message_count,
-                                    session_name.clone(),
+                                    session_name,
                                 );
                                 Ok(())
-                            }();
+                            })();
                             let cx = AgentCx::for_request();
                             let _ = tx.send(cx.cx(), res);
                         });

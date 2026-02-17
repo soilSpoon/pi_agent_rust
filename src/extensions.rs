@@ -33977,9 +33977,7 @@ mod tests {
         for op in &["get_thinking_level", "set_thinking_level"] {
             let request = HostcallRequest {
                 call_id: format!("rt-session-{op}"),
-                kind: HostcallKind::Session {
-                    op: op.to_string(),
-                },
+                kind: HostcallKind::Session { op: op.to_string() },
                 payload: json!({}),
                 trace_id: 17,
                 extension_id: None,
@@ -34030,9 +34028,7 @@ mod tests {
         for op in ops {
             let request = HostcallRequest {
                 call_id: format!("rt-session-{op}"),
-                kind: HostcallKind::Session {
-                    op: op.to_string(),
-                },
+                kind: HostcallKind::Session { op: op.to_string() },
                 payload: json!({}),
                 trace_id: 19,
                 extension_id: None,
@@ -34040,7 +34036,10 @@ mod tests {
 
             let payload = hostcall_request_to_payload(&request);
             assert_eq!(payload.method, "session", "method mismatch for {op}");
-            assert_eq!(payload.capability, "session", "capability mismatch for {op}");
+            assert_eq!(
+                payload.capability, "session",
+                "capability mismatch for {op}"
+            );
             let ctx = payload.context.as_ref().unwrap_or_else(|| {
                 panic!("context expected for session.{op}");
             });
@@ -34050,8 +34049,7 @@ mod tests {
                 "opcode code mismatch for {op}"
             );
             assert_eq!(
-                ctx["io_uring_lane_input"]["capability_class"],
-                "session",
+                ctx["io_uring_lane_input"]["capability_class"], "session",
                 "capability_class mismatch for {op}"
             );
         }
@@ -34079,9 +34077,7 @@ mod tests {
         for op in event_ops {
             let request = HostcallRequest {
                 call_id: format!("rt-events-{op}"),
-                kind: HostcallKind::Events {
-                    op: op.to_string(),
-                },
+                kind: HostcallKind::Events { op: op.to_string() },
                 payload: json!({}),
                 trace_id: 20,
                 extension_id: None,
@@ -34108,8 +34104,7 @@ mod tests {
                 "opcode code mismatch for events.{op}"
             );
             assert_eq!(
-                ctx["io_uring_lane_input"]["capability_class"],
-                "events",
+                ctx["io_uring_lane_input"]["capability_class"], "events",
                 "capability_class mismatch for events.{op}"
             );
         }

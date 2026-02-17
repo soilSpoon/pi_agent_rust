@@ -1565,6 +1565,13 @@ fn scenario_jsonl_artifact_contract() {
         "contract test",
         0.9,
     ));
+    manager.record_security_alert(SecurityAlert::from_policy_denial(
+        "ext.contract",
+        "exec",
+        "spawn",
+        "denied by policy",
+        "deny_caps",
+    ));
 
     // Export all artifacts.
     let ledger = manager.runtime_risk_ledger_artifact();
@@ -1621,17 +1628,54 @@ fn scenario_jsonl_artifact_contract() {
             "method",
             "reason_codes",
             "summary",
+            "policy_source",
             "action",
+            "remediation",
             "risk_score",
             "context_hash",
         ] {
             assert!(alert.get(field).is_some(), "alert missing field: {field}");
         }
     }
+    let has_policy_denial_with_reason =
+        alert_json["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alert| {
+                alert["category"] == "policy_denial"
+                    && alert["action"] == "deny"
+                    && alert["policy_source"]
+                        .as_str()
+                        .is_some_and(|value| !value.trim().is_empty())
+                    && alert["reason_codes"]
+                        .as_array()
+                        .is_some_and(|codes| !codes.is_empty())
+            });
+    assert!(
+        has_policy_denial_with_reason,
+        "security alert artifact must include a policy-denial row with non-empty policy_source and reason_codes"
+    );
 
     // Verify telemetry artifact schema fields.
     let telem_json: serde_json::Value = serde_json::to_value(&telemetry).expect("telem to value");
     assert!(telem_json.get("schema").is_some());
+
+    let expected_capability_class = |capability: &str| -> &str {
+        match capability {
+            "read" | "write" => "filesystem",
+            "exec" => "execution",
+            "env" => "environment",
+            "http" => "network",
+            "session" => "session",
+            "events" => "events",
+            "ui" => "ui",
+            "log" => "telemetry",
+            "tool" => "tool",
+            _ => "unknown",
+        }
+    };
+
     for event in telem_json["entries"].as_array().unwrap() {
         for field in &[
             "schema",
@@ -1642,6 +1686,12 @@ fn scenario_jsonl_artifact_contract() {
             "method",
             "risk_score",
             "selected_action",
+            "policy_reason",
+            "lane",
+            "lane_decision_reason",
+            "lane_matrix_key",
+            "reason_codes",
+            "explanation_summary",
             "latency_ms",
             "redaction_summary",
         ] {
@@ -1650,6 +1700,46 @@ fn scenario_jsonl_artifact_contract() {
                 "telemetry missing field: {field}"
             );
         }
+
+        let capability = event["capability"]
+            .as_str()
+            .expect("telemetry capability must be string");
+        let method = event["method"]
+            .as_str()
+            .expect("telemetry method must be string");
+        let policy_reason = event["policy_reason"]
+            .as_str()
+            .expect("telemetry policy_reason must be string");
+        assert!(
+            !policy_reason.trim().is_empty(),
+            "telemetry policy_reason must be non-empty"
+        );
+        let lane_decision_reason = event["lane_decision_reason"]
+            .as_str()
+            .expect("telemetry lane_decision_reason must be string");
+        assert!(
+            !lane_decision_reason.trim().is_empty(),
+            "telemetry lane_decision_reason must be non-empty"
+        );
+
+        let lane_matrix_key = event["lane_matrix_key"]
+            .as_str()
+            .expect("telemetry lane_matrix_key must be string");
+        let lane_segments: Vec<&str> = lane_matrix_key.split('|').collect();
+        assert_eq!(
+            lane_segments.len(),
+            3,
+            "lane_matrix_key must follow method|opcode_or_fallback|capability_class"
+        );
+        assert_eq!(
+            lane_segments[0], method,
+            "lane_matrix_key method segment must match telemetry method"
+        );
+        assert_eq!(
+            lane_segments[2],
+            expected_capability_class(capability),
+            "lane_matrix_key capability class segment must match capability mapping"
+        );
     }
 
     // Verify exec mediation artifact.
