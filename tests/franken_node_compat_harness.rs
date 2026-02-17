@@ -23,11 +23,26 @@ fn reports_dir() -> PathBuf {
 }
 
 fn is_real_node(path: &str) -> bool {
-    // Bun's node shim doesn't support --version properly.
-    // Real Node prints "v20.x.y\n".
-    Command::new(path).arg("--version").output().is_ok_and(|o| {
-        o.status.success() && String::from_utf8_lossy(&o.stdout).trim().starts_with('v')
-    })
+    // Guard against Bun's `node` shim being mistaken for real Node in CI/worker images.
+    let version_ok = Command::new(path).arg("--version").output().is_ok_and(|o| {
+        if !o.status.success() {
+            return false;
+        }
+        let version = String::from_utf8_lossy(&o.stdout);
+        let mut chars = version.trim().chars();
+        matches!(chars.next(), Some('v')) && chars.next().is_some_and(|c| c.is_ascii_digit())
+    });
+    if !version_ok {
+        return false;
+    }
+
+    Command::new(path)
+        .args([
+            "-p",
+            "(process.release && process.release.name) + ':' + !!(process.versions && process.versions.node) + ':' + !!(process.versions && process.versions.bun)",
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "node:true:false")
 }
 
 fn find_node() -> Option<String> {
