@@ -1772,7 +1772,7 @@ fn franken_node_claim_contract_fails_closed_on_missing_multi_tier_execution_evid
         .get_mut("claim_tiers")
         .and_then(Value::as_array_mut)
         .expect("claim_tiers must be an array");
-    let tier3 = tiers
+    let tier3_entry = tiers
         .iter_mut()
         .find(|tier| {
             tier.get("tier_id")
@@ -1781,7 +1781,7 @@ fn franken_node_claim_contract_fails_closed_on_missing_multi_tier_execution_evid
                 .is_some_and(|tier_id| tier_id == "TIER-3-FULL-NODE-BUN-REPLACEMENT")
         })
         .expect("TIER-3-FULL-NODE-BUN-REPLACEMENT must exist");
-    let evidence = tier3
+    let evidence = tier3_entry
         .get_mut("required_evidence")
         .and_then(Value::as_array_mut)
         .expect("TIER-3 required_evidence must be an array");
