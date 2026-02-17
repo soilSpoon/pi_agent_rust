@@ -1567,7 +1567,7 @@ mod tests {
         ]);
 
         let text = extract_text_user_content(&content);
-        assert_eq!(text, "part 1part 2");
+        assert_eq!(text, "part 1[Image: image/png (8 bytes)]part 2");
     }
 
     // ─── Provider builder tests ─────────────────────────────────────────

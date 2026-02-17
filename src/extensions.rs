@@ -21638,11 +21638,24 @@ impl ExtensionManager {
                 lane_dispatch_latency_ms,
             ) = lane_execution.map_or_else(
                 || {
+                    let method = decision.method.trim().to_ascii_lowercase();
+                    let capability = decision.capability.trim().to_ascii_lowercase();
+                    let capability_class = hostcall_capability_class_from_capability(&capability);
+                    let lane_reason = if outcome_error_code.is_some() {
+                        "no_dispatch_runtime_risk"
+                    } else {
+                        "missing_lane_execution_metadata"
+                    };
+                    let lane_reason_owned = lane_reason.to_string();
                     (
-                        "unknown".to_string(),
-                        String::new(),
-                        None,
-                        "unknown|fallback|unknown".to_string(),
+                        if outcome_error_code.is_some() {
+                            "compat".to_string()
+                        } else {
+                            "unknown".to_string()
+                        },
+                        lane_reason_owned.clone(),
+                        Some(lane_reason_owned),
+                        format!("{method}|fallback|{capability_class}"),
                         0,
                     )
                 },

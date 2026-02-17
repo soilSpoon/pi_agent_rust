@@ -1084,6 +1084,10 @@ data: {"type":"message_stop"}
 
     #[test]
     fn test_stream_surfaces_pending_event_before_utf8_error() {
+        // Input: "data: ok\n\ndata: \xFF\n\n"
+        // The parser feeds valid prefix "data: ok\n\ndata: " → emits event("ok"),
+        // then recovers remainder "\n\n" after the 0xFF → completes partial "data: "
+        // → emits event(""). All pending events drain before the error.
         let chunks = vec![Ok(b"data: ok\n\ndata: \xFF\n\n".to_vec())];
         let mut stream = SseStream::new(stream::iter(chunks));
 
@@ -1092,17 +1096,22 @@ data: {"type":"message_stop"}
             let diag = json!({
                 "fixture_id": "sse-valid-event-before-invalid-utf8",
                 "seed": "deterministic-static",
-                "expected_sequence": ["Ok(data=ok)", "Err(invalid utf8)"],
+                "expected_sequence": ["Ok(data=ok)", "Ok(data=)", "Err(invalid utf8)"],
                 "actual_first": {"event": first.event, "data": first.data},
             })
             .to_string();
             assert_eq!(first.data, "ok", "{diag}");
 
+            // The recovered remainder "\n\n" completes the partial "data: " line,
+            // producing an empty-data event before the error surfaces.
+            let second = stream.next().await.expect("second item").expect("second ok");
+            assert_eq!(second.data, "", "{diag}");
+
             let err = stream
                 .next()
                 .await
-                .expect("second item")
-                .expect_err("second should be utf8 error");
+                .expect("third item")
+                .expect_err("third should be utf8 error");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{diag}");
         });
     }
@@ -1111,7 +1120,9 @@ data: {"type":"message_stop"}
     fn test_stream_resumes_parsing_remainder_after_utf8_error() {
         // "data: ok\n\n" (valid) + 0xFF (invalid) + "data: after\n\n" (valid)
         // Sent in one chunk.
-        // Expect: Ok(ok), Err(invalid), Ok(after)
+        // The recovery code feeds remainder "data: after\n\n" to pending_events
+        // before the error is stored, so events drain first:
+        // Expect: Ok(ok), Ok(after), Err(invalid)
 
         let mut bytes = b"data: ok\n\n".to_vec();
         bytes.push(0xFF);
@@ -1120,18 +1131,17 @@ data: {"type":"message_stop"}
         let mut stream = SseStream::new(stream::iter(vec![Ok(bytes)]));
 
         futures::executor::block_on(async {
-            // 1. "ok"
+            // 1. "ok" — from valid prefix before 0xFF
             let first = stream.next().await.expect("1").expect("ok");
             assert_eq!(first.data, "ok");
 
-            // 2. Error
-            let err = stream.next().await.expect("2").expect_err("error");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-
-            // 3. "after"
-            // Ensure the remainder was successfully processed and didn't get dropped
-            let second = stream.next().await.expect("3").expect("after");
+            // 2. "after" — recovered from remainder after 0xFF (pending events drain first)
+            let second = stream.next().await.expect("2").expect("after");
             assert_eq!(second.data, "after");
+
+            // 3. Error — surfaces after all pending events are delivered
+            let err = stream.next().await.expect("3").expect_err("error");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         });
     }
 

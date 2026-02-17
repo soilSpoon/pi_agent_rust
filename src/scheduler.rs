@@ -3118,7 +3118,7 @@ mod tests {
         );
         assert_eq!(
             json["fallback_reasons"]["hugepage"],
-            serde_json::Value::Null
+            serde_json::json!("hugepage_disabled")
         );
     }
 
