@@ -1,13 +1,14 @@
 //! `PiJS` workload harness for deterministic perf baselines.
 #![forbid(unsafe_code)]
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::executor::block_on;
 use pi::error::{Error, Result};
 use pi::extensions_js::PiJsRuntime;
 use pi::perf_build;
 use pi::scheduler::HostcallOutcome;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 const BENCH_BEGIN_FN: &str = "__bench_begin_roundtrip";
@@ -46,6 +47,91 @@ struct Args {
     /// Tool calls per iteration.
     #[arg(long, default_value_t = 1)]
     tool_calls: usize,
+    /// Runtime engine used by the benchmark harness.
+    #[arg(long, value_enum, default_value_t = WorkloadRuntimeEngine::Quickjs)]
+    runtime_engine: WorkloadRuntimeEngine,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum WorkloadRuntimeEngine {
+    Quickjs,
+    NativeRustPreview,
+}
+
+impl WorkloadRuntimeEngine {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quickjs => "quickjs",
+            Self::NativeRustPreview => "native_rust_preview",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeHostcallRequest {
+    call_id: u64,
+}
+
+#[derive(Debug, Default)]
+struct NativeBenchRuntime {
+    next_call_id: u64,
+    pending: VecDeque<NativeHostcallRequest>,
+    inflight_call_id: Option<u64>,
+    roundtrip_done: bool,
+}
+
+impl NativeBenchRuntime {
+    fn begin_roundtrip(&mut self) {
+        self.roundtrip_done = false;
+        self.next_call_id = self.next_call_id.saturating_add(1);
+        let call_id = self.next_call_id;
+        self.inflight_call_id = Some(call_id);
+        self.pending.push_back(NativeHostcallRequest { call_id });
+    }
+
+    fn drain_hostcall_request(&mut self) -> Result<NativeHostcallRequest> {
+        self.pending.pop_front().ok_or_else(|| {
+            Error::extension("native workload: missing pending hostcall request".to_string())
+        })
+    }
+
+    fn complete_hostcall(&mut self, call_id: u64, outcome: HostcallOutcome) -> Result<()> {
+        let expected = self.inflight_call_id.take().ok_or_else(|| {
+            Error::extension("native workload: no inflight hostcall to complete".to_string())
+        })?;
+
+        if expected != call_id {
+            return Err(Error::extension(format!(
+                "native workload: call_id mismatch (expected {expected}, got {call_id})"
+            )));
+        }
+
+        match outcome {
+            HostcallOutcome::Success(value) => {
+                if value.as_bool() == Some(true) {
+                    self.roundtrip_done = true;
+                    Ok(())
+                } else {
+                    Err(Error::extension(
+                        "native workload: completion payload missing boolean true".to_string(),
+                    ))
+                }
+            }
+            other => Err(Error::extension(format!(
+                "native workload: unsupported completion outcome: {other:?}"
+            ))),
+        }
+    }
+
+    fn assert_roundtrip(&self) -> Result<()> {
+        if self.roundtrip_done && self.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::extension(
+                "native workload: tool roundtrip did not resolve".to_string(),
+            ))
+        }
+    }
 }
 
 fn main() {
@@ -57,18 +143,48 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
-    let runtime = block_on(PiJsRuntime::new())?;
-    block_on(runtime.eval(BENCH_TOOL_SETUP))?;
     let build_profile = perf_build::detect_build_profile();
     let allocator = perf_build::resolve_bench_allocator();
     let binary_path = std::env::current_exe()
         .ok()
         .map_or_else(|| "unknown".to_string(), |path| path.display().to_string());
 
+    let quickjs_runtime = if args.runtime_engine == WorkloadRuntimeEngine::Quickjs {
+        let runtime = block_on(PiJsRuntime::new())?;
+        block_on(runtime.eval(BENCH_TOOL_SETUP))?;
+        Some(runtime)
+    } else {
+        None
+    };
+    let mut native_runtime = if args.runtime_engine == WorkloadRuntimeEngine::NativeRustPreview {
+        Some(NativeBenchRuntime::default())
+    } else {
+        None
+    };
+
     let start = Instant::now();
     for _ in 0..args.iterations {
         for _ in 0..args.tool_calls {
-            run_tool_roundtrip(&runtime)?;
+            match args.runtime_engine {
+                WorkloadRuntimeEngine::Quickjs => {
+                    if let Some(runtime) = quickjs_runtime.as_ref() {
+                        run_tool_roundtrip_quickjs(runtime)?;
+                    } else {
+                        return Err(Error::extension(
+                            "quickjs runtime unexpectedly unavailable".to_string(),
+                        ));
+                    }
+                }
+                WorkloadRuntimeEngine::NativeRustPreview => {
+                    if let Some(runtime) = native_runtime.as_mut() {
+                        run_tool_roundtrip_native(runtime)?;
+                    } else {
+                        return Err(Error::extension(
+                            "native runtime unexpectedly unavailable".to_string(),
+                        ));
+                    }
+                }
+            }
         }
     }
     let elapsed = start.elapsed();
@@ -79,6 +195,7 @@ fn run() -> Result<()> {
     let total_calls_u128 = total_calls as u128;
 
     let per_call_us = elapsed_micros.checked_div(total_calls_u128).unwrap_or(0);
+    let per_call_us_f64 = per_call_us.to_string().parse::<f64>().unwrap_or(0.0);
     let calls_per_sec = total_calls_u128
         .saturating_mul(1_000_000)
         .checked_div(elapsed_micros)
@@ -94,9 +211,12 @@ fn run() -> Result<()> {
             "tool_calls_per_iteration": args.tool_calls,
             "total_calls": total_calls,
             "elapsed_ms": elapsed_millis,
+            "elapsed_us": elapsed_micros,
             "per_call_us": per_call_us,
+            "per_call_us_f64": per_call_us_f64,
             "calls_per_sec": calls_per_sec,
             "build_profile": build_profile,
+            "runtime_engine": args.runtime_engine.as_str(),
             "allocator_requested": allocator.requested,
             "allocator_request_source": allocator.requested_source,
             "allocator_effective": allocator.effective.as_str(),
@@ -108,7 +228,7 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn run_tool_roundtrip(runtime: &PiJsRuntime) -> Result<()> {
+fn run_tool_roundtrip_quickjs(runtime: &PiJsRuntime) -> Result<()> {
     block_on(async {
         runtime.call_global_void(BENCH_BEGIN_FN).await?;
         let mut requests = runtime.drain_hostcall_requests();
@@ -131,10 +251,19 @@ fn run_tool_roundtrip(runtime: &PiJsRuntime) -> Result<()> {
     })
 }
 
+fn run_tool_roundtrip_native(runtime: &mut NativeBenchRuntime) -> Result<()> {
+    runtime.begin_roundtrip();
+    let request = runtime.drain_hostcall_request()?;
+    runtime.complete_hostcall(request.call_id, HostcallOutcome::Success(json!(true)))?;
+    runtime.assert_roundtrip()
+}
+
 #[cfg(test)]
 mod tests {
     use pi::perf_build::profile_from_target_path;
     use std::path::Path;
+
+    use crate::{NativeBenchRuntime, run_tool_roundtrip_native};
 
     #[test]
     fn profile_from_target_path_detects_perf() {
@@ -165,5 +294,11 @@ mod tests {
     fn profile_from_target_path_returns_none_outside_target() {
         let path = Path::new("/tmp/repo/bin/pijs_workload");
         assert_eq!(profile_from_target_path(path), None);
+    }
+
+    #[test]
+    fn native_runtime_roundtrip_resolves() {
+        let mut runtime = NativeBenchRuntime::default();
+        run_tool_roundtrip_native(&mut runtime).expect("native runtime roundtrip");
     }
 }

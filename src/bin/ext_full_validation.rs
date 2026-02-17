@@ -1037,6 +1037,7 @@ fn classify_item(
             provider_failure_count,
             failure_category.as_deref(),
             failure_reason.as_deref(),
+            item.notes.as_deref(),
         )
     };
 
@@ -1135,13 +1136,31 @@ fn classify_vendored(
     provider_failures: usize,
     failure_category: Option<&str>,
     failure_reason: Option<&str>,
+    item_notes: Option<&str>,
 ) -> Classification {
     if manifest_entry.is_none() {
+        let notes = item_notes.unwrap_or_default().to_ascii_lowercase();
+        if notes_indicate_non_extension(&notes) {
+            return Classification {
+                verdict: Verdict::NotExtension,
+                confidence: 0.99,
+                reason:
+                    "Vendored candidate is intentionally excluded from direct ExtensionAPI conformance scope."
+                        .to_string(),
+                suggested_fix: None,
+            };
+        }
+
         return Classification {
-            verdict: Verdict::NeedsReview,
-            confidence: 0.25,
-            reason: "Vendored candidate is missing from VALIDATED_MANIFEST.json.".to_string(),
-            suggested_fix: Some("Regenerate or repair VALIDATED_MANIFEST.json.".to_string()),
+            verdict: Verdict::HarnessGap,
+            confidence: 0.84,
+            reason:
+                "Vendored candidate is not represented in VALIDATED_MANIFEST.json coverage."
+                    .to_string(),
+            suggested_fix: Some(
+                "If this package is a direct ExtensionAPI entrypoint, add/repair manifest mapping and rerun conformance shards."
+                    .to_string(),
+            ),
         };
     }
 
@@ -1744,11 +1763,60 @@ fn lookup_by_id_or_alias<'a, T>(
     map: &'a HashMap<String, T>,
     item: &pi::extension_popularity::CandidateItem,
 ) -> Option<&'a T> {
-    map.get(&item.id).or_else(|| {
-        item.aliases
-            .iter()
-            .find_map(|alias| map.get(alias.as_str()))
-    })
+    if let Some(value) = map.get(&item.id) {
+        return Some(value);
+    }
+
+    if let Some(value) = item
+        .aliases
+        .iter()
+        .find_map(|alias| map.get(alias.as_str()))
+    {
+        return Some(value);
+    }
+
+    derive_candidate_id_variants(item)
+        .into_iter()
+        .find_map(|candidate| map.get(&candidate))
+}
+
+fn derive_candidate_id_variants(item: &pi::extension_popularity::CandidateItem) -> Vec<String> {
+    let mut out = Vec::new();
+    push_candidate_id_variants(&item.id, &mut out);
+    for alias in &item.aliases {
+        push_candidate_id_variants(alias, &mut out);
+    }
+    dedup_sorted(out)
+}
+
+fn push_candidate_id_variants(raw: &str, out: &mut Vec<String>) {
+    if let Some(rest) = raw.strip_prefix("npm/@") {
+        // Normalize scoped npm IDs to the flattened artifact/manifest convention:
+        // npm/@scope/name -> npm/scope-name
+        out.push(format!("npm/{}", rest.replace('/', "-")));
+    }
+
+    if let Some(rest) = raw.strip_prefix("npm:@") {
+        out.push(format!("npm/{}", rest.replace('/', "-")));
+    }
+}
+
+fn notes_indicate_non_extension(notes_lower: &str) -> bool {
+    [
+        "no extensionapi default-export entrypoint",
+        "no extension entrypoint",
+        "not a pi extension",
+        "not an extension",
+        "customtoolfactory",
+        "toolapi tool factory",
+        "tool factories",
+        "not tracked as a direct extensionapi",
+        "excluded from direct extensionapi",
+        "kept out of master catalog",
+        "typed git utility library surface",
+    ]
+    .iter()
+    .any(|marker| notes_lower.contains(marker))
 }
 
 fn onboarding_entry_relevant(entry: &OnboardingQueueEntry) -> Option<bool> {
