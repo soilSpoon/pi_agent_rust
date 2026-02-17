@@ -1757,6 +1757,90 @@ fn stage_probe_recommendation(stage: &str) -> &'static str {
     }
 }
 
+fn pair_probe_recommendation(left: &str, right: &str) -> String {
+    format!(
+        "{} + {}",
+        stage_probe_recommendation(left),
+        stage_probe_recommendation(right)
+    )
+}
+
+fn build_interference_matrix(
+    parsed: &[ParsedProfileRecord],
+) -> (Vec<Value>, InterferenceMatrixCompletenessReport) {
+    let mut pair_totals_us = BTreeMap::<String, f64>::new();
+    let mut pair_samples = BTreeMap::<String, u64>::new();
+    let mut pair_scenario_us = BTreeMap::<String, BTreeMap<String, f64>>::new();
+
+    for entry in parsed {
+        for (left_idx, left_stage) in STAGE_DECOMPOSITION.iter().enumerate() {
+            for right_stage in STAGE_DECOMPOSITION.iter().skip(left_idx + 1) {
+                let Some(pair_key) = format_interference_pair_key(left_stage, right_stage) else {
+                    continue;
+                };
+                let interaction_us = entry.total_us
+                    * stage_weight_component(entry.weights, left_stage)
+                    * stage_weight_component(entry.weights, right_stage);
+                *pair_totals_us.entry(pair_key.clone()).or_insert(0.0) += interaction_us;
+                *pair_samples.entry(pair_key.clone()).or_insert(0) += entry.samples;
+                let scenario_totals = pair_scenario_us.entry(pair_key).or_default();
+                *scenario_totals.entry(entry.scenario.clone()).or_insert(0.0) += interaction_us;
+            }
+        }
+    }
+
+    let total_interaction_us = pair_totals_us.values().sum::<f64>().max(1.0);
+    let mut interference_entries = pair_totals_us
+        .into_iter()
+        .map(|(pair, interaction_us)| {
+            let sample_count = pair_samples.get(&pair).copied().unwrap_or(0);
+            let dominant_scenario = pair_scenario_us
+                .get(&pair)
+                .and_then(|scenario_totals| {
+                    scenario_totals
+                        .iter()
+                        .max_by(|lhs, rhs| lhs.1.total_cmp(rhs.1))
+                        .map(|(scenario, _)| scenario.clone())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let (left_stage, right_stage) = parse_interference_pair_key(&pair)
+                .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+            json!({
+                "pair": pair,
+                "stages": [left_stage, right_stage],
+                "interaction_us": interaction_us,
+                "share_pct": (interaction_us / total_interaction_us) * 100.0,
+                "avg_us_per_sample": interaction_us / (sample_count.max(1) as f64),
+                "sample_count": sample_count,
+                "dominant_scenario": dominant_scenario,
+                "recommended_probe": pair_probe_recommendation(&left_stage, &right_stage),
+            })
+        })
+        .collect::<Vec<_>>();
+    interference_entries.sort_by(|lhs, rhs| {
+        let lhs_score = json_number_as_f64(lhs.get("interaction_us")).unwrap_or(0.0);
+        let rhs_score = json_number_as_f64(rhs.get("interaction_us")).unwrap_or(0.0);
+        rhs_score.total_cmp(&lhs_score)
+    });
+
+    let levers = STAGE_DECOMPOSITION
+        .iter()
+        .map(|stage| (*stage).to_string())
+        .collect::<Vec<_>>();
+    let observed_pair_keys = interference_entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("pair")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    let completeness = evaluate_interference_matrix_completeness(&levers, &observed_pair_keys);
+
+    (interference_entries, completeness)
+}
+
 fn parse_rfc3339_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
     let raw = value.and_then(Value::as_str)?;
     DateTime::parse_from_rfc3339(raw)
@@ -2326,6 +2410,8 @@ fn build_hotspot_matrix(
         let rhs = json_number_as_f64(b.get("ev_score")).unwrap_or(0.0);
         rhs.total_cmp(&lhs)
     });
+    let (interference_matrix, interference_matrix_completeness) =
+        build_interference_matrix(&parsed);
     let voi_scheduler = build_voi_scheduler_plan(VoiPlannerInputs {
         hotspot_entries: &hotspot_entries,
         run_metadata,
@@ -2367,6 +2453,8 @@ fn build_hotspot_matrix(
             "total": grand_total,
         },
         "hotspot_matrix": hotspot_entries,
+        "interference_matrix": interference_matrix,
+        "interference_matrix_completeness": interference_matrix_completeness,
         "voi_scheduler": voi_scheduler,
         "scenario_breakdown": scenario_breakdown,
         "downstream_consumers": DEFAULT_DOWNSTREAM_BEADS,
@@ -2374,6 +2462,7 @@ fn build_hotspot_matrix(
             "stage_decomposition": STAGE_DECOMPOSITION,
             "ev_formula": "share_pct * optimization_potential * confidence * pmu_multiplier",
             "confidence_formula": "clamp(log(sample_count+1)/8, 0.35, 0.99)",
+            "interference_formula": "sum(total_us * stage_weight_a * stage_weight_b) over parsed scenarios",
             "notes": "Queue/schedule attribution is inferred from scenario-specific stage weights; PMU counters shape ev_score via stage multipliers when available. Before/after PMU deltas and outcome comparison (p50/p95/p99 + resource proxies) are included for regression gating."
         },
     })
@@ -2388,6 +2477,8 @@ fn validate_hotspot_matrix_schema(matrix: &Value) -> Result<()> {
         "artifacts",
         "stage_totals_us",
         "hotspot_matrix",
+        "interference_matrix",
+        "interference_matrix_completeness",
         "voi_scheduler",
         "scenario_breakdown",
         "downstream_consumers",
@@ -2664,6 +2755,181 @@ fn validate_hotspot_matrix_schema(matrix: &Value) -> Result<()> {
             "hotspot_matrix missing stage entries for {missing:?}"
         )));
     }
+
+    let Some(interference_matrix) = matrix.get("interference_matrix").and_then(Value::as_array)
+    else {
+        return Err(Error::extension(
+            "interference_matrix must be an array".to_string(),
+        ));
+    };
+    if interference_matrix.is_empty() {
+        return Err(Error::extension(
+            "interference_matrix must contain at least one pair entry".to_string(),
+        ));
+    }
+
+    let mut observed_pair_keys = Vec::with_capacity(interference_matrix.len());
+    let mut share_pct_total = 0.0;
+    for (idx, entry) in interference_matrix.iter().enumerate() {
+        let Some(entry_obj) = entry.as_object() else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} must be an object"
+            )));
+        };
+        for field in [
+            "pair",
+            "stages",
+            "interaction_us",
+            "share_pct",
+            "sample_count",
+            "recommended_probe",
+        ] {
+            if entry_obj.get(field).is_none() {
+                return Err(Error::extension(format!(
+                    "interference entry {idx} missing field: {field}"
+                )));
+            }
+        }
+
+        let Some(pair_key) = entry_obj.get("pair").and_then(Value::as_str) else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field pair must be a string"
+            )));
+        };
+        let Some((left_stage, right_stage)) = parse_interference_pair_key(pair_key) else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field pair must parse as '<stage>+<stage>'"
+            )));
+        };
+        let Some(canonical_pair) = format_interference_pair_key(&left_stage, &right_stage) else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field pair must canonicalize"
+            )));
+        };
+        if canonical_pair != pair_key {
+            return Err(Error::extension(format!(
+                "interference entry {idx} pair must be canonicalized, expected {canonical_pair}, got {pair_key}"
+            )));
+        }
+
+        let Some(stages) = entry_obj.get("stages").and_then(Value::as_array) else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field stages must be an array"
+            )));
+        };
+        if stages.len() != 2 {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field stages must contain exactly 2 stage names"
+            )));
+        }
+        let Some(stages_left) = stages.first().and_then(Value::as_str) else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} stages[0] must be a string"
+            )));
+        };
+        let Some(stages_right) = stages.get(1).and_then(Value::as_str) else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} stages[1] must be a string"
+            )));
+        };
+        if !(STAGE_DECOMPOSITION.contains(&stages_left)
+            && STAGE_DECOMPOSITION.contains(&stages_right))
+        {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field stages must be members of {STAGE_DECOMPOSITION:?}"
+            )));
+        }
+        if stages_left != left_stage || stages_right != right_stage {
+            return Err(Error::extension(format!(
+                "interference entry {idx} stages must match parsed pair ordering ({left_stage}, {right_stage})"
+            )));
+        }
+
+        let Some(interaction_us) = entry_obj.get("interaction_us").and_then(Value::as_f64) else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field interaction_us must be a number"
+            )));
+        };
+        if !interaction_us.is_finite() || interaction_us < 0.0 {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field interaction_us must be finite and non-negative"
+            )));
+        }
+
+        let Some(share_pct) = entry_obj.get("share_pct").and_then(Value::as_f64) else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field share_pct must be a number"
+            )));
+        };
+        if !share_pct.is_finite() || share_pct < 0.0 {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field share_pct must be finite and non-negative"
+            )));
+        }
+        share_pct_total += share_pct;
+
+        if entry_obj
+            .get("sample_count")
+            .and_then(Value::as_u64)
+            .is_none()
+        {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field sample_count must be an integer"
+            )));
+        }
+        let Some(recommended_probe) = entry_obj.get("recommended_probe").and_then(Value::as_str)
+        else {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field recommended_probe must be a string"
+            )));
+        };
+        if recommended_probe.trim().is_empty() {
+            return Err(Error::extension(format!(
+                "interference entry {idx} field recommended_probe must be non-empty"
+            )));
+        }
+
+        observed_pair_keys.push(pair_key.to_string());
+    }
+    if (share_pct_total - 100.0).abs() > 0.5 {
+        return Err(Error::extension(format!(
+            "interference_matrix share_pct values must sum to ~100, got {share_pct_total:.3}"
+        )));
+    }
+
+    let levers = STAGE_DECOMPOSITION
+        .iter()
+        .map(|stage| (*stage).to_string())
+        .collect::<Vec<_>>();
+    let computed_completeness =
+        evaluate_interference_matrix_completeness(&levers, &observed_pair_keys);
+    if !computed_completeness.complete {
+        return Err(Error::extension(format!(
+            "interference_matrix completeness failed: missing={:?} duplicates={:?} unknown={:?}",
+            computed_completeness.missing_pairs,
+            computed_completeness.duplicate_pairs,
+            computed_completeness.unknown_pairs
+        )));
+    }
+
+    let Some(reported_completeness_raw) = matrix.get("interference_matrix_completeness") else {
+        return Err(Error::extension(
+            "interference_matrix_completeness must be present".to_string(),
+        ));
+    };
+    let reported_completeness: InterferenceMatrixCompletenessReport =
+        serde_json::from_value(reported_completeness_raw.clone()).map_err(|err| {
+            Error::extension(format!(
+                "interference_matrix_completeness must match expected schema: {err}"
+            ))
+        })?;
+    if reported_completeness != computed_completeness {
+        return Err(Error::extension(format!(
+            "interference_matrix_completeness mismatch: expected {:?}, got {:?}",
+            computed_completeness, reported_completeness
+        )));
+    }
+
     let Some(voi) = matrix.get("voi_scheduler").and_then(Value::as_object) else {
         return Err(Error::extension(
             "voi_scheduler must be an object".to_string(),
@@ -3128,6 +3394,33 @@ mod tests {
             Some(VOI_SCHEDULER_SCHEMA),
             "missing VOI scheduler artifact"
         );
+        let interference = matrix
+            .get("interference_matrix")
+            .and_then(Value::as_array)
+            .expect("interference_matrix array");
+        assert_eq!(
+            interference.len(),
+            15,
+            "expected complete 6C2 interference matrix coverage"
+        );
+        assert!(
+            interference.iter().all(|entry| entry.get("pair").is_some()),
+            "every interference entry must include pair key"
+        );
+        let completeness = matrix
+            .get("interference_matrix_completeness")
+            .and_then(Value::as_object)
+            .expect("interference_matrix_completeness object");
+        assert_eq!(
+            completeness.get("complete").and_then(Value::as_bool),
+            Some(true),
+            "interference matrix completeness must be true"
+        );
+        assert_eq!(
+            completeness.get("expectedPairs").and_then(Value::as_u64),
+            Some(15),
+            "interference matrix expectedPairs must match 6C2"
+        );
     }
 
     #[test]
@@ -3260,6 +3553,38 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("hotspot_matrix contains duplicate stage entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_incomplete_interference_matrix() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        matrix
+            .pointer_mut("/interference_matrix")
+            .and_then(Value::as_array_mut)
+            .expect("interference_matrix array")
+            .pop();
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string()
+                .contains("interference_matrix completeness failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_unparseable_interference_pair() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        *matrix
+            .pointer_mut("/interference_matrix/0/pair")
+            .expect("interference_matrix[0].pair") = json!("queue");
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string()
+                .contains("interference entry 0 field pair must parse"),
             "unexpected error: {err}"
         );
     }

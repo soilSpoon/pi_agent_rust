@@ -831,10 +831,7 @@ fn percentile_us(sorted: &[f64], pct: usize) -> f64 {
 }
 
 /// Measure per-event latency for N dispatches on a loaded manager, return sorted samples in us.
-fn measure_event_latencies(
-    manager: &ExtensionManager,
-    iterations: usize,
-) -> Vec<f64> {
+fn measure_event_latencies(manager: &ExtensionManager, iterations: usize) -> Vec<f64> {
     let mut samples = Vec::with_capacity(iterations);
 
     for _ in 0..iterations {
@@ -1030,7 +1027,9 @@ fn interference_single_vs_composed() {
         1.0
     };
 
-    eprintln!("[interference] deltas: p50_ratio={p50_ratio:.2}x p95_ratio={p95_ratio:.2}x p99_ratio={p99_ratio:.2}x tail_amp={tail_amplification:.2}x");
+    eprintln!(
+        "[interference] deltas: p50_ratio={p50_ratio:.2}x p95_ratio={p95_ratio:.2}x p99_ratio={p99_ratio:.2}x tail_amp={tail_amplification:.2}x"
+    );
 
     records.push(json!({
         "schema": "pi.ext.interference.v1",
@@ -1106,7 +1105,10 @@ fn composed_extension_load_succeeds() {
                 .await
         }
     });
-    assert!(result.is_ok(), "composed dispatch should succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "composed dispatch should succeed: {result:?}"
+    );
 
     // Collect diagnostics on the composed manager.
     let diag = collect_diagnostics("composed", &manager);

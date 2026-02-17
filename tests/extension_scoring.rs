@@ -5,9 +5,12 @@ mod common;
 use chrono::{DateTime, TimeZone, Utc};
 use common::TestHarness;
 use pi::extension_scoring::{
-    CandidateInput, CompatStatus, Compatibility, Gates, LicenseInfo, MarketplaceSignals, Recency,
-    Redistribution, RiskInfo, RiskLevel, Signals, Tags, score_candidates,
+    CandidateInput, CompatStatus, Compatibility, Gates, InterferenceMatrixCompletenessReport,
+    LicenseInfo, MarketplaceSignals, Recency, Redistribution, RiskInfo, RiskLevel, Signals, Tags,
+    evaluate_interference_matrix_completeness, format_interference_pair_key,
+    parse_interference_pair_key, score_candidates,
 };
+use serde_json::Value;
 use std::collections::HashMap;
 
 fn fixed_as_of() -> DateTime<Utc> {
@@ -256,4 +259,74 @@ fn e2e_scoring_fixture_outputs_artifacts() {
     } else {
         harness.record_artifact("artifact_index", &index_path);
     }
+}
+
+#[test]
+fn interference_pair_key_roundtrip_normalizes_and_rejects_bad_shapes() {
+    let parsed = parse_interference_pair_key(" Queue + marshal ").expect("pair should parse");
+    assert_eq!(parsed, ("marshal".to_string(), "queue".to_string()));
+
+    let formatted = format_interference_pair_key("queue", "marshal").expect("pair should format");
+    assert_eq!(formatted, "marshal+queue");
+
+    assert!(parse_interference_pair_key("queue").is_none());
+    assert!(parse_interference_pair_key("queue+").is_none());
+    assert!(parse_interference_pair_key("+queue").is_none());
+    assert!(parse_interference_pair_key("queue+marshal+io").is_none());
+}
+
+#[test]
+fn interference_matrix_completeness_reports_missing_duplicate_and_unknown_pairs() {
+    let levers = vec![
+        "marshal".to_string(),
+        " queue ".to_string(),
+        "queue".to_string(),
+        "policy".to_string(),
+    ];
+    let observed = vec![
+        "marshal+queue".to_string(),
+        "queue+marshal".to_string(), // duplicate (canonicalized)
+        "queue+policy".to_string(),
+        "policy+policy".to_string(), // self-pair: unknown
+        "bad-shape".to_string(),     // malformed key: unknown
+    ];
+
+    let report = evaluate_interference_matrix_completeness(&levers, &observed);
+    assert_eq!(report.expected_pairs, 3);
+    assert_eq!(report.observed_pairs, 2);
+    assert_eq!(report.missing_pairs, vec!["marshal+policy".to_string()]);
+    assert_eq!(report.duplicate_pairs, vec!["marshal+queue".to_string()]);
+    assert_eq!(
+        report.unknown_pairs,
+        vec!["bad-shape".to_string(), "policy+policy".to_string()]
+    );
+    assert!(!report.complete);
+}
+
+#[test]
+fn interference_matrix_completeness_schema_uses_camel_case_and_round_trips() {
+    let levers = vec![
+        "marshal".to_string(),
+        "queue".to_string(),
+        "policy".to_string(),
+    ];
+    let observed = vec![
+        "marshal+queue".to_string(),
+        "marshal+policy".to_string(),
+        "queue+policy".to_string(),
+    ];
+
+    let report = evaluate_interference_matrix_completeness(&levers, &observed);
+    assert!(report.complete);
+
+    let json = serde_json::to_value(&report).expect("serialize completeness report");
+    assert_eq!(json.get("expectedPairs").and_then(Value::as_u64), Some(3));
+    assert_eq!(json.get("observedPairs").and_then(Value::as_u64), Some(3));
+    assert_eq!(json.get("complete").and_then(Value::as_bool), Some(true));
+    assert!(json.get("expected_pairs").is_none());
+    assert!(json.get("observed_pairs").is_none());
+
+    let round_trip: InterferenceMatrixCompletenessReport =
+        serde_json::from_value(json).expect("deserialize completeness report");
+    assert_eq!(round_trip, report);
 }
