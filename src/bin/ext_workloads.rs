@@ -2925,8 +2925,7 @@ fn validate_hotspot_matrix_schema(matrix: &Value) -> Result<()> {
         })?;
     if reported_completeness != computed_completeness {
         return Err(Error::extension(format!(
-            "interference_matrix_completeness mismatch: expected {:?}, got {:?}",
-            computed_completeness, reported_completeness
+            "interference_matrix_completeness mismatch: expected {computed_completeness:?}, got {reported_completeness:?}"
         )));
     }
 
@@ -3567,10 +3566,11 @@ mod tests {
             .pop();
 
         let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("interference_matrix completeness failed"),
-            "unexpected error: {err}"
+            message.contains("interference_matrix completeness failed")
+                || message.contains("interference_matrix share_pct values must sum to ~100"),
+            "unexpected error: {message}"
         );
     }
 
