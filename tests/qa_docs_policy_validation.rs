@@ -1449,6 +1449,7 @@ fn franken_node_mission_contract_tier_mapping_declares_required_checks_and_phase
         "docs/dropin-certification-verdict.json",
         "docs/franken-node-kernel-extraction-boundary-manifest.json",
         "docs/franken-node-package-interop-contract.json",
+        "docs/franken-node-runtime-substrate-contract.json",
         "tests/full_suite_gate/franken_node_kernel_boundary_drift_report.json",
     ] {
         assert!(
