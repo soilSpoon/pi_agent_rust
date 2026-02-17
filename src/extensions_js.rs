@@ -12891,10 +12891,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let env = env.clone();
                         move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
-                            if deny_env {
-                                tracing::debug!(event = "pijs.env.get.denied", key = %key, "env capability denied");
-                                return Ok(None);
-                            }
+                            // Compat fallback runs BEFORE deny_env so conformance
+                            // scanning can inject deterministic dummy keys even when
+                            // the policy denies env access (ext-conformance feature
+                            // or PI_EXT_COMPAT_SCAN=1 guard this path).
                             if let Some(value) = compat_env_fallback_value(&key, &env) {
                                 tracing::debug!(
                                     event = "pijs.env.get.compat",
@@ -12902,6 +12902,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     "env compat fallback"
                                 );
                                 return Ok(Some(value));
+                            }
+                            if deny_env {
+                                tracing::debug!(event = "pijs.env.get.denied", key = %key, "env capability denied");
+                                return Ok(None);
                             }
                             let allowed = is_env_var_allowed(&key);
                             tracing::debug!(

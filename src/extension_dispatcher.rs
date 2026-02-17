@@ -746,17 +746,32 @@ struct IoUringBridgeDispatch {
     fallback_reason: Option<&'static str>,
 }
 
+fn clone_payload_object_without_reserved(
+    map: &serde_json::Map<String, Value>,
+    reserved_keys: &[&str],
+) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        if reserved_keys.iter().any(|reserved| *reserved == key) {
+            continue;
+        }
+        out.insert(key.clone(), value.clone());
+    }
+    out
+}
+
 fn protocol_params_from_request(request: &HostcallRequest) -> Value {
     match &request.kind {
         HostcallKind::Tool { name } => {
-            serde_json::json!({ "name": name, "input": request.payload.clone() })
+            let mut object = serde_json::Map::with_capacity(2);
+            object.insert("name".to_string(), Value::String(name.clone()));
+            object.insert("input".to_string(), request.payload.clone());
+            Value::Object(object)
         }
         HostcallKind::Exec { cmd } => {
             let mut object = match &request.payload {
                 Value::Object(map) => {
-                    let mut out = map.clone();
-                    out.remove("command");
-                    out
+                    clone_payload_object_without_reserved(map, &["command", "cmd"])
                 }
                 Value::Null => serde_json::Map::new(),
                 other => {
@@ -771,7 +786,7 @@ fn protocol_params_from_request(request: &HostcallRequest) -> Value {
         HostcallKind::Http | HostcallKind::Log => request.payload.clone(),
         HostcallKind::Session { op } | HostcallKind::Ui { op } | HostcallKind::Events { op } => {
             let mut object = match &request.payload {
-                Value::Object(map) => map.clone(),
+                Value::Object(map) => clone_payload_object_without_reserved(map, &["op"]),
                 Value::Null => serde_json::Map::new(),
                 other => {
                     let mut out = serde_json::Map::new();
@@ -1677,7 +1692,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .await
             }
             HostcallKind::Exec { cmd } => {
-                self.dispatch_exec(&request.call_id, cmd, request.payload.clone())
+                self.dispatch_exec_ref(&request.call_id, cmd, &request.payload)
                     .await
             }
             HostcallKind::Http => {
@@ -1685,7 +1700,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .await
             }
             HostcallKind::Session { op } => {
-                self.dispatch_session(&request.call_id, op, request.payload.clone())
+                self.dispatch_session_ref(&request.call_id, op, &request.payload)
                     .await
             }
             HostcallKind::Ui { op } => {
@@ -1698,11 +1713,11 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 .await
             }
             HostcallKind::Events { op } => {
-                self.dispatch_events(
+                self.dispatch_events_ref(
                     &request.call_id,
                     request.extension_id.as_deref(),
                     op,
-                    request.payload.clone(),
+                    &request.payload,
                 )
                 .await
             }
@@ -2171,7 +2186,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     ExecMediationResult::Allow => {}
                 }
 
-                self.dispatch_exec(&payload.call_id, cmd, payload.params.clone())
+                self.dispatch_exec_ref(&payload.call_id, cmd, &payload.params)
                     .await
             }
             Some(ProtocolHostcallMethod::Http) => {
@@ -2205,7 +2220,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         message: "host_call events requires params.op".to_string(),
                     };
                 };
-                self.dispatch_events(&payload.call_id, None, op, payload.params.clone())
+                self.dispatch_events_ref(&payload.call_id, None, op, &payload.params)
                     .await
             }
             Some(ProtocolHostcallMethod::Log) => {
@@ -2247,12 +2262,22 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         }
     }
 
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    #[allow(clippy::future_not_send)]
     async fn dispatch_exec(
         &self,
         call_id: &str,
         cmd: &str,
         payload: serde_json::Value,
+    ) -> HostcallOutcome {
+        self.dispatch_exec_ref(call_id, cmd, &payload).await
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn dispatch_exec_ref(
+        &self,
+        call_id: &str,
+        cmd: &str,
+        payload: &serde_json::Value,
     ) -> HostcallOutcome {
         use std::io::Read as _;
         use std::process::{Command, Stdio};
@@ -2427,14 +2452,17 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             })
         }
 
-        let args_value = payload
-            .get("args")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let args_array = match args_value {
-            serde_json::Value::Null => Vec::new(),
-            serde_json::Value::Array(items) => items,
-            _ => {
+        let args = match payload.get("args") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), ToString::to_string)
+                })
+                .collect::<Vec<_>>(),
+            Some(_) => {
                 return HostcallOutcome::Error {
                     code: "invalid_request".to_string(),
                     message: "exec args must be an array".to_string(),
@@ -2442,35 +2470,23 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             }
         };
 
-        let args = args_array
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map_or_else(|| value.to_string(), ToString::to_string)
-            })
-            .collect::<Vec<_>>();
-
         let options = payload
             .get("options")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
+            .and_then(serde_json::Value::as_object);
         let cwd = options
-            .get("cwd")
+            .and_then(|opts| opts.get("cwd"))
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| self.cwd.clone(), PathBuf::from);
         let timeout_ms = options
-            .get("timeout")
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| options.get("timeoutMs").and_then(serde_json::Value::as_u64))
-            .or_else(|| {
-                options
-                    .get("timeout_ms")
+            .and_then(|opts| {
+                opts.get("timeout")
                     .and_then(serde_json::Value::as_u64)
+                    .or_else(|| opts.get("timeoutMs").and_then(serde_json::Value::as_u64))
+                    .or_else(|| opts.get("timeout_ms").and_then(serde_json::Value::as_u64))
             })
             .filter(|ms| *ms > 0);
         let stream = options
-            .get("stream")
+            .and_then(|opts| opts.get("stream"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
@@ -3007,10 +3023,22 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     #[allow(clippy::future_not_send)]
     async fn dispatch_events(
         &self,
-        _call_id: &str,
+        call_id: &str,
         extension_id: Option<&str>,
         op: &str,
         payload: Value,
+    ) -> HostcallOutcome {
+        self.dispatch_events_ref(call_id, extension_id, op, &payload)
+            .await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_events_ref(
+        &self,
+        _call_id: &str,
+        extension_id: Option<&str>,
+        op: &str,
+        payload: &Value,
     ) -> HostcallOutcome {
         match op.trim() {
             "list" => match self.list_extension_events(extension_id).await {
