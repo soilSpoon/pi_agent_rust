@@ -803,6 +803,22 @@ fn check_artifact_present(root: &Path, artifact_rel: &str) -> (String, Option<St
     }
 }
 
+/// Convert blocking `skip` states into fail-closed failures.
+fn fail_close_blocking_skips(gates: &mut [SubGate]) {
+    for gate in gates {
+        if gate.blocking && gate.status == "skip" {
+            gate.status = "fail".to_string();
+            let prior_detail = gate
+                .detail
+                .take()
+                .unwrap_or_else(|| "Blocking gate reported skip".to_string());
+            gate.detail = Some(format!(
+                "{prior_detail}; fail-closed policy: blocking gates cannot remain in skip state"
+            ));
+        }
+    }
+}
+
 /// Collect all sub-gate results.
 #[allow(clippy::too_many_lines)]
 fn collect_gates(root: &Path) -> Vec<SubGate> {
@@ -1203,6 +1219,8 @@ fn collect_gates(root: &Path) -> Vec<SubGate> {
                 .to_string(),
         ),
     });
+
+    fail_close_blocking_skips(&mut gates);
 
     gates
 }
@@ -2666,6 +2684,55 @@ fn perf3x_bead_coverage_evaluator_fails_on_malformed_contract() {
         detail.contains("Invalid PERF-3X coverage contract"),
         "expected malformed-contract failure, got: {detail}"
     );
+}
+
+#[test]
+fn fail_close_blocking_skips_only_converts_blocking_skip_statuses() {
+    let mut gates = vec![
+        SubGate {
+            id: "blocking_skip".to_string(),
+            name: "Blocking skip".to_string(),
+            bead: "bd-test.1".to_string(),
+            status: "skip".to_string(),
+            blocking: true,
+            artifact_path: Some("missing.json".to_string()),
+            detail: Some("Artifact not found: missing.json".to_string()),
+            reproduce_command: None,
+        },
+        SubGate {
+            id: "non_blocking_skip".to_string(),
+            name: "Non-blocking skip".to_string(),
+            bead: "bd-test.2".to_string(),
+            status: "skip".to_string(),
+            blocking: false,
+            artifact_path: Some("optional.json".to_string()),
+            detail: Some("Artifact not found: optional.json".to_string()),
+            reproduce_command: None,
+        },
+        SubGate {
+            id: "blocking_pass".to_string(),
+            name: "Blocking pass".to_string(),
+            bead: "bd-test.3".to_string(),
+            status: "pass".to_string(),
+            blocking: true,
+            artifact_path: Some("present.json".to_string()),
+            detail: None,
+            reproduce_command: None,
+        },
+    ];
+
+    fail_close_blocking_skips(&mut gates);
+
+    assert_eq!(gates[0].status, "fail");
+    assert!(
+        gates[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("fail-closed policy")
+    );
+    assert_eq!(gates[1].status, "skip");
+    assert_eq!(gates[2].status, "pass");
 }
 
 #[test]
