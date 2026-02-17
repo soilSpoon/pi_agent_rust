@@ -110,9 +110,47 @@ configure_cargo_runner() {
 
 run_cargo() {
     if [[ ${#CARGO_RUNNER_ARGS[@]} -gt 0 ]]; then
-        "${CARGO_RUNNER_ARGS[@]}" cargo "$@"
+        local env_overrides=()
+        local remote_target_dir remote_tmpdir
+
+        if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+            remote_target_dir="$(path_for_remote_runner "$CARGO_TARGET_DIR")"
+            if [[ "$remote_target_dir" != "$CARGO_TARGET_DIR" ]]; then
+                env_overrides+=("CARGO_TARGET_DIR=$remote_target_dir")
+            fi
+        fi
+        if [[ -n "${TMPDIR:-}" ]]; then
+            remote_tmpdir="$(path_for_remote_runner "$TMPDIR")"
+            if [[ "$remote_tmpdir" != "$TMPDIR" ]]; then
+                env_overrides+=("TMPDIR=$remote_tmpdir")
+            fi
+        fi
+
+        if [[ ${#env_overrides[@]} -gt 0 ]]; then
+            "${CARGO_RUNNER_ARGS[@]}" env "${env_overrides[@]}" cargo "$@"
+        else
+            "${CARGO_RUNNER_ARGS[@]}" cargo "$@"
+        fi
     else
         cargo "$@"
+    fi
+}
+
+path_for_remote_runner() {
+    local original="$1"
+    if [[ "$original" == "$PROJECT_ROOT/"* ]]; then
+        printf '%s' "${original#$PROJECT_ROOT/}"
+    else
+        printf '%s' "$original"
+    fi
+}
+
+path_for_test_harness() {
+    local original="$1"
+    if [[ ${#CARGO_RUNNER_ARGS[@]} -gt 0 ]]; then
+        path_for_remote_runner "$original"
+    else
+        printf '%s' "$original"
     fi
 }
 
@@ -809,8 +847,11 @@ run_unit_target() {
     echo "[unit] Running: $target"
     start_epoch=$(date +%s%N 2>/dev/null || date +%s)
 
-    export TEST_LOG_JSONL_PATH="$target_dir/test-log.jsonl"
-    export TEST_ARTIFACT_INDEX_PATH="$target_dir/artifact-index.jsonl"
+    local test_log_env_path artifact_index_env_path
+    test_log_env_path="$(path_for_test_harness "$target_dir/test-log.jsonl")"
+    artifact_index_env_path="$(path_for_test_harness "$target_dir/artifact-index.jsonl")"
+    export TEST_LOG_JSONL_PATH="$test_log_env_path"
+    export TEST_ARTIFACT_INDEX_PATH="$artifact_index_env_path"
     export RUST_LOG="$LOG_LEVEL"
 
     set +e
@@ -883,8 +924,11 @@ run_suite() {
     start_epoch=$(date +%s%N 2>/dev/null || date +%s)
 
     # Set per-suite environment for test harness logging.
-    export TEST_LOG_JSONL_PATH="$suite_dir/test-log.jsonl"
-    export TEST_ARTIFACT_INDEX_PATH="$suite_dir/artifact-index.jsonl"
+    local test_log_env_path artifact_index_env_path
+    test_log_env_path="$(path_for_test_harness "$suite_dir/test-log.jsonl")"
+    artifact_index_env_path="$(path_for_test_harness "$suite_dir/artifact-index.jsonl")"
+    export TEST_LOG_JSONL_PATH="$test_log_env_path"
+    export TEST_ARTIFACT_INDEX_PATH="$artifact_index_env_path"
     export RUST_LOG="$LOG_LEVEL"
 
     set +e
@@ -4152,6 +4196,9 @@ perf_extension_stratification_path_raw = str(
 perf_phase1_matrix_validation_path_raw = str(
     os.environ.get("PERF_PHASE1_MATRIX_VALIDATION_JSON", "")
 ).strip()
+perf_parameter_sweeps_path_raw = str(
+    os.environ.get("PERF_PARAMETER_SWEEPS_JSON", "")
+).strip()
 
 if perf_evidence_dir_raw:
     if not perf_baseline_confidence_path_raw:
@@ -4166,6 +4213,10 @@ if perf_evidence_dir_raw:
         perf_phase1_matrix_validation_path_raw = str(
             Path(perf_evidence_dir_raw) / "results" / "phase1_matrix_validation.json"
         )
+    if not perf_parameter_sweeps_path_raw:
+        perf_parameter_sweeps_path_raw = str(
+            Path(perf_evidence_dir_raw) / "results" / "parameter_sweeps.json"
+        )
 
 perf_baseline_confidence_path = (
     Path(perf_baseline_confidence_path_raw) if perf_baseline_confidence_path_raw else None
@@ -4177,6 +4228,9 @@ perf_phase1_matrix_validation_path = (
     Path(perf_phase1_matrix_validation_path_raw)
     if perf_phase1_matrix_validation_path_raw
     else None
+)
+perf_parameter_sweeps_path = (
+    Path(perf_parameter_sweeps_path_raw) if perf_parameter_sweeps_path_raw else None
 )
 ci_env = env_truthy("CI_ENV", default=env_truthy("CI", default=False))
 claim_integrity_required = env_truthy(
@@ -6151,11 +6205,63 @@ require_keys(
     "conformance.summary_json",
     summary_report,
     summary_report_path,
-    ["schema", "generated_at", "counts", "pass_rate_pct", "evidence"],
+    [
+        "schema",
+        "generated_at",
+        "run_id",
+        "correlation_id",
+        "counts",
+        "pass_rate_pct",
+        "evidence",
+    ],
     strict=strict_conformance,
 )
 
 if isinstance(summary_report, dict):
+    conformance_run_id = str(summary_report.get("run_id", "")).strip()
+    require_condition(
+        "conformance.summary_run_id_nonempty",
+        path=summary_report_path,
+        ok=bool(conformance_run_id),
+        ok_msg="conformance summary run_id is set",
+        fail_msg="conformance summary run_id is empty",
+        strict=strict_conformance,
+        remediation=(
+            "Emit conformance_summary.run_id from the latest canonical consolidated "
+            "conformance run."
+        ),
+    )
+
+    conformance_correlation_id = str(summary_report.get("correlation_id", "")).strip()
+    require_condition(
+        "conformance.summary_correlation_id_nonempty",
+        path=summary_report_path,
+        ok=bool(conformance_correlation_id),
+        ok_msg="conformance summary correlation_id is set",
+        fail_msg="conformance summary correlation_id is empty",
+        strict=strict_conformance,
+        remediation=(
+            "Emit conformance_summary.correlation_id and keep it aligned with "
+            "run_all summary correlation_id."
+        ),
+    )
+    require_condition(
+        "conformance.summary_correlation_id_matches_summary",
+        path=summary_report_path,
+        ok=bool(summary_correlation_id)
+        and conformance_correlation_id == summary_correlation_id,
+        ok_msg="conformance summary correlation_id matches run summary correlation_id",
+        fail_msg=(
+            "conformance summary correlation_id mismatch: expected "
+            f"{summary_correlation_id!r}, got {conformance_correlation_id!r}"
+        ),
+        strict=strict_conformance,
+        remediation=(
+            "Set conformance_summary.correlation_id from run_all summary correlation_id "
+            "for canonical consolidated lineage."
+        ),
+    )
+
     evidence_payload = summary_report.get("evidence")
     require_condition(
         "conformance.summary_json.evidence_object",
@@ -7333,6 +7439,36 @@ else:
             f"{perf_phase1_matrix_validation_path}"
         )
 
+parameter_sweeps = None
+if perf_parameter_sweeps_path is None:
+    if claim_integrity_gate_active:
+        add_check(
+            "claim_integrity.parameter_sweeps_path_configured",
+            perf_sli_matrix_path,
+            False,
+            "PERF_PARAMETER_SWEEPS_JSON/PERF_EVIDENCE_DIR not configured",
+        )
+        record_issue(
+            "claim_integrity.parameter_sweeps_path_configured",
+            "missing parameter_sweeps path for claim-integrity validation",
+            strict=claim_integrity_required,
+            remediation=(
+                "Set PERF_PARAMETER_SWEEPS_JSON (or PERF_EVIDENCE_DIR) to "
+                "parameter_sweeps.json before run_all validation."
+            ),
+        )
+        evidence_missing_or_stale_reasons.append("missing parameter_sweeps.json path")
+else:
+    parameter_sweeps = load_json(
+        "claim_integrity.parameter_sweeps_json",
+        perf_parameter_sweeps_path,
+        strict=claim_integrity_required,
+    )
+    if parameter_sweeps is None and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            f"missing/invalid parameter_sweeps artifact at {perf_parameter_sweeps_path}"
+        )
+
 if isinstance(extension_stratification, dict) and perf_extension_stratification_path is not None:
     require_keys(
         "claim_integrity.extension_stratification_json",
@@ -8314,6 +8450,403 @@ if isinstance(phase1_matrix_validation, dict) and perf_phase1_matrix_validation_
             "opportunity_matrix/parameter_sweeps"
         )
 
+    weighted_bottleneck_raw = phase1_matrix_validation.get(
+        "weighted_bottleneck_attribution"
+    )
+    weighted_bottleneck_obj = (
+        weighted_bottleneck_raw if isinstance(weighted_bottleneck_raw, dict) else None
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_object",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_bottleneck_obj is not None,
+        ok_msg="phase-1 matrix weighted_bottleneck_attribution object present",
+        fail_msg=(
+            "phase-1 matrix validation missing weighted_bottleneck_attribution object"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Emit weighted_bottleneck_attribution object with schema/status/"
+            "lineage/per_scale/global_ranking in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if weighted_bottleneck_obj is None and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation missing weighted_bottleneck_attribution object"
+        )
+
+    weighted_bottleneck_schema = (
+        str(weighted_bottleneck_obj.get("schema", "")).strip()
+        if isinstance(weighted_bottleneck_obj, dict)
+        else ""
+    )
+    weighted_bottleneck_schema_ok = (
+        weighted_bottleneck_schema == "pi.perf.phase1_weighted_bottleneck_attribution.v1"
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_schema",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_bottleneck_schema_ok,
+        ok_msg="phase-1 matrix weighted_bottleneck_attribution schema is canonical",
+        fail_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution schema mismatch: "
+            f"{weighted_bottleneck_schema or 'missing_or_non_string'}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set weighted_bottleneck_attribution.schema to "
+            "pi.perf.phase1_weighted_bottleneck_attribution.v1 in "
+            "scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not weighted_bottleneck_schema_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation weighted_bottleneck_attribution schema mismatch"
+        )
+
+    weighted_bottleneck_status_raw = (
+        weighted_bottleneck_obj.get("status")
+        if isinstance(weighted_bottleneck_obj, dict)
+        else None
+    )
+    weighted_bottleneck_status = (
+        weighted_bottleneck_status_raw.strip().lower()
+        if isinstance(weighted_bottleneck_status_raw, str)
+        else ""
+    )
+    weighted_bottleneck_status_ok = weighted_bottleneck_status in {"computed", "missing"}
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_status_valid",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_bottleneck_status_ok,
+        ok_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution.status is "
+            "computed|missing"
+        ),
+        fail_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution.status must be "
+            "computed|missing, got "
+            f"{weighted_bottleneck_status_raw!r}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set weighted_bottleneck_attribution.status to computed or missing in "
+            "scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not weighted_bottleneck_status_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation weighted_bottleneck_attribution.status must "
+            "be computed|missing"
+        )
+
+    weighted_bottleneck_per_scale_raw = (
+        weighted_bottleneck_obj.get("per_scale")
+        if isinstance(weighted_bottleneck_obj, dict)
+        else None
+    )
+    weighted_bottleneck_global_ranking_raw = (
+        weighted_bottleneck_obj.get("global_ranking")
+        if isinstance(weighted_bottleneck_obj, dict)
+        else None
+    )
+    weighted_bottleneck_per_scale = (
+        weighted_bottleneck_per_scale_raw
+        if isinstance(weighted_bottleneck_per_scale_raw, list)
+        else None
+    )
+    weighted_bottleneck_global_ranking = (
+        weighted_bottleneck_global_ranking_raw
+        if isinstance(weighted_bottleneck_global_ranking_raw, list)
+        else None
+    )
+    weighted_bottleneck_outputs_array_ok = (
+        weighted_bottleneck_per_scale is not None
+        and weighted_bottleneck_global_ranking is not None
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_outputs_array",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_bottleneck_outputs_array_ok,
+        ok_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution per_scale/global_ranking "
+            "arrays are present"
+        ),
+        fail_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution requires array fields: "
+            f"per_scale={type(weighted_bottleneck_per_scale_raw).__name__}, "
+            f"global_ranking={type(weighted_bottleneck_global_ranking_raw).__name__}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Emit weighted_bottleneck_attribution.per_scale and "
+            "weighted_bottleneck_attribution.global_ranking as arrays in "
+            "scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not weighted_bottleneck_outputs_array_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation weighted_bottleneck_attribution output arrays "
+            "missing/invalid"
+        )
+
+    weighted_bottleneck_lineage_raw = (
+        weighted_bottleneck_obj.get("lineage")
+        if isinstance(weighted_bottleneck_obj, dict)
+        else None
+    )
+    weighted_bottleneck_lineage = (
+        weighted_bottleneck_lineage_raw
+        if isinstance(weighted_bottleneck_lineage_raw, dict)
+        else None
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_lineage_object",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_bottleneck_lineage is not None,
+        ok_msg="phase-1 matrix weighted_bottleneck_attribution.lineage object present",
+        fail_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution.lineage must be an object"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Emit weighted_bottleneck_attribution.lineage with "
+            "source_cell_count and valid_cell_count in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if weighted_bottleneck_lineage is None and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation weighted_bottleneck_attribution.lineage missing"
+        )
+
+    def parse_non_negative_weighted_count(raw: object) -> int | None:
+        if isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            return raw if raw >= 0 else None
+        if isinstance(raw, str):
+            candidate = raw.strip()
+            if candidate.isdigit():
+                return int(candidate)
+        return None
+
+    weighted_source_cell_count = parse_non_negative_weighted_count(
+        weighted_bottleneck_lineage.get("source_cell_count")
+        if isinstance(weighted_bottleneck_lineage, dict)
+        else None
+    )
+    weighted_valid_cell_count = parse_non_negative_weighted_count(
+        weighted_bottleneck_lineage.get("valid_cell_count")
+        if isinstance(weighted_bottleneck_lineage, dict)
+        else None
+    )
+    weighted_lineage_counts_present = (
+        weighted_source_cell_count is not None
+        and weighted_valid_cell_count is not None
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_lineage_counts_present",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_lineage_counts_present,
+        ok_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution.lineage count fields "
+            "are present and non-negative"
+        ),
+        fail_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution.lineage requires "
+            "non-negative integer source_cell_count/valid_cell_count: "
+            f"source={weighted_source_cell_count!r}, "
+            f"valid={weighted_valid_cell_count!r}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Emit non-negative integer lineage.source_cell_count and "
+            "lineage.valid_cell_count in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not weighted_lineage_counts_present and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation weighted_bottleneck_attribution lineage counts "
+            "missing/invalid"
+        )
+
+    weighted_lineage_bounds_ok = (
+        weighted_lineage_counts_present
+        and weighted_valid_cell_count <= weighted_source_cell_count
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_lineage_bounds",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_lineage_bounds_ok,
+        ok_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution lineage preserves "
+            "valid_cell_count <= source_cell_count"
+        ),
+        fail_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution lineage bounds invalid: "
+            f"source_cell_count={weighted_source_cell_count!r}, "
+            f"valid_cell_count={weighted_valid_cell_count!r}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Keep weighted_bottleneck_attribution.lineage.valid_cell_count <= "
+            "lineage.source_cell_count in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not weighted_lineage_bounds_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation weighted_bottleneck_attribution lineage "
+            "bounds invalid (valid_cell_count > source_cell_count)"
+        )
+
+    matrix_cells_raw_for_weighted = phase1_matrix_validation.get("matrix_cells")
+    matrix_cells_for_weighted = (
+        matrix_cells_raw_for_weighted
+        if isinstance(matrix_cells_raw_for_weighted, list)
+        else None
+    )
+    weighted_lineage_source_matches_matrix = (
+        not isinstance(matrix_cells_for_weighted, list)
+        or not weighted_lineage_counts_present
+        or weighted_source_cell_count == len(matrix_cells_for_weighted)
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_lineage_source_matches_matrix_cells",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_lineage_source_matches_matrix,
+        ok_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution lineage source count "
+            "matches matrix_cells length"
+        ),
+        fail_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution lineage source count "
+            "must match matrix_cells length: "
+            f"lineage.source_cell_count={weighted_source_cell_count!r}, "
+            f"matrix_cells={len(matrix_cells_for_weighted) if isinstance(matrix_cells_for_weighted, list) else 'n/a'}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set weighted_bottleneck_attribution.lineage.source_cell_count to "
+            "phase1_matrix_validation.matrix_cells length in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not weighted_lineage_source_matches_matrix and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation weighted_bottleneck_attribution lineage "
+            "source_cell_count mismatch with matrix_cells length"
+        )
+
+    weighted_per_scale_len = (
+        len(weighted_bottleneck_per_scale)
+        if isinstance(weighted_bottleneck_per_scale, list)
+        else 0
+    )
+    weighted_global_ranking_len = (
+        len(weighted_bottleneck_global_ranking)
+        if isinstance(weighted_bottleneck_global_ranking, list)
+        else 0
+    )
+    weighted_status_coherence_ok = (
+        weighted_lineage_counts_present
+        and weighted_bottleneck_status_ok
+        and (
+            (
+                weighted_bottleneck_status == "missing"
+                and weighted_valid_cell_count == 0
+                and weighted_per_scale_len == 0
+                and weighted_global_ranking_len == 0
+            )
+            or (
+                weighted_bottleneck_status == "computed"
+                and weighted_valid_cell_count > 0
+                and weighted_per_scale_len > 0
+                and weighted_global_ranking_len > 0
+            )
+        )
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_status_coherence",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_status_coherence_ok,
+        ok_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution status coheres with "
+            "lineage/output cardinalities"
+        ),
+        fail_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution status coherence failed: "
+            f"status={weighted_bottleneck_status_raw!r}, "
+            f"valid_cell_count={weighted_valid_cell_count!r}, "
+            f"per_scale_len={weighted_per_scale_len}, "
+            f"global_ranking_len={weighted_global_ranking_len}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "When status=missing set lineage.valid_cell_count=0 with empty "
+            "per_scale/global_ranking; when status=computed require "
+            "lineage.valid_cell_count>0 and non-empty outputs in "
+            "scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not weighted_status_coherence_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation weighted_bottleneck_attribution status/output "
+            "coherence failed"
+        )
+
+    expected_weighted_stage_keys = {"open_ms", "append_ms", "save_ms", "index_ms"}
+    weighted_stage_rows_invalid: list[str] = []
+    weighted_observed_stage_keys: set[str] = set()
+    if weighted_bottleneck_status == "computed" and isinstance(
+        weighted_bottleneck_global_ranking, list
+    ):
+        for index, row in enumerate(weighted_bottleneck_global_ranking):
+            if not isinstance(row, dict):
+                weighted_stage_rows_invalid.append(
+                    f"global_ranking[{index}] must be an object"
+                )
+                continue
+            stage_raw = row.get("stage")
+            if not isinstance(stage_raw, str) or not stage_raw.strip():
+                weighted_stage_rows_invalid.append(
+                    f"global_ranking[{index}].stage must be a non-empty string"
+                )
+                continue
+            weighted_observed_stage_keys.add(stage_raw.strip().lower())
+    weighted_stage_coverage_ok = (
+        weighted_bottleneck_status != "computed"
+        or (
+            not weighted_stage_rows_invalid
+            and weighted_observed_stage_keys == expected_weighted_stage_keys
+        )
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_weighted_bottleneck_stage_coverage",
+        path=perf_phase1_matrix_validation_path,
+        ok=weighted_stage_coverage_ok,
+        ok_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution.global_ranking has "
+            "canonical stage coverage"
+        ),
+        fail_msg=(
+            "phase-1 matrix weighted_bottleneck_attribution.global_ranking stage "
+            "coverage mismatch: "
+            f"observed={sorted(weighted_observed_stage_keys)}, "
+            f"expected={sorted(expected_weighted_stage_keys)}, "
+            f"invalid={weighted_stage_rows_invalid}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "When weighted_bottleneck_attribution.status=computed, populate "
+            "global_ranking rows with canonical stages "
+            "open_ms/append_ms/save_ms/index_ms in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not weighted_stage_coverage_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation weighted_bottleneck_attribution stage coverage "
+            "mismatch for global_ranking"
+        )
+
     matrix_cells = phase1_matrix_validation.get("matrix_cells")
     matrix_cells_list = matrix_cells if isinstance(matrix_cells, list) else []
     stage_summary = phase1_matrix_validation.get("stage_summary")
@@ -8590,6 +9123,314 @@ if isinstance(phase1_matrix_validation, dict) and perf_phase1_matrix_validation_
             continue
         if mapped_shape:
             phase1_realistic_session_shapes_observed.add(mapped_shape)
+
+if isinstance(parameter_sweeps, dict) and perf_parameter_sweeps_path is not None:
+    require_keys(
+        "claim_integrity.parameter_sweeps_json",
+        parameter_sweeps,
+        perf_parameter_sweeps_path,
+        [
+            "schema",
+            "generated_at",
+            "run_id",
+            "correlation_id",
+            "source_identity",
+            "sweep_plan",
+            "selected_defaults",
+            "readiness",
+        ],
+        strict=claim_integrity_required,
+    )
+    require_condition(
+        "claim_integrity.parameter_sweeps_schema",
+        path=perf_parameter_sweeps_path,
+        ok=parameter_sweeps.get("schema") == "pi.perf.parameter_sweeps.v1",
+        ok_msg="parameter_sweeps schema matches",
+        fail_msg=(
+            "parameter_sweeps schema mismatch: expected 'pi.perf.parameter_sweeps.v1'"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set parameter_sweeps.schema to pi.perf.parameter_sweeps.v1 in "
+            "scripts/perf/orchestrate.sh."
+        ),
+    )
+    if (
+        parameter_sweeps.get("schema") != "pi.perf.parameter_sweeps.v1"
+        and claim_integrity_gate_active
+    ):
+        evidence_missing_or_stale_reasons.append(
+            "parameter_sweeps schema mismatch (expected pi.perf.parameter_sweeps.v1)"
+        )
+
+    validate_generated_at_freshness(
+        payload=parameter_sweeps,
+        payload_path=perf_parameter_sweeps_path,
+        check_id="claim_integrity.parameter_sweeps_generated_at_fresh",
+        label="parameter_sweeps",
+    )
+
+    sweeps_correlation_id = str(parameter_sweeps.get("correlation_id", "")).strip()
+    sweeps_correlation_ok = (
+        bool(sweeps_correlation_id)
+        and bool(expected_claim_correlation_id)
+        and sweeps_correlation_id == expected_claim_correlation_id
+    )
+    require_condition(
+        "claim_integrity.parameter_sweeps_correlation_matches_run",
+        path=perf_parameter_sweeps_path,
+        ok=sweeps_correlation_ok,
+        ok_msg="parameter_sweeps correlation_id matches run summary/environment",
+        fail_msg=(
+            "parameter_sweeps correlation_id mismatch: "
+            f"expected={expected_claim_correlation_id!r}, observed={sweeps_correlation_id!r}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set parameter_sweeps.correlation_id from orchestrate run correlation "
+            "and keep it aligned with run_all summary/environment."
+        ),
+    )
+    if not sweeps_correlation_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "parameter_sweeps correlation_id mismatch with run summary/environment"
+        )
+
+    source_identity_raw = parameter_sweeps.get("source_identity")
+    source_identity_obj = (
+        source_identity_raw if isinstance(source_identity_raw, dict) else None
+    )
+    require_condition(
+        "claim_integrity.parameter_sweeps_source_identity_object",
+        path=perf_parameter_sweeps_path,
+        ok=source_identity_obj is not None,
+        ok_msg="parameter_sweeps source_identity object present",
+        fail_msg="parameter_sweeps source_identity must be an object",
+        strict=claim_integrity_required,
+        remediation=(
+            "Emit parameter_sweeps.source_identity in scripts/perf/orchestrate.sh."
+        ),
+    )
+
+    source_artifact = (
+        str(source_identity_obj.get("source_artifact", "")).strip()
+        if isinstance(source_identity_obj, dict)
+        else ""
+    )
+    source_artifact_ok = source_artifact == "phase1_matrix_validation"
+    require_condition(
+        "claim_integrity.parameter_sweeps_source_identity",
+        path=perf_parameter_sweeps_path,
+        ok=source_artifact_ok,
+        ok_msg="parameter_sweeps source_identity references phase1_matrix_validation",
+        fail_msg=(
+            "parameter_sweeps source_identity.source_artifact must be "
+            f"'phase1_matrix_validation', got {source_artifact!r}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set parameter_sweeps.source_identity.source_artifact to "
+            "'phase1_matrix_validation' in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not source_artifact_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "parameter_sweeps source_identity.source_artifact mismatch"
+        )
+
+    source_artifact_path = (
+        str(source_identity_obj.get("source_artifact_path", "")).strip()
+        if isinstance(source_identity_obj, dict)
+        else ""
+    )
+    source_artifact_path_ok = bool(source_artifact_path)
+    if source_artifact_path_ok:
+        normalized_source_path = source_artifact_path.replace("\\", "/")
+        source_artifact_path_ok = normalized_source_path.endswith(
+            "/phase1_matrix_validation.json"
+        ) or normalized_source_path.endswith("phase1_matrix_validation.json")
+        if source_artifact_path_ok and perf_phase1_matrix_validation_path is not None:
+            expected_phase1_path = str(perf_phase1_matrix_validation_path).replace("\\", "/")
+            source_artifact_path_ok = normalized_source_path.endswith(expected_phase1_path)
+    require_condition(
+        "claim_integrity.parameter_sweeps_source_artifact_path_matches_phase1",
+        path=perf_parameter_sweeps_path,
+        ok=source_artifact_path_ok,
+        ok_msg="parameter_sweeps source artifact path links to phase1 matrix artifact",
+        fail_msg=(
+            "parameter_sweeps source_identity.source_artifact_path must resolve to "
+            f"phase1_matrix_validation.json (observed={source_artifact_path!r})"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set parameter_sweeps.source_identity.source_artifact_path to the emitted "
+            "phase1_matrix_validation.json path in scripts/perf/orchestrate.sh."
+        ),
+    )
+
+    readiness_raw = parameter_sweeps.get("readiness")
+    readiness_obj = readiness_raw if isinstance(readiness_raw, dict) else None
+    require_condition(
+        "claim_integrity.parameter_sweeps_readiness_object",
+        path=perf_parameter_sweeps_path,
+        ok=readiness_obj is not None,
+        ok_msg="parameter_sweeps readiness object present",
+        fail_msg="parameter_sweeps readiness must be an object",
+        strict=claim_integrity_required,
+        remediation=(
+            "Emit parameter_sweeps.readiness in scripts/perf/orchestrate.sh."
+        ),
+    )
+
+    readiness_status = (
+        str(readiness_obj.get("status", "")).strip().lower()
+        if isinstance(readiness_obj, dict)
+        else ""
+    )
+    readiness_flag = (
+        readiness_obj.get("ready_for_phase5")
+        if isinstance(readiness_obj, dict)
+        else None
+    )
+    blocking_reasons = (
+        readiness_obj.get("blocking_reasons")
+        if isinstance(readiness_obj, dict)
+        else None
+    )
+    readiness_status_coherence_ok = (
+        readiness_status in {"ready", "blocked"}
+        and isinstance(readiness_flag, bool)
+        and isinstance(blocking_reasons, list)
+        and (
+            (
+                readiness_status == "ready"
+                and readiness_flag is True
+                and len(blocking_reasons) == 0
+            )
+            or (
+                readiness_status == "blocked"
+                and readiness_flag is False
+                and len(blocking_reasons) > 0
+            )
+        )
+    )
+    require_condition(
+        "claim_integrity.parameter_sweeps_readiness_status_coherence",
+        path=perf_parameter_sweeps_path,
+        ok=readiness_status_coherence_ok,
+        ok_msg="parameter_sweeps readiness status/flags are coherent",
+        fail_msg=(
+            "parameter_sweeps readiness status coherence failed: "
+            f"status={readiness_status!r}, ready_for_phase5={readiness_flag!r}, "
+            f"blocking_reasons={blocking_reasons!r}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set parameter_sweeps.readiness so ready => ready_for_phase5=true + empty "
+            "blocking_reasons; blocked => ready_for_phase5=false + non-empty "
+            "blocking_reasons."
+        ),
+    )
+
+    selected_defaults_raw = parameter_sweeps.get("selected_defaults")
+    selected_defaults_obj = (
+        selected_defaults_raw if isinstance(selected_defaults_raw, dict) else None
+    )
+    required_default_keys = ["flush_cadence_ms", "queue_max_items", "compaction_quota_mb"]
+    selected_defaults_ok = isinstance(selected_defaults_obj, dict)
+    invalid_selected_defaults: list[str] = []
+    if isinstance(selected_defaults_obj, dict):
+        for key in required_default_keys:
+            parsed = parse_session_messages_value(selected_defaults_obj.get(key))
+            if parsed is None:
+                invalid_selected_defaults.append(key)
+    else:
+        invalid_selected_defaults.extend(required_default_keys)
+
+    selected_defaults_ok = selected_defaults_ok and not invalid_selected_defaults
+    require_condition(
+        "claim_integrity.parameter_sweeps_selected_defaults_fields",
+        path=perf_parameter_sweeps_path,
+        ok=selected_defaults_ok,
+        ok_msg=(
+            "parameter_sweeps selected_defaults include positive integer values "
+            "for flush/queue/compaction knobs"
+        ),
+        fail_msg=(
+            "parameter_sweeps selected_defaults missing/invalid required fields: "
+            f"{invalid_selected_defaults}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Emit positive integer selected_defaults for flush_cadence_ms, "
+            "queue_max_items, and compaction_quota_mb in scripts/perf/orchestrate.sh."
+        ),
+    )
+
+    sweep_plan_raw = parameter_sweeps.get("sweep_plan")
+    sweep_plan_obj = sweep_plan_raw if isinstance(sweep_plan_raw, dict) else None
+    dimensions_raw = (
+        sweep_plan_obj.get("dimensions") if isinstance(sweep_plan_obj, dict) else None
+    )
+    dimensions_list = dimensions_raw if isinstance(dimensions_raw, list) else None
+    required_dimension_names = {
+        "flush_cadence_ms",
+        "queue_max_items",
+        "compaction_quota_mb",
+    }
+    observed_dimension_names: set[str] = set()
+    invalid_dimension_reasons: list[str] = []
+    if isinstance(dimensions_list, list):
+        for index, dimension in enumerate(dimensions_list):
+            if not isinstance(dimension, dict):
+                invalid_dimension_reasons.append(
+                    f"dimensions[{index}] must be an object"
+                )
+                continue
+            name = str(dimension.get("name", "")).strip()
+            if not name:
+                invalid_dimension_reasons.append(
+                    f"dimensions[{index}].name must be a non-empty string"
+                )
+                continue
+            observed_dimension_names.add(name)
+            candidates = dimension.get("candidate_values")
+            if not isinstance(candidates, list) or not candidates:
+                invalid_dimension_reasons.append(
+                    f"dimensions[{index}].candidate_values must be a non-empty array"
+                )
+    else:
+        invalid_dimension_reasons.append("sweep_plan.dimensions must be an array")
+
+    dimensions_cover_core_knobs_ok = (
+        not invalid_dimension_reasons
+        and required_dimension_names.issubset(observed_dimension_names)
+    )
+    require_condition(
+        "claim_integrity.parameter_sweeps_dimensions_cover_core_knobs",
+        path=perf_parameter_sweeps_path,
+        ok=dimensions_cover_core_knobs_ok,
+        ok_msg=(
+            "parameter_sweeps sweep_plan.dimensions cover core knobs "
+            "flush/queue/compaction with candidate values"
+        ),
+        fail_msg=(
+            "parameter_sweeps sweep_plan.dimensions invalid/missing core knobs: "
+            f"observed={sorted(observed_dimension_names)}, "
+            f"required={sorted(required_dimension_names)}, "
+            f"invalid={invalid_dimension_reasons}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Emit sweep_plan.dimensions entries for flush_cadence_ms, "
+            "queue_max_items, and compaction_quota_mb with non-empty "
+            "candidate_values arrays in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not dimensions_cover_core_knobs_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "parameter_sweeps sweep_plan.dimensions missing/invalid for core knobs"
+        )
 
 realistic_shape_coverage_path = perf_baseline_confidence_path
 if isinstance(phase1_matrix_validation, dict) and perf_phase1_matrix_validation_path is not None:
