@@ -3590,6 +3590,54 @@ mod tests {
     }
 
     #[test]
+    fn hotspot_matrix_schema_rejects_noncanonical_interference_pair() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        *matrix
+            .pointer_mut("/interference_matrix/0/pair")
+            .expect("interference_matrix[0].pair") = json!("queue+marshal");
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string().contains("pair must be canonicalized"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_interference_share_pct_drift() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        let original_share = matrix
+            .pointer("/interference_matrix/0/share_pct")
+            .and_then(Value::as_f64)
+            .expect("interference_matrix[0].share_pct");
+        *matrix
+            .pointer_mut("/interference_matrix/0/share_pct")
+            .expect("interference_matrix[0].share_pct") = json!(original_share + 5.0);
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string()
+                .contains("interference_matrix share_pct values must sum to ~100"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_completeness_report_mismatch() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        *matrix
+            .pointer_mut("/interference_matrix_completeness/complete")
+            .expect("interference_matrix_completeness.complete") = json!(false);
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string()
+                .contains("interference_matrix_completeness mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn hotspot_matrix_schema_rejects_stage_count_drift() {
         let mut matrix = hotspot_matrix_schema_fixture();
         matrix

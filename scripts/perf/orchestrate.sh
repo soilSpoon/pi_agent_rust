@@ -1260,6 +1260,19 @@ def comparison_row(metric_substr: str, category_substr: str | None = None):
     return None
 
 
+def extract_ratio_from_comparison_row(row):
+    if not isinstance(row, dict):
+        return None
+    rust_value = parse_float(row.get("rust_value"))
+    legacy_value = parse_float(row.get("legacy_value"))
+    if rust_value is not None and legacy_value and legacy_value > 0:
+        return rust_value / legacy_value
+    metric = str(row.get("metric", "")).lower()
+    if rust_value is not None and "ratio" in metric:
+        return rust_value
+    return None
+
+
 legacy_cold_samples_ms: list[float] = []
 legacy_tool_samples_us: list[float] = []
 for record in legacy_records:
@@ -1298,11 +1311,17 @@ if per_call_node_ratio is None and per_call_abs_us is not None and legacy_tool_u
     per_call_node_ratio = per_call_abs_us / legacy_tool_us
 
 full_e2e_row = comparison_row("200 iters x 1 tool", "e2e process")
-if isinstance(full_e2e_row, dict):
-    rust_value = parse_float(full_e2e_row.get("rust_value"))
-    legacy_value = parse_float(full_e2e_row.get("legacy_value"))
-    if rust_value is not None and legacy_value and legacy_value > 0:
-        full_e2e_node_ratio = rust_value / legacy_value
+full_e2e_node_ratio = extract_ratio_from_comparison_row(full_e2e_row)
+if full_e2e_node_ratio is None:
+    # Some perf_comparison payloads publish ratio rows separately from E2E rows.
+    ratio_row = comparison_row("rust-to-ts ratio", "load time")
+    full_e2e_node_ratio = extract_ratio_from_comparison_row(ratio_row)
+if full_e2e_node_ratio is None and full_e2e_abs_ms is not None:
+    # Last-resort fallback when E2E absolute timing exists but legacy baselines are absent.
+    for proxy_ratio in (per_call_node_ratio, cold_node_ratio):
+        if proxy_ratio is not None and proxy_ratio > 0:
+            full_e2e_node_ratio = proxy_ratio
+            break
 
 # Bun coverage is still missing in existing benchmark sources; emit explicit proxy/missing state.
 def bun_ratio_from_node(node_ratio):
@@ -2024,6 +2043,201 @@ missing_cells = [
     )
 ]
 
+def compute_weighted_bottleneck_attribution(
+    matrix_cells: list[dict],
+    stage_keys: list[str],
+    required_scales: list[int],
+    required_partition_tags: list[str],
+) -> dict:
+    valid_cells: list[dict] = []
+    for cell in matrix_cells:
+        if not isinstance(cell, dict):
+            continue
+        if str(cell.get("status", "")).strip().lower() != "pass":
+            continue
+        stage_attribution = cell.get("stage_attribution")
+        if not isinstance(stage_attribution, dict):
+            continue
+        total_stage_ms = parse_float(stage_attribution.get("total_stage_ms"))
+        if total_stage_ms is None or total_stage_ms <= 0:
+            continue
+        valid_cells.append(cell)
+
+    if not valid_cells:
+        return {
+            "schema": "pi.perf.phase1_weighted_bottleneck_attribution.v1",
+            "status": "missing",
+            "weighting_policy": "session_messages",
+            "confidence_method": "weighted_normal_approx_95",
+            "reason": "no_pass_cells_with_stage_totals",
+            "per_scale": [],
+            "global_ranking": [],
+            "lineage": {
+                "source_stream": "phase1_matrix_validation.matrix_cells",
+                "source_cell_count": len(matrix_cells),
+                "valid_cell_count": 0,
+            },
+        }
+
+    per_scale = []
+    for session_messages in required_scales:
+        partitions = []
+        for partition in required_partition_tags:
+            selected = next(
+                (
+                    cell
+                    for cell in valid_cells
+                    if str(cell.get("workload_partition", "")).strip() == partition
+                    and parse_int(cell.get("session_messages")) == session_messages
+                ),
+                None,
+            )
+            if not selected:
+                partitions.append(
+                    {
+                        "workload_partition": partition,
+                        "present": False,
+                        "scenario_id": f"{partition}/session_{session_messages}",
+                        "stage_pct": {stage: None for stage in stage_keys},
+                    }
+                )
+                continue
+
+            stage_attribution = selected.get("stage_attribution", {})
+            total_stage_ms = parse_float(stage_attribution.get("total_stage_ms"))
+            if not isinstance(stage_attribution, dict) or total_stage_ms is None or total_stage_ms <= 0:
+                partitions.append(
+                    {
+                        "workload_partition": partition,
+                        "present": True,
+                        "scenario_id": selected.get("scenario_id"),
+                        "stage_pct": {stage: None for stage in stage_keys},
+                    }
+                )
+                continue
+
+            stage_pct = {}
+            for stage in stage_keys:
+                stage_value = parse_float(stage_attribution.get(stage))
+                stage_pct[stage] = (
+                    (stage_value / total_stage_ms) * 100.0
+                    if stage_value is not None and stage_value >= 0
+                    else None
+                )
+
+            partitions.append(
+                {
+                    "workload_partition": partition,
+                    "present": True,
+                    "scenario_id": selected.get("scenario_id"),
+                    "total_stage_ms": total_stage_ms,
+                    "stage_pct": stage_pct,
+                }
+            )
+
+        per_scale.append(
+            {
+                "session_messages": session_messages,
+                "partitions": partitions,
+            }
+        )
+
+    weighted_stage_ms = {stage: 0.0 for stage in stage_keys}
+    weighted_total_stage_ms = 0.0
+    stage_share_observations: dict[str, list[tuple[float, float]]] = {
+        stage: [] for stage in stage_keys
+    }
+
+    for cell in valid_cells:
+        stage_attribution = cell.get("stage_attribution", {})
+        if not isinstance(stage_attribution, dict):
+            continue
+        total_stage_ms = parse_float(stage_attribution.get("total_stage_ms"))
+        if total_stage_ms is None or total_stage_ms <= 0:
+            continue
+        session_messages = parse_int(cell.get("session_messages"))
+        cell_weight = float(session_messages if session_messages and session_messages > 0 else 1)
+        weighted_total_stage_ms += total_stage_ms * cell_weight
+        for stage in stage_keys:
+            stage_value = parse_float(stage_attribution.get(stage))
+            if stage_value is None:
+                continue
+            weighted_stage_ms[stage] += stage_value * cell_weight
+            stage_share_observations[stage].append((stage_value / total_stage_ms, cell_weight))
+
+    def weighted_confidence_interval(observations: list[tuple[float, float]]):
+        if not observations:
+            return (None, None, None)
+        total_weight = sum(weight for _, weight in observations)
+        if total_weight <= 0:
+            return (None, None, None)
+        mean_share = sum(share * weight for share, weight in observations) / total_weight
+        total_weight_sq = sum(weight * weight for _, weight in observations)
+        if total_weight_sq <= 0:
+            return (mean_share, None, None)
+        effective_n = (total_weight * total_weight) / total_weight_sq
+        variance = (
+            sum(weight * ((share - mean_share) ** 2) for share, weight in observations)
+            / total_weight
+        )
+        if effective_n <= 1:
+            return (mean_share, None, None)
+        standard_error = (variance / effective_n) ** 0.5
+        delta = 1.96 * standard_error
+        lower = max(0.0, mean_share - delta)
+        upper = min(1.0, mean_share + delta)
+        return (mean_share, lower, upper)
+
+    global_ranking = []
+    for stage in stage_keys:
+        weighted_ms = weighted_stage_ms[stage]
+        contribution_pct = (
+            (weighted_ms / weighted_total_stage_ms) * 100.0
+            if weighted_total_stage_ms > 0
+            else None
+        )
+        mean_share, ci95_lower, ci95_upper = weighted_confidence_interval(
+            stage_share_observations[stage]
+        )
+        global_ranking.append(
+            {
+                "stage": stage,
+                "weighted_stage_ms": weighted_ms,
+                "weighted_contribution_pct": contribution_pct,
+                "mean_share_pct": (mean_share * 100.0) if mean_share is not None else None,
+                "ci95_lower_pct": (ci95_lower * 100.0) if ci95_lower is not None else None,
+                "ci95_upper_pct": (ci95_upper * 100.0) if ci95_upper is not None else None,
+                "sample_size": len(stage_share_observations[stage]),
+            }
+        )
+
+    global_ranking.sort(
+        key=lambda row: row.get("weighted_contribution_pct") or -1.0,
+        reverse=True,
+    )
+
+    return {
+        "schema": "pi.perf.phase1_weighted_bottleneck_attribution.v1",
+        "status": "computed",
+        "weighting_policy": "session_messages",
+        "confidence_method": "weighted_normal_approx_95",
+        "per_scale": per_scale,
+        "global_ranking": global_ranking,
+        "lineage": {
+            "source_stream": "phase1_matrix_validation.matrix_cells",
+            "source_cell_count": len(matrix_cells),
+            "valid_cell_count": len(valid_cells),
+        },
+    }
+
+
+weighted_bottleneck_attribution = compute_weighted_bottleneck_attribution(
+    cells,
+    required_stage_keys,
+    required_sizes,
+    required_partitions,
+)
+
 suite_logs = {}
 for suite_name in ["perf_baseline_variance", "perf_regression", "perf_budgets"]:
     suite_dir = output_dir / "results" / suite_name
@@ -2037,7 +2251,13 @@ for suite_name in ["perf_baseline_variance", "perf_regression", "perf_budgets"]:
 
 fault_injection_candidates = []
 if fault_injection_root.exists():
-    fault_injection_candidates = sorted(fault_injection_root.glob("*/summary.json"))
+    summary_candidates = list(fault_injection_root.glob("*/summary.json"))
+    integrity_candidates = list(
+        fault_injection_root.glob("*/integrity-summary.json")
+    )
+    fault_injection_candidates = sorted(
+        {path for path in summary_candidates + integrity_candidates}
+    )
 fault_injection_summary_path = (
     fault_injection_candidates[-1] if fault_injection_candidates else None
 )
@@ -2124,6 +2344,7 @@ payload = {
         "covered_cells": covered_cells,
         "missing_cells": missing_cells,
     },
+    "weighted_bottleneck_attribution": weighted_bottleneck_attribution,
     "primary_outcomes": {
         "status": primary_status,
         "wall_clock_ms": primary_wall_clock_ms,

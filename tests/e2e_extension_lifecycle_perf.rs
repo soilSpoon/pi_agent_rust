@@ -1384,3 +1384,733 @@ fn interference_scaling_by_count() {
         );
     }
 }
+
+// ─── Per-Stage Decomposition & Contention Attribution ────────────────────────
+
+/// Measure per-phase latency (cold_load, event_dispatch, tool_call) for a
+/// single extension, returning sorted sample vectors keyed by phase name.
+fn measure_phase_latencies(
+    ext_name: &str,
+    spec: &JsExtensionLoadSpec,
+    harness: &common::TestHarness,
+    iterations: usize,
+) -> BTreeMap<String, Vec<f64>> {
+    let mut phase_samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+
+    // Cold load samples
+    let mut cold_samples = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let start = Instant::now();
+        let cwd = harness.temp_dir().to_path_buf();
+        let mgr = ExtensionManager::new();
+        let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+        let js_cfg = PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            ..Default::default()
+        };
+        let ok = (|| -> Result<(), String> {
+            let rt = common::run_async({
+                let mgr = mgr.clone();
+                let tools = Arc::clone(&tools);
+                async move {
+                    JsExtensionRuntimeHandle::start(js_cfg, tools, mgr)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            })?;
+            mgr.set_js_runtime(rt);
+            common::run_async({
+                let mgr = mgr.clone();
+                let s = spec.clone();
+                async move {
+                    mgr.load_js_extensions(vec![s])
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            })?;
+            Ok(())
+        })();
+        cold_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        shutdown(&mgr);
+        if ok.is_err() {
+            break;
+        }
+    }
+    cold_samples.sort_by(f64::total_cmp);
+    phase_samples.insert("cold_load".to_string(), cold_samples);
+
+    // Event dispatch + tool call on a persistent manager
+    let manager = setup_manager_with_extension(harness, spec);
+
+    let event_samples = measure_event_latencies(&manager, iterations);
+    phase_samples.insert("event_dispatch".to_string(), event_samples);
+
+    // Tool call samples
+    if let Some(runtime) = manager.js_runtime() {
+        let ctx = json!({ "hasUI": false, "cwd": project_root().display().to_string() });
+        let tool_name = ext_name.to_string();
+        let mut tool_samples = Vec::with_capacity(iterations);
+        for i in 0..iterations {
+            let start = Instant::now();
+            let _ = futures::executor::block_on(runtime.execute_tool(
+                tool_name.clone(),
+                format!("decomp-{i}"),
+                json!({"name": "test"}),
+                ctx.clone(),
+                NORMAL_TIMEOUT_MS,
+            ));
+            tool_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+        tool_samples.sort_by(f64::total_cmp);
+        phase_samples.insert("tool_call".to_string(), tool_samples);
+    }
+
+    shutdown(&manager);
+    phase_samples
+}
+
+/// Measure per-phase latency on a composed manager (all extensions loaded).
+fn measure_composed_phase_latencies(
+    harness: &common::TestHarness,
+    specs: &[JsExtensionLoadSpec],
+    iterations: usize,
+) -> BTreeMap<String, Vec<f64>> {
+    let mut phase_samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+
+    // Cold load for composed
+    let mut cold_samples = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let start = Instant::now();
+        let cwd = harness.temp_dir().to_path_buf();
+        let mgr = ExtensionManager::new();
+        let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+        let js_cfg = PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            ..Default::default()
+        };
+        let ok = (|| -> Result<(), String> {
+            let rt = common::run_async({
+                let mgr = mgr.clone();
+                let tools = Arc::clone(&tools);
+                async move {
+                    JsExtensionRuntimeHandle::start(js_cfg, tools, mgr)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            })?;
+            mgr.set_js_runtime(rt);
+            common::run_async({
+                let mgr = mgr.clone();
+                let s = specs.to_vec();
+                async move {
+                    mgr.load_js_extensions(s)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            })?;
+            Ok(())
+        })();
+        cold_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        shutdown(&mgr);
+        if ok.is_err() {
+            break;
+        }
+    }
+    cold_samples.sort_by(f64::total_cmp);
+    phase_samples.insert("cold_load".to_string(), cold_samples);
+
+    // Event dispatch and tool calls on persistent composed manager
+    let composed = setup_composed_manager(harness, specs);
+    let event_samples = measure_event_latencies(&composed, iterations);
+    phase_samples.insert("event_dispatch".to_string(), event_samples);
+
+    // Tool call on first extension that has a tool
+    if let Some(runtime) = composed.js_runtime() {
+        let ctx = json!({ "hasUI": false, "cwd": project_root().display().to_string() });
+        let tool_name = "hello".to_string();
+        let mut tool_samples = Vec::with_capacity(iterations);
+        for i in 0..iterations {
+            let start = Instant::now();
+            let _ = futures::executor::block_on(runtime.execute_tool(
+                tool_name.clone(),
+                format!("composed-decomp-{i}"),
+                json!({"name": "test"}),
+                ctx.clone(),
+                NORMAL_TIMEOUT_MS,
+            ));
+            tool_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+        tool_samples.sort_by(f64::total_cmp);
+        phase_samples.insert("tool_call".to_string(), tool_samples);
+    }
+
+    shutdown(&composed);
+    phase_samples
+}
+
+/// Per-stage decomposition: compare single-extension vs composed latency broken
+/// down by phase (cold_load, event_dispatch, tool_call). Identifies which phase
+/// suffers the most interference under composition.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stage_decomposition_composed_vs_isolated() {
+    let iterations = 20;
+    let mut specs: Vec<JsExtensionLoadSpec> = Vec::new();
+    let mut records: Vec<Value> = Vec::new();
+    let mut single_phase_data: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
+
+    for ext_name in LIFECYCLE_EXTENSIONS {
+        let entry = artifact_entry(ext_name);
+        if !entry.exists() {
+            continue;
+        }
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry).expect("spec");
+        specs.push(spec.clone());
+
+        let harness = common::TestHarness::new(format!("decomp_single_{ext_name}"));
+        let phase_data = measure_phase_latencies(ext_name, &spec, &harness, iterations);
+
+        for (phase, samples) in &phase_data {
+            let rec = samples_to_record(ext_name, samples);
+            eprintln!(
+                "[decomp] {ext_name}/{phase} single: p50={:.1}us p95={:.1}us",
+                rec.p50_us, rec.p95_us
+            );
+            records.push(json!({
+                "schema": "pi.ext.decomposition.v1",
+                "mode": "single",
+                "extension": ext_name,
+                "phase": phase,
+                "p50_us": rec.p50_us,
+                "p95_us": rec.p95_us,
+                "p99_us": rec.p99_us,
+                "mean_us": rec.mean_us,
+                "sample_count": rec.count,
+            }));
+        }
+        single_phase_data.insert(ext_name.to_string(), phase_data);
+    }
+
+    if specs.len() < 2 {
+        eprintln!("[skip] need >=2 extensions for decomposition test");
+        return;
+    }
+
+    let harness = common::TestHarness::new("decomp_composed");
+    let composed_phases = measure_composed_phase_latencies(&harness, &specs, iterations);
+
+    for (phase, samples) in &composed_phases {
+        let rec = samples_to_record("composed", samples);
+        eprintln!(
+            "[decomp] composed/{phase}: p50={:.1}us p95={:.1}us",
+            rec.p50_us, rec.p95_us
+        );
+        records.push(json!({
+            "schema": "pi.ext.decomposition.v1",
+            "mode": "composed",
+            "extension": "composed",
+            "extension_count": specs.len(),
+            "phase": phase,
+            "p50_us": rec.p50_us,
+            "p95_us": rec.p95_us,
+            "p99_us": rec.p99_us,
+            "mean_us": rec.mean_us,
+            "sample_count": rec.count,
+        }));
+    }
+
+    let phases = ["cold_load", "event_dispatch", "tool_call"];
+    let mut phase_ratios: Vec<Value> = Vec::new();
+    let mut worst_phase = String::new();
+    let mut worst_ratio = 0.0_f64;
+
+    for phase in &phases {
+        let singles: Vec<f64> = single_phase_data
+            .values()
+            .filter_map(|ext_phases| {
+                ext_phases
+                    .get(*phase)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| percentile_us(s, 50))
+            })
+            .collect();
+
+        let avg_single_p50 = if singles.is_empty() {
+            continue;
+        } else {
+            singles.iter().sum::<f64>() / singles.len() as f64
+        };
+
+        let composed_p50 = composed_phases
+            .get(*phase)
+            .filter(|s| !s.is_empty())
+            .map_or(0.0, |s| percentile_us(s, 50));
+
+        let ratio = if avg_single_p50 > 0.0 {
+            composed_p50 / avg_single_p50
+        } else {
+            1.0
+        };
+
+        let avg_single_p95: f64 = single_phase_data
+            .values()
+            .filter_map(|ext_phases| {
+                ext_phases
+                    .get(*phase)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| percentile_us(s, 95))
+            })
+            .sum::<f64>()
+            / singles.len().max(1) as f64;
+
+        let composed_p95 = composed_phases
+            .get(*phase)
+            .filter(|s| !s.is_empty())
+            .map_or(0.0, |s| percentile_us(s, 95));
+
+        let tail_ratio = if avg_single_p95 > 0.0 {
+            composed_p95 / avg_single_p95
+        } else {
+            1.0
+        };
+
+        eprintln!("[decomp] {phase}: p50_ratio={ratio:.2}x tail_ratio={tail_ratio:.2}x");
+
+        if ratio > worst_ratio {
+            worst_ratio = ratio;
+            worst_phase = phase.to_string();
+        }
+
+        phase_ratios.push(json!({
+            "schema": "pi.ext.decomposition.v1",
+            "mode": "ratio",
+            "phase": phase,
+            "avg_single_p50_us": avg_single_p50,
+            "composed_p50_us": composed_p50,
+            "p50_interference_ratio": ratio,
+            "avg_single_p95_us": avg_single_p95,
+            "composed_p95_us": composed_p95,
+            "p95_interference_ratio": tail_ratio,
+        }));
+    }
+    records.extend(phase_ratios);
+
+    if !worst_phase.is_empty() {
+        records.push(json!({
+            "schema": "pi.ext.decomposition.v1",
+            "mode": "summary",
+            "worst_interference_phase": worst_phase,
+            "worst_p50_ratio": worst_ratio,
+        }));
+        eprintln!("[decomp] worst phase: {worst_phase} at {worst_ratio:.2}x");
+    }
+
+    let output_path = project_root().join("target/perf/e2e_decomposition.jsonl");
+    write_jsonl(&records, &output_path);
+    eprintln!(
+        "\n[output] {} decomposition records written to {}",
+        records.len(),
+        output_path.display()
+    );
+
+    for record in &records {
+        if record.get("mode").and_then(Value::as_str) == Some("ratio") {
+            let ratio = record
+                .get("p50_interference_ratio")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            let phase = record
+                .get("phase")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            assert!(
+                ratio < 15.0,
+                "{phase} p50 interference ratio {ratio:.2}x exceeds 15x"
+            );
+        }
+    }
+}
+
+/// Pairwise extension contention matrix: measure interference for each pair
+/// of extensions (hello+pirate, hello+diff, pirate+diff) to identify which
+/// pair causes the most contention.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn pairwise_extension_contention_matrix() {
+    let iterations = 20;
+    let mut specs: Vec<(String, JsExtensionLoadSpec)> = Vec::new();
+
+    for ext_name in LIFECYCLE_EXTENSIONS {
+        let entry = artifact_entry(ext_name);
+        if !entry.exists() {
+            continue;
+        }
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry).expect("spec");
+        specs.push((ext_name.to_string(), spec));
+    }
+
+    if specs.len() < 2 {
+        eprintln!("[skip] need >=2 extensions for contention matrix");
+        return;
+    }
+
+    let mut records: Vec<Value> = Vec::new();
+
+    // Phase A: Single-extension baselines.
+    let mut baselines: BTreeMap<String, LatencySamples> = BTreeMap::new();
+    for (name, spec) in &specs {
+        let harness = common::TestHarness::new(format!("contention_single_{name}"));
+        let manager = setup_manager_with_extension(&harness, spec);
+        let samples = measure_event_latencies(&manager, iterations);
+        let rec = samples_to_record(name, &samples);
+        eprintln!(
+            "[contention] {name} single: p50={:.1}us p95={:.1}us",
+            rec.p50_us, rec.p95_us
+        );
+        baselines.insert(name.clone(), rec.clone());
+        records.push(json!({
+            "schema": "pi.ext.contention.v1",
+            "phase": "baseline",
+            "extensions": [name],
+            "p50_us": rec.p50_us,
+            "p95_us": rec.p95_us,
+            "p99_us": rec.p99_us,
+            "mean_us": rec.mean_us,
+        }));
+        shutdown(&manager);
+    }
+
+    // Phase B: Pairwise measurements.
+    let mut pair_ratios: Vec<(String, String, f64, f64)> = Vec::new();
+
+    for i in 0..specs.len() {
+        for j in (i + 1)..specs.len() {
+            let (name_a, spec_a) = &specs[i];
+            let (name_b, spec_b) = &specs[j];
+            let pair_label = format!("{name_a}+{name_b}");
+
+            let harness = common::TestHarness::new(format!("contention_pair_{name_a}_{name_b}"));
+            let pair_specs = vec![spec_a.clone(), spec_b.clone()];
+            let manager = setup_composed_manager(&harness, &pair_specs);
+            let samples = measure_event_latencies(&manager, iterations);
+            let rec = samples_to_record(&pair_label, &samples);
+
+            let bl_first_p50 = baselines.get(name_a).map_or(1.0, |b| b.p50_us);
+            let bl_second_p50 = baselines.get(name_b).map_or(1.0, |b| b.p50_us);
+            let avg_baseline = f64::midpoint(bl_first_p50, bl_second_p50);
+            let p50_ratio = if avg_baseline > 0.0 {
+                rec.p50_us / avg_baseline
+            } else {
+                1.0
+            };
+
+            let bl_first_p95 = baselines.get(name_a).map_or(1.0, |b| b.p95_us);
+            let bl_second_p95 = baselines.get(name_b).map_or(1.0, |b| b.p95_us);
+            let avg_baseline_p95 = f64::midpoint(bl_first_p95, bl_second_p95);
+            let p95_ratio = if avg_baseline_p95 > 0.0 {
+                rec.p95_us / avg_baseline_p95
+            } else {
+                1.0
+            };
+
+            eprintln!(
+                "[contention] {pair_label}: p50={:.1}us p95={:.1}us ratio={p50_ratio:.2}x tail={p95_ratio:.2}x",
+                rec.p50_us, rec.p95_us
+            );
+
+            pair_ratios.push((name_a.clone(), name_b.clone(), p50_ratio, p95_ratio));
+            records.push(json!({
+                "schema": "pi.ext.contention.v1",
+                "phase": "pair",
+                "extensions": [name_a, name_b],
+                "pair": pair_label,
+                "p50_us": rec.p50_us,
+                "p95_us": rec.p95_us,
+                "p99_us": rec.p99_us,
+                "mean_us": rec.mean_us,
+                "avg_baseline_p50_us": avg_baseline,
+                "avg_baseline_p95_us": avg_baseline_p95,
+                "p50_interference_ratio": p50_ratio,
+                "p95_interference_ratio": p95_ratio,
+            }));
+
+            shutdown(&manager);
+        }
+    }
+
+    let hottest = pair_ratios
+        .iter()
+        .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    if let Some((ext_a, ext_b, ratio, tail)) = hottest {
+        records.push(json!({
+            "schema": "pi.ext.contention.v1",
+            "phase": "summary",
+            "hottest_pair": format!("{ext_a}+{ext_b}"),
+            "hottest_p50_ratio": ratio,
+            "hottest_p95_ratio": tail,
+            "total_pairs_measured": pair_ratios.len(),
+        }));
+        eprintln!(
+            "[contention] hottest pair: {ext_a}+{ext_b} at {ratio:.2}x p50, {tail:.2}x p95"
+        );
+    }
+
+    let output_path = project_root().join("target/perf/e2e_contention.jsonl");
+    write_jsonl(&records, &output_path);
+    eprintln!(
+        "\n[output] {} contention records written to {}",
+        records.len(),
+        output_path.display()
+    );
+
+    for (ext_a, ext_b, ratio, _) in &pair_ratios {
+        assert!(
+            *ratio < 12.0,
+            "{ext_a}+{ext_b} p50 ratio {ratio:.2}x exceeds 12x (severe pairwise contention)"
+        );
+    }
+}
+
+/// Structured regression gate: runs composed measurement, compares against
+/// per-phase and per-pair thresholds, and emits a structured pass/fail report
+/// with specific regression indicators for each dimension.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn regression_gate_structured_report() {
+    let iterations = 20;
+    let phase_p50_threshold = 12.0_f64;
+    let phase_p95_threshold = 18.0_f64;
+    let tail_amplification_threshold = 3.0_f64;
+    let overall_p50_threshold = 10.0_f64;
+
+    let mut specs: Vec<JsExtensionLoadSpec> = Vec::new();
+    let mut records: Vec<Value> = Vec::new();
+    let mut gate_failures: Vec<String> = Vec::new();
+
+    for ext_name in LIFECYCLE_EXTENSIONS {
+        let entry = artifact_entry(ext_name);
+        if !entry.exists() {
+            continue;
+        }
+        specs.push(JsExtensionLoadSpec::from_entry_path(&entry).expect("spec"));
+    }
+
+    if specs.len() < 2 {
+        eprintln!("[skip] need >=2 extensions for regression gate");
+        return;
+    }
+
+    let mut baselines: BTreeMap<String, LatencySamples> = BTreeMap::new();
+    for (i, ext_name) in LIFECYCLE_EXTENSIONS.iter().enumerate() {
+        if i >= specs.len() {
+            break;
+        }
+        let harness = common::TestHarness::new(format!("reggate_single_{ext_name}"));
+        let manager = setup_manager_with_extension(&harness, &specs[i]);
+        let samples = measure_event_latencies(&manager, iterations);
+        baselines.insert(ext_name.to_string(), samples_to_record(ext_name, &samples));
+        shutdown(&manager);
+    }
+
+    let harness = common::TestHarness::new("reggate_composed");
+    let composed = setup_composed_manager(&harness, &specs);
+    let composed_samples = measure_event_latencies(&composed, iterations);
+    let composed_rec = samples_to_record("composed", &composed_samples);
+
+    let single_phase_data: BTreeMap<String, BTreeMap<String, Vec<f64>>> = LIFECYCLE_EXTENSIONS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ext_name)| {
+            if i >= specs.len() {
+                return None;
+            }
+            let h = common::TestHarness::new(format!("reggate_phase_{ext_name}"));
+            let data = measure_phase_latencies(ext_name, &specs[i], &h, iterations);
+            Some((ext_name.to_string(), data))
+        })
+        .collect();
+
+    let composed_harness = common::TestHarness::new("reggate_composed_phases");
+    let composed_phases = measure_composed_phase_latencies(&composed_harness, &specs, iterations);
+
+    // Gate 1: Overall composed vs single p50 ratio.
+    let baseline_count = baselines.len() as f64;
+    let avg_baseline_p50 = baselines.values().map(|b| b.p50_us).sum::<f64>() / baseline_count;
+    let avg_baseline_p95 = baselines.values().map(|b| b.p95_us).sum::<f64>() / baseline_count;
+
+    let overall_p50_ratio = if avg_baseline_p50 > 0.0 {
+        composed_rec.p50_us / avg_baseline_p50
+    } else {
+        1.0
+    };
+
+    let gate1_pass = overall_p50_ratio < overall_p50_threshold;
+    if !gate1_pass {
+        gate_failures.push(format!(
+            "overall_p50: {overall_p50_ratio:.2}x >= {overall_p50_threshold}x"
+        ));
+    }
+    eprintln!(
+        "[reggate] overall p50 ratio: {overall_p50_ratio:.2}x (threshold: {overall_p50_threshold}x) {}",
+        if gate1_pass { "PASS" } else { "FAIL" }
+    );
+
+    // Gate 2: Tail amplification.
+    let single_tail = if avg_baseline_p50 > 0.0 {
+        avg_baseline_p95 / avg_baseline_p50
+    } else {
+        1.0
+    };
+    let composed_tail = if composed_rec.p50_us > 0.0 {
+        composed_rec.p95_us / composed_rec.p50_us
+    } else {
+        1.0
+    };
+    let tail_amp = if single_tail > 0.0 {
+        composed_tail / single_tail
+    } else {
+        1.0
+    };
+
+    let gate2_pass = tail_amp < tail_amplification_threshold;
+    if !gate2_pass {
+        gate_failures.push(format!(
+            "tail_amplification: {tail_amp:.2}x >= {tail_amplification_threshold}x"
+        ));
+    }
+    eprintln!(
+        "[reggate] tail amplification: {tail_amp:.2}x (threshold: {tail_amplification_threshold}x) {}",
+        if gate2_pass { "PASS" } else { "FAIL" }
+    );
+
+    // Gate 3: Per-phase regression check.
+    let mut phase_gates: Vec<Value> = Vec::new();
+    for phase in &["cold_load", "event_dispatch", "tool_call"] {
+        let singles: Vec<f64> = single_phase_data
+            .values()
+            .filter_map(|ext| {
+                ext.get(*phase)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| percentile_us(s, 50))
+            })
+            .collect();
+        let avg_single_p50 = if singles.is_empty() {
+            continue;
+        } else {
+            singles.iter().sum::<f64>() / singles.len() as f64
+        };
+
+        let composed_p50 = composed_phases
+            .get(*phase)
+            .filter(|s| !s.is_empty())
+            .map_or(0.0, |s| percentile_us(s, 50));
+        let ratio = if avg_single_p50 > 0.0 {
+            composed_p50 / avg_single_p50
+        } else {
+            1.0
+        };
+
+        let singles_p95: Vec<f64> = single_phase_data
+            .values()
+            .filter_map(|ext| {
+                ext.get(*phase)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| percentile_us(s, 95))
+            })
+            .collect();
+        let avg_single_p95 = if singles_p95.is_empty() {
+            0.0
+        } else {
+            singles_p95.iter().sum::<f64>() / singles_p95.len() as f64
+        };
+
+        let composed_p95 = composed_phases
+            .get(*phase)
+            .filter(|s| !s.is_empty())
+            .map_or(0.0, |s| percentile_us(s, 95));
+        let p95_ratio = if avg_single_p95 > 0.0 {
+            composed_p95 / avg_single_p95
+        } else {
+            1.0
+        };
+
+        let p50_pass = ratio < phase_p50_threshold;
+        let p95_pass = p95_ratio < phase_p95_threshold;
+        if !p50_pass {
+            gate_failures.push(format!(
+                "phase_{phase}_p50: {ratio:.2}x >= {phase_p50_threshold}x"
+            ));
+        }
+        if !p95_pass {
+            gate_failures.push(format!(
+                "phase_{phase}_p95: {p95_ratio:.2}x >= {phase_p95_threshold}x"
+            ));
+        }
+        eprintln!(
+            "[reggate] {phase}: p50={ratio:.2}x p95={p95_ratio:.2}x {}",
+            if p50_pass && p95_pass { "PASS" } else { "FAIL" }
+        );
+
+        phase_gates.push(json!({
+            "phase": phase,
+            "avg_single_p50_us": avg_single_p50,
+            "composed_p50_us": composed_p50,
+            "p50_ratio": ratio,
+            "p50_pass": p50_pass,
+            "avg_single_p95_us": avg_single_p95,
+            "composed_p95_us": composed_p95,
+            "p95_ratio": p95_ratio,
+            "p95_pass": p95_pass,
+        }));
+    }
+
+    shutdown(&composed);
+
+    let all_pass = gate_failures.is_empty();
+    let report = json!({
+        "schema": "pi.ext.regression_gate.v1",
+        "verdict": if all_pass { "pass" } else { "fail" },
+        "extension_count": specs.len(),
+        "iterations": iterations,
+        "gates": {
+            "overall_p50": {
+                "ratio": overall_p50_ratio,
+                "threshold": overall_p50_threshold,
+                "pass": gate1_pass,
+            },
+            "tail_amplification": {
+                "value": tail_amp,
+                "threshold": tail_amplification_threshold,
+                "pass": gate2_pass,
+            },
+            "per_phase": phase_gates,
+        },
+        "failures": gate_failures,
+        "baselines": baselines.iter().map(|(k, v)| {
+            json!({
+                "extension": k,
+                "p50_us": v.p50_us,
+                "p95_us": v.p95_us,
+            })
+        }).collect::<Vec<_>>(),
+        "composed": {
+            "p50_us": composed_rec.p50_us,
+            "p95_us": composed_rec.p95_us,
+            "p99_us": composed_rec.p99_us,
+        },
+    });
+
+    records.push(report);
+
+    let output_path = project_root().join("target/perf/e2e_regression_gate.jsonl");
+    write_jsonl(&records, &output_path);
+    eprintln!(
+        "\n[reggate] verdict: {} ({} gate failures) -> {}",
+        if all_pass { "PASS" } else { "FAIL" },
+        gate_failures.len(),
+        output_path.display()
+    );
+
+    assert!(all_pass, "regression gate FAILED: {gate_failures:?}");
+}

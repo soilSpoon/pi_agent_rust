@@ -594,6 +594,10 @@ fn validate_protocol_record(record: &Value) -> Result<(), String> {
     if scenario_id.trim().is_empty() {
         return Err("scenario_metadata.scenario_id must be non-empty".to_string());
     }
+    let scenario = record
+        .get("scenario")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
 
     if partition == PARTITION_REALISTIC {
         if !scenario_id.starts_with("realistic/session_") {
@@ -615,6 +619,30 @@ fn validate_protocol_record(record: &Value) -> Result<(), String> {
             ));
         }
     } else {
+        if scenario == "session_workload_matrix" {
+            if !scenario_id.starts_with("matched-state/session_") {
+                return Err(format!(
+                    "session_workload_matrix matched-state scenario_id must be matched-state/session_*, got: {scenario_id}"
+                ));
+            }
+            let replay = metadata
+                .get("replay_input")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "matched-state matrix requires object replay_input".to_string())?;
+            let size = replay
+                .get("session_messages")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    "matched-state matrix replay_input requires session_messages".to_string()
+                })?;
+            if !REALISTIC_SESSION_SIZES.contains(&size) {
+                return Err(format!(
+                    "unsupported matched-state session_messages: {size} (expected one of {REALISTIC_SESSION_SIZES:?})"
+                ));
+            }
+            return Ok(());
+        }
+
         let matched_valid = [
             "cold_start",
             "warm_start",
@@ -2053,6 +2081,40 @@ fn protocol_record_validator_accepts_golden_fixture() {
     assert!(
         validate_protocol_record(&golden).is_ok(),
         "golden protocol fixture should pass validation"
+    );
+}
+
+#[test]
+fn protocol_record_validator_accepts_matched_state_session_matrix_fixture() {
+    let fixture = json!({
+        "schema": "pi.ext.rust_bench.v1",
+        "runtime": "pi_agent_rust",
+        "scenario": "session_workload_matrix",
+        "extension": "core",
+        "protocol_schema": BENCH_PROTOCOL_SCHEMA,
+        "protocol_version": BENCH_PROTOCOL_VERSION,
+        "partition": PARTITION_MATCHED_STATE,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": CONFIDENCE_HIGH,
+        "correlation_id": "0123456789abcdef0123456789abcdef",
+        "scenario_metadata": {
+            "runtime": "pi_agent_rust",
+            "build_profile": "release",
+            "host": {
+                "os": "linux",
+                "arch": "x86_64",
+                "cpu_model": "test-cpu",
+                "cpu_cores": 8,
+            },
+            "scenario_id": "matched-state/session_100000",
+            "replay_input": {
+                "session_messages": 100_000,
+            },
+        },
+    });
+    assert!(
+        validate_protocol_record(&fixture).is_ok(),
+        "matched-state matrix fixture should pass validation"
     );
 }
 
