@@ -861,8 +861,7 @@ fn build_extension_remediation_backlog(
             let tracking_issue = extension_exception
                 .map(|meta| meta.tracking_issue.trim())
                 .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| follow_up_bead.clone());
+                .map_or_else(|| follow_up_bead.clone(), ToOwned::to_owned);
             let fallback_validation = extension_exception.map_or_else(
                 || "exception_policy entry missing; fallback guidance derived from cause policy".to_string(),
                 |meta| {

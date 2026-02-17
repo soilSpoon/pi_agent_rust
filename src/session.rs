@@ -1539,7 +1539,6 @@ impl Session {
                     let (tx, rx) = oneshot::channel::<JsonlSaveResult>();
 
                     let header_snapshot = self.header.clone();
-                    let header_for_index = header_snapshot.clone();
                     let entries_to_save = std::mem::take(&mut self.entries);
 
                     let path_for_thread = path_clone.clone();
@@ -1566,7 +1565,7 @@ impl Session {
                             enqueue_session_index_snapshot_update(
                                 sessions_root,
                                 path_for_thread,
-                                header_for_index,
+                                header_snapshot,
                                 message_count,
                                 session_name,
                             );
@@ -1596,7 +1595,7 @@ impl Session {
                     match result {
                         Ok(entries) => {
                             self.entries = entries;
-                            self.rebuild_all_caches();
+                            // Keep derived caches as-is: save path does not mutate entry ordering/content.
                             self.persisted_entry_count
                                 .store(self.entries.len(), Ordering::SeqCst);
                             self.header_dirty = false;
@@ -1605,7 +1604,6 @@ impl Session {
                         }
                         Err((err, entries)) => {
                             self.entries = entries;
-                            self.rebuild_all_caches();
                             Err(err)
                         }
                     }?;
