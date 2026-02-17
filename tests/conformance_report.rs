@@ -37,6 +37,35 @@ fn provenance_path() -> PathBuf {
 
 static CONFORMANCE_REPORT_IO_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+fn normalize_optional_env(value: Option<String>) -> Option<String> {
+    value
+        .map(|candidate| candidate.trim().to_string())
+        .filter(|candidate| !candidate.is_empty())
+}
+
+fn resolve_conformance_summary_lineage(
+    github_run_id: Option<String>,
+    ci_run_id: Option<String>,
+    ci_correlation_id: Option<String>,
+    now: DateTime<Utc>,
+) -> (String, String) {
+    let run_id = normalize_optional_env(github_run_id)
+        .or_else(|| normalize_optional_env(ci_run_id))
+        .unwrap_or_else(|| format!("local-{}", now.format("%Y%m%dT%H%M%S%3fZ")));
+    let correlation_id = normalize_optional_env(ci_correlation_id)
+        .unwrap_or_else(|| format!("conformance-summary-{run_id}"));
+    (run_id, correlation_id)
+}
+
+fn current_conformance_summary_lineage(now: DateTime<Utc>) -> (String, String) {
+    resolve_conformance_summary_lineage(
+        std::env::var("GITHUB_RUN_ID").ok(),
+        std::env::var("CI_RUN_ID").ok(),
+        std::env::var("CI_CORRELATION_ID").ok(),
+        now,
+    )
+}
+
 // ─── Data Structures ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -865,9 +894,13 @@ fn generate_conformance_report_impl() {
         .filter(|e| statuses.get(&e.id).and_then(|s| s.rust_load_ms).is_some())
         .count();
 
+    let summary_now = Utc::now();
+    let (summary_run_id, summary_correlation_id) = current_conformance_summary_lineage(summary_now);
     let summary = json!({
         "schema": "pi.ext.conformance_summary.v2",
-        "generated_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        "generated_at": summary_now.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "run_id": summary_run_id,
+        "correlation_id": summary_correlation_id,
         "counts": {
             "total": total,
             "pass": pass,
@@ -1398,4 +1431,48 @@ fn trend_report_updates_history() {
         serde_json::from_str(&std::fs::read_to_string(&trend_path).unwrap()).unwrap();
     assert_eq!(report2.history.len(), 2);
     assert_eq!(report2.history[1].pass, 85);
+}
+
+#[test]
+fn conformance_summary_lineage_prefers_github_and_explicit_correlation() {
+    let now = DateTime::parse_from_rfc3339("2026-02-17T00:00:00Z")
+        .expect("parse fixed timestamp")
+        .with_timezone(&Utc);
+    let (run_id, correlation_id) = resolve_conformance_summary_lineage(
+        Some(" 12345 ".to_string()),
+        Some("fallback-run".to_string()),
+        Some(" corr-abc ".to_string()),
+        now,
+    );
+    assert_eq!(run_id, "12345");
+    assert_eq!(correlation_id, "corr-abc");
+}
+
+#[test]
+fn conformance_summary_lineage_uses_ci_run_id_when_github_missing() {
+    let now = DateTime::parse_from_rfc3339("2026-02-17T00:00:00Z")
+        .expect("parse fixed timestamp")
+        .with_timezone(&Utc);
+    let (run_id, correlation_id) =
+        resolve_conformance_summary_lineage(None, Some("ci-777".to_string()), None, now);
+    assert_eq!(run_id, "ci-777");
+    assert_eq!(correlation_id, "conformance-summary-ci-777");
+}
+
+#[test]
+fn conformance_summary_lineage_falls_back_to_local_run_id() {
+    let now = DateTime::parse_from_rfc3339("2026-02-17T01:02:03Z")
+        .expect("parse fixed timestamp")
+        .with_timezone(&Utc);
+    let (run_id, correlation_id) = resolve_conformance_summary_lineage(
+        Some("  ".to_string()),
+        Some(String::new()),
+        Some("   ".to_string()),
+        now,
+    );
+    assert!(
+        run_id.starts_with("local-20260217T010203"),
+        "unexpected local run_id format: {run_id}"
+    );
+    assert_eq!(correlation_id, format!("conformance-summary-{run_id}"));
 }

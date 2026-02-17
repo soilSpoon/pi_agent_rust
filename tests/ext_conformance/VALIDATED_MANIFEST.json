@@ -4644,25 +4644,13 @@
       "entry_path": "npm/pi-package-test/extensions/confirm-destructive.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": true,
-        "registers_commands": true,
-        "registers_flags": true,
+        "registers_tools": false,
+        "registers_commands": false,
+        "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "agent_end",
-          "agent_start",
-          "before_agent_start",
-          "context",
-          "session_before_compact",
           "session_before_fork",
-          "session_before_switch",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "tool_call",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "session_before_switch"
         ],
         "uses_exec": false,
         "uses_http": false,
@@ -4674,44 +4662,12 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [
-          "signal_loop_success"
-        ],
-        "commands": [
-          "cost",
-          "flicker-corp",
-          "footer",
-          "fun-working",
-          "handoff",
-          "loop",
-          "mem",
-          "oracle",
-          "plan",
-          "remember",
-          "signature-flicker",
-          "speedread",
-          "status",
-          "status-refresh",
-          "todos",
-          "ultrathink",
-          "usage"
-        ],
+        "tools": [],
+        "commands": [],
         "flags": [],
         "event_handlers": [
-          "agent_end",
-          "agent_start",
-          "before_agent_start",
-          "context",
-          "session_before_compact",
           "session_before_fork",
-          "session_before_switch",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "tool_call",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "session_before_switch"
         ]
       }
     },

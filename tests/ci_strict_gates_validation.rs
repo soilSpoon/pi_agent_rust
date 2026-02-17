@@ -12,7 +12,6 @@
 //! cargo test --test ci_strict_gates_validation
 //! ```
 
-#![allow(clippy::too_many_lines)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::items_after_statements)]
 
@@ -25,8 +24,12 @@ const TEST_DOUBLE_INVENTORY_PATH: &str = "docs/test_double_inventory.json";
 const TESTING_POLICY_PATH: &str = "docs/testing-policy.md";
 const SUITE_CLASSIFICATION_PATH: &str = "tests/suite_classification.toml";
 const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
+const CI_OPERATOR_RUNBOOK_PATH: &str = "docs/ci-operator-runbook.md";
 const SCENARIO_MATRIX_PATH: &str = "docs/e2e_scenario_matrix.json";
 const FULL_SUITE_GATE_PATH: &str = "tests/ci_full_suite_gate.rs";
+const PRACTICAL_FINISH_GATE_ID: &str = "practical_finish_checkpoint";
+const EXT_REMEDIATION_GATE_ID: &str = "extension_remediation_backlog";
+const PARAMETER_SWEEPS_GATE_ID: &str = "parameter_sweeps_integrity";
 
 fn load_json(path: &str) -> Value {
     let content = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"));
@@ -220,6 +223,91 @@ fn ci_workflow_has_evidence_bundle_gate() {
     );
 }
 
+#[test]
+fn ci_operator_runbook_retains_perf3x_incident_addendum_heading() {
+    let runbook = load_text(CI_OPERATOR_RUNBOOK_PATH);
+    assert!(
+        runbook.contains("### PERF-3X Gate Incident Addendum (bd-3ar8v.6.4)"),
+        "CI operator runbook must retain PERF-3X incident addendum heading"
+    );
+}
+
+#[test]
+fn ci_operator_runbook_retains_perf3x_incident_artifact_checklist() {
+    let runbook = load_text(CI_OPERATOR_RUNBOOK_PATH);
+    for token in [
+        "tests/full_suite_gate/practical_finish_checkpoint.json",
+        "tests/full_suite_gate/extension_remediation_backlog.json",
+        "tests/perf/reports/budget_summary.json",
+        "tests/perf/reports/perf_comparison.json",
+        "tests/perf/reports/stress_triage.json",
+        "tests/perf/reports/budget_events.jsonl",
+        "tests/perf/reports/perf_comparison_events.jsonl",
+        "tests/perf/reports/stress_events.jsonl",
+    ] {
+        assert!(
+            runbook.contains(token),
+            "CI operator runbook must retain PERF-3X artifact token: {token}"
+        );
+    }
+}
+
+#[test]
+fn ci_operator_runbook_retains_parameter_sweeps_signature_playbook_tokens() {
+    let runbook = load_text(CI_OPERATOR_RUNBOOK_PATH);
+    for token in [
+        "### PERF-3X signature: `parameter_sweeps_integrity` gate failure",
+        "full_suite_verdict.json",
+        "parameter_sweeps_integrity",
+        "tests/perf/reports/parameter_sweeps.json",
+        "tests/perf/reports/parameter_sweeps_events.jsonl",
+        "tests/perf/reports/phase1_matrix_validation.json",
+        "rch exec -- cargo test --test release_evidence_gate --",
+        "parameter_sweeps_contract_links_phase1_matrix_and_readiness --nocapture --exact",
+        "Enforce artifact schema `pi.perf.parameter_sweeps.v1`.",
+        "source_identity",
+        "phase1_matrix_validation",
+        "status = ready",
+        "status = blocked",
+        "ready_for_phase5",
+        "blocking_reasons",
+        "docs/qa-runbook.md",
+        "PERF-3X Regression Triage (bd-3ar8v.6.4)",
+    ] {
+        assert!(
+            runbook.contains(token),
+            "CI operator runbook must retain parameter_sweeps signature token: {token}"
+        );
+    }
+}
+
+#[test]
+fn ci_operator_runbook_retains_practical_finish_signature_playbook_tokens() {
+    let runbook = load_text(CI_OPERATOR_RUNBOOK_PATH);
+    for token in [
+        "### PERF-3X signature: `practical_finish_checkpoint` readiness drift",
+        "technical PERF-3X issue(s) still open",
+        "Fail-closed practical-finish source read error",
+        "tests/full_suite_gate/practical_finish_checkpoint.json",
+        ".beads/issues.jsonl",
+        "tests/full_suite_gate/certification_events.jsonl",
+        "rch exec -- cargo test --test ci_full_suite_gate --",
+        "practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact",
+        "rch exec -- cargo test --test release_readiness -- practical_finish_checkpoint_ -- --nocapture",
+        "pi.perf3x.practical_finish_checkpoint.v1",
+        "technical_completion_reached",
+        "residual_open_scope",
+        "open_perf3x_count = technical_open_count + docs_or_report_open_count",
+        "docs/qa-runbook.md",
+        "PERF-3X Regression Triage (bd-3ar8v.6.4)",
+    ] {
+        assert!(
+            runbook.contains(token),
+            "CI operator runbook must retain practical_finish signature token: {token}"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Section 5: Full suite gate has blocking gates
 // ═══════════════════════════════════════════════════════════════════════════
@@ -266,6 +354,66 @@ fn full_suite_gate_validates_waiver_lifecycle() {
         gate.contains("waiver"),
         "full suite gate must validate waiver lifecycle"
     );
+}
+
+#[test]
+fn full_suite_gate_wires_practical_finish_checkpoint_contract() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    for token in [
+        PRACTICAL_FINISH_GATE_ID,
+        "evaluate_practical_finish_checkpoint",
+        "pi.perf3x.practical_finish_checkpoint.v1",
+    ] {
+        assert!(
+            gate.contains(token),
+            "full suite gate must retain practical_finish_checkpoint token: {token}"
+        );
+    }
+}
+
+#[test]
+fn full_suite_gate_wires_extension_remediation_backlog_contract() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    for token in [
+        EXT_REMEDIATION_GATE_ID,
+        "check_extension_remediation_backlog_artifact",
+        "pi.qa.extension_remediation_backlog.v1",
+    ] {
+        assert!(
+            gate.contains(token),
+            "full suite gate must retain extension_remediation_backlog token: {token}"
+        );
+    }
+}
+
+#[test]
+fn full_suite_gate_wires_parameter_sweeps_integrity_contract() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    for token in [
+        PARAMETER_SWEEPS_GATE_ID,
+        "check_parameter_sweeps_artifact",
+        "pi.perf.parameter_sweeps.v1",
+    ] {
+        assert!(
+            gate.contains(token),
+            "full suite gate must retain parameter_sweeps token: {token}"
+        );
+    }
+}
+
+#[test]
+fn full_suite_gate_keeps_phase1_matrix_claim_integrity_tokens() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    for token in [
+        "claim_integrity.phase1_matrix_validation_path_configured",
+        "claim_integrity.phase1_matrix_validation_schema",
+        "claim_integrity.phase1_matrix_cells_primary_e2e_metrics_present",
+    ] {
+        assert!(
+            gate.contains(token),
+            "full suite gate must retain phase1 matrix claim-integrity token: {token}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

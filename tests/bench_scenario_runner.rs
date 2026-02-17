@@ -22,9 +22,9 @@ use pi::extensions::JsExtensionLoadSpec;
 use pi::extensions_js::{HostcallKind, PiJsRuntime, PiJsRuntimeConfig};
 use pi::scheduler::{HostcallOutcome, WallClock};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -791,22 +791,22 @@ fn write_jsonl(records: &[Value], path: &Path) {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-#[test]
-#[allow(clippy::too_many_lines)]
-fn run_scenario_suite_and_emit_jsonl() {
-    let records = run_all_scenarios().expect("scenario suite should complete");
-
-    // Must have benchmark records for configured extensions (excluding matrix seed rows).
-    let benchmarked_extensions: std::collections::HashSet<_> = records
+fn collect_benchmarked_extensions(records: &[Value]) -> HashSet<String> {
+    records
         .iter()
         .filter(|record| {
             record.get("scenario").and_then(Value::as_str) != Some(MATRIX_SCENARIO_SESSION_WORKLOAD)
         })
-        .filter_map(|r| r.get("extension").and_then(Value::as_str))
-        .collect();
+        .filter_map(|record| record.get("extension").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn assert_expected_benchmarked_extensions(records: &[Value]) {
+    let benchmarked_extensions = collect_benchmarked_extensions(records);
     for expected_ext in BENCH_EXTENSIONS {
         assert!(
-            benchmarked_extensions.contains(expected_ext),
+            benchmarked_extensions.contains(*expected_ext),
             "missing benchmark records for extension: {expected_ext}; observed={benchmarked_extensions:?}"
         );
     }
@@ -817,12 +817,14 @@ fn run_scenario_suite_and_emit_jsonl() {
         benchmarked_extensions.len(),
         benchmarked_extensions
     );
+}
 
-    // Must have all extension benchmark scenario types + matrix source scenario.
-    let scenarios: std::collections::HashSet<_> = records
+fn assert_required_scenarios(records: &[Value]) {
+    let scenarios: HashSet<&str> = records
         .iter()
-        .filter_map(|r| r.get("scenario").and_then(Value::as_str))
+        .filter_map(|record| record.get("scenario").and_then(Value::as_str))
         .collect();
+
     for expected in &[
         "cold_start",
         "warm_start",
@@ -832,10 +834,11 @@ fn run_scenario_suite_and_emit_jsonl() {
     ] {
         assert!(scenarios.contains(expected), "missing scenario: {expected}");
     }
-    // Fail closed on per-extension scenario drift: each benchmarked extension
-    // must emit all core scenario rows.
+}
+
+fn assert_per_extension_scenarios(records: &[Value]) {
     for ext_name in BENCH_EXTENSIONS {
-        let ext_scenarios: std::collections::HashSet<_> = records
+        let ext_scenarios: HashSet<&str> = records
             .iter()
             .filter(|record| record.get("extension").and_then(Value::as_str) == Some(*ext_name))
             .filter_map(|record| record.get("scenario").and_then(Value::as_str))
@@ -847,22 +850,11 @@ fn run_scenario_suite_and_emit_jsonl() {
             );
         }
     }
+}
 
-    let matrix_rows = records
-        .iter()
-        .filter(|record| {
-            record.get("scenario").and_then(Value::as_str) == Some(MATRIX_SCENARIO_SESSION_WORKLOAD)
-        })
-        .count();
-    assert_eq!(
-        matrix_rows,
-        MATRIX_SESSION_SIZES.len() * 2,
-        "expected one matched-state and one realistic matrix row per required session size"
-    );
-    // Fail closed on matrix-shape drift: every required (partition, size)
-    // cell must be present exactly once.
+fn collect_matrix_key_counts(records: &[Value]) -> BTreeMap<(String, u64), usize> {
     let mut matrix_key_counts: BTreeMap<(String, u64), usize> = BTreeMap::new();
-    for record in &records {
+    for record in records {
         if record.get("scenario").and_then(Value::as_str) != Some(MATRIX_SCENARIO_SESSION_WORKLOAD)
         {
             continue;
@@ -881,52 +873,62 @@ fn run_scenario_suite_and_emit_jsonl() {
             .entry((partition, session_messages))
             .or_insert(0) += 1;
     }
+    matrix_key_counts
+}
 
-    let expected_matrix_keys: std::collections::HashSet<(String, u64)> =
-        [PARTITION_MATCHED_STATE, PARTITION_REALISTIC]
-            .into_iter()
-            .flat_map(|partition| {
-                MATRIX_SESSION_SIZES
-                    .iter()
-                    .copied()
-                    .map(move |session_messages| (partition.to_string(), session_messages))
-            })
-            .collect();
-    let observed_matrix_keys: std::collections::HashSet<(String, u64)> =
-        matrix_key_counts.keys().cloned().collect();
+fn expected_matrix_keys() -> HashSet<(String, u64)> {
+    [PARTITION_MATCHED_STATE, PARTITION_REALISTIC]
+        .into_iter()
+        .flat_map(|partition| {
+            MATRIX_SESSION_SIZES
+                .iter()
+                .copied()
+                .map(move |session_messages| (partition.to_string(), session_messages))
+        })
+        .collect()
+}
+
+fn assert_matrix_rows(records: &[Value]) {
+    let matrix_rows = records
+        .iter()
+        .filter(|record| {
+            record.get("scenario").and_then(Value::as_str) == Some(MATRIX_SCENARIO_SESSION_WORKLOAD)
+        })
+        .count();
     assert_eq!(
-        observed_matrix_keys, expected_matrix_keys,
+        matrix_rows,
+        MATRIX_SESSION_SIZES.len() * 2,
+        "expected one matched-state and one realistic matrix row per required session size"
+    );
+
+    let matrix_key_counts = collect_matrix_key_counts(records);
+    let observed_matrix_keys: HashSet<(String, u64)> = matrix_key_counts.keys().cloned().collect();
+    assert_eq!(
+        observed_matrix_keys,
+        expected_matrix_keys(),
         "session_workload_matrix rows must cover required partition-size cells exactly"
     );
-    for (key, count) in matrix_key_counts {
+    for ((partition, session_messages), count) in matrix_key_counts {
         assert_eq!(
             count, 1,
-            "duplicate session_workload_matrix row for partition={} session_messages={}",
-            key.0, key.1
+            "duplicate session_workload_matrix row for partition={partition} session_messages={session_messages}"
         );
     }
+}
 
-    // All records must have schema field
-    for record in &records {
+fn assert_records_have_schema(records: &[Value]) {
+    for record in records {
         assert_eq!(
             record.get("schema").and_then(Value::as_str),
             Some("pi.ext.rust_bench.v1"),
             "record missing schema: {record}"
         );
     }
+}
 
-    // Write JSONL output
-    let output_path = project_root().join("target/perf/scenario_runner.jsonl");
-    write_jsonl(&records, &output_path);
-    eprintln!(
-        "\n[output] {} records written to {}",
-        records.len(),
-        output_path.display()
-    );
-
-    // Print summary
+fn print_scenario_summary(records: &[Value]) {
     eprintln!("\n=== Scenario Runner Summary ===");
-    for record in &records {
+    for record in records {
         let ext = record
             .get("extension")
             .and_then(Value::as_str)
@@ -955,138 +957,180 @@ fn run_scenario_suite_and_emit_jsonl() {
     }
 }
 
+#[test]
+fn run_scenario_suite_and_emit_jsonl() {
+    let records = run_all_scenarios().expect("scenario suite should complete");
+
+    assert_expected_benchmarked_extensions(&records);
+    assert_required_scenarios(&records);
+    assert_per_extension_scenarios(&records);
+    assert_matrix_rows(&records);
+    assert_records_have_schema(&records);
+
+    // Write JSONL output
+    let output_path = project_root().join("target/perf/scenario_runner.jsonl");
+    write_jsonl(&records, &output_path);
+    eprintln!(
+        "\n[output] {} records written to {}",
+        records.len(),
+        output_path.display()
+    );
+
+    print_scenario_summary(&records);
+}
+
 /// Verify output stability: re-run and compare structure (not timing values).
 #[test]
-#[allow(clippy::too_many_lines)]
 fn scenario_output_has_stable_structure() {
     let records = run_all_scenarios().expect("scenario suite should complete");
 
     for record in &records {
         let obj = record.as_object().expect("record should be object");
 
-        // Required fields present
-        assert!(obj.contains_key("schema"), "missing schema");
-        assert!(obj.contains_key("runtime"), "missing runtime");
-        assert!(obj.contains_key("scenario"), "missing scenario");
-        assert!(obj.contains_key("extension"), "missing extension");
-        assert!(obj.contains_key("env"), "missing env");
-        assert!(
-            obj.contains_key("protocol_schema"),
-            "missing protocol_schema"
-        );
-        assert!(
-            obj.contains_key("protocol_version"),
-            "missing protocol_version"
-        );
-        assert!(obj.contains_key("partition"), "missing partition");
-        assert!(obj.contains_key("evidence_class"), "missing evidence_class");
-        assert!(obj.contains_key("confidence"), "missing confidence");
-        assert!(obj.contains_key("correlation_id"), "missing correlation_id");
-        assert!(
-            obj.contains_key("scenario_metadata"),
-            "missing scenario_metadata"
-        );
+        assert_record_structure(obj);
+    }
+}
 
-        assert_eq!(
-            obj.get("protocol_schema").and_then(Value::as_str),
-            Some(BENCH_PROTOCOL_SCHEMA),
-            "unexpected protocol_schema",
-        );
-        assert_eq!(
-            obj.get("protocol_version").and_then(Value::as_str),
-            Some(BENCH_PROTOCOL_VERSION),
-            "unexpected protocol_version",
-        );
-        let partition = obj.get("partition").and_then(Value::as_str).unwrap_or("");
+fn assert_record_structure(obj: &Map<String, Value>) {
+    assert_record_required_fields(obj);
+    assert_protocol_and_partition_contract(obj);
+    assert_env_fingerprint_fields(obj);
+    let metadata = assert_scenario_metadata_fields(obj);
+    assert_matrix_scenario_structure(obj, metadata);
+}
+
+fn assert_record_required_fields(obj: &Map<String, Value>) {
+    assert!(obj.contains_key("schema"), "missing schema");
+    assert!(obj.contains_key("runtime"), "missing runtime");
+    assert!(obj.contains_key("scenario"), "missing scenario");
+    assert!(obj.contains_key("extension"), "missing extension");
+    assert!(obj.contains_key("env"), "missing env");
+    assert!(
+        obj.contains_key("protocol_schema"),
+        "missing protocol_schema"
+    );
+    assert!(
+        obj.contains_key("protocol_version"),
+        "missing protocol_version"
+    );
+    assert!(obj.contains_key("partition"), "missing partition");
+    assert!(obj.contains_key("evidence_class"), "missing evidence_class");
+    assert!(obj.contains_key("confidence"), "missing confidence");
+    assert!(obj.contains_key("correlation_id"), "missing correlation_id");
+    assert!(
+        obj.contains_key("scenario_metadata"),
+        "missing scenario_metadata"
+    );
+}
+
+fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
+    assert_eq!(
+        obj.get("protocol_schema").and_then(Value::as_str),
+        Some(BENCH_PROTOCOL_SCHEMA),
+        "unexpected protocol_schema",
+    );
+    assert_eq!(
+        obj.get("protocol_version").and_then(Value::as_str),
+        Some(BENCH_PROTOCOL_VERSION),
+        "unexpected protocol_version",
+    );
+    let partition = obj.get("partition").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        matches!(partition, PARTITION_MATCHED_STATE | PARTITION_REALISTIC),
+        "unexpected partition: {partition}"
+    );
+    assert_eq!(
+        obj.get("evidence_class").and_then(Value::as_str),
+        Some(EVIDENCE_CLASS_MEASURED),
+        "unexpected evidence_class",
+    );
+    assert_eq!(
+        obj.get("confidence").and_then(Value::as_str),
+        Some(CONFIDENCE_HIGH),
+        "unexpected confidence",
+    );
+    let correlation_id = obj
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        !correlation_id.is_empty(),
+        "correlation_id must be non-empty"
+    );
+}
+
+fn assert_env_fingerprint_fields(obj: &Map<String, Value>) {
+    let env = obj.get("env").expect("env must be present");
+    for field in &[
+        "os",
+        "arch",
+        "cpu_model",
+        "cpu_cores",
+        "mem_total_mb",
+        "build_profile",
+        "git_commit",
+        "config_hash",
+    ] {
+        assert!(env.get(field).is_some(), "env missing field: {field}");
+    }
+}
+
+fn assert_scenario_metadata_fields(obj: &Map<String, Value>) -> &Map<String, Value> {
+    let metadata = obj
+        .get("scenario_metadata")
+        .and_then(Value::as_object)
+        .expect("scenario_metadata must be object");
+    for field in &[
+        "runtime",
+        "build_profile",
+        "host",
+        "scenario_id",
+        "replay_input",
+    ] {
         assert!(
-            matches!(partition, PARTITION_MATCHED_STATE | PARTITION_REALISTIC),
-            "unexpected partition: {partition}"
+            metadata.contains_key(*field),
+            "scenario_metadata missing field: {field}"
         );
-        assert_eq!(
-            obj.get("evidence_class").and_then(Value::as_str),
-            Some(EVIDENCE_CLASS_MEASURED),
-            "unexpected evidence_class",
-        );
-        assert_eq!(
-            obj.get("confidence").and_then(Value::as_str),
-            Some(CONFIDENCE_HIGH),
-            "unexpected confidence",
-        );
+    }
+    metadata
+}
 
-        let correlation_id = obj
-            .get("correlation_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+fn assert_matrix_scenario_structure(obj: &Map<String, Value>, metadata: &Map<String, Value>) {
+    if obj.get("scenario").and_then(Value::as_str) != Some(MATRIX_SCENARIO_SESSION_WORKLOAD) {
+        return;
+    }
+
+    let scenario_id = metadata
+        .get("scenario_id")
+        .and_then(Value::as_str)
+        .expect("matrix scenario_id must be a string");
+    assert!(
+        scenario_id.starts_with("matched-state/session_")
+            || scenario_id.starts_with("realistic/session_"),
+        "unexpected matrix scenario_id: {scenario_id}"
+    );
+    let replay_input = metadata
+        .get("replay_input")
+        .and_then(Value::as_object)
+        .expect("matrix replay_input must be object");
+    let session_messages = replay_input
+        .get("session_messages")
+        .and_then(Value::as_u64)
+        .expect("matrix replay_input.session_messages must be integer");
+    assert!(
+        MATRIX_SESSION_SIZES.contains(&session_messages),
+        "unexpected matrix session_messages: {session_messages}"
+    );
+
+    for metric in ["open_ms", "append_ms", "save_ms"] {
+        let value = obj
+            .get(metric)
+            .and_then(Value::as_f64)
+            .expect("matrix stage metrics must be numeric");
         assert!(
-            !correlation_id.is_empty(),
-            "correlation_id must be non-empty"
+            value > 0.0,
+            "matrix stage metric must be positive: {metric}={value}"
         );
-
-        // Env fingerprint has required fields
-        let env = obj.get("env").unwrap();
-        for field in &[
-            "os",
-            "arch",
-            "cpu_model",
-            "cpu_cores",
-            "mem_total_mb",
-            "build_profile",
-            "git_commit",
-            "config_hash",
-        ] {
-            assert!(env.get(field).is_some(), "env missing field: {field}");
-        }
-
-        let metadata = obj
-            .get("scenario_metadata")
-            .and_then(Value::as_object)
-            .expect("scenario_metadata must be object");
-        for field in &[
-            "runtime",
-            "build_profile",
-            "host",
-            "scenario_id",
-            "replay_input",
-        ] {
-            assert!(
-                metadata.contains_key(*field),
-                "scenario_metadata missing field: {field}"
-            );
-        }
-
-        if obj.get("scenario").and_then(Value::as_str) == Some(MATRIX_SCENARIO_SESSION_WORKLOAD) {
-            let scenario_id = metadata
-                .get("scenario_id")
-                .and_then(Value::as_str)
-                .expect("matrix scenario_id must be a string");
-            assert!(
-                scenario_id.starts_with("matched-state/session_")
-                    || scenario_id.starts_with("realistic/session_"),
-                "unexpected matrix scenario_id: {scenario_id}"
-            );
-            let replay_input = metadata
-                .get("replay_input")
-                .and_then(Value::as_object)
-                .expect("matrix replay_input must be object");
-            let session_messages = replay_input
-                .get("session_messages")
-                .and_then(Value::as_u64)
-                .expect("matrix replay_input.session_messages must be integer");
-            assert!(
-                MATRIX_SESSION_SIZES.contains(&session_messages),
-                "unexpected matrix session_messages: {session_messages}"
-            );
-            for metric in ["open_ms", "append_ms", "save_ms"] {
-                let value = obj
-                    .get(metric)
-                    .and_then(Value::as_f64)
-                    .expect("matrix stage metrics must be numeric");
-                assert!(
-                    value > 0.0,
-                    "matrix stage metric must be positive: {metric}={value}"
-                );
-            }
-        }
     }
 }
 

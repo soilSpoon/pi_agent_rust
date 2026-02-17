@@ -14,6 +14,8 @@
     "smoke_logs": 16
   },
   "generated_at": "2026-02-16T20:45:35Z",
+  "run_id": "local-20260217T030608928Z",
+  "correlation_id": "must-pass-gate-local-20260217T030608928Z",
   "negative": {
     "fail": 0,
     "pass": 30

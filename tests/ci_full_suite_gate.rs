@@ -26,6 +26,7 @@
 //! 13. Waiver lifecycle (bd-1f42.8.8.1)
 //! 14. SEC-6.4 security compatibility conformance (bd-1a2cu)
 //! 15. PERF-3X bead-to-artifact coverage audit (bd-3ar8v.6.11)
+//! 16. Practical-finish checkpoint (bd-3ar8v.6.9)
 //!
 //! Run:
 //!   cargo test --test `ci_full_suite_gate` -- --nocapture
@@ -36,6 +37,15 @@ use std::path::{Component, Path, PathBuf};
 
 const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 const RUN_ALL_SCRIPT_PATH: &str = "scripts/e2e/run_all.sh";
+const QA_RUNBOOK_PATH: &str = "docs/qa-runbook.md";
+const CI_OPERATOR_RUNBOOK_PATH: &str = "docs/ci-operator-runbook.md";
+const PRACTICAL_FINISH_SNAPSHOT_PATH: &str =
+    "tests/full_suite_gate/practical_finish_issues_snapshot.jsonl";
+const PRACTICAL_FINISH_ISSUE_SOURCES: &[&str] = &[
+    ".beads/issues.jsonl",
+    ".beads/beads.base.jsonl",
+    PRACTICAL_FINISH_SNAPSHOT_PATH,
+];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -349,6 +359,36 @@ struct Perf3xBeadCoverageRow {
     log_evidence: Vec<String>,
 }
 
+#[derive(Debug)]
+struct Perf3xBeadCoverageEvaluation {
+    status: String,
+    detail: Option<String>,
+    rows: Vec<Perf3xBeadCoverageRow>,
+    missing_evidence: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct Perf3xBeadCoverageAuditRow {
+    bead: String,
+    unit_evidence: Vec<String>,
+    e2e_evidence: Vec<String>,
+    log_evidence: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct Perf3xBeadCoverageAuditReport {
+    schema: String,
+    generated_at: String,
+    contract_schema: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    row_count: usize,
+    missing_evidence_count: usize,
+    missing_evidence: Vec<String>,
+    rows: Vec<Perf3xBeadCoverageAuditRow>,
+}
+
 /// Critical implementation beads that must appear in the PERF-3X coverage matrix.
 const PERF3X_CRITICAL_BEADS: &[&str] = &[
     "bd-3ar8v.2.8",
@@ -359,6 +399,307 @@ const PERF3X_CRITICAL_BEADS: &[&str] = &[
     "bd-3ar8v.4.10",
     "bd-3ar8v.6.11",
 ];
+const PERF3X_COVERAGE_AUDIT_ARTIFACT_REL: &str =
+    "tests/full_suite_gate/perf3x_bead_coverage_audit.json";
+#[allow(dead_code)]
+const PRACTICAL_FINISH_CHECKPOINT_ARTIFACT_REL: &str =
+    "tests/full_suite_gate/practical_finish_checkpoint.json";
+const EXTENSION_REMEDIATION_BACKLOG_ARTIFACT_REL: &str =
+    "tests/full_suite_gate/extension_remediation_backlog.json";
+const EXTENSION_REMEDIATION_BACKLOG_SCHEMA: &str = "pi.qa.extension_remediation_backlog.v1";
+const OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/opportunity_matrix.json";
+const OPPORTUNITY_MATRIX_SCHEMA: &str = "pi.perf.opportunity_matrix.v1";
+const PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/parameter_sweeps.json";
+const PARAMETER_SWEEPS_SCHEMA: &str = "pi.perf.parameter_sweeps.v1";
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize)]
+struct PracticalFinishOpenIssue {
+    id: String,
+    title: String,
+    status: String,
+    issue_type: String,
+    labels: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Serialize)]
+struct PracticalFinishCheckpointReport {
+    schema: String,
+    generated_at: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    technical_completion_reached: bool,
+    residual_open_scope: String,
+    open_perf3x_count: usize,
+    technical_open_count: usize,
+    docs_or_report_open_count: usize,
+    technical_open_issues: Vec<PracticalFinishOpenIssue>,
+    docs_or_report_open_issues: Vec<PracticalFinishOpenIssue>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct PracticalFinishIssueRecord {
+    id: String,
+    status: String,
+    #[serde(default)]
+    issue_type: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+#[allow(dead_code)]
+fn normalize_issue_labels(labels: &[String]) -> Vec<String> {
+    let mut normalized = labels
+        .iter()
+        .map(|label| label.trim().to_ascii_lowercase())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+#[allow(dead_code)]
+fn is_open_issue_status(status: &str) -> bool {
+    let normalized = status.trim().to_ascii_lowercase();
+    normalized == "open" || normalized == "in_progress"
+}
+
+#[allow(dead_code)]
+fn is_practical_finish_in_scope_issue_id(id: &str) -> bool {
+    id.starts_with("bd-3ar8v") && !id.starts_with("bd-3ar8v.7")
+}
+
+#[allow(dead_code)]
+fn filter_practical_finish_leaf_issues(
+    open_issues: Vec<PracticalFinishOpenIssue>,
+) -> Vec<PracticalFinishOpenIssue> {
+    let open_ids = open_issues
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+
+    open_issues
+        .into_iter()
+        .filter(|issue| {
+            let prefix = format!("{}.", issue.id);
+            !open_ids
+                .iter()
+                .any(|other_id| other_id != &issue.id && other_id.starts_with(&prefix))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn is_docs_or_report_issue(issue: &PracticalFinishOpenIssue) -> bool {
+    if issue.issue_type.eq_ignore_ascii_case("docs") {
+        return true;
+    }
+
+    issue.labels.iter().any(|label| {
+        matches!(
+            label.as_str(),
+            "docs" | "docs-last" | "documentation" | "report" | "runbook"
+        )
+    })
+}
+
+#[allow(dead_code)]
+fn load_open_perf3x_issues(root: &Path) -> Result<Vec<PracticalFinishOpenIssue>, String> {
+    let (source, _path, contents) = read_practical_finish_issue_source(root)?;
+
+    let mut latest_by_id: HashMap<String, PracticalFinishOpenIssue> = HashMap::new();
+    for (line_idx, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record: PracticalFinishIssueRecord = serde_json::from_str(line)
+            .map_err(|err| format!("invalid JSONL row {} in {source}: {err}", line_idx + 1))?;
+        let id = record.id.trim();
+        if id.is_empty() {
+            return Err(format!(
+                "invalid JSONL row {} in {source}: missing id",
+                line_idx + 1
+            ));
+        }
+        if !is_practical_finish_in_scope_issue_id(id) {
+            continue;
+        }
+        let status = record.status.trim().to_ascii_lowercase();
+        let issue_type = if record.issue_type.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            record.issue_type.trim().to_ascii_lowercase()
+        };
+        let title = if record.title.trim().is_empty() {
+            "(untitled)".to_string()
+        } else {
+            record.title.trim().to_string()
+        };
+        let labels = normalize_issue_labels(&record.labels);
+        latest_by_id.insert(
+            id.to_string(),
+            PracticalFinishOpenIssue {
+                id: id.to_string(),
+                title,
+                status,
+                issue_type,
+                labels,
+            },
+        );
+    }
+
+    let mut open = latest_by_id
+        .into_values()
+        .filter(|issue| is_open_issue_status(&issue.status))
+        .collect::<Vec<_>>();
+    open.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(filter_practical_finish_leaf_issues(open))
+}
+
+#[allow(dead_code)]
+fn read_practical_finish_issue_source(
+    root: &Path,
+) -> Result<(&'static str, PathBuf, String), String> {
+    let mut missing_paths = Vec::new();
+
+    for relative in PRACTICAL_FINISH_ISSUE_SOURCES {
+        let path = root.join(relative);
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => return Ok((*relative, path, contents)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing_paths.push(path);
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to read practical-finish source {relative} at {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let tried = missing_paths
+        .iter()
+        .map(|path| format!("`{}`", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "failed to read practical-finish source: none of the candidate files exist ({tried})"
+    ))
+}
+
+#[allow(dead_code)]
+fn split_practical_finish_issue_buckets(
+    open_issues: &[PracticalFinishOpenIssue],
+) -> (Vec<PracticalFinishOpenIssue>, Vec<PracticalFinishOpenIssue>) {
+    let mut docs_or_report = Vec::new();
+    let mut technical = Vec::new();
+    for issue in open_issues {
+        if is_docs_or_report_issue(issue) {
+            docs_or_report.push(issue.clone());
+        } else {
+            technical.push(issue.clone());
+        }
+    }
+    (docs_or_report, technical)
+}
+
+#[allow(dead_code)]
+fn build_practical_finish_checkpoint_report(root: &Path) -> PracticalFinishCheckpointReport {
+    use chrono::{SecondsFormat, Utc};
+
+    let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let open_perf3x = match load_open_perf3x_issues(root) {
+        Ok(issues) => issues,
+        Err(err) => {
+            return PracticalFinishCheckpointReport {
+                schema: "pi.perf3x.practical_finish_checkpoint.v1".to_string(),
+                generated_at,
+                status: "fail".to_string(),
+                detail: Some(format!(
+                    "Fail-closed practical-finish source read error: {err}"
+                )),
+                technical_completion_reached: false,
+                residual_open_scope: "technical_remaining".to_string(),
+                open_perf3x_count: 0,
+                technical_open_count: 0,
+                docs_or_report_open_count: 0,
+                technical_open_issues: Vec::new(),
+                docs_or_report_open_issues: Vec::new(),
+            };
+        }
+    };
+
+    let (docs_or_report_open, technical_open) = split_practical_finish_issue_buckets(&open_perf3x);
+    let technical_completion_reached = technical_open.is_empty();
+    let residual_open_scope = if technical_completion_reached {
+        if docs_or_report_open.is_empty() {
+            "none".to_string()
+        } else {
+            "docs_or_report_only".to_string()
+        }
+    } else {
+        "technical_remaining".to_string()
+    };
+    let status = if technical_completion_reached {
+        "pass".to_string()
+    } else {
+        "fail".to_string()
+    };
+    let detail = if technical_completion_reached {
+        if docs_or_report_open.is_empty() {
+            Some("Practical-finish checkpoint reached: no open PERF-3X issues remain.".to_string())
+        } else {
+            Some(format!(
+                "Practical-finish checkpoint reached: technical PERF-3X scope complete; {} docs/report issue(s) remain.",
+                docs_or_report_open.len()
+            ))
+        }
+    } else {
+        let preview = technical_open
+            .iter()
+            .take(5)
+            .map(|issue| issue.id.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if technical_open.len() > 5 {
+            ", ..."
+        } else {
+            ""
+        };
+        Some(format!(
+            "Practical-finish checkpoint blocked: {} technical PERF-3X issue(s) still open ({preview}{suffix})",
+            technical_open.len()
+        ))
+    };
+
+    PracticalFinishCheckpointReport {
+        schema: "pi.perf3x.practical_finish_checkpoint.v1".to_string(),
+        generated_at,
+        status,
+        detail,
+        technical_completion_reached,
+        residual_open_scope,
+        open_perf3x_count: open_perf3x.len(),
+        technical_open_count: technical_open.len(),
+        docs_or_report_open_count: docs_or_report_open.len(),
+        technical_open_issues: technical_open,
+        docs_or_report_open_issues: docs_or_report_open,
+    }
+}
+
+#[allow(dead_code)]
+fn evaluate_practical_finish_checkpoint(root: &Path) -> (String, Option<String>) {
+    let report = build_practical_finish_checkpoint_report(root);
+    (report.status, report.detail)
+}
 
 /// Machine-readable coverage contract consumed by the Phase-5 gate.
 fn perf3x_bead_coverage_contract() -> Value {
@@ -677,14 +1018,19 @@ fn validate_perf3x_bead_coverage_contract(
 }
 
 /// Evaluate contract coverage against files present in repository artifacts.
-fn evaluate_perf3x_bead_coverage(root: &Path, contract: &Value) -> (String, Option<String>) {
+fn evaluate_perf3x_bead_coverage_internal(
+    root: &Path,
+    contract: &Value,
+) -> Perf3xBeadCoverageEvaluation {
     let rows = match validate_perf3x_bead_coverage_contract(contract) {
         Ok(rows) => rows,
         Err(err) => {
-            return (
-                "fail".to_string(),
-                Some(format!("Invalid PERF-3X coverage contract: {err}")),
-            );
+            return Perf3xBeadCoverageEvaluation {
+                status: "fail".to_string(),
+                detail: Some(format!("Invalid PERF-3X coverage contract: {err}")),
+                rows: Vec::new(),
+                missing_evidence: Vec::new(),
+            };
         }
     };
 
@@ -705,13 +1051,15 @@ fn evaluate_perf3x_bead_coverage(root: &Path, contract: &Value) -> (String, Opti
     missing.sort();
 
     if missing.is_empty() {
-        return (
-            "pass".to_string(),
-            Some(format!(
+        return Perf3xBeadCoverageEvaluation {
+            status: "pass".to_string(),
+            detail: Some(format!(
                 "Validated {} PERF-3X bead coverage row(s) with complete unit/e2e/log evidence paths",
                 rows.len()
             )),
-        );
+            rows,
+            missing_evidence: missing,
+        };
     }
 
     let preview = missing
@@ -721,16 +1069,59 @@ fn evaluate_perf3x_bead_coverage(root: &Path, contract: &Value) -> (String, Opti
         .collect::<Vec<_>>()
         .join(", ");
     let suffix = if missing.len() > 3 { " ..." } else { "" };
-    (
-        "fail".to_string(),
-        Some(format!(
+    Perf3xBeadCoverageEvaluation {
+        status: "fail".to_string(),
+        detail: Some(format!(
             "Coverage contract parsed ({} rows) but {} evidence path(s) are missing (fail-closed): {}{}",
             rows.len(),
             missing.len(),
             preview,
             suffix
         )),
-    )
+        rows,
+        missing_evidence: missing,
+    }
+}
+
+fn evaluate_perf3x_bead_coverage(root: &Path, contract: &Value) -> (String, Option<String>) {
+    let evaluation = evaluate_perf3x_bead_coverage_internal(root, contract);
+    (evaluation.status, evaluation.detail)
+}
+
+fn build_perf3x_bead_coverage_audit_report(
+    root: &Path,
+    contract: &Value,
+) -> Perf3xBeadCoverageAuditReport {
+    use chrono::{SecondsFormat, Utc};
+
+    let evaluation = evaluate_perf3x_bead_coverage_internal(root, contract);
+    let contract_schema = contract
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let rows = evaluation
+        .rows
+        .into_iter()
+        .map(|row| Perf3xBeadCoverageAuditRow {
+            bead: row.bead,
+            unit_evidence: row.unit_evidence,
+            e2e_evidence: row.e2e_evidence,
+            log_evidence: row.log_evidence,
+        })
+        .collect::<Vec<_>>();
+
+    Perf3xBeadCoverageAuditReport {
+        schema: "pi.perf3x.bead_coverage.audit.v1".to_string(),
+        generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        contract_schema,
+        status: evaluation.status,
+        detail: evaluation.detail,
+        row_count: rows.len(),
+        missing_evidence_count: evaluation.missing_evidence.len(),
+        missing_evidence: evaluation.missing_evidence,
+        rows,
+    }
 }
 
 /// Check a JSON artifact for a specific status field.
@@ -791,8 +1182,7 @@ fn validate_must_pass_lineage_metadata(
     let run_id = verdict
         .get("run_id")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
+        .map_or("", str::trim);
     if run_id.is_empty() {
         return Err(format!(
             "{artifact_rel} missing non-empty lineage field 'run_id'"
@@ -802,8 +1192,7 @@ fn validate_must_pass_lineage_metadata(
     let correlation_id = verdict
         .get("correlation_id")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
+        .map_or("", str::trim);
     if correlation_id.is_empty() {
         return Err(format!(
             "{artifact_rel} missing non-empty lineage field 'correlation_id'"
@@ -818,8 +1207,7 @@ fn validate_must_pass_lineage_metadata(
     let generated_at = verdict
         .get("generated_at")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
+        .map_or("", str::trim);
     if generated_at.is_empty() {
         return Err(format!(
             "{artifact_rel} missing non-empty freshness field 'generated_at'"
@@ -862,6 +1250,660 @@ fn check_must_pass_gate_artifact(root: &Path, artifact_rel: &str) -> (String, Op
     if let Err(detail) =
         validate_must_pass_lineage_metadata(&verdict, artifact_rel, chrono::Utc::now())
     {
+        return ("fail".to_string(), Some(detail));
+    }
+
+    ("pass".to_string(), None)
+}
+
+fn check_extension_remediation_backlog_artifact(
+    root: &Path,
+    artifact_rel: &str,
+) -> (String, Option<String>) {
+    let full = root.join(artifact_rel);
+    let Some(backlog) = load_json(&full) else {
+        return (
+            "skip".to_string(),
+            Some(format!("Artifact not found: {artifact_rel}")),
+        );
+    };
+
+    let schema = backlog
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if schema != EXTENSION_REMEDIATION_BACKLOG_SCHEMA {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "schema='{schema}' (expected '{EXTENSION_REMEDIATION_BACKLOG_SCHEMA}')"
+            )),
+        );
+    }
+
+    let Some(entries) = backlog.get("entries").and_then(Value::as_array) else {
+        return (
+            "fail".to_string(),
+            Some("missing entries array".to_string()),
+        );
+    };
+    let entry_count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+
+    let Some(total_non_pass) = backlog
+        .pointer("/summary/total_non_pass_extensions")
+        .and_then(Value::as_u64)
+    else {
+        return (
+            "fail".to_string(),
+            Some("missing summary.total_non_pass_extensions".to_string()),
+        );
+    };
+    let Some(actionable) = backlog
+        .pointer("/summary/actionable")
+        .and_then(Value::as_u64)
+    else {
+        return (
+            "fail".to_string(),
+            Some("missing summary.actionable".to_string()),
+        );
+    };
+    let Some(non_actionable) = backlog
+        .pointer("/summary/non_actionable")
+        .and_then(Value::as_u64)
+    else {
+        return (
+            "fail".to_string(),
+            Some("missing summary.non_actionable".to_string()),
+        );
+    };
+
+    if total_non_pass != entry_count {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "summary.total_non_pass_extensions={total_non_pass} does not match entries.len={entry_count}"
+            )),
+        );
+    }
+
+    let Some(summary_breakdown) = actionable.checked_add(non_actionable) else {
+        return (
+            "fail".to_string(),
+            Some("summary.actionable + summary.non_actionable overflowed".to_string()),
+        );
+    };
+    if summary_breakdown != total_non_pass {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "summary.actionable({actionable}) + summary.non_actionable({non_actionable}) != summary.total_non_pass_extensions({total_non_pass})"
+            )),
+        );
+    }
+
+    ("pass".to_string(), None)
+}
+
+fn find_latest_opportunity_matrix(root: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for relative in [
+        "tests/perf/reports/opportunity_matrix.json",
+        "tests/perf/runs/results/opportunity_matrix.json",
+    ] {
+        let candidate = root.join(relative);
+        if candidate.is_file() {
+            candidates.push(candidate);
+        }
+    }
+
+    let e2e_results_dir = root.join("tests/e2e_results");
+    if let Ok(entries) = std::fs::read_dir(e2e_results_dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("results/opportunity_matrix.json");
+            if candidate.is_file() {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    candidates.pop()
+}
+
+fn validate_opportunity_matrix_readiness(
+    readiness: &serde_json::Map<String, Value>,
+    artifact: &str,
+) -> Result<(), String> {
+    let status = readiness
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if !matches!(status, "ready" | "blocked") {
+        return Err(format!(
+            "opportunity_matrix.readiness.status must be ready|blocked in {artifact}, got {status}"
+        ));
+    }
+
+    let decision = readiness
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if !matches!(decision, "RANKED" | "NO_DECISION") {
+        return Err(format!(
+            "opportunity_matrix.readiness.decision must be RANKED|NO_DECISION in {artifact}, got {decision}"
+        ));
+    }
+
+    let Some(ready_for_phase5) = readiness.get("ready_for_phase5").and_then(Value::as_bool) else {
+        return Err(format!(
+            "opportunity_matrix.readiness.ready_for_phase5 must be boolean in {artifact}"
+        ));
+    };
+    let Some(blocking_reasons) = readiness.get("blocking_reasons").and_then(Value::as_array) else {
+        return Err(format!(
+            "opportunity_matrix.readiness.blocking_reasons must be an array in {artifact}"
+        ));
+    };
+
+    match status {
+        "ready" => {
+            if !ready_for_phase5 {
+                return Err(format!(
+                    "opportunity_matrix.readiness.ready_for_phase5 must be true when status=ready in {artifact}"
+                ));
+            }
+            if decision != "RANKED" {
+                return Err(format!(
+                    "opportunity_matrix.readiness.decision must be RANKED when status=ready in {artifact}"
+                ));
+            }
+            if !blocking_reasons.is_empty() {
+                return Err(format!(
+                    "opportunity_matrix.readiness.blocking_reasons must be empty when status=ready in {artifact}"
+                ));
+            }
+        }
+        "blocked" => {
+            if ready_for_phase5 {
+                return Err(format!(
+                    "opportunity_matrix.readiness.ready_for_phase5 must be false when status=blocked in {artifact}"
+                ));
+            }
+            if decision != "NO_DECISION" {
+                return Err(format!(
+                    "opportunity_matrix.readiness.decision must be NO_DECISION when status=blocked in {artifact}"
+                ));
+            }
+            if blocking_reasons.is_empty() {
+                return Err(format!(
+                    "opportunity_matrix.readiness.blocking_reasons must be non-empty when status=blocked in {artifact}"
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn validate_opportunity_matrix_ranked_rows(
+    ranked: &[Value],
+    readiness_status: &str,
+    artifact: &str,
+) -> Result<(), String> {
+    if readiness_status == "ready" && ranked.is_empty() {
+        return Err(format!(
+            "opportunity_matrix.ranked_opportunities must be non-empty when readiness.status=ready in {artifact}"
+        ));
+    }
+    if readiness_status == "blocked" && !ranked.is_empty() {
+        return Err(format!(
+            "opportunity_matrix.ranked_opportunities must be empty when readiness.status=blocked in {artifact}"
+        ));
+    }
+
+    for (index, row) in ranked.iter().enumerate() {
+        let Some(row_obj) = row.as_object() else {
+            return Err(format!(
+                "opportunity_matrix.ranked_opportunities[{index}] must be an object in {artifact}"
+            ));
+        };
+        let expected_rank = u64::try_from(index + 1).unwrap_or(u64::MAX);
+        let rank = row_obj.get("rank").and_then(Value::as_u64).ok_or_else(|| {
+            format!(
+                "opportunity_matrix.ranked_opportunities[{index}].rank must be a positive integer in {artifact}"
+            )
+        })?;
+        if rank != expected_rank {
+            return Err(format!(
+                "opportunity_matrix.ranked_opportunities[{index}].rank expected {expected_rank}, got {rank} in {artifact}"
+            ));
+        }
+
+        let stage = row_obj
+            .get("stage")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if stage.is_empty() {
+            return Err(format!(
+                "opportunity_matrix.ranked_opportunities[{index}].stage must be non-empty in {artifact}"
+            ));
+        }
+
+        let Some(priority_score) = row_obj.get("priority_score").and_then(Value::as_f64) else {
+            return Err(format!(
+                "opportunity_matrix.ranked_opportunities[{index}].priority_score must be numeric in {artifact}"
+            ));
+        };
+        if !priority_score.is_finite() || priority_score <= 0.0 {
+            return Err(format!(
+                "opportunity_matrix.ranked_opportunities[{index}].priority_score must be > 0 in {artifact}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn check_opportunity_matrix_artifact(root: &Path) -> (String, Option<String>) {
+    let Some(path) = find_latest_opportunity_matrix(root) else {
+        return (
+            "skip".to_string(),
+            Some(
+                "opportunity_matrix artifact not found (expected tests/perf/reports, tests/perf/runs/results, or tests/e2e_results/*/results)".to_string(),
+            ),
+        );
+    };
+    let artifact = path.strip_prefix(root).map_or_else(
+        |_| path.display().to_string(),
+        |relative| relative.display().to_string(),
+    );
+    let Some(matrix) = load_json(&path) else {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "opportunity_matrix artifact is not valid JSON: {artifact}"
+            )),
+        );
+    };
+
+    let schema = matrix
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if schema != OPPORTUNITY_MATRIX_SCHEMA {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "opportunity_matrix schema mismatch in {artifact}: expected {OPPORTUNITY_MATRIX_SCHEMA}, got {schema}"
+            )),
+        );
+    }
+
+    let Some(source_identity) = matrix.get("source_identity").and_then(Value::as_object) else {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "opportunity_matrix.source_identity must be an object in {artifact}"
+            )),
+        );
+    };
+    let source_artifact = source_identity
+        .get("source_artifact")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if source_artifact != "phase1_matrix_validation" {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "opportunity_matrix.source_identity.source_artifact mismatch in {artifact}: {source_artifact}"
+            )),
+        );
+    }
+    let source_artifact_path = source_identity
+        .get("source_artifact_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if source_artifact_path.trim().is_empty()
+        || !source_artifact_path.contains("phase1_matrix_validation.json")
+    {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "opportunity_matrix.source_identity.source_artifact_path must reference phase1_matrix_validation.json in {artifact}"
+            )),
+        );
+    }
+
+    let weighted_schema = source_identity
+        .get("weighted_bottleneck_schema")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if weighted_schema != "pi.perf.phase1_weighted_bottleneck_attribution.v1" {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "opportunity_matrix.source_identity.weighted_bottleneck_schema mismatch in {artifact}: {weighted_schema}"
+            )),
+        );
+    }
+    let weighted_status = source_identity
+        .get("weighted_bottleneck_status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !matches!(weighted_status, "computed" | "missing") {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "opportunity_matrix.source_identity.weighted_bottleneck_status must be computed|missing in {artifact}, got {weighted_status}"
+            )),
+        );
+    }
+
+    let Some(readiness) = matrix.get("readiness").and_then(Value::as_object) else {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "opportunity_matrix.readiness must be an object in {artifact}"
+            )),
+        );
+    };
+    if let Err(detail) = validate_opportunity_matrix_readiness(readiness, &artifact) {
+        return ("fail".to_string(), Some(detail));
+    }
+    let readiness_status = readiness
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    let Some(ranked) = matrix.get("ranked_opportunities").and_then(Value::as_array) else {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "opportunity_matrix.ranked_opportunities must be an array in {artifact}"
+            )),
+        );
+    };
+    if let Err(detail) =
+        validate_opportunity_matrix_ranked_rows(ranked, readiness_status, &artifact)
+    {
+        return ("fail".to_string(), Some(detail));
+    }
+
+    ("pass".to_string(), None)
+}
+
+fn find_latest_parameter_sweeps(root: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for relative in [
+        "tests/perf/reports/parameter_sweeps.json",
+        "tests/perf/runs/results/parameter_sweeps.json",
+    ] {
+        let candidate = root.join(relative);
+        if candidate.is_file() {
+            candidates.push(candidate);
+        }
+    }
+
+    let e2e_results_dir = root.join("tests/e2e_results");
+    if let Ok(entries) = std::fs::read_dir(e2e_results_dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("results/parameter_sweeps.json");
+            if candidate.is_file() {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    candidates.pop()
+}
+
+fn validate_parameter_sweeps_readiness(
+    readiness: &serde_json::Map<String, Value>,
+    artifact: &str,
+) -> Result<(), String> {
+    let status = readiness
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if !matches!(status, "ready" | "blocked") {
+        return Err(format!(
+            "parameter_sweeps.readiness.status must be ready|blocked in {artifact}, got {status}"
+        ));
+    }
+
+    let Some(ready_for_phase5) = readiness.get("ready_for_phase5").and_then(Value::as_bool) else {
+        return Err(format!(
+            "parameter_sweeps.readiness.ready_for_phase5 must be boolean in {artifact}"
+        ));
+    };
+    let Some(blocking_reasons) = readiness.get("blocking_reasons").and_then(Value::as_array) else {
+        return Err(format!(
+            "parameter_sweeps.readiness.blocking_reasons must be an array in {artifact}"
+        ));
+    };
+
+    match status {
+        "ready" => {
+            if !ready_for_phase5 {
+                return Err(format!(
+                    "parameter_sweeps.readiness.ready_for_phase5 must be true when status=ready in {artifact}"
+                ));
+            }
+            if !blocking_reasons.is_empty() {
+                return Err(format!(
+                    "parameter_sweeps.readiness.blocking_reasons must be empty when status=ready in {artifact}"
+                ));
+            }
+        }
+        "blocked" => {
+            if ready_for_phase5 {
+                return Err(format!(
+                    "parameter_sweeps.readiness.ready_for_phase5 must be false when status=blocked in {artifact}"
+                ));
+            }
+            if blocking_reasons.is_empty() {
+                return Err(format!(
+                    "parameter_sweeps.readiness.blocking_reasons must be non-empty when status=blocked in {artifact}"
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn validate_parameter_sweeps_selected_defaults(
+    selected_defaults: &serde_json::Map<String, Value>,
+    artifact: &str,
+) -> Result<(), String> {
+    for key in ["flush_cadence_ms", "queue_max_items", "compaction_quota_mb"] {
+        let Some(value) = selected_defaults.get(key).and_then(Value::as_u64) else {
+            return Err(format!(
+                "parameter_sweeps.selected_defaults.{key} must be a positive integer in {artifact}"
+            ));
+        };
+        if value == 0 {
+            return Err(format!(
+                "parameter_sweeps.selected_defaults.{key} must be > 0 in {artifact}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_parameter_sweeps_dimensions(
+    sweep_plan: &serde_json::Map<String, Value>,
+    artifact: &str,
+) -> Result<(), String> {
+    let Some(dimensions) = sweep_plan.get("dimensions").and_then(Value::as_array) else {
+        return Err(format!(
+            "parameter_sweeps.sweep_plan.dimensions must be an array in {artifact}"
+        ));
+    };
+
+    let mut seen = HashSet::new();
+    for (index, dimension) in dimensions.iter().enumerate() {
+        let Some(dimension_obj) = dimension.as_object() else {
+            return Err(format!(
+                "parameter_sweeps.sweep_plan.dimensions[{index}] must be an object in {artifact}"
+            ));
+        };
+        let name = dimension_obj
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if name.is_empty() {
+            return Err(format!(
+                "parameter_sweeps.sweep_plan.dimensions[{index}].name must be non-empty in {artifact}"
+            ));
+        }
+
+        let Some(candidate_values) = dimension_obj
+            .get("candidate_values")
+            .and_then(Value::as_array)
+        else {
+            return Err(format!(
+                "parameter_sweeps.sweep_plan.dimensions[{index}].candidate_values must be an array in {artifact}"
+            ));
+        };
+        if candidate_values.is_empty() {
+            return Err(format!(
+                "parameter_sweeps.sweep_plan.dimensions[{index}].candidate_values must be non-empty in {artifact}"
+            ));
+        }
+
+        seen.insert(name.to_string());
+    }
+
+    for required in ["flush_cadence_ms", "queue_max_items", "compaction_quota_mb"] {
+        if !seen.contains(required) {
+            return Err(format!(
+                "parameter_sweeps.sweep_plan.dimensions missing required knob {required} in {artifact}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn check_parameter_sweeps_artifact(root: &Path) -> (String, Option<String>) {
+    let Some(path) = find_latest_parameter_sweeps(root) else {
+        return (
+            "skip".to_string(),
+            Some(
+                "parameter_sweeps artifact not found (expected tests/perf/reports, tests/perf/runs/results, or tests/e2e_results/*/results)".to_string(),
+            ),
+        );
+    };
+    let artifact = path.strip_prefix(root).map_or_else(
+        |_| path.display().to_string(),
+        |relative| relative.display().to_string(),
+    );
+    let Some(sweeps) = load_json(&path) else {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "parameter_sweeps artifact is not valid JSON: {artifact}"
+            )),
+        );
+    };
+
+    let schema = sweeps
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if schema != PARAMETER_SWEEPS_SCHEMA {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "parameter_sweeps schema mismatch in {artifact}: expected {PARAMETER_SWEEPS_SCHEMA}, got {schema}"
+            )),
+        );
+    }
+
+    let Some(source_identity) = sweeps.get("source_identity").and_then(Value::as_object) else {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "parameter_sweeps.source_identity must be an object in {artifact}"
+            )),
+        );
+    };
+    let source_artifact = source_identity
+        .get("source_artifact")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if source_artifact != "phase1_matrix_validation" {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "parameter_sweeps.source_identity.source_artifact mismatch in {artifact}: {source_artifact}"
+            )),
+        );
+    }
+    let source_artifact_path = source_identity
+        .get("source_artifact_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if source_artifact_path.trim().is_empty()
+        || !source_artifact_path.contains("phase1_matrix_validation.json")
+    {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "parameter_sweeps.source_identity.source_artifact_path must reference phase1_matrix_validation.json in {artifact}"
+            )),
+        );
+    }
+
+    let Some(readiness) = sweeps.get("readiness").and_then(Value::as_object) else {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "parameter_sweeps.readiness must be an object in {artifact}"
+            )),
+        );
+    };
+    if let Err(detail) = validate_parameter_sweeps_readiness(readiness, &artifact) {
+        return ("fail".to_string(), Some(detail));
+    }
+
+    let Some(selected_defaults) = sweeps.get("selected_defaults").and_then(Value::as_object) else {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "parameter_sweeps.selected_defaults must be an object in {artifact}"
+            )),
+        );
+    };
+    if let Err(detail) = validate_parameter_sweeps_selected_defaults(selected_defaults, &artifact) {
+        return ("fail".to_string(), Some(detail));
+    }
+
+    let Some(sweep_plan) = sweeps.get("sweep_plan").and_then(Value::as_object) else {
+        return (
+            "fail".to_string(),
+            Some(format!(
+                "parameter_sweeps.sweep_plan must be an object in {artifact}"
+            )),
+        );
+    };
+    if let Err(detail) = validate_parameter_sweeps_dimensions(sweep_plan, &artifact) {
         return ("fail".to_string(), Some(detail));
     }
 
@@ -920,6 +1962,28 @@ fn write_non_empty_artifact(
     }
 
     Ok(bytes)
+}
+
+fn write_json_artifact(
+    path: &Path,
+    artifact_rel: &str,
+    value: &impl serde::Serialize,
+) -> Result<u64, String> {
+    let payload = serde_json::to_string_pretty(value)
+        .map_err(|err| format!("failed to serialize {artifact_rel}: {err}"))?;
+    write_non_empty_artifact(path, artifact_rel, &payload)
+}
+
+fn assert_non_empty_text_artifact(path: &Path, artifact_rel: &str) -> Result<u64, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {artifact_rel} at {}: {err}", path.display()))?;
+    if contents.trim().is_empty() {
+        return Err(format!(
+            "empty artifact body detected for {artifact_rel} at {}",
+            path.display()
+        ));
+    }
+    Ok(contents.len() as u64)
 }
 
 /// Convert blocking `skip` states into fail-closed failures.
@@ -1284,10 +2348,76 @@ fn collect_gates(root: &Path) -> Vec<SubGate> {
         bead: "bd-3ar8v.6.11".to_string(),
         status,
         blocking: true,
-        artifact_path: Some("tests/full_suite_gate/certification_events.jsonl".to_string()),
+        artifact_path: Some(PERF3X_COVERAGE_AUDIT_ARTIFACT_REL.to_string()),
         detail,
         reproduce_command: Some(
             "cargo test --test ci_full_suite_gate -- perf3x_bead_coverage_contract_is_well_formed --nocapture --exact".to_string(),
+        ),
+    });
+
+    // Gate 16: Practical-finish checkpoint (bd-3ar8v.6.9).
+    // Validates that open PERF-3X residual work is restricted to docs/report
+    // wrap-up only; any remaining technical issues fail closed.
+    let (status, detail) = evaluate_practical_finish_checkpoint(root);
+    gates.push(SubGate {
+        id: "practical_finish_checkpoint".to_string(),
+        name: "Practical-finish checkpoint (docs-only residual filter)".to_string(),
+        bead: "bd-3ar8v.6.9".to_string(),
+        status,
+        blocking: true,
+        artifact_path: Some(PRACTICAL_FINISH_CHECKPOINT_ARTIFACT_REL.to_string()),
+        detail,
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact".to_string(),
+        ),
+    });
+
+    // Gate 17: Extension remediation backlog artifact integrity (bd-3ar8v.6.8).
+    let (status, detail) = check_extension_remediation_backlog_artifact(
+        root,
+        EXTENSION_REMEDIATION_BACKLOG_ARTIFACT_REL,
+    );
+    gates.push(SubGate {
+        id: "extension_remediation_backlog".to_string(),
+        name: "Extension remediation backlog artifact integrity".to_string(),
+        bead: "bd-3ar8v.6.8".to_string(),
+        status,
+        blocking: true,
+        artifact_path: Some(EXTENSION_REMEDIATION_BACKLOG_ARTIFACT_REL.to_string()),
+        detail,
+        reproduce_command: Some(
+            "cargo test --test qa_certification_dossier -- certification_dossier --nocapture --exact"
+                .to_string(),
+        ),
+    });
+
+    // Gate 18: Opportunity matrix artifact integrity (bd-3ar8v.6.1).
+    let (status, detail) = check_opportunity_matrix_artifact(root);
+    gates.push(SubGate {
+        id: "opportunity_matrix_integrity".to_string(),
+        name: "Opportunity matrix artifact integrity".to_string(),
+        bead: "bd-3ar8v.6.1".to_string(),
+        status,
+        blocking: true,
+        artifact_path: Some(OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL.to_string()),
+        detail,
+        reproduce_command: Some(
+            "cargo test --test release_evidence_gate -- phase1_weighted_attribution_contract_links_phase5_consumers --nocapture --exact".to_string(),
+        ),
+    });
+
+    // Gate 19: Parameter sweeps artifact integrity (bd-3ar8v.6.2).
+    let (status, detail) = check_parameter_sweeps_artifact(root);
+    gates.push(SubGate {
+        id: "parameter_sweeps_integrity".to_string(),
+        name: "Parameter sweeps artifact integrity".to_string(),
+        bead: "bd-3ar8v.6.2".to_string(),
+        status,
+        blocking: true,
+        artifact_path: Some(PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL.to_string()),
+        detail,
+        reproduce_command: Some(
+            "cargo test --test release_evidence_gate -- parameter_sweeps_contract_links_phase1_matrix_and_readiness --nocapture --exact".to_string(),
         ),
     });
 
@@ -1792,6 +2922,23 @@ fn full_certification() {
     let root = repo_root();
     let report_dir = root.join("tests").join("full_suite_gate");
     let _ = std::fs::create_dir_all(&report_dir);
+    let perf3x_coverage_audit_report =
+        build_perf3x_bead_coverage_audit_report(&root, &perf3x_bead_coverage_contract());
+    let perf3x_coverage_audit_path = report_dir.join("perf3x_bead_coverage_audit.json");
+    write_json_artifact(
+        &perf3x_coverage_audit_path,
+        PERF3X_COVERAGE_AUDIT_ARTIFACT_REL,
+        &perf3x_coverage_audit_report,
+    )
+    .unwrap_or_else(|detail| panic!("fail-closed perf3x coverage audit emission: {detail}"));
+    let practical_finish_checkpoint_report = build_practical_finish_checkpoint_report(&root);
+    let practical_finish_checkpoint_path = report_dir.join("practical_finish_checkpoint.json");
+    write_json_artifact(
+        &practical_finish_checkpoint_path,
+        PRACTICAL_FINISH_CHECKPOINT_ARTIFACT_REL,
+        &practical_finish_checkpoint_report,
+    )
+    .unwrap_or_else(|detail| panic!("fail-closed practical-finish checkpoint emission: {detail}"));
 
     eprintln!("\n=== Full Certification Lane (bd-1f42.8.8.1) ===\n");
 
@@ -1965,10 +3112,12 @@ fn full_certification() {
 
     // Write certification verdict
     let cert_path = report_dir.join("certification_verdict.json");
-    let _ = std::fs::write(
+    write_json_artifact(
         &cert_path,
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
-    );
+        "tests/full_suite_gate/certification_verdict.json",
+        &report,
+    )
+    .unwrap_or_else(|detail| panic!("fail-closed certification verdict emission: {detail}"));
 
     // Write JSONL events for certification
     let cert_events_path = report_dir.join("certification_events.jsonl");
@@ -1985,9 +3134,18 @@ fn full_certification() {
             "waived": waivers_applied.contains(&gate.id),
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         });
-        lines.push(serde_json::to_string(&line).unwrap_or_default());
+        lines.push(
+            serde_json::to_string(&line).unwrap_or_else(|err| {
+                panic!("fail-closed certification events serialization: {err}")
+            }),
+        );
     }
-    let _ = std::fs::write(&cert_events_path, lines.join("\n") + "\n");
+    write_non_empty_artifact(
+        &cert_events_path,
+        "tests/full_suite_gate/certification_events.jsonl",
+        &(lines.join("\n") + "\n"),
+    )
+    .unwrap_or_else(|detail| panic!("fail-closed certification events emission: {detail}"));
 
     // Write certification markdown report
     let mut md = String::new();
@@ -2076,6 +3234,11 @@ fn full_certification() {
         &md,
     )
     .unwrap_or_else(|detail| panic!("fail-closed certification report emission: {detail}"));
+    assert_non_empty_text_artifact(
+        &cert_md_path,
+        "tests/full_suite_gate/certification_report.md",
+    )
+    .unwrap_or_else(|detail| panic!("fail-closed certification report verification: {detail}"));
 
     // Print summary
     eprintln!("=== Certification Verdict: {} ===", verdict.to_uppercase());
@@ -2093,6 +3256,11 @@ fn full_certification() {
     eprintln!("    Cert:    {}", cert_path.display());
     eprintln!("    Waiver:  {}", waiver_path.display());
     eprintln!("    Events:  {}", cert_events_path.display());
+    eprintln!("    Coverage: {}", perf3x_coverage_audit_path.display());
+    eprintln!(
+        "    Practical Finish: {}",
+        practical_finish_checkpoint_path.display()
+    );
     eprintln!("    MD:      {}", cert_md_path.display());
     eprintln!();
 }
@@ -2809,6 +3977,667 @@ fn perf3x_bead_coverage_evaluator_fails_on_malformed_contract() {
 }
 
 #[test]
+fn perf3x_bead_coverage_sub_gate_points_to_dedicated_audit_artifact() {
+    let gates = collect_gates(&repo_root());
+    let gate = gates
+        .iter()
+        .find(|gate| gate.id == "perf3x_bead_coverage")
+        .expect("perf3x_bead_coverage gate should exist");
+    assert_eq!(
+        gate.artifact_path.as_deref(),
+        Some(PERF3X_COVERAGE_AUDIT_ARTIFACT_REL),
+        "coverage gate should point at dedicated audit artifact path"
+    );
+}
+
+#[test]
+fn perf3x_bead_coverage_audit_report_includes_contract_schema_and_rows() {
+    let report =
+        build_perf3x_bead_coverage_audit_report(&repo_root(), &perf3x_bead_coverage_contract());
+    assert_eq!(report.schema, "pi.perf3x.bead_coverage.audit.v1");
+    assert_eq!(report.contract_schema, "pi.perf3x.bead_coverage.v1");
+    assert_eq!(
+        report.row_count,
+        PERF3X_CRITICAL_BEADS.len(),
+        "audit report row count should track current critical PERF-3X contract entries"
+    );
+    assert_eq!(
+        report.rows.len(),
+        report.row_count,
+        "row_count should match serialized rows"
+    );
+}
+
+#[test]
+fn perf3x_bead_coverage_audit_report_tracks_missing_evidence_fail_closed() {
+    let mut temp = std::env::temp_dir();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before unix epoch")
+        .as_nanos();
+    temp.push(format!(
+        "pi_agent_rust_perf3x_coverage_audit_missing_{nonce}"
+    ));
+    std::fs::create_dir_all(&temp).expect("create temp root");
+
+    let report = build_perf3x_bead_coverage_audit_report(&temp, &perf3x_bead_coverage_contract());
+    assert_eq!(
+        report.status, "fail",
+        "missing evidence paths must fail the audit report"
+    );
+    assert!(
+        report.missing_evidence_count > 0,
+        "audit should surface missing evidence entries"
+    );
+    assert_eq!(
+        report.missing_evidence.len(),
+        report.missing_evidence_count,
+        "missing evidence count should match missing evidence payload length"
+    );
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("fail-closed"),
+        "detail should mention fail-closed policy: {detail}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+fn write_practical_finish_issue_fixture(root: &Path, entries: &[Value]) {
+    write_practical_finish_issue_fixture_to(root, ".beads/issues.jsonl", entries);
+}
+
+fn write_practical_finish_issue_fixture_to(root: &Path, relative: &str, entries: &[Value]) {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create practical-finish source directory");
+    }
+    let mut lines = entries
+        .iter()
+        .map(|entry| serde_json::to_string(entry).expect("serialize fixture entry"))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    std::fs::write(path, lines.join("\n") + "\n").expect("write issues fixture");
+}
+
+#[test]
+fn practical_finish_classifier_marks_docs_and_report_labels() {
+    let docs_issue = PracticalFinishOpenIssue {
+        id: "bd-3ar8v.6.5".to_string(),
+        title: "Final report artifact".to_string(),
+        status: "open".to_string(),
+        issue_type: "task".to_string(),
+        labels: vec!["report".to_string()],
+    };
+    assert!(
+        is_docs_or_report_issue(&docs_issue),
+        "report-labeled issue should classify as docs/report"
+    );
+
+    let technical_issue = PracticalFinishOpenIssue {
+        id: "bd-3ar8v.6.2".to_string(),
+        title: "Parameter sweeps".to_string(),
+        status: "open".to_string(),
+        issue_type: "task".to_string(),
+        labels: vec!["perf-3x".to_string(), "tuning".to_string()],
+    };
+    assert!(
+        !is_docs_or_report_issue(&technical_issue),
+        "technical tuning issue should remain in technical bucket"
+    );
+}
+
+#[test]
+fn practical_finish_report_passes_with_docs_only_residual_open_issues() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture(
+        temp.path(),
+        &[serde_json::json!({
+            "id": "bd-3ar8v.6.5",
+            "status": "open",
+            "issue_type": "task",
+            "title": "Final report and go/no-go summary",
+            "labels": ["report"]
+        })],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(
+        report.status, "pass",
+        "docs/report-only residual should satisfy practical-finish gate"
+    );
+    assert!(
+        report.technical_completion_reached,
+        "docs/report-only residual should mark technical completion reached"
+    );
+    assert_eq!(report.residual_open_scope, "docs_or_report_only");
+    assert_eq!(report.technical_open_count, 0);
+    assert_eq!(report.docs_or_report_open_count, 1);
+    assert!(
+        report
+            .detail
+            .unwrap_or_default()
+            .contains("docs/report issue(s) remain"),
+        "pass detail should explain docs/report-only residual state"
+    );
+}
+
+#[test]
+fn practical_finish_report_fails_when_technical_open_issues_remain() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture(
+        temp.path(),
+        &[
+            serde_json::json!({
+                "id": "bd-3ar8v.6.2",
+                "status": "in_progress",
+                "issue_type": "task",
+                "title": "Parameter sweep execution",
+                "labels": ["perf-3x", "tuning"]
+            }),
+            serde_json::json!({
+                "id": "bd-3ar8v.6.5",
+                "status": "open",
+                "issue_type": "task",
+                "title": "Final report and go/no-go summary",
+                "labels": ["report"]
+            }),
+        ],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(
+        report.status, "fail",
+        "remaining technical work should block practical-finish checkpoint"
+    );
+    assert!(
+        !report.technical_completion_reached,
+        "technical residuals must keep technical completion false"
+    );
+    assert_eq!(report.residual_open_scope, "technical_remaining");
+    assert_eq!(report.technical_open_count, 1);
+    assert_eq!(report.docs_or_report_open_count, 1);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("bd-3ar8v.6.2"),
+        "failure detail should identify blocking technical issue IDs: {detail}"
+    );
+}
+
+#[test]
+fn practical_finish_report_falls_back_to_beads_base_when_live_issues_missing() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture_to(
+        temp.path(),
+        ".beads/beads.base.jsonl",
+        &[serde_json::json!({
+            "id": "bd-3ar8v.6.5",
+            "status": "open",
+            "issue_type": "task",
+            "title": "Final report and go/no-go summary",
+            "labels": ["report"]
+        })],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(
+        report.status, "pass",
+        "beads.base fallback should allow practical-finish evaluation"
+    );
+    assert!(
+        report.technical_completion_reached,
+        "docs/report fallback residual should still mark technical completion reached"
+    );
+    assert_eq!(report.residual_open_scope, "docs_or_report_only");
+    assert_eq!(report.open_perf3x_count, 1);
+    assert_eq!(report.technical_open_count, 0);
+    assert_eq!(report.docs_or_report_open_count, 1);
+}
+
+#[test]
+fn practical_finish_report_falls_back_to_snapshot_when_beads_sources_missing() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture_to(
+        temp.path(),
+        PRACTICAL_FINISH_SNAPSHOT_PATH,
+        &[serde_json::json!({
+            "id": "bd-3ar8v.6.5",
+            "status": "open",
+            "issue_type": "task",
+            "title": "Final report and go/no-go summary",
+            "labels": ["report"]
+        })],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(
+        report.status, "pass",
+        "snapshot fallback should allow practical-finish evaluation when .beads sources are unavailable"
+    );
+    assert!(
+        report.technical_completion_reached,
+        "docs/report fallback residual should still mark technical completion reached"
+    );
+    assert_eq!(report.residual_open_scope, "docs_or_report_only");
+    assert_eq!(report.open_perf3x_count, 1);
+    assert_eq!(report.technical_open_count, 0);
+    assert_eq!(report.docs_or_report_open_count, 1);
+}
+
+#[test]
+fn practical_finish_report_passes_with_no_open_perf3x_issues() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture(temp.path(), &[]);
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(report.status, "pass");
+    assert!(
+        report.technical_completion_reached,
+        "no open perf-3x issues should mark technical completion reached"
+    );
+    assert_eq!(report.residual_open_scope, "none");
+    assert_eq!(report.open_perf3x_count, 0);
+    assert_eq!(report.technical_open_count, 0);
+    assert_eq!(report.docs_or_report_open_count, 0);
+}
+
+#[test]
+fn practical_finish_report_ignores_rollup_parent_nodes() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture(
+        temp.path(),
+        &[
+            serde_json::json!({
+                "id": "bd-3ar8v",
+                "status": "open",
+                "issue_type": "epic",
+                "title": "PERF-3X epic rollup",
+                "labels": ["perf-3x"]
+            }),
+            serde_json::json!({
+                "id": "bd-3ar8v.6",
+                "status": "open",
+                "issue_type": "task",
+                "title": "Phase 5 rollup",
+                "labels": ["perf-3x"]
+            }),
+            serde_json::json!({
+                "id": "bd-3ar8v.6.2",
+                "status": "in_progress",
+                "issue_type": "task",
+                "title": "Parameter sweep execution",
+                "labels": ["perf-3x", "tuning"]
+            }),
+        ],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(report.status, "fail");
+    assert_eq!(
+        report.open_perf3x_count, 1,
+        "rollup nodes should not count as leaf practical-finish blockers"
+    );
+    assert_eq!(report.technical_open_count, 1);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("bd-3ar8v.6.2"),
+        "leaf blocking ID should be surfaced in failure detail: {detail}"
+    );
+    assert!(
+        !detail.contains("bd-3ar8v,"),
+        "rollup parent IDs should be excluded from failure detail: {detail}"
+    );
+}
+
+#[test]
+fn practical_finish_report_excludes_post_perf3x_phase7_nodes() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture(
+        temp.path(),
+        &[
+            serde_json::json!({
+                "id": "bd-3ar8v.7.2",
+                "status": "open",
+                "issue_type": "task",
+                "title": "Post-PERF-3X follow-on runtime hardening",
+                "labels": ["perf-3x"]
+            }),
+            serde_json::json!({
+                "id": "bd-3ar8v.6.5",
+                "status": "open",
+                "issue_type": "task",
+                "title": "Final report and go/no-go summary",
+                "labels": ["report"]
+            }),
+        ],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(
+        report.status, "pass",
+        "post-PERF-3X phase-7 nodes must not block practical-finish checkpoint"
+    );
+    assert!(
+        report.technical_completion_reached,
+        "phase-7-only technical nodes should not count toward Phase-5 practical-finish blockers"
+    );
+    assert_eq!(report.open_perf3x_count, 1);
+    assert_eq!(report.technical_open_count, 0);
+    assert_eq!(report.docs_or_report_open_count, 1);
+}
+
+#[test]
+fn practical_finish_sub_gate_is_blocking_and_points_to_dedicated_artifact() {
+    let gates = collect_gates(&repo_root());
+    let gate = gates
+        .iter()
+        .find(|gate| gate.id == "practical_finish_checkpoint")
+        .expect("practical_finish_checkpoint gate should exist");
+    assert!(
+        gate.blocking,
+        "practical-finish gate must be release-blocking"
+    );
+    assert_eq!(
+        gate.artifact_path.as_deref(),
+        Some(PRACTICAL_FINISH_CHECKPOINT_ARTIFACT_REL),
+        "practical-finish gate should point at dedicated checkpoint artifact"
+    );
+}
+
+#[test]
+fn extension_remediation_backlog_sub_gate_is_blocking_and_points_to_dedicated_artifact() {
+    let gates = collect_gates(&repo_root());
+    let gate = gates
+        .iter()
+        .find(|gate| gate.id == "extension_remediation_backlog")
+        .expect("extension_remediation_backlog gate should exist");
+    assert!(
+        gate.blocking,
+        "extension remediation backlog gate must be release-blocking"
+    );
+    assert_eq!(
+        gate.artifact_path.as_deref(),
+        Some(EXTENSION_REMEDIATION_BACKLOG_ARTIFACT_REL),
+        "extension remediation backlog gate should point at dedicated artifact"
+    );
+}
+
+#[test]
+fn extension_remediation_backlog_gate_fails_closed_on_summary_shape_mismatch() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let report_dir = temp.path().join("tests").join("full_suite_gate");
+    std::fs::create_dir_all(&report_dir).expect("create report directory");
+    let artifact_path = report_dir.join("extension_remediation_backlog.json");
+    let payload = serde_json::json!({
+        "schema": "pi.qa.extension_remediation_backlog.v1",
+        "summary": {
+            "total_non_pass_extensions": 2,
+            "actionable": 1,
+            "non_actionable": 0
+        },
+        "entries": [
+            { "extension_id": "npm/example-a" }
+        ]
+    });
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&payload).expect("serialize payload"),
+    )
+    .expect("write artifact");
+
+    let (status, detail) = check_extension_remediation_backlog_artifact(
+        temp.path(),
+        EXTENSION_REMEDIATION_BACKLOG_ARTIFACT_REL,
+    );
+    assert_eq!(status, "fail");
+    assert!(
+        detail
+            .unwrap_or_default()
+            .contains("summary.total_non_pass_extensions"),
+        "shape mismatch should be reported explicitly"
+    );
+}
+
+#[test]
+fn extension_remediation_backlog_gate_passes_on_consistent_summary_shape() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let report_dir = temp.path().join("tests").join("full_suite_gate");
+    std::fs::create_dir_all(&report_dir).expect("create report directory");
+    let artifact_path = report_dir.join("extension_remediation_backlog.json");
+    let payload = serde_json::json!({
+        "schema": "pi.qa.extension_remediation_backlog.v1",
+        "summary": {
+            "total_non_pass_extensions": 2,
+            "actionable": 1,
+            "non_actionable": 1
+        },
+        "entries": [
+            { "extension_id": "npm/example-a" },
+            { "extension_id": "npm/example-b" }
+        ]
+    });
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&payload).expect("serialize payload"),
+    )
+    .expect("write artifact");
+
+    let (status, detail) = check_extension_remediation_backlog_artifact(
+        temp.path(),
+        EXTENSION_REMEDIATION_BACKLOG_ARTIFACT_REL,
+    );
+    assert_eq!(status, "pass");
+    assert!(
+        detail.is_none(),
+        "valid shape should not produce gate detail"
+    );
+}
+
+#[test]
+fn opportunity_matrix_sub_gate_is_blocking_and_points_to_primary_artifact() {
+    let gates = collect_gates(&repo_root());
+    let gate = gates
+        .iter()
+        .find(|gate| gate.id == "opportunity_matrix_integrity")
+        .expect("opportunity_matrix_integrity gate should exist");
+    assert!(
+        gate.blocking,
+        "opportunity matrix gate must be release-blocking"
+    );
+    assert_eq!(
+        gate.artifact_path.as_deref(),
+        Some(OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL),
+        "opportunity matrix gate should point at primary artifact path"
+    );
+}
+
+#[test]
+fn opportunity_matrix_gate_fails_closed_on_readiness_decision_incoherence() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let report_dir = temp.path().join("tests").join("perf").join("reports");
+    std::fs::create_dir_all(&report_dir).expect("create report directory");
+    let artifact_path = report_dir.join("opportunity_matrix.json");
+    let payload = serde_json::json!({
+        "schema": "pi.perf.opportunity_matrix.v1",
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": "tests/perf/reports/phase1_matrix_validation.json",
+            "weighted_bottleneck_schema": "pi.perf.phase1_weighted_bottleneck_attribution.v1",
+            "weighted_bottleneck_status": "computed"
+        },
+        "readiness": {
+            "status": "ready",
+            "decision": "NO_DECISION",
+            "ready_for_phase5": true,
+            "blocking_reasons": []
+        },
+        "ranked_opportunities": [
+            {
+                "rank": 1,
+                "stage": "open_ms",
+                "priority_score": 1.2
+            }
+        ]
+    });
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&payload).expect("serialize payload"),
+    )
+    .expect("write artifact");
+
+    let (status, detail) = check_opportunity_matrix_artifact(temp.path());
+    assert_eq!(status, "fail");
+    assert!(
+        detail.unwrap_or_default().contains("readiness.decision"),
+        "readiness decision mismatch should be reported explicitly"
+    );
+}
+
+#[test]
+fn opportunity_matrix_gate_passes_on_consistent_contract_shape() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let report_dir = temp.path().join("tests").join("perf").join("reports");
+    std::fs::create_dir_all(&report_dir).expect("create report directory");
+    let artifact_path = report_dir.join("opportunity_matrix.json");
+    let payload = serde_json::json!({
+        "schema": "pi.perf.opportunity_matrix.v1",
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": "tests/perf/reports/phase1_matrix_validation.json",
+            "weighted_bottleneck_schema": "pi.perf.phase1_weighted_bottleneck_attribution.v1",
+            "weighted_bottleneck_status": "missing"
+        },
+        "readiness": {
+            "status": "blocked",
+            "decision": "NO_DECISION",
+            "ready_for_phase5": false,
+            "blocking_reasons": ["phase1_matrix_not_ready_for_phase5"]
+        },
+        "ranked_opportunities": []
+    });
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&payload).expect("serialize payload"),
+    )
+    .expect("write artifact");
+
+    let (status, detail) = check_opportunity_matrix_artifact(temp.path());
+    assert_eq!(status, "pass");
+    assert!(
+        detail.is_none(),
+        "valid contract should not produce gate detail"
+    );
+}
+
+#[test]
+fn parameter_sweeps_sub_gate_is_blocking_and_points_to_primary_artifact() {
+    let gates = collect_gates(&repo_root());
+    let gate = gates
+        .iter()
+        .find(|gate| gate.id == "parameter_sweeps_integrity")
+        .expect("parameter_sweeps_integrity gate should exist");
+    assert!(
+        gate.blocking,
+        "parameter sweeps gate must be release-blocking"
+    );
+    assert_eq!(
+        gate.artifact_path.as_deref(),
+        Some(PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL),
+        "parameter sweeps gate should point at primary artifact path"
+    );
+}
+
+#[test]
+fn parameter_sweeps_gate_fails_closed_on_readiness_incoherence() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let report_dir = temp.path().join("tests").join("perf").join("reports");
+    std::fs::create_dir_all(&report_dir).expect("create report directory");
+    let artifact_path = report_dir.join("parameter_sweeps.json");
+    let payload = serde_json::json!({
+        "schema": "pi.perf.parameter_sweeps.v1",
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": "tests/perf/reports/phase1_matrix_validation.json"
+        },
+        "readiness": {
+            "status": "ready",
+            "ready_for_phase5": false,
+            "blocking_reasons": []
+        },
+        "selected_defaults": {
+            "flush_cadence_ms": 500,
+            "queue_max_items": 3072,
+            "compaction_quota_mb": 96
+        },
+        "sweep_plan": {
+            "dimensions": [
+                { "name": "flush_cadence_ms", "candidate_values": [250, 500] },
+                { "name": "queue_max_items", "candidate_values": [1024, 2048] },
+                { "name": "compaction_quota_mb", "candidate_values": [64, 96] }
+            ]
+        }
+    });
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&payload).expect("serialize payload"),
+    )
+    .expect("write artifact");
+
+    let (status, detail) = check_parameter_sweeps_artifact(temp.path());
+    assert_eq!(status, "fail");
+    assert!(
+        detail.unwrap_or_default().contains("readiness"),
+        "readiness mismatch should be reported explicitly"
+    );
+}
+
+#[test]
+fn parameter_sweeps_gate_passes_on_consistent_contract_shape() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let report_dir = temp.path().join("tests").join("perf").join("reports");
+    std::fs::create_dir_all(&report_dir).expect("create report directory");
+    let artifact_path = report_dir.join("parameter_sweeps.json");
+    let payload = serde_json::json!({
+        "schema": "pi.perf.parameter_sweeps.v1",
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": "tests/perf/reports/phase1_matrix_validation.json"
+        },
+        "readiness": {
+            "status": "blocked",
+            "ready_for_phase5": false,
+            "blocking_reasons": ["phase1_matrix_not_ready_for_phase5"]
+        },
+        "selected_defaults": {
+            "flush_cadence_ms": 500,
+            "queue_max_items": 3072,
+            "compaction_quota_mb": 96
+        },
+        "sweep_plan": {
+            "dimensions": [
+                { "name": "flush_cadence_ms", "candidate_values": [250, 500] },
+                { "name": "queue_max_items", "candidate_values": [1024, 2048] },
+                { "name": "compaction_quota_mb", "candidate_values": [64, 96] }
+            ]
+        }
+    });
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&payload).expect("serialize payload"),
+    )
+    .expect("write artifact");
+
+    let (status, detail) = check_parameter_sweeps_artifact(temp.path());
+    assert_eq!(status, "pass");
+    assert!(
+        detail.is_none(),
+        "valid contract should not produce gate detail"
+    );
+}
+
+#[test]
 fn fail_close_blocking_skips_only_converts_blocking_skip_statuses() {
     let mut gates = vec![
         SubGate {
@@ -2890,6 +4719,29 @@ fn write_non_empty_artifact_fails_when_write_path_is_not_a_file() {
     );
 }
 
+#[test]
+fn assert_non_empty_text_artifact_rejects_whitespace_only_file() {
+    let mut path = std::env::temp_dir();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before unix epoch")
+        .as_nanos();
+    path.push(format!(
+        "pi_agent_rust_certification_report_empty_{nonce}.md"
+    ));
+
+    std::fs::write(&path, " \n\t").expect("write whitespace artifact");
+    let err =
+        assert_non_empty_text_artifact(&path, "tests/full_suite_gate/certification_report.md")
+            .expect_err("whitespace-only report must fail closed");
+    assert!(
+        err.contains("empty artifact body"),
+        "expected empty-body detail, got: {err}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 fn fixed_utc(ts: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(ts)
         .unwrap_or_else(|err| panic!("invalid fixed RFC3339 timestamp {ts}: {err}"))
@@ -2909,9 +4761,11 @@ fn must_pass_lineage_fixture(generated_at: &str) -> Value {
 fn must_pass_lineage_validator_accepts_fresh_linked_metadata() {
     let now = fixed_utc("2026-02-17T00:00:00Z");
     let verdict = must_pass_lineage_fixture("2026-02-16T23:59:00Z");
-    let result =
-        validate_must_pass_lineage_metadata(&verdict, "must_pass_gate_verdict.json", now);
-    assert!(result.is_ok(), "fresh linked metadata should pass: {result:?}");
+    let result = validate_must_pass_lineage_metadata(&verdict, "must_pass_gate_verdict.json", now);
+    assert!(
+        result.is_ok(),
+        "fresh linked metadata should pass: {result:?}"
+    );
 }
 
 #[test]
@@ -2921,7 +4775,10 @@ fn must_pass_lineage_validator_fails_when_run_id_missing() {
     verdict["run_id"] = serde_json::json!(" ");
     let err = validate_must_pass_lineage_metadata(&verdict, "must_pass_gate_verdict.json", now)
         .expect_err("missing run_id must fail closed");
-    assert!(err.contains("run_id"), "expected run_id failure detail: {err}");
+    assert!(
+        err.contains("run_id"),
+        "expected run_id failure detail: {err}"
+    );
 }
 
 #[test]
@@ -3059,6 +4916,80 @@ fn run_all_wires_scenario_cell_status_artifacts_into_evidence_contract() {
         assert!(
             script.contains(token),
             "run_all.sh must include scenario-cell status token: {token}"
+        );
+    }
+}
+
+#[test]
+fn qa_runbook_contains_perf3x_regression_triage_playbooks() {
+    let runbook = std::fs::read_to_string(QA_RUNBOOK_PATH)
+        .unwrap_or_else(|err| panic!("failed to read {QA_RUNBOOK_PATH}: {err}"));
+
+    for token in [
+        "## PERF-3X Regression Triage (bd-3ar8v.6.4)",
+        "fail-closed artifact checks",
+        "tests/full_suite_gate/perf3x_bead_coverage_audit.json",
+        "tests/full_suite_gate/practical_finish_checkpoint.json",
+        "tests/perf/reports/budget_summary.json",
+        "tests/perf/reports/perf_comparison.json",
+        "tests/perf/reports/stress_triage.json",
+        "tests/perf/reports/parameter_sweeps.json",
+        "tests/perf/reports/budget_events.jsonl",
+        "tests/perf/reports/perf_comparison_events.jsonl",
+        "tests/perf/reports/stress_events.jsonl",
+        "tests/perf/reports/parameter_sweeps_events.jsonl",
+    ] {
+        assert!(
+            runbook.contains(token),
+            "qa runbook must include PERF-3X triage token: {token}"
+        );
+    }
+}
+
+#[test]
+fn qa_runbook_contains_perf3x_final_go_no_go_workflow() {
+    let runbook = std::fs::read_to_string(QA_RUNBOOK_PATH)
+        .unwrap_or_else(|err| panic!("failed to read {QA_RUNBOOK_PATH}: {err}"));
+
+    for token in [
+        "### Final >=3x Go/No-Go Decision Workflow (bd-3ar8v.6.5)",
+        "`NO-GO` (fail-closed)",
+        "tests/perf/reports/opportunity_matrix.json",
+        "tests/perf/reports/parameter_sweeps.json",
+        "perf3x_bead_coverage = pass",
+        "practical_finish_checkpoint = pass",
+        "extension_remediation_backlog = pass",
+        "opportunity_matrix_integrity = pass",
+        "parameter_sweeps_integrity = pass",
+    ] {
+        assert!(
+            runbook.contains(token),
+            "qa runbook must include final go/no-go token: {token}"
+        );
+    }
+}
+
+#[test]
+fn ci_operator_runbook_contains_perf3x_gate_incident_addendum() {
+    let runbook = std::fs::read_to_string(CI_OPERATOR_RUNBOOK_PATH)
+        .unwrap_or_else(|err| panic!("failed to read {CI_OPERATOR_RUNBOOK_PATH}: {err}"));
+
+    for token in [
+        "### PERF-3X Gate Incident Addendum (bd-3ar8v.6.4)",
+        "Treat missing/stale PERF-3X artifacts as blocking failures",
+        "tests/full_suite_gate/perf3x_bead_coverage_audit.json",
+        "tests/full_suite_gate/practical_finish_checkpoint.json",
+        "tests/perf/reports/parameter_sweeps.json",
+        "tests/perf/reports/budget_events.jsonl",
+        "tests/perf/reports/perf_comparison_events.jsonl",
+        "tests/perf/reports/stress_events.jsonl",
+        "tests/perf/reports/parameter_sweeps_events.jsonl",
+        "docs/qa-runbook.md",
+        "PERF-3X Regression Triage (bd-3ar8v.6.4)",
+    ] {
+        assert!(
+            runbook.contains(token),
+            "ci-operator runbook must include PERF-3X addendum token: {token}"
         );
     }
 }

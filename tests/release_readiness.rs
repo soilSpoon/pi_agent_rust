@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use tempfile::tempdir;
 
 const REPORT_SCHEMA: &str = "pi.release_readiness.v1";
 const MUST_PASS_GATE_SCHEMA: &str = "pi.ext.must_pass_gate.v1";
@@ -874,6 +875,29 @@ fn collect_conformance(root: &Path) -> DimensionScore {
     load_json(&path).map_or_else(
         || no_data(name, "conformance_summary.json not found"),
         |v| {
+            let run_id = v.pointer("/run_id").and_then(V::as_str).map_or("", str::trim);
+            let correlation_id = v
+                .pointer("/correlation_id")
+                .and_then(V::as_str)
+                .map_or("", str::trim);
+            if run_id.is_empty() || correlation_id.is_empty() {
+                let mut missing = Vec::new();
+                if run_id.is_empty() {
+                    missing.push("run_id");
+                }
+                if correlation_id.is_empty() {
+                    missing.push("correlation_id");
+                }
+                return DimensionScore {
+                    name: name.to_string(),
+                    signal: Signal::Fail,
+                    detail: format!(
+                        "conformance summary missing required lineage field(s): {}",
+                        missing.join(", ")
+                    ),
+                };
+            }
+
             let pass_rate = get_f64(&v, "/pass_rate_pct");
             let pass = get_u64(&v, "/counts/pass");
             let fail = get_u64(&v, "/counts/fail");
@@ -1160,6 +1184,117 @@ fn generate_release_readiness_report() {
 fn conformance_dimension_has_data() {
     let dim = collect_conformance(&repo_root());
     assert_ne!(dim.signal, Signal::NoData, "conformance: {}", dim.detail);
+}
+
+#[test]
+fn conformance_dimension_fail_closed_when_lineage_missing() {
+    let root = tempdir().expect("create tempdir");
+    let reports_dir = root.path().join("tests/ext_conformance/reports");
+    std::fs::create_dir_all(&reports_dir).expect("create conformance reports dir");
+    let summary_path = reports_dir.join("conformance_summary.json");
+    std::fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.conformance_summary.v2",
+            "generated_at": "2026-02-17T06:00:00Z",
+            "counts": { "total": 10, "pass": 10, "fail": 0 },
+            "pass_rate_pct": 100.0,
+            "negative": { "pass": 1, "fail": 0 }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("write conformance summary fixture");
+
+    let dim = collect_conformance(root.path());
+    assert_eq!(dim.signal, Signal::Fail, "{}", dim.detail);
+    assert!(
+        dim.detail.contains("run_id") && dim.detail.contains("correlation_id"),
+        "expected missing lineage fields in detail, got: {}",
+        dim.detail
+    );
+}
+
+#[test]
+fn conformance_dimension_fail_closed_when_run_id_missing() {
+    let root = tempdir().expect("create tempdir");
+    let reports_dir = root.path().join("tests/ext_conformance/reports");
+    std::fs::create_dir_all(&reports_dir).expect("create conformance reports dir");
+    let summary_path = reports_dir.join("conformance_summary.json");
+    std::fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.conformance_summary.v2",
+            "generated_at": "2026-02-17T06:00:00Z",
+            "correlation_id": "corr-123",
+            "counts": { "total": 10, "pass": 10, "fail": 0 },
+            "pass_rate_pct": 100.0,
+            "negative": { "pass": 1, "fail": 0 }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("write conformance summary fixture");
+
+    let dim = collect_conformance(root.path());
+    assert_eq!(dim.signal, Signal::Fail, "{}", dim.detail);
+    assert!(
+        dim.detail.contains("run_id"),
+        "expected missing run_id in detail, got: {}",
+        dim.detail
+    );
+}
+
+#[test]
+fn conformance_dimension_fail_closed_when_correlation_id_missing() {
+    let root = tempdir().expect("create tempdir");
+    let reports_dir = root.path().join("tests/ext_conformance/reports");
+    std::fs::create_dir_all(&reports_dir).expect("create conformance reports dir");
+    let summary_path = reports_dir.join("conformance_summary.json");
+    std::fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.conformance_summary.v2",
+            "generated_at": "2026-02-17T06:00:00Z",
+            "run_id": "run-123",
+            "counts": { "total": 10, "pass": 10, "fail": 0 },
+            "pass_rate_pct": 100.0,
+            "negative": { "pass": 1, "fail": 0 }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("write conformance summary fixture");
+
+    let dim = collect_conformance(root.path());
+    assert_eq!(dim.signal, Signal::Fail, "{}", dim.detail);
+    assert!(
+        dim.detail.contains("correlation_id"),
+        "expected missing correlation_id in detail, got: {}",
+        dim.detail
+    );
+}
+
+#[test]
+fn conformance_dimension_accepts_lineage_when_present() {
+    let root = tempdir().expect("create tempdir");
+    let reports_dir = root.path().join("tests/ext_conformance/reports");
+    std::fs::create_dir_all(&reports_dir).expect("create conformance reports dir");
+    let summary_path = reports_dir.join("conformance_summary.json");
+    std::fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.conformance_summary.v2",
+            "generated_at": "2026-02-17T06:00:00Z",
+            "run_id": "run-123",
+            "correlation_id": "corr-123",
+            "counts": { "total": 10, "pass": 10, "fail": 0 },
+            "pass_rate_pct": 100.0,
+            "negative": { "pass": 1, "fail": 0 }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("write conformance summary fixture");
+
+    let dim = collect_conformance(root.path());
+    assert_eq!(dim.signal, Signal::Pass, "{}", dim.detail);
 }
 
 #[test]

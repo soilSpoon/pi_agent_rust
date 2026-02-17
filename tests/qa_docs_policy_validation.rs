@@ -28,6 +28,7 @@ use std::process::{Command, Output};
 const TESTING_POLICY_PATH: &str = "docs/testing-policy.md";
 const NON_MOCK_RUBRIC_PATH: &str = "docs/non-mock-rubric.json";
 const QA_RUNBOOK_PATH: &str = "docs/qa-runbook.md";
+const CI_OPERATOR_RUNBOOK_PATH: &str = "docs/ci-operator-runbook.md";
 const FLAKE_TRIAGE_PATH: &str = "docs/flake-triage-policy.md";
 const SCENARIO_MATRIX_PATH: &str = "docs/e2e_scenario_matrix.json";
 const PERF_SLI_MATRIX_PATH: &str = "docs/perf_sli_matrix.json";
@@ -60,13 +61,67 @@ fn parse_f64_literal_after(haystack: &str, needle: &str) -> Option<f64> {
     literal.parse::<f64>().ok()
 }
 
+fn parse_identifier_after(haystack: &str, needle: &str) -> Option<String> {
+    let start = haystack.find(needle)? + needle.len();
+    let token: String = haystack[start..]
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
+        .collect();
+    if token.is_empty() {
+        return None;
+    }
+    token.rsplit("::").next().map(ToString::to_string)
+}
+
+fn resolve_f64_constant_in_source(source: &str, constant_name: &str) -> Option<f64> {
+    source
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            line.contains(constant_name)
+                && line.contains(": f64")
+                && (line.starts_with("const ")
+                    || line.starts_with("pub const ")
+                    || line.starts_with("pub(crate) const "))
+        })
+        .and_then(|line| parse_f64_literal_after(line, "="))
+}
+
+fn parse_f64_or_resolved_const_after(
+    haystack: &str,
+    needle: &str,
+    local_source: &str,
+    fallback_sources: &[&str],
+) -> Option<f64> {
+    if let Some(value) = parse_f64_literal_after(haystack, needle) {
+        return Some(value);
+    }
+    let constant_name = parse_identifier_after(haystack, needle)?;
+    if let Some(value) = resolve_f64_constant_in_source(local_source, &constant_name) {
+        return Some(value);
+    }
+    for path in fallback_sources {
+        let source = load_text(path);
+        if let Some(value) = resolve_f64_constant_in_source(&source, &constant_name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn binary_size_threshold_from_perf_budgets_source() -> f64 {
     let source = load_text("tests/perf_budgets.rs");
     let anchor = source
         .find("name: \"binary_size_release\"")
         .expect("perf_budgets.rs must define binary_size_release budget");
-    parse_f64_literal_after(&source[anchor..], "threshold:")
-        .expect("binary_size_release budget must define a numeric threshold")
+    parse_f64_or_resolved_const_after(
+        &source[anchor..],
+        "threshold:",
+        &source,
+        &["src/perf_build.rs"],
+    )
+    .expect("binary_size_release budget must define a numeric threshold")
 }
 
 fn binary_size_threshold_from_perf_regression_source() -> f64 {
@@ -74,8 +129,13 @@ fn binary_size_threshold_from_perf_regression_source() -> f64 {
     let anchor = source
         .find("fn binary_size_check")
         .expect("perf_regression.rs must define binary_size_check");
-    parse_f64_literal_after(&source[anchor..], "let threshold =")
-        .expect("binary_size_check must define a numeric threshold")
+    parse_f64_or_resolved_const_after(
+        &source[anchor..],
+        "let threshold =",
+        &source,
+        &["src/perf_build.rs"],
+    )
+    .expect("binary_size_check must define a numeric threshold")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -251,6 +311,47 @@ fn testing_policy_defines_gate_promotion_runbook() {
         policy.contains("rollback"),
         "must document rollback procedure"
     );
+}
+
+#[test]
+fn testing_policy_documents_practical_finish_docs_last_contract() {
+    let policy = load_text(TESTING_POLICY_PATH);
+    let required_tokens = [
+        "Practical-finish checkpoint policy (bd-3ar8v.6.9)",
+        "docs-last contract",
+        "practical_finish_checkpoint",
+        "parameter_sweeps_integrity",
+        "extension_remediation_backlog",
+        "docs/report scope",
+        "technical open PERF-3X issue is",
+    ];
+    for token in &required_tokens {
+        assert!(
+            policy.contains(token),
+            "testing-policy must retain practical-finish docs-last token: {token}"
+        );
+    }
+}
+
+#[test]
+fn testing_policy_practical_finish_policy_references_required_artifacts() {
+    let policy = load_text(TESTING_POLICY_PATH);
+    let required_artifact_tokens = [
+        "tests/full_suite_gate/practical_finish_checkpoint.json",
+        "pi.perf3x.practical_finish_checkpoint.v1",
+        "tests/perf/reports/parameter_sweeps.json",
+        "pi.perf.parameter_sweeps.v1",
+        "tests/full_suite_gate/extension_remediation_backlog.json",
+        "pi.qa.extension_remediation_backlog.v1",
+        "tests/ci_full_suite_gate.rs",
+        "tests/release_readiness.rs",
+    ];
+    for token in &required_artifact_tokens {
+        assert!(
+            policy.contains(token),
+            "testing-policy practical-finish policy must reference token: {token}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -503,6 +604,93 @@ fn qa_runbook_documents_extension_failure_dossier() {
         runbook.contains("Extension Failure Dossier") || runbook.contains("conformance_summary"),
         "runbook must document extension failure dossier interpretation"
     );
+}
+
+#[test]
+fn qa_runbook_contains_perf3x_regression_triage_contract() {
+    let runbook = load_text(QA_RUNBOOK_PATH);
+    let required_tokens = [
+        "## PERF-3X Regression Triage (bd-3ar8v.6.4)",
+        "practical_finish_checkpoint.json",
+        "parameter_sweeps.json",
+        "Perf diagnostics (budget/comparison/stress/parameter-sweeps event streams)",
+        "tests/full_suite_gate/practical_finish_checkpoint.json",
+        "tests/full_suite_gate/extension_remediation_backlog.json",
+        "tests/perf/reports/parameter_sweeps.json",
+        "tests/perf/reports/parameter_sweeps_events.jsonl",
+    ];
+    for token in &required_tokens {
+        assert!(
+            runbook.contains(token),
+            "qa-runbook.md must retain PERF-3X triage token: {token}"
+        );
+    }
+}
+
+#[test]
+fn qa_runbook_contains_perf3x_signature_quick_reference() {
+    let runbook = load_text(QA_RUNBOOK_PATH);
+    let required_tokens = [
+        "### PERF-3X signature quick-reference",
+        "First remediation action",
+        "`parameter_sweeps_integrity`",
+        "`practical_finish_checkpoint`",
+        "tests/perf/reports/parameter_sweeps_events.jsonl",
+        "tests/full_suite_gate/practical_finish_checkpoint.json",
+        "cargo test --test release_evidence_gate -- parameter_sweeps_contract_links_phase1_matrix_and_readiness --nocapture --exact",
+        "cargo test --test ci_full_suite_gate -- practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact",
+    ];
+    for token in &required_tokens {
+        assert!(
+            runbook.contains(token),
+            "qa-runbook.md must retain PERF-3X signature quick-reference token: {token}"
+        );
+    }
+}
+
+#[test]
+fn ci_operator_runbook_contains_perf3x_incident_signature_playbooks() {
+    let runbook = load_text(CI_OPERATOR_RUNBOOK_PATH);
+    let required_tokens = [
+        "### PERF-3X Gate Incident Addendum (bd-3ar8v.6.4)",
+        "### PERF-3X signature: `parameter_sweeps_integrity` gate failure",
+        "### PERF-3X signature: `practical_finish_checkpoint` readiness drift",
+        "tests/full_suite_gate/practical_finish_checkpoint.json",
+        "tests/perf/reports/parameter_sweeps.json",
+        "tests/perf/reports/parameter_sweeps_events.jsonl",
+        "docs/qa-runbook.md",
+        "PERF-3X Regression Triage (bd-3ar8v.6.4)",
+    ];
+    for token in &required_tokens {
+        assert!(
+            runbook.contains(token),
+            "ci-operator-runbook.md must retain PERF-3X signature token: {token}"
+        );
+    }
+}
+
+#[test]
+fn qa_runbook_contains_user_facing_diagnostics_workflow_tokens() {
+    let runbook = load_text(QA_RUNBOOK_PATH);
+    let required_tokens = [
+        "### User-facing diagnostics workflow (durability/resume/extension/build-profile)",
+        "#### Durability troubleshooting",
+        "#### Resume troubleshooting",
+        "#### Extension troubleshooting",
+        "#### Build-profile troubleshooting",
+        "cargo test --test release_evidence_gate -- parameter_sweeps_contract_links_phase1_matrix_and_readiness --nocapture --exact",
+        "./scripts/e2e/run_all.sh --rerun-from <scenario-id> --diff-from <baseline-dir>",
+        "tests/e2e_results/<ts>/<suite>/test-log.jsonl",
+        "tests/full_suite_gate/extension_remediation_backlog.json",
+        "tests/perf/reports/perf_comparison.json",
+        "tests/perf/reports/perf_comparison_events.jsonl",
+    ];
+    for token in &required_tokens {
+        assert!(
+            runbook.contains(token),
+            "qa-runbook.md must retain user-facing diagnostics workflow token: {token}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1396,6 +1584,16 @@ fn run_all_claim_integrity_gate_wires_fail_closed_conditions() {
         "claim_integrity.phase1_matrix_consumption_contract_object",
         "claim_integrity.phase1_matrix_downstream_beads_include_phase5",
         "claim_integrity.phase1_matrix_downstream_consumers_contract",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_object",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_schema",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_status_valid",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_outputs_array",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_lineage_object",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_lineage_counts_present",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_lineage_bounds",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_lineage_source_matches_matrix_cells",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_status_coherence",
+        "claim_integrity.phase1_matrix_weighted_bottleneck_stage_coverage",
         "failure_or_gap_reasons",
         "expected_regression_guard_reason_set",
         "_regression_unverified",

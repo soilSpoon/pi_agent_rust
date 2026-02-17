@@ -257,8 +257,12 @@ export default function init(pi) {{
         counter: 0,
     }};
 
+    // Guard against duplicate extension loads in shared runtimes.
+    globalThis.__pi_mem_probe_seq = (globalThis.__pi_mem_probe_seq ?? 0) + 1;
+    const toolName = "mem_probe_{i}_" + globalThis.__pi_mem_probe_seq;
+
     pi.registerTool({{
-        name: "mem_probe_{i}",
+        name: toolName,
         description: "Memory probe tool {i}",
         execute: async (_callId, _input) => {{
             state.counter++;

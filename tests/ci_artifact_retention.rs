@@ -235,6 +235,29 @@ fn evidence_contract_schema_enforced_in_runner() {
     eprintln!("[OK] Evidence contract schema enforced in runner");
 }
 
+#[test]
+fn conformance_summary_lineage_contract_enforced_in_runner() {
+    let root = repo_root();
+    let script_path = root.join("scripts/e2e/run_all.sh");
+    let content = load_text(&script_path).expect("run_all.sh must exist");
+
+    let required_tokens = [
+        "conformance.summary_run_id_nonempty",
+        "conformance.summary_correlation_id_nonempty",
+        "conformance.summary_correlation_id_matches_summary",
+        "Emit conformance_summary.run_id from the latest canonical consolidated",
+    ];
+
+    for token in &required_tokens {
+        assert!(
+            content.contains(token),
+            "run_all.sh must enforce conformance lineage token: {token}"
+        );
+    }
+
+    eprintln!("[OK] Conformance summary lineage contract enforced in runner");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Triage workflow documentation validation
 // ═══════════════════════════════════════════════════════════════════════

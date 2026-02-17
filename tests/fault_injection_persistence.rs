@@ -836,6 +836,23 @@ fn fault_inject_save_to_readonly_filesystem() {
     std::fs::set_permissions(parent, readonly_perms).unwrap();
     trace.log("FAULT", "make_parent_readonly", "directory set to r-x");
 
+    // Some execution environments (for example root-capable workers) can still
+    // create files after chmod 0555. Probe this so assertions stay deterministic.
+    let probe_path = parent.join(".readonly-probe");
+    let readonly_enforced = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe_path)
+        .map_or(true, |_| {
+            let _ = std::fs::remove_file(&probe_path);
+            false
+        });
+    trace.log(
+        "FAULT",
+        "readonly_probe",
+        format!("readonly_enforced={readonly_enforced}"),
+    );
+
     // Force full rewrite by dirtying header.
     session.set_model_header(Some("test".to_string()), None, None);
     session.append_message(make_msg("will-fail-save"));
@@ -846,12 +863,21 @@ fn fault_inject_save_to_readonly_filesystem() {
         format!("result: {}", if result.is_ok() { "ok" } else { "err" }),
     );
 
-    // The save should fail because we can't create temp files in readonly dir.
-    assert!(
-        result.is_err(),
-        "save to read-only directory should fail\nTrace:\n{}",
-        trace.dump()
-    );
+    if readonly_enforced {
+        // The save should fail because we can't create temp files in readonly dir.
+        assert!(
+            result.is_err(),
+            "save to read-only directory should fail\nTrace:\n{}",
+            trace.dump()
+        );
+    } else {
+        // Root-capable environments may bypass directory mode restrictions.
+        assert!(
+            result.is_ok(),
+            "save unexpectedly failed in readonly-bypass environment\nTrace:\n{}",
+            trace.dump()
+        );
+    }
 
     // Restore permissions.
     let mut restored_perms = orig_perms;
@@ -863,12 +889,14 @@ fn fault_inject_save_to_readonly_filesystem() {
         "directory permissions restored",
     );
 
-    // Original file should still be intact.
+    // Original file should still be intact if the readonly fault was enforced.
+    // Otherwise, expect the save to have succeeded with the new entry present.
     let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    let expected_len = if readonly_enforced { 1 } else { 2 };
     assert_eq!(
         loaded.entries.len(),
-        1,
-        "original data should survive failed rewrite\nTrace:\n{}",
+        expected_len,
+        "unexpected persisted entry count after readonly fault probe\nTrace:\n{}",
         trace.dump()
     );
 

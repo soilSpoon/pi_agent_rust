@@ -372,6 +372,8 @@ struct ExtensionConformanceResult {
 /// even when some extensions fail.
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn try_conformance(ext_id: &str) -> ExtensionConformanceResult {
+    use std::collections::HashMap;
+
     let manifest = load_manifest();
     let Some(entry) = manifest.find(ext_id) else {
         return ExtensionConformanceResult {
@@ -431,8 +433,25 @@ fn try_conformance(ext_id: &str) -> ExtensionConformanceResult {
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    // Some npm extensions gate registration behind API-key presence checks.
+    // Conformance validates registration shape, so inject deterministic dummy
+    // keys for those specific extensions.
+    let env: HashMap<String, String> = match ext_id {
+        "npm/aliou-pi-linkup" => HashMap::from([(
+            "LINKUP_API_KEY".to_string(),
+            "conformance-dummy-key".to_string(),
+        )]),
+        "npm/aliou-pi-synthetic" => HashMap::from([(
+            "SYNTHETIC_API_KEY".to_string(),
+            "conformance-dummy-key".to_string(),
+        )]),
+        _ => HashMap::new(),
+    };
+
     let js_config = PiJsRuntimeConfig {
         cwd: cwd.display().to_string(),
+        env,
+        deny_env: false,
         ..Default::default()
     };
 
@@ -2694,6 +2713,7 @@ fn try_conformance_with_env(
     let js_config = PiJsRuntimeConfig {
         cwd: cwd.display().to_string(),
         env,
+        deny_env: false,
         ..Default::default()
     };
 

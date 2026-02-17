@@ -402,6 +402,25 @@ fn extension_stratification_candidates(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
+fn phase1_matrix_validation_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(path) = std::env::var("PERF_PHASE1_MATRIX_VALIDATION_JSON") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            paths.push(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(dir) = std::env::var("PERF_EVIDENCE_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            paths.push(PathBuf::from(trimmed).join("results/phase1_matrix_validation.json"));
+        }
+    }
+    paths.push(root.join("target/perf/results/phase1_matrix_validation.json"));
+    paths.push(root.join("tests/perf/reports/phase1_matrix_validation.json"));
+    paths
+}
+
 fn first_existing_path(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find(|p| p.exists()).cloned()
 }
@@ -565,6 +584,244 @@ fn microbench_only_claim_failure(path: &Path, payload: &Value) -> Option<DataCon
         })
 }
 
+#[allow(clippy::too_many_lines)]
+fn evaluate_phase1_weighted_attribution_contract(
+    root: &Path,
+    max_age_hours: f64,
+) -> Vec<DataContractFailure> {
+    let mut failures = Vec::new();
+    let candidates = phase1_matrix_validation_candidates(root);
+    if let Some(detail) = evaluate_artifact_contract(&candidates, max_age_hours) {
+        failures.push(DataContractFailure {
+            contract_id: "missing_or_stale_phase1_matrix_validation_evidence".to_string(),
+            budget_name: None,
+            detail,
+            remediation: "Generate fresh phase1_matrix_validation.json in the current perf run."
+                .to_string(),
+        });
+        return failures;
+    }
+
+    let Some(path) = first_existing_path(&candidates) else {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_phase1_matrix_validation_contract".to_string(),
+            budget_name: None,
+            detail: "phase1 matrix validation artifact not found".to_string(),
+            remediation: "Emit phase1_matrix_validation.json before evaluating perf budgets."
+                .to_string(),
+        });
+        return failures;
+    };
+
+    let Some(payload) = read_json_file(&path) else {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_phase1_matrix_validation_contract".to_string(),
+            budget_name: None,
+            detail: format!("failed to parse JSON at {}", path.display()),
+            remediation: "Write valid JSON for phase1_matrix_validation artifact.".to_string(),
+        });
+        return failures;
+    };
+
+    let matrix_schema = payload.get("schema").and_then(Value::as_str);
+    if matrix_schema != Some("pi.perf.phase1_matrix_validation.v1") {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_phase1_matrix_validation_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "phase1 matrix schema must be pi.perf.phase1_matrix_validation.v1 (observed={}) in {}",
+                matrix_schema.unwrap_or("missing_or_non_string"),
+                path.display()
+            ),
+            remediation:
+                "Set phase1_matrix_validation.schema to pi.perf.phase1_matrix_validation.v1."
+                    .to_string(),
+        });
+    }
+
+    let Some(weighted) = payload
+        .get("weighted_bottleneck_attribution")
+        .and_then(Value::as_object)
+    else {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "phase1_matrix_validation.weighted_bottleneck_attribution must be an object in {}",
+                path.display()
+            ),
+            remediation:
+                "Emit weighted_bottleneck_attribution object with schema/status/lineage and outputs."
+                    .to_string(),
+        });
+        return failures;
+    };
+
+    let weighted_schema = weighted.get("schema").and_then(Value::as_str);
+    if weighted_schema != Some("pi.perf.phase1_weighted_bottleneck_attribution.v1") {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "weighted_bottleneck_attribution.schema must be pi.perf.phase1_weighted_bottleneck_attribution.v1 (observed={}) in {}",
+                weighted_schema.unwrap_or("missing_or_non_string"),
+                path.display()
+            ),
+            remediation:
+                "Set weighted_bottleneck_attribution.schema to pi.perf.phase1_weighted_bottleneck_attribution.v1."
+                    .to_string(),
+        });
+    }
+
+    let weighted_status = weighted.get("status").and_then(Value::as_str);
+    if !matches!(weighted_status, Some("computed" | "missing")) {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "weighted_bottleneck_attribution.status must be one of computed/missing (observed={}) in {}",
+                weighted_status.unwrap_or("missing_or_non_string"),
+                path.display()
+            ),
+            remediation:
+                "Set weighted_bottleneck_attribution.status to computed or missing.".to_string(),
+        });
+    }
+
+    let per_scale = weighted.get("per_scale").and_then(Value::as_array);
+    if per_scale.is_none() {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "weighted_bottleneck_attribution.per_scale must be an array in {}",
+                path.display()
+            ),
+            remediation:
+                "Emit weighted_bottleneck_attribution.per_scale as an array (empty only when status=missing)."
+                    .to_string(),
+        });
+    }
+
+    let global_ranking = weighted.get("global_ranking").and_then(Value::as_array);
+    if global_ranking.is_none() {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "weighted_bottleneck_attribution.global_ranking must be an array in {}",
+                path.display()
+            ),
+            remediation:
+                "Emit weighted_bottleneck_attribution.global_ranking as an array (empty only when status=missing)."
+                    .to_string(),
+        });
+    }
+
+    let Some(lineage) = weighted.get("lineage").and_then(Value::as_object) else {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "weighted_bottleneck_attribution.lineage must be an object in {}",
+                path.display()
+            ),
+            remediation:
+                "Emit weighted_bottleneck_attribution.lineage with source_cell_count and valid_cell_count."
+                    .to_string(),
+        });
+        return failures;
+    };
+
+    let source_cell_count = lineage.get("source_cell_count").and_then(Value::as_u64);
+    let valid_cell_count = lineage.get("valid_cell_count").and_then(Value::as_u64);
+
+    if source_cell_count.is_none() || valid_cell_count.is_none() {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "weighted_bottleneck_attribution.lineage requires integer source_cell_count and valid_cell_count in {}",
+                path.display()
+            ),
+            remediation:
+                "Emit integer lineage.source_cell_count and lineage.valid_cell_count.".to_string(),
+        });
+        return failures;
+    }
+
+    let source_cell_count = source_cell_count.unwrap_or_default();
+    let valid_cell_count = valid_cell_count.unwrap_or_default();
+    if valid_cell_count > source_cell_count {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "weighted_bottleneck_attribution.lineage.valid_cell_count ({valid_cell_count}) must be <= source_cell_count ({source_cell_count}) in {}",
+                path.display()
+            ),
+            remediation:
+                "Correct weighted_bottleneck_attribution.lineage counts to preserve valid<=source."
+                    .to_string(),
+        });
+    }
+
+    if let Some(matrix_cells) = payload.get("matrix_cells").and_then(Value::as_array) {
+        let observed_source = matrix_cells.len() as u64;
+        if source_cell_count != observed_source {
+            failures.push(DataContractFailure {
+                contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+                budget_name: None,
+                detail: format!(
+                    "weighted_bottleneck_attribution.lineage.source_cell_count ({source_cell_count}) must equal phase1_matrix_validation.matrix_cells length ({observed_source}) in {}",
+                    path.display()
+                ),
+                remediation:
+                    "Align weighted_bottleneck_attribution.lineage.source_cell_count with matrix_cells length."
+                        .to_string(),
+            });
+        }
+    }
+
+    let per_scale_len = per_scale.map_or(0, Vec::len);
+    let global_ranking_len = global_ranking.map_or(0, Vec::len);
+    match weighted_status {
+        Some("missing") => {
+            if valid_cell_count != 0 || per_scale_len != 0 || global_ranking_len != 0 {
+                failures.push(DataContractFailure {
+                    contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+                    budget_name: None,
+                    detail: format!(
+                        "weighted_bottleneck_attribution.status=missing requires lineage.valid_cell_count=0 and empty per_scale/global_ranking (observed valid_cell_count={valid_cell_count}, per_scale={per_scale_len}, global_ranking={global_ranking_len}) in {}",
+                        path.display()
+                    ),
+                    remediation:
+                        "When status=missing, set lineage.valid_cell_count=0 and emit empty per_scale/global_ranking arrays."
+                            .to_string(),
+                });
+            }
+        }
+        Some("computed") => {
+            if valid_cell_count == 0 || per_scale_len == 0 || global_ranking_len == 0 {
+                failures.push(DataContractFailure {
+                    contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+                    budget_name: None,
+                    detail: format!(
+                        "weighted_bottleneck_attribution.status=computed requires lineage.valid_cell_count>0 and non-empty per_scale/global_ranking (observed valid_cell_count={valid_cell_count}, per_scale={per_scale_len}, global_ranking={global_ranking_len}) in {}",
+                        path.display()
+                    ),
+                    remediation:
+                        "When status=computed, ensure lineage.valid_cell_count>0 with populated per_scale/global_ranking outputs."
+                            .to_string(),
+                });
+            }
+        }
+        _ => {}
+    }
+
+    failures
+}
+
 fn evaluate_required_e2e_ratio_contract(
     root: &Path,
     max_age_hours: f64,
@@ -649,6 +906,10 @@ fn collect_data_contract_failures(root: &Path) -> Vec<DataContractFailure> {
     }
 
     failures.extend(evaluate_required_e2e_ratio_contract(root, max_age_hours));
+    failures.extend(evaluate_phase1_weighted_attribution_contract(
+        root,
+        max_age_hours,
+    ));
     failures
 }
 
@@ -1696,6 +1957,104 @@ fn write_stratification_artifact_with_claim_guard(
     .expect("write stratification artifact");
 }
 
+fn valid_weighted_bottleneck_attribution_fixture() -> Value {
+    json!({
+        "schema": "pi.perf.phase1_weighted_bottleneck_attribution.v1",
+        "status": "computed",
+        "weighting_policy": "session_messages",
+        "confidence_method": "weighted_normal_approx_95",
+        "per_scale": [
+            {
+                "session_messages": 100_000,
+                "partitions": [
+                    {
+                        "workload_partition": "matched-state",
+                        "present": true,
+                        "scenario_id": "matched-state/session_100000",
+                        "total_stage_ms": 117.0,
+                        "stage_pct": {
+                            "open_ms": 41.0,
+                            "append_ms": 31.0,
+                            "save_ms": 19.0,
+                            "index_ms": 9.0
+                        }
+                    },
+                    {
+                        "workload_partition": "realistic",
+                        "present": true,
+                        "scenario_id": "realistic/session_100000",
+                        "total_stage_ms": 105.0,
+                        "stage_pct": {
+                            "open_ms": 42.0,
+                            "append_ms": 30.0,
+                            "save_ms": 18.0,
+                            "index_ms": 10.0
+                        }
+                    }
+                ]
+            }
+        ],
+        "global_ranking": [
+            {
+                "stage": "open_ms",
+                "weighted_stage_ms": 9_200_000.0,
+                "weighted_contribution_pct": 41.4,
+                "mean_share_pct": 41.4,
+                "ci95_lower_pct": 40.8,
+                "ci95_upper_pct": 42.0,
+                "sample_size": 2
+            }
+        ],
+        "lineage": {
+            "source_stream": "phase1_matrix_validation.matrix_cells",
+            "source_cell_count": 2,
+            "valid_cell_count": 2
+        }
+    })
+}
+
+fn write_phase1_matrix_validation_artifact(path: &Path, weighted_bottleneck_attribution: &Value) {
+    let payload = json!({
+        "schema": "pi.perf.phase1_matrix_validation.v1",
+        "run_id": "20260217T000000Z",
+        "correlation_id": "abc123def456",
+        "matrix_cells": [
+            {
+                "workload_partition": "matched-state",
+                "session_messages": 100_000,
+                "scenario_id": "matched-state/session_100000",
+                "status": "pass",
+                "stage_attribution": {
+                    "open_ms": 48.0,
+                    "append_ms": 36.0,
+                    "save_ms": 22.0,
+                    "index_ms": 11.0,
+                    "total_stage_ms": 117.0
+                }
+            },
+            {
+                "workload_partition": "realistic",
+                "session_messages": 100_000,
+                "scenario_id": "realistic/session_100000",
+                "status": "pass",
+                "stage_attribution": {
+                    "open_ms": 44.0,
+                    "append_ms": 32.0,
+                    "save_ms": 19.0,
+                    "index_ms": 10.0,
+                    "total_stage_ms": 105.0
+                }
+            }
+        ],
+        "weighted_bottleneck_attribution": weighted_bottleneck_attribution
+    });
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+    )
+    .expect("write phase1 matrix artifact");
+}
+
 #[test]
 fn required_e2e_ratio_contract_fails_when_full_e2e_evidence_missing() {
     let tmp = tempfile::tempdir().expect("create tempdir");
@@ -1907,6 +2266,106 @@ fn required_e2e_ratio_contract_accepts_bun_killer_ratio_at_threshold() {
             .iter()
             .any(|failure| failure.contract_id == "bun_killer_ratio_release_gate"),
         "did not expect bun_killer_ratio_release_gate failure, got: {failures:?}",
+    );
+}
+
+#[test]
+fn phase1_weighted_contract_accepts_valid_artifact() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf/results");
+    std::fs::create_dir_all(&perf_dir).expect("create perf results dir");
+    let artifact = perf_dir.join("phase1_matrix_validation.json");
+    write_phase1_matrix_validation_artifact(
+        &artifact,
+        &valid_weighted_bottleneck_attribution_fixture(),
+    );
+
+    let failures = evaluate_phase1_weighted_attribution_contract(tmp.path(), 24.0);
+    assert!(
+        failures.is_empty(),
+        "did not expect weighted-attribution contract failures, got: {failures:?}",
+    );
+}
+
+#[test]
+fn phase1_weighted_contract_fails_when_object_missing() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf/results");
+    std::fs::create_dir_all(&perf_dir).expect("create perf results dir");
+    let artifact = perf_dir.join("phase1_matrix_validation.json");
+    write_phase1_matrix_validation_artifact(&artifact, &Value::Null);
+
+    let failures = evaluate_phase1_weighted_attribution_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "invalid_weighted_bottleneck_attribution_contract"
+                && failure.detail.contains("must be an object")
+        }),
+        "expected missing weighted-attribution object failure, got: {failures:?}",
+    );
+}
+
+#[test]
+fn phase1_weighted_contract_fails_when_schema_invalid() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf/results");
+    std::fs::create_dir_all(&perf_dir).expect("create perf results dir");
+    let artifact = perf_dir.join("phase1_matrix_validation.json");
+    let mut weighted = valid_weighted_bottleneck_attribution_fixture();
+    weighted["schema"] = json!("pi.perf.phase1_weighted_bottleneck_attribution.v0");
+    write_phase1_matrix_validation_artifact(&artifact, &weighted);
+
+    let failures = evaluate_phase1_weighted_attribution_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "invalid_weighted_bottleneck_attribution_contract"
+                && failure
+                    .detail
+                    .contains("schema must be pi.perf.phase1_weighted_bottleneck_attribution.v1")
+        }),
+        "expected invalid weighted schema failure, got: {failures:?}",
+    );
+}
+
+#[test]
+fn phase1_weighted_contract_fails_when_status_invalid() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf/results");
+    std::fs::create_dir_all(&perf_dir).expect("create perf results dir");
+    let artifact = perf_dir.join("phase1_matrix_validation.json");
+    let mut weighted = valid_weighted_bottleneck_attribution_fixture();
+    weighted["status"] = json!("partial");
+    write_phase1_matrix_validation_artifact(&artifact, &weighted);
+
+    let failures = evaluate_phase1_weighted_attribution_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "invalid_weighted_bottleneck_attribution_contract"
+                && failure
+                    .detail
+                    .contains("status must be one of computed/missing")
+        }),
+        "expected invalid weighted status failure, got: {failures:?}",
+    );
+}
+
+#[test]
+fn phase1_weighted_contract_fails_when_missing_status_coherence_breaks() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf/results");
+    std::fs::create_dir_all(&perf_dir).expect("create perf results dir");
+    let artifact = perf_dir.join("phase1_matrix_validation.json");
+    let mut weighted = valid_weighted_bottleneck_attribution_fixture();
+    weighted["status"] = json!("missing");
+    write_phase1_matrix_validation_artifact(&artifact, &weighted);
+
+    let failures = evaluate_phase1_weighted_attribution_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "invalid_weighted_bottleneck_attribution_contract"
+                && failure.detail.contains("status=missing requires")
+        }),
+        "expected missing-status coherence failure, got: {failures:?}",
     );
 }
 
