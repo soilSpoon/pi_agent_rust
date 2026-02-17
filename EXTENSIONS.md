@@ -868,8 +868,8 @@ This is the contract used by:
   "name": "Todo",
   "version": "0.1.0",
   "api_version": "1.0",
-  "runtime": "js",
-  "entrypoint": "src/index.ts",
+  "runtime": "native-rust",
+  "entrypoint": "extension.native.json",
 
   "capabilities": ["read"],
   "capability_manifest": {
@@ -887,9 +887,9 @@ Fields:
   harness fixtures.
 - `name` / `version` / `api_version` (required): must match the protocol
   `register` payload (§3).
-- `runtime` (required): `js` or `wasm`.
+- `runtime` (required): `native-rust` or `wasm`.
 - `entrypoint` (required): path relative to extension root:
-  - JS: source entrypoint (pre‑bundle), e.g. `src/index.ts`.
+  - Native Rust runtime: descriptor entrypoint, e.g. `extension.native.json`.
   - WASM: component artifact path, e.g. `dist/extension.wasm`.
 - `capabilities` (optional, legacy): flat list used as a coarse capability set
   until all extensions emit a scoped manifest.

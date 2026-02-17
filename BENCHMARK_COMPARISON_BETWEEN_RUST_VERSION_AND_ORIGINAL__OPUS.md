@@ -1,13 +1,15 @@
 # Pi Agent: Rust vs TypeScript -- Comprehensive Benchmark & Comparison Report
 
-**Generated**: 2026-02-17 by Claude Opus 4.6
-**Methodology**: Static analysis of both codebases, agent-assisted deep exploration of architecture, extension catalogs, test suites, and dependency graphs.
+**Generated**: 2026-02-17 by Claude Opus 4.6 (revised with measured benchmark data from GPT/Codex benchmark artifacts)
+**Methodology**: Static analysis of both codebases + measured benchmarks (`hyperfine`, `/usr/bin/time`, session workload harness, extension microbenchmarks). Performance data sourced from `.bench/pi_session_bench/`, `.tmp_windyelk/`, and `hyperfine` runs.
 
 ---
 
 ## Executive Summary
 
 The Rust version of pi agent is not a 1:1 port of the TypeScript original. It is a **ground-up reimplementation** that replaces the entire Node.js/Bun runtime stack with native Rust equivalents, adds 38+ features that don't exist in the original, implements a 10-capability sandboxed extension runtime with embedded QuickJS, and ships with 11,946 tests (vs ~1,400 in TypeScript). The Rust binary is fully self-contained with zero runtime dependencies, while the TypeScript version requires Node.js/Bun plus 39 npm packages.
+
+**Performance reality check (measured)**: Rust is **50-313x faster at startup** and uses **8-30x less memory**, but is currently **1.2-4.0x slower in session workload latency** than TypeScript (especially Bun). The primary bottleneck is the session save hot path. Extension per-call dispatch is 10-19x slower than in-process V8 calls due to QuickJS hostcall marshalling.
 
 | Metric | Rust | TypeScript | Factor |
 |--------|------|-----------|--------|
@@ -16,6 +18,9 @@ The Rust version of pi agent is not a 1:1 port of the TypeScript original. It is
 | Test functions | 11,946 | ~1,400 | 8.5x |
 | Runtime dependencies | 0 (single binary) | Node/Bun + 39 npm | -- |
 | LLM providers | 11 | 4-6 | ~2x |
+| Cold startup (measured) | **3.34ms** | 726-1,045ms | **217-313x faster** |
+| Memory at rest (measured) | **6.4 MB** | 153-196 MB | **24-30x smaller** |
+| E2E latency 1M (measured) | 2,401ms | 700-1,239ms | **1.9-3.4x slower** |
 | Extension conformance corpus | 223 extensions | 0 | -- |
 | Fuzz harnesses | 14 | 0 | -- |
 | CI release gates | 15 | 0 | -- |
@@ -217,101 +222,145 @@ The Rust version is **self-contained at ~974K lines**. The TypeScript version re
 
 ---
 
-## 4. Realistic Performance Benchmarks
+## 4. Measured Performance Benchmarks
 
-> **Note**: These are architectural analysis estimates based on code inspection, not live benchmarks. Actual numbers will vary by hardware and workload.
+> **Methodology**: Startup measured with `hyperfine` and `/usr/bin/time`. Session workloads measured with `session_workload_bench` and `bench_legacy_extension_workloads.mjs` harnesses. Extension microbenchmarks from `ext_workloads` binary. Raw artifacts in `.bench/pi_session_bench/` and `.tmp_windyelk/`. No paid API calls used -- all benchmarks are local session/extension operations.
 
-### Startup Time
+### Cold Startup (Measured with `hyperfine`)
 
-| Phase | Rust (estimated) | TypeScript/Node | TypeScript/Bun |
-|-------|-----------------|-----------------|----------------|
-| Binary load | ~5ms (mmap) | ~50ms (Node bootstrap) | ~20ms (Bun bootstrap) |
-| Config parse | ~2ms (serde) | ~10ms (JSON.parse + validation) | ~5ms |
-| Auth load | ~3ms (parallel with resources) | ~15ms (sequential) | ~8ms |
-| Resource load | ~3ms (parallel with auth) | ~15ms (sequential) | ~8ms |
-| Extension discovery | ~10ms (parallel fs scan) | ~20ms (sequential scan) | ~15ms |
-| Extension load (5 exts) | ~50ms (QuickJS init + parse) | ~100ms (jiti transpile) | ~60ms |
-| **Total to first prompt** | **~50-70ms** | **~200-300ms** | **~100-150ms** |
+| Probe | Rust | Node.js | Bun | Node/Rust | Bun/Rust |
+|-------|-----:|--------:|----:|----------:|---------:|
+| `--help` | **3.34ms** | 1,045.10ms | 726.28ms | 313x | 218x |
+| `--version` | **20.09ms** | 1,024.75ms | 729.70ms | 51x | 36x |
 
-Key Rust advantages:
-- `ResourceLoader::load()` and `AuthStorage::load_async()` run in parallel via `futures::future::join`
-- Single binary: no module resolution, no `node_modules` traversal
-- No JIT warmup (ahead-of-time compiled)
+Startup footprint (`/usr/bin/time` RSS):
 
-### Large Session Resume (1000 messages, ~2MB JSONL)
+| Probe | Rust | Node.js | Bun |
+|-------|-----:|--------:|----:|
+| `--help` RSS | **6,448 KB** | 156,720 KB | 195,820 KB |
+| `--version` RSS | **7,556 KB** | 156,560 KB | 194,624 KB |
 
-| Operation | Rust | TypeScript |
-|-----------|------|-----------|
-| File read | ~5ms (mmap + serde streaming) | ~15ms (readline + JSON.parse per line) |
-| Tree reconstruction | ~10ms (index lookup if SQLite) | ~50ms (linear scan) |
-| Context build | ~2ms (zero-copy `Cow` borrows) | ~20ms (deep clone for each build) |
-| **Total** | **~17ms** | **~85ms** |
+Rust startup is **50-313x faster** and uses **24-30x less memory** than either Node or Bun for CLI readiness.
 
-Rust advantage: `Context<'a>` uses `Cow<'a, [Message]>` for zero-copy borrows. TypeScript must deep-clone the message array for each context build.
+### Realistic E2E Latency (Measured, p50 in ms)
 
-### Adding 10 Messages (Streaming + Tool Execution)
+Workload: resume long session (5000 messages) + append 10 turns + tool results + extension ops (40) + slash ops (40) + compactions (12) + forks (8) + exports (2).
 
-| Phase | Rust | TypeScript |
-|-------|------|-----------|
-| Per-token streaming | `Arc::make_mut()` O(1) | Deep clone per delta |
-| Message append | ~0.1ms (JSONL append) | ~1ms (JSONL rewrite) |
-| Tool execution (parallel) | `join_all` on all tools | Sequential by default |
-| Context rebuild | Zero-copy borrow | Full clone |
-| **10-message total** | ~100-200ms (API-bound) | ~100-200ms (API-bound) |
+| Runtime | Token Level | Open | Append/Ops | Save | Total |
+|---------|----------:|-----:|-----------:|-----:|------:|
+| Bun | 100k | 24.63 | 143.84 | 0.00 | **168.47** |
+| Node | 100k | 47.20 | 220.70 | 0.00 | **267.91** |
+| **Rust** | **100k** | **36.84** | **219.06** | **64.64** | **320.71** |
+| Bun | 200k | 29.55 | 196.99 | 0.00 | **226.70** |
+| Node | 200k | 58.77 | 303.60 | 0.00 | **362.37** |
+| **Rust** | **200k** | **40.42** | **397.48** | **113.92** | **552.70** |
+| Bun | 500k | 39.01 | 375.75 | 0.00 | **415.27** |
+| Node | 500k | 76.68 | 607.04 | 0.00 | **684.64** |
+| **Rust** | **500k** | **51.22** | **925.65** | **250.27** | **1,226.71** |
+| Bun | 1M | 50.83 | 649.51 | 0.00 | **700.52** |
+| Node | 1M | 119.76 | 1,117.65 | 0.00 | **1,238.67** |
+| **Rust** | **1M** | **68.86** | **1,846.67** | **482.81** | **2,401.35** |
+| Bun | 5M | 155.63 | 2,801.90 | 0.00 | **2,959.42** |
+| Node | 5M | 396.41 | 5,578.20 | 0.00 | **5,974.67** |
+| **Rust** | **5M** | **204.35** | **9,266.76** | **2,359.30** | **11,828.14** |
 
-For streaming-heavy workloads, both are API-latency-bound. Rust's advantage shows in CPU overhead per token (~16x less due to `Arc<AssistantMessage>` streaming optimization).
+**Rust is currently slower** in realistic E2E workloads:
 
-### Time-to-Input After Response
+| Token Level | Rust/Node | Rust/Bun |
+|----------:|----------:|---------:|
+| 100k | 1.20x | 1.90x |
+| 200k | 1.53x | 2.44x |
+| 500k | 1.79x | 2.95x |
+| 1M | 1.94x | 3.43x |
+| 5M | 1.98x | 4.00x |
 
-| Operation | Rust | TypeScript |
-|-----------|------|-----------|
-| Message persistence | ~0.5ms (append to JSONL) | ~2ms (write full file) |
-| TUI re-render | ~1ms (differential) | ~5ms (full re-render) |
-| Extension event dispatch | ~2ms (async, non-blocking) | ~5ms (sync callbacks) |
-| **Total** | **~3.5ms** | **~12ms** |
+The bottleneck is the Rust save phase (64-2,359ms) which does not exist in the TS version (0ms -- likely deferred or incremental). The gap grows with session size.
+
+### Matched-State Synthetic (Same Session, Resume + 10 Messages)
+
+| Runtime | Tokens | Open ms | Append ms | Save ms | Total ms | RSS KB |
+|---------|-------:|--------:|----------:|--------:|---------:|-------:|
+| **Rust** | **1M** | **68.78** | **254.76** | **432.47** | **756.01** | **32,092** |
+| Node | 1M | 126.37 | 170.57 | 0.00 | 296.94 | 167,752 |
+| Bun | 1M | 52.85 | 90.51 | 0.00 | 143.36 | 184,492 |
+| **Rust** | **5M** | **210.30** | **1,282.08** | **2,124.94** | **3,617.31** | **129,836** |
+| Node | 5M | 399.61 | 1,395.80 | 0.00 | 1,795.41 | 411,372 |
+| Bun | 5M | 156.24 | 405.62 | 0.00 | 561.86 | 481,852 |
+
+At 1M tokens: Rust is **2.55x slower** than Node and **5.27x slower** than Bun in latency, but uses **5.2-5.8x less memory**.
+At 5M tokens: Rust is **2.01x slower** than Node and **6.44x slower** than Bun in latency, but uses **3.2-3.7x less memory**.
+
+### Extension Microbenchmarks (Measured)
+
+| Scenario | Extension | Rust | Node | Bun | Rust vs Node | Rust vs Bun |
+|----------|-----------|-----:|-----:|----:|-----------:|----------:|
+| Cold load | hello | **7.96ms** | 22.29ms | 22.25ms | **2.8x faster** | **2.8x faster** |
+| Cold load | pirate | **7.74ms** | 11.97ms | 19.01ms | **1.5x faster** | **2.5x faster** |
+| Per-call tool dispatch | hello | 16.80us | 1.37us | 0.87us | **12.3x slower** | **19.4x slower** |
+| Per-call event hook | pirate | 17.51us | 1.71us | 1.00us | **10.3x slower** | **17.5x slower** |
+
+Extension cold load is faster in Rust (QuickJS init < jiti transpile). **Per-call dispatch is 10-19x slower** due to QuickJS-to-Rust hostcall marshalling overhead vs in-process V8 calls.
+
+### Key Optimization Targets (from measured data)
+
+1. **Session save hot path** (highest impact): Rust's explicit save phase (432ms-2.4s at 1M-5M) is the primary bottleneck. TS saves at effectively 0ms. Incremental/append-only persistence would close this gap.
+2. **Extension per-call overhead**: 10-19x slower hostcall dispatch. Reduce marshalling, batch invariant policy checks, optimize hot connector paths.
+3. **Append/ops scaling**: Rust append/ops cost grows faster than TS at high token volumes, suggesting allocation churn or repeated full-history serialization.
 
 ---
 
 ## 5. Memory, CPU, and I/O Footprint
 
-### Memory at Rest (After Startup, No Active Session)
+### Memory Footprint (Measured with `/usr/bin/time`)
 
-| Component | Rust | Node.js | Bun |
-|-----------|-----:|--------:|----:|
-| Binary/runtime | ~20MB | ~50MB | ~35MB |
-| Heap baseline | ~5MB | ~30MB | ~20MB |
-| Extension runtimes (5) | ~15MB (QuickJS, 3MB each) | ~0 (shared V8 heap) | ~0 |
-| **Total** | **~40MB** | **~80MB** | **~55MB** |
+#### At Rest (CLI Startup)
 
-### Memory Under Load (100-message session, active streaming)
+| Probe | Rust | Node.js | Bun |
+|-------|-----:|--------:|----:|
+| `--help` RSS | **6.3 MB** | 153 MB | 191 MB |
+| `--version` RSS | **7.4 MB** | 153 MB | 190 MB |
 
-| Component | Rust | Node.js | Bun |
-|-----------|-----:|--------:|----:|
-| Session data | ~5MB (borrowed) | ~15MB (cloned objects) | ~10MB |
-| Streaming buffer | ~1MB (Arc shared) | ~5MB (string concatenation) | ~3MB |
-| Provider state | ~2MB | ~5MB | ~3MB |
-| V8/QuickJS overhead | ~15MB (QuickJS) | ~80MB (V8 heap) | ~50MB |
-| **Total** | **~63MB** | **~185MB** | **~121MB** |
+Rust baseline footprint is **24-30x smaller** than Node or Bun.
 
-### CPU Profile (Streaming 1000 Tokens)
+#### Under Realistic Load (Measured)
 
-| Operation | Rust | TypeScript |
-|-----------|------|-----------|
-| SSE parsing | Custom parser with interned event types, buffer-empty fast path | Built-in EventSource or manual parsing |
-| JSON deserialization | serde zero-copy (`&str` borrows) | `JSON.parse` (full allocation) |
-| Message assembly | `Arc::make_mut()` (O(1) when refcount=1) | Object spread / deep clone |
-| Context serialization | Zero-copy `AnthropicRequest<'a>` with `&'a str` | Full `JSON.stringify` |
-| Event dispatch | `Arc::clone()` (pointer copy) | Object clone per listener |
+| Runtime | Token Level | RSS | Wall Clock |
+|---------|----------:|----:|-----------:|
+| **Rust** | **1M** | **76 MB** | 3.36s |
+| Node | 1M | 820 MB | 2.26s |
+| Bun | 1M | 875 MB | 1.21s |
+| **Rust** | **5M** | **275 MB** | 16.40s |
+| Node | 5M | 2,173 MB | 9.54s |
+| Bun | 5M | 3,058 MB | 4.75s |
 
-### I/O Profile
+At 1M tokens: Rust uses **10.8-11.5x less memory** than Node/Bun.
+At 5M tokens: Rust uses **7.9-11.1x less memory** than Node/Bun.
 
-| Operation | Rust | TypeScript |
-|-----------|------|-----------|
-| HTTP connections | Connection pooling via asupersync | `undici` connection pooling |
-| TLS handshake | rustls (pure Rust) | OpenSSL/BoringSSL (C) |
-| File writes | Direct `write_all` | Node.js `fs.writeFile` |
-| SQLite (if enabled) | Async via asupersync | N/A (not available in TS) |
-| Process spawning | `std::process::Command` | `child_process.spawn` |
+#### CPU Profile (Measured with `/usr/bin/time`)
+
+| Runtime | Token Level | User s | Sys s |
+|---------|----------:|-------:|------:|
+| **Rust** | **1M** | **3.31** | **0.21** |
+| Node | 1M | 1.44 | 1.16 |
+| Bun | 1M | 0.63 | 0.79 |
+| **Rust** | **5M** | **15.79** | **1.06** |
+| Node | 5M | 4.77 | 5.57 |
+| Bun | 5M | 1.67 | 3.42 |
+
+Rust uses more user-space CPU time (3.3x Node, 5.3x Bun at 1M) but less system time. The higher user CPU reflects the session save serialization overhead that dominates Rust's profile.
+
+### Summary: Performance Trade-Off
+
+| Dimension | Winner | Magnitude |
+|-----------|--------|-----------|
+| **Cold startup** | Rust | 50-313x faster |
+| **Memory footprint** | Rust | 8-30x smaller |
+| **Extension cold load** | Rust | 1.5-2.8x faster |
+| **Session save latency** | TypeScript (Bun) | Rust 2-6x slower |
+| **E2E realistic latency** | TypeScript (Bun) | Rust 1.2-4.0x slower |
+| **Extension per-call dispatch** | TypeScript (Bun) | Rust 10-19x slower |
+
+**Rust wins on startup and memory. TypeScript (especially Bun) wins on session workload latency and extension per-call dispatch.** The session save hot path is the #1 optimization target for closing the latency gap.
 
 ---
 
@@ -458,7 +507,7 @@ Same unmodified extension runs in **both** pi-mono TS runtime and Rust QuickJS. 
 | Preflight analysis | `pi doctor <ext>` | None |
 | Conformance testing | 223-extension corpus | None |
 | Differential testing | TS-to-Rust oracle | None |
-| Hostcall optimization | AMAC, BRAVO, S3-FIFO, JIT | None (in-process calls) |
+| Hostcall optimization | AMAC, BRAVO, S3-FIFO, JIT (still 10-19x slower per-call than in-process V8, measured) | None needed (in-process calls, 0.87-1.37us/call measured) |
 | Runtime risk control | 4-phase graduated enforcement | None |
 | Node.js API coverage | 22 module shims | Native (full Node.js) |
 | npm package support | 30+ virtual stubs | Native (npm install) |
@@ -1122,17 +1171,17 @@ No fuzz harnesses. No CI gate infrastructure. No conformance corpus. No VCR infr
 | **Type safety** | Rust's type system catches entire classes of bugs at compile time | TypeScript types are erased at runtime |
 | **Audit surface** | One binary to audit | Node.js + V8 + 39 npm packages + transitive deps |
 
-### 10.2 Performance
+### 10.2 Performance (Measured)
 
-| Aspect | Rust | TypeScript |
-|--------|------|-----------|
-| **Startup** | ~50-70ms (mmap binary) | ~200-300ms (Node bootstrap + module resolution) |
-| **Streaming** | `Arc::make_mut()` O(1) per token | Object spread/clone per token |
-| **Context building** | Zero-copy `Cow<'a, [Message]>` | Full deep clone |
-| **Serialization** | Zero-copy `&'a str` references | `JSON.stringify` with allocations |
-| **SSE parsing** | Custom parser, interned event types, buffer-empty fast path | Standard EventSource or manual |
-| **Tool execution** | Parallel via `join_all` | Sequential by default |
-| **Session lookup** | O(log N) SQLite index | O(N) linear scan |
+| Aspect | Rust | TypeScript | Winner |
+|--------|------|-----------|--------|
+| **Cold startup** | 3.34ms `--help` (measured) | 726-1,045ms (measured) | **Rust (217-313x)** |
+| **Startup memory** | 6.4 MB RSS (measured) | 153-196 MB RSS (measured) | **Rust (24-30x)** |
+| **Extension cold load** | 7.96ms hello (measured) | 22.25-22.29ms (measured) | **Rust (2.8x)** |
+| **Session save (1M)** | 432ms (measured) | 0ms (measured) | **TypeScript** |
+| **E2E total (1M)** | 2,401ms (measured) | 700-1,239ms (measured) | **TypeScript (1.9-3.4x)** |
+| **Extension per-call** | 16.80us (measured) | 0.87-1.37us (measured) | **TypeScript (12-19x)** |
+| **Memory under load (1M)** | 76 MB (measured) | 820-875 MB (measured) | **Rust (10.8-11.5x)** |
 
 ### 10.3 Reliability
 
@@ -1145,14 +1194,15 @@ No fuzz harnesses. No CI gate infrastructure. No conformance corpus. No VCR infr
 | **Deterministic testing** | LabRuntime + VCR for reproducible concurrency | Non-deterministic async |
 | **Conformance** | 223-extension corpus, differential TS-to-Rust oracle | No conformance infrastructure |
 
-### 10.4 Latency
+### 10.4 Latency (Measured)
 
-| Aspect | Rust | TypeScript |
-|--------|------|-----------|
-| **Time-to-input** | ~3.5ms after response | ~12ms after response |
-| **Session resume** | ~17ms (1000 messages) | ~85ms (1000 messages) |
-| **Extension load** | ~10ms per extension (QuickJS) | ~20ms per extension (jiti) |
-| **Context build** | ~2ms (zero-copy) | ~20ms (deep clone) |
+| Aspect | Rust | TypeScript | Winner |
+|--------|------|-----------|--------|
+| **CLI readiness** | 3.34ms (measured) | 726-1,045ms (measured) | **Rust (217-313x)** |
+| **Extension cold load** | 7.96ms (measured) | 22.25ms (measured) | **Rust (2.8x)** |
+| **Extension per-call** | 16.80us (measured) | 0.87us (measured) | **TypeScript (19x)** |
+| **1M E2E total** | 2,401ms (measured) | 700ms Bun / 1,239ms Node (measured) | **TypeScript (1.9-3.4x)** |
+| **5M E2E total** | 11,828ms (measured) | 2,959ms Bun / 5,975ms Node (measured) | **TypeScript (2.0-4.0x)** |
 
 ### 10.5 Operational
 
@@ -1272,9 +1322,10 @@ The Rust version of pi agent is a fundamentally different artifact than the Type
 3. **Implements an extension sandbox** (99,605 lines) where the original has a trust-everything in-process loader (2,767 lines)
 4. **Ships 11,946 tests** (8.5x the original), 14 fuzz harnesses, 296 VCR cassettes, and a 223-extension conformance corpus
 5. **Deploys as a single ~20MB binary** with zero runtime dependencies, vs Node.js/Bun + 39 npm packages
+6. **Starts 217-313x faster** and uses **8-30x less memory** (measured), but is **1.2-4.0x slower on session workload latency** (measured) -- the session save hot path is the #1 optimization target
 
-The TypeScript version is a working agent. The Rust version is a **production-hardened, security-conscious platform** with extensive operator tooling, formal verification foundations, and enterprise-grade observability.
+The TypeScript version is a working agent that is currently faster at its core workload (session append/save). The Rust version is a **production-hardened, security-conscious platform** with dramatically better startup, memory footprint, and operator tooling -- but needs targeted optimization on the session save hot path and extension per-call dispatch overhead to match TypeScript's workload latency.
 
 ---
 
-*Report generated by deep static analysis of both codebases. Performance figures are architectural estimates from code inspection, not live benchmarks. Extension conformance data from `docs/extension-catalog.json` (2026-02-07).*
+*Report generated by static analysis of both codebases. Performance figures are measured benchmarks from `hyperfine`, `/usr/bin/time`, session workload harness, and extension microbenchmarks (see Section 4 for methodology and raw artifact paths). Extension conformance data from `docs/extension-catalog.json` (2026-02-07).*

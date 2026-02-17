@@ -24,11 +24,11 @@
     "runtime": {
       "type": "string",
       "description": "Runtime that executes the entrypoint.",
-      "enum": ["js", "wasm"]
+      "enum": ["native-rust", "wasm"]
     },
     "entrypoint": {
       "type": "string",
-      "description": "Relative path to the extension entry module (PiJS) or component (WASM)."
+      "description": "Relative path to the extension descriptor (native-rust) or component (WASM)."
     },
     "api_version": {
       "type": "string",

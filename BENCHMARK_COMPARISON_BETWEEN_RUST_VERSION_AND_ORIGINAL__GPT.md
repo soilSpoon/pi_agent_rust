@@ -353,6 +353,59 @@ Interpretation:
 - Rust cold-load is now clearly competitive/faster on these representative extensions.
 - Per-call dispatch overhead remains materially higher in Rust and is still a primary extension-runtime optimization target.
 
+### 7.2.1 Incremental Optimization Update (2026-02-17)
+
+After targeted extension-hotpath changes in `src/extensions.rs` (context payload cache reuse, `Arc<Value>` context transfer across runtime command channel, reduced task-id allocation overhead, and `await_js_task` fast-path handling), we re-ran release `ext_workloads`.
+
+Artifacts:
+- `.tmp_codex/ext_workloads_after_arc_release.jsonl`
+- `.tmp_codex/ext_workloads_after_arc_release_matrix.json`
+- `.tmp_codex/ext_workloads_after_arc_release_trace.jsonl`
+Repeated samples:
+- `.tmp_codex/ext_workloads_release_rep1.jsonl`
+- `.tmp_codex/ext_workloads_release_rep2.jsonl`
+- `.tmp_codex/ext_workloads_release_rep3.jsonl`
+
+Updated Rust-only deltas vs the previous values in this report:
+
+| Scenario | Prior Rust (report baseline) | Updated Rust (release) | Change |
+|---|---:|---:|---:|
+| `ext_load_init/load_init_cold` (hello, p50) | 7.96 ms | 6.93 ms | 1.15x faster (`~13.0%`) |
+| `ext_load_init/load_init_cold` (pirate, p50) | 7.74 ms | 6.48 ms | 1.19x faster (`~16.3%`) |
+| `ext_tool_call/hello` | 16.80 us/call | 11.88 us/call | 1.41x faster (`~29.3%`) |
+| `ext_event_hook/before_agent_start` | 17.51 us/call | 15.02 us/call | 1.17x faster (`~14.2%`) |
+
+Replication note:
+- 3 immediate repeated release runs showed some host-contention variance (tool-call `~12.18-13.25us`, event-hook `~15.41-17.05us`), but still materially better than the prior baseline.
+
+### 7.2.2 QuickJS vs Native-Rust Preview (internal micro-harness)
+
+We also ran `pijs_workload` to isolate runtime-engine overhead for a minimal tool roundtrip:
+
+| Runtime engine | Command | Result |
+|---|---|---:|
+| QuickJS | `cargo run --release --bin pijs_workload -- --iterations 20000 --tool-calls 1 --runtime-engine quickjs` | `per_call_us_f64 = 8.4248398` |
+| Native Rust preview | `cargo run --release --bin pijs_workload -- --iterations 20000 --tool-calls 1 --runtime-engine native-rust-preview` | `per_call_us_f64 = 0.0088345` |
+
+Important caveat:
+- `native-rust-preview` is a synthetic preview path in this harness (not yet full extension semantics parity), so this is not a drop-in replacement benchmark.
+- It is still a strong directional signal that removing the QuickJS boundary can recover orders of magnitude in per-call overhead once parity is implemented.
+
+### 7.2.3 QuickJS Removal Program (performance inversion path)
+
+To actually invert the extension overhead (Rust faster than legacy per-call), the benchmark data supports a staged replacement:
+
+1. Native runtime tier for hot-path hooks/tools first (`tool_call`, `tool_result`, high-frequency event hooks).
+2. Keep QuickJS as compatibility fallback for non-hot or unsupported extension features during migration.
+3. Introduce ahead-of-time extension lowering (manifest + typed hostcall IR) so dispatch bypasses JS marshalling for validated extensions.
+4. Preserve existing policy/quota/risk guardrails in native dispatcher, but move them to pre-validated typed structs to eliminate repeated JSON decoding.
+5. Gate rollout behind existing conformance corpus and perf SLI gates:
+   - no regression in vendored pass rate,
+   - `ext_tool_call/hello` and `ext_event_hook/before_agent_start` must beat current legacy baselines.
+
+Near-term measurable target from current data:
+- Drive `ext_tool_call/hello` from ~`11.9-12.3us` to `<1.3us` and `ext_event_hook/before_agent_start` from ~`15.0-15.5us` to `<1.7us` while maintaining conformance.
+
 ## 7.3 Corpus Conformance (223+ extension target)
 
 Source: `tests/ext_conformance/reports/pipeline/full_validation_report.compat2.json` (`generatedAt=2026-02-14T09:05:16Z`)

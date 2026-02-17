@@ -6,10 +6,10 @@ Pi requires Rust nightly (2024 edition).
 
 ```bash
 # Build dev binary
-cargo build
+rch exec -- cargo build
 
 # Build release binary (optimized)
-cargo build --release
+rch exec -- cargo build --release
 ```
 
 ## Sibling Crates (Published vs Local Dev)
@@ -42,12 +42,16 @@ We enforce a strict "no mocks" policy for core logic. Tests use real filesystem 
 
 ```bash
 # Run all tests
-cargo test
+rch exec -- cargo test
 
 # Run specific module
-cargo test config
-cargo test session
+rch exec -- cargo test config
+rch exec -- cargo test session
 ```
+
+For multi-agent sessions, treat `rch exec --` as mandatory for compilation commands. Use
+`./scripts/smoke.sh --require-rch` and `./scripts/ext_quality_pipeline.sh --require-rch`
+to avoid accidental local compile storms.
 
 ### Conformance Tests
 
@@ -154,10 +158,10 @@ Before submitting a PR, ensure all gates pass:
 cargo fmt --check
 
 # Lint check (deny warnings)
-cargo clippy --all-targets -- -D warnings
+rch exec -- cargo clippy --all-targets -- -D warnings
 
 # Tests
-cargo test --all-targets
+rch exec -- cargo test --all-targets
 ```
 
 ## Project Structure
