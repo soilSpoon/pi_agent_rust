@@ -10122,7 +10122,7 @@ pub struct HostCallContext<'a> {
 /// - `session/ui/events`:  `{ "op": <string>, ...payload_fields }`
 pub fn hostcall_request_to_payload(request: &HostcallRequest) -> HostCallPayload {
     let method = request.method().to_string();
-    let capability = request.required_capability();
+    let capability = request.required_capability().to_string();
     let params = request.params_for_hash();
     let timeout_ms = js_hostcall_timeout_ms(request);
     let context = merge_hostcall_context(
@@ -10250,6 +10250,40 @@ fn token_eq_ascii_folded(left: &str, right: &str) -> bool {
     }
 }
 
+#[inline]
+fn with_folded_ascii_alnum_token<T>(token: &str, f: impl FnOnce(&[u8]) -> T) -> T {
+    const INLINE_CAP: usize = 64;
+    let mut inline = [0_u8; INLINE_CAP];
+    let mut inline_len = 0_usize;
+    let mut heap: Option<Vec<u8>> = None;
+
+    for byte in token.trim().bytes() {
+        if !byte.is_ascii_alphanumeric() {
+            continue;
+        }
+        let folded = byte.to_ascii_lowercase();
+        if let Some(buf) = heap.as_mut() {
+            buf.push(folded);
+            continue;
+        }
+        if inline_len < INLINE_CAP {
+            inline[inline_len] = folded;
+            inline_len += 1;
+        } else {
+            let mut buf = Vec::with_capacity(token.len());
+            buf.extend_from_slice(&inline[..inline_len]);
+            buf.push(folded);
+            heap = Some(buf);
+        }
+    }
+
+    if let Some(buf) = heap {
+        f(buf.as_slice())
+    } else {
+        f(&inline[..inline_len])
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostcallMethodAtom {
     Tool,
@@ -10259,15 +10293,12 @@ enum HostcallMethodAtom {
 }
 
 fn intern_hostcall_method_atom(method: &str) -> HostcallMethodAtom {
-    if token_eq_ascii_folded(method, "tool") {
-        HostcallMethodAtom::Tool
-    } else if token_eq_ascii_folded(method, "session") {
-        HostcallMethodAtom::Session
-    } else if token_eq_ascii_folded(method, "events") {
-        HostcallMethodAtom::Events
-    } else {
-        HostcallMethodAtom::Unknown
-    }
+    with_folded_ascii_alnum_token(method, |folded| match folded {
+        b"tool" => HostcallMethodAtom::Tool,
+        b"session" => HostcallMethodAtom::Session,
+        b"events" => HostcallMethodAtom::Events,
+        _ => HostcallMethodAtom::Unknown,
+    })
 }
 
 fn hostcall_param_op(params: &Value) -> Option<&str> {
@@ -10316,79 +10347,50 @@ fn parse_common_hostcall_opcode_code(code: &str) -> Option<CommonHostcallOpcode>
 }
 
 fn parse_tool_opcode_atom(name: &str) -> Option<CommonHostcallOpcode> {
-    if token_eq_ascii_folded(name, "read") {
-        Some(CommonHostcallOpcode::ToolRead)
-    } else if token_eq_ascii_folded(name, "write") {
-        Some(CommonHostcallOpcode::ToolWrite)
-    } else if token_eq_ascii_folded(name, "edit") {
-        Some(CommonHostcallOpcode::ToolEdit)
-    } else if token_eq_ascii_folded(name, "bash") {
-        Some(CommonHostcallOpcode::ToolBash)
-    } else {
-        None
-    }
+    with_folded_ascii_alnum_token(name, |folded| match folded {
+        b"read" => Some(CommonHostcallOpcode::ToolRead),
+        b"write" => Some(CommonHostcallOpcode::ToolWrite),
+        b"edit" => Some(CommonHostcallOpcode::ToolEdit),
+        b"bash" => Some(CommonHostcallOpcode::ToolBash),
+        _ => None,
+    })
 }
 
 fn parse_session_opcode_atom(op: &str) -> Option<CommonHostcallOpcode> {
-    if token_eq_ascii_folded(op, "getstate") {
-        Some(CommonHostcallOpcode::SessionGetState)
-    } else if token_eq_ascii_folded(op, "getmessages") {
-        Some(CommonHostcallOpcode::SessionGetMessages)
-    } else if token_eq_ascii_folded(op, "getentries") {
-        Some(CommonHostcallOpcode::SessionGetEntries)
-    } else if token_eq_ascii_folded(op, "getbranch") {
-        Some(CommonHostcallOpcode::SessionGetBranch)
-    } else if token_eq_ascii_folded(op, "getfile") {
-        Some(CommonHostcallOpcode::SessionGetFile)
-    } else if token_eq_ascii_folded(op, "getname") {
-        Some(CommonHostcallOpcode::SessionGetName)
-    } else if token_eq_ascii_folded(op, "setname") {
-        Some(CommonHostcallOpcode::SessionSetName)
-    } else if token_eq_ascii_folded(op, "getmodel") {
-        Some(CommonHostcallOpcode::SessionGetModel)
-    } else if token_eq_ascii_folded(op, "setmodel") {
-        Some(CommonHostcallOpcode::SessionSetModel)
-    } else if token_eq_ascii_folded(op, "getthinkinglevel") {
-        Some(CommonHostcallOpcode::SessionGetThinkingLevel)
-    } else if token_eq_ascii_folded(op, "setthinkinglevel") {
-        Some(CommonHostcallOpcode::SessionSetThinkingLevel)
-    } else if token_eq_ascii_folded(op, "setlabel") {
-        Some(CommonHostcallOpcode::SessionSetLabel)
-    } else {
-        None
-    }
+    with_folded_ascii_alnum_token(op, |folded| match folded {
+        b"getstate" => Some(CommonHostcallOpcode::SessionGetState),
+        b"getmessages" => Some(CommonHostcallOpcode::SessionGetMessages),
+        b"getentries" => Some(CommonHostcallOpcode::SessionGetEntries),
+        b"getbranch" => Some(CommonHostcallOpcode::SessionGetBranch),
+        b"getfile" => Some(CommonHostcallOpcode::SessionGetFile),
+        b"getname" => Some(CommonHostcallOpcode::SessionGetName),
+        b"setname" => Some(CommonHostcallOpcode::SessionSetName),
+        b"getmodel" => Some(CommonHostcallOpcode::SessionGetModel),
+        b"setmodel" => Some(CommonHostcallOpcode::SessionSetModel),
+        b"getthinkinglevel" => Some(CommonHostcallOpcode::SessionGetThinkingLevel),
+        b"setthinkinglevel" => Some(CommonHostcallOpcode::SessionSetThinkingLevel),
+        b"setlabel" => Some(CommonHostcallOpcode::SessionSetLabel),
+        _ => None,
+    })
 }
 
 fn parse_events_opcode_atom(op: &str) -> Option<CommonHostcallOpcode> {
-    if token_eq_ascii_folded(op, "getactivetools") {
-        Some(CommonHostcallOpcode::EventsGetActiveTools)
-    } else if token_eq_ascii_folded(op, "getalltools") {
-        Some(CommonHostcallOpcode::EventsGetAllTools)
-    } else if token_eq_ascii_folded(op, "setactivetools") {
-        Some(CommonHostcallOpcode::EventsSetActiveTools)
-    } else if token_eq_ascii_folded(op, "emit") {
-        Some(CommonHostcallOpcode::EventsEmit)
-    } else if token_eq_ascii_folded(op, "list") {
-        Some(CommonHostcallOpcode::EventsList)
-    } else if token_eq_ascii_folded(op, "getmodel") {
-        Some(CommonHostcallOpcode::EventsGetModel)
-    } else if token_eq_ascii_folded(op, "setmodel") {
-        Some(CommonHostcallOpcode::EventsSetModel)
-    } else if token_eq_ascii_folded(op, "getthinkinglevel") {
-        Some(CommonHostcallOpcode::EventsGetThinkingLevel)
-    } else if token_eq_ascii_folded(op, "setthinkinglevel") {
-        Some(CommonHostcallOpcode::EventsSetThinkingLevel)
-    } else if token_eq_ascii_folded(op, "getflag") {
-        Some(CommonHostcallOpcode::EventsGetFlag)
-    } else if token_eq_ascii_folded(op, "listflags") {
-        Some(CommonHostcallOpcode::EventsListFlags)
-    } else if token_eq_ascii_folded(op, "appendentry") {
-        Some(CommonHostcallOpcode::EventsAppendEntry)
-    } else if token_eq_ascii_folded(op, "registercommand") {
-        Some(CommonHostcallOpcode::EventsRegisterCommand)
-    } else {
-        None
-    }
+    with_folded_ascii_alnum_token(op, |folded| match folded {
+        b"getactivetools" => Some(CommonHostcallOpcode::EventsGetActiveTools),
+        b"getalltools" => Some(CommonHostcallOpcode::EventsGetAllTools),
+        b"setactivetools" => Some(CommonHostcallOpcode::EventsSetActiveTools),
+        b"emit" => Some(CommonHostcallOpcode::EventsEmit),
+        b"list" => Some(CommonHostcallOpcode::EventsList),
+        b"getmodel" => Some(CommonHostcallOpcode::EventsGetModel),
+        b"setmodel" => Some(CommonHostcallOpcode::EventsSetModel),
+        b"getthinkinglevel" => Some(CommonHostcallOpcode::EventsGetThinkingLevel),
+        b"setthinkinglevel" => Some(CommonHostcallOpcode::EventsSetThinkingLevel),
+        b"getflag" => Some(CommonHostcallOpcode::EventsGetFlag),
+        b"listflags" => Some(CommonHostcallOpcode::EventsListFlags),
+        b"appendentry" => Some(CommonHostcallOpcode::EventsAppendEntry),
+        b"registercommand" => Some(CommonHostcallOpcode::EventsRegisterCommand),
+        _ => None,
+    })
 }
 
 fn derive_common_hostcall_opcode(method: &str, params: &Value) -> Option<CommonHostcallOpcode> {
@@ -11603,7 +11605,7 @@ fn validate_tool_result(payload: &ToolResultPayload) -> Result<()> {
     Ok(())
 }
 
-fn validate_host_call(payload: &HostCallPayload) -> Result<()> {
+pub(crate) fn validate_host_call(payload: &HostCallPayload) -> Result<()> {
     if payload.call_id.trim().is_empty() {
         return Err(Error::validation("Host call_id is empty"));
     }
@@ -14746,9 +14748,15 @@ mod native_runtime_experimental {
     /// JSON templates in `*.native.json` entry files.
     #[derive(Clone)]
     pub struct NativeRustExtensionRuntimeHandle {
-        state: Arc<Mutex<NativeRustRuntimeState>>,
+        state: Arc<RwLock<NativeRustRuntimeState>>,
     }
 
+    #[allow(
+        clippy::manual_let_else,
+        clippy::needless_pass_by_value,
+        clippy::option_if_let_else,
+        clippy::significant_drop_tightening
+    )]
     impl NativeRustExtensionRuntimeHandle {
         pub async fn start() -> Result<Self> {
             Ok(Self {
@@ -14879,9 +14887,20 @@ mod native_runtime_experimental {
             ctx_payload: Arc<Value>,
             _timeout_ms: u64,
         ) -> Result<Value> {
+            self.execute_tool_ref(&tool_name, &tool_call_id, input, ctx_payload)
+                .await
+        }
+
+        pub async fn execute_tool_ref(
+            &self,
+            tool_name: &str,
+            tool_call_id: &str,
+            input: Value,
+            ctx_payload: Arc<Value>,
+        ) -> Result<Value> {
             let guard = self.state.lock().unwrap();
             let template =
-                Self::find_handler_template(&guard, NativeRustHandlerKind::Tool, &tool_name)
+                Self::find_handler_template(&guard, NativeRustHandlerKind::Tool, tool_name)
                     .ok_or_else(|| {
                         Error::extension(format!(
                             "Native Rust extension tool handler not found for '{}'",
@@ -14889,8 +14908,14 @@ mod native_runtime_experimental {
                         ))
                     })?;
             let mut bindings = HashMap::new();
-            bindings.insert("tool_name".to_string(), Value::String(tool_name));
-            bindings.insert("tool_call_id".to_string(), Value::String(tool_call_id));
+            bindings.insert(
+                "tool_name".to_string(),
+                Value::String(tool_name.to_string()),
+            );
+            bindings.insert(
+                "tool_call_id".to_string(),
+                Value::String(tool_call_id.to_string()),
+            );
             bindings.insert("input".to_string(), input);
             bindings.insert("ctx".to_string(), (*ctx_payload).clone());
             Ok(render_native_template_value(&template, &bindings))
@@ -15198,15 +15223,33 @@ mod native_runtime_experimental {
             ctx_payload: Arc<Value>,
             timeout_ms: u64,
         ) -> Result<Value> {
+            self.execute_tool_ref(&tool_name, &tool_call_id, input, ctx_payload, timeout_ms)
+                .await
+        }
+
+        pub async fn execute_tool_ref(
+            &self,
+            tool_name: &str,
+            tool_call_id: &str,
+            input: Value,
+            ctx_payload: Arc<Value>,
+            timeout_ms: u64,
+        ) -> Result<Value> {
             match self {
                 Self::Js(runtime) => {
                     runtime
-                        .execute_tool(tool_name, tool_call_id, input, ctx_payload, timeout_ms)
+                        .execute_tool(
+                            tool_name.to_string(),
+                            tool_call_id.to_string(),
+                            input,
+                            ctx_payload,
+                            timeout_ms,
+                        )
                         .await
                 }
                 Self::NativeRust(runtime) => {
                     runtime
-                        .execute_tool(tool_name, tool_call_id, input, ctx_payload, timeout_ms)
+                        .execute_tool_ref(tool_name, tool_call_id, input, ctx_payload)
                         .await
                 }
             }
@@ -16696,7 +16739,13 @@ mod native_runtime_duplicate_scaffold {
         tool_outputs: HashMap<String, Value>,
         command_outputs: HashMap<String, Value>,
         shortcut_outputs: HashMap<String, Value>,
-        provider_streams: HashMap<String, Vec<Value>>,
+        provider_streams: HashMap<String, Arc<[Value]>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct NativeRustProviderStreamCursor {
+        chunks: Arc<[Value]>,
+        next_index: usize,
     }
 
     #[derive(Debug, Default)]
@@ -16708,7 +16757,7 @@ mod native_runtime_duplicate_scaffold {
         provider_stream_extension_index: HashMap<String, usize>,
         event_hook_extension_indexes: HashMap<String, Vec<usize>>,
         registered_tools: Vec<ExtensionToolDef>,
-        streams: HashMap<String, VecDeque<Value>>,
+        streams: HashMap<String, NativeRustProviderStreamCursor>,
         next_stream_id: u64,
         flags: HashMap<(String, String), Value>,
         repair_events: Vec<ExtensionRepairEvent>,
@@ -16796,7 +16845,7 @@ mod native_runtime_duplicate_scaffold {
             self.extensions.get(extension_index)
         }
 
-        fn provider_stream_chunks(&self, provider_id: &str) -> Option<Vec<Value>> {
+        fn provider_stream_chunks(&self, provider_id: &str) -> Option<Arc<[Value]>> {
             let extension_index = *self.provider_stream_extension_index.get(provider_id)?;
             self.extensions
                 .get(extension_index)?
@@ -16844,386 +16893,49 @@ mod native_runtime_duplicate_scaffold {
         }
     }
 
-    #[derive(Debug)]
-    enum NativeRustRuntimeCommand {
-        LoadExtensions {
-            specs: Vec<NativeRustExtensionLoadSpec>,
-            reply: oneshot::Sender<Result<Vec<JsExtensionSnapshot>>>,
-        },
-        GetRegisteredTools {
-            reply: oneshot::Sender<Result<Vec<ExtensionToolDef>>>,
-        },
-        PumpOnce {
-            reply: oneshot::Sender<Result<bool>>,
-        },
-        DispatchEvent {
-            event_name: String,
-            event_payload: Value,
-            ctx_payload: Arc<Value>,
-            reply: oneshot::Sender<Result<Value>>,
-        },
-        DispatchEventBatch {
-            events: Vec<(String, Value)>,
-            ctx_payload: Arc<Value>,
-            reply: oneshot::Sender<Result<Vec<Result<Value>>>>,
-        },
-        ExecuteTool {
-            tool_name: String,
-            tool_call_id: String,
-            input: Value,
-            reply: oneshot::Sender<Result<Value>>,
-        },
-        ExecuteCommand {
-            command_name: String,
-            args: String,
-            reply: oneshot::Sender<Result<Value>>,
-        },
-        ExecuteShortcut {
-            key_id: String,
-            reply: oneshot::Sender<Result<Value>>,
-        },
-        ProviderStreamSimpleStart {
-            provider_id: String,
-            model: Value,
-            context: Value,
-            options: Value,
-            reply: oneshot::Sender<Result<String>>,
-        },
-        ProviderStreamSimpleNext {
-            stream_id: String,
-            reply: oneshot::Sender<Result<Option<Value>>>,
-        },
-        ProviderStreamSimpleCancel {
-            stream_id: String,
-            reply: Option<oneshot::Sender<Result<()>>>,
-        },
-        SetFlagValue {
-            extension_id: String,
-            flag_name: String,
-            value: Value,
-            reply: oneshot::Sender<Result<()>>,
-        },
-        DrainRepairEvents {
-            reply: oneshot::Sender<Vec<ExtensionRepairEvent>>,
-        },
-        ResetTransientState {
-            reply: oneshot::Sender<Result<()>>,
-        },
-        Shutdown,
-    }
-
     #[derive(Clone)]
     pub struct NativeRustExtensionRuntimeHandle {
-        sender: mpsc::Sender<NativeRustRuntimeCommand>,
-        exit_signal: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         state: Arc<Mutex<NativeRustRuntimeState>>,
     }
 
     impl NativeRustExtensionRuntimeHandle {
-        #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
         pub async fn start() -> Result<Self> {
-            let (tx, rx) = mpsc::channel(64);
-            let (init_tx, init_rx) = oneshot::channel::<Result<()>>();
-            let (exit_tx, exit_rx) = oneshot::channel();
-            let state = Arc::new(Mutex::new(NativeRustRuntimeState::default()));
-            let runtime_state = Arc::clone(&state);
-
-            thread::spawn(move || {
-                let runtime = RuntimeBuilder::current_thread()
-                    .build()
-                    .expect("native extension runtime build");
-                runtime.block_on(async move {
-                let cx = Cx::for_request();
-                let _ = init_tx.send(&cx, Ok(()));
-                while let Ok(command) = rx.recv(&cx).await {
-                    let Ok(mut state) = runtime_state.lock() else {
-                        break;
-                    };
-                    match command {
-                        NativeRustRuntimeCommand::Shutdown => break,
-                        NativeRustRuntimeCommand::LoadExtensions { specs, reply } => {
-                            let result = load_native_extensions_from_specs(&specs)
-                                .map(|loaded| state.load_extensions(loaded));
-                            let _ = reply.send(&cx, result);
-                        }
-                        NativeRustRuntimeCommand::GetRegisteredTools { reply } => {
-                            let _ = reply.send(&cx, Ok(state.registered_tools.clone()));
-                        }
-                        NativeRustRuntimeCommand::PumpOnce { reply } => {
-                            let _ = reply.send(&cx, Ok(false));
-                        }
-                        NativeRustRuntimeCommand::DispatchEvent {
-                            event_name,
-                            event_payload,
-                            ctx_payload,
-                            reply,
-                        } => {
-                            let response =
-                                state.dispatch_event(&event_name, &event_payload, ctx_payload.as_ref());
-                            let _ = reply.send(&cx, Ok(response));
-                        }
-                        NativeRustRuntimeCommand::DispatchEventBatch {
-                            events,
-                            ctx_payload,
-                            reply,
-                        } => {
-                            let mut out = Vec::with_capacity(events.len());
-                            for (event_name, payload) in events {
-                                out.push(Ok(state.dispatch_event(
-                                    &event_name,
-                                    &payload,
-                                    ctx_payload.as_ref(),
-                                )));
-                            }
-                            let _ = reply.send(&cx, Ok(out));
-                        }
-                        NativeRustRuntimeCommand::ExecuteTool {
-                            tool_name,
-                            tool_call_id,
-                            input,
-                            reply,
-                        } => {
-                            let result = if let Some(extension) = state.find_tool_extension(&tool_name)
-                            {
-                                if let Some(value) = extension.tool_outputs.get(&tool_name) {
-                                    Ok(value.clone())
-                                } else {
-                                    Ok(json!({
-                                        "content": [
-                                            {
-                                                "type": "text",
-                                                "text": format!("native-rust tool `{tool_name}` executed")
-                                            }
-                                        ],
-                                        "details": {
-                                            "runtime": "native-rust",
-                                            "toolName": tool_name,
-                                            "toolCallId": tool_call_id,
-                                            "input": input
-                                        }
-                                    }))
-                                }
-                            } else {
-                                Err(Error::extension(format!(
-                                    "native-rust tool `{tool_name}` is not registered"
-                                )))
-                            };
-                            let _ = reply.send(&cx, result);
-                        }
-                        NativeRustRuntimeCommand::ExecuteCommand {
-                            command_name,
-                            args,
-                            reply,
-                        } => {
-                            let result =
-                                if let Some(extension) = state.find_command_extension(&command_name) {
-                                    if let Some(value) =
-                                        extension.command_outputs.get(&command_name)
-                                    {
-                                        Ok(value.clone())
-                                    } else {
-                                        Ok(json!({
-                                            "runtime": "native-rust",
-                                            "command": command_name,
-                                            "args": args,
-                                        }))
-                                    }
-                                } else {
-                                    Err(Error::extension(format!(
-                                        "native-rust command `{command_name}` is not registered"
-                                    )))
-                                };
-                            let _ = reply.send(&cx, result);
-                        }
-                        NativeRustRuntimeCommand::ExecuteShortcut { key_id, reply } => {
-                            let result = if let Some(extension) = state.find_shortcut_extension(&key_id)
-                            {
-                                if let Some(value) = extension.shortcut_outputs.get(&key_id) {
-                                    Ok(value.clone())
-                                } else {
-                                    Ok(json!({
-                                        "runtime": "native-rust",
-                                        "shortcut": key_id,
-                                    }))
-                                }
-                            } else {
-                                Err(Error::extension(format!(
-                                    "native-rust shortcut `{key_id}` is not registered"
-                                )))
-                            };
-                            let _ = reply.send(&cx, result);
-                        }
-                        NativeRustRuntimeCommand::ProviderStreamSimpleStart {
-                            provider_id,
-                            model,
-                            context,
-                            options,
-                            reply,
-                        } => {
-                            let Some(stream_chunks) = state.provider_stream_chunks(&provider_id) else {
-                                let _ = reply.send(
-                                    &cx,
-                                    Err(Error::extension(format!(
-                                        "native-rust provider `{provider_id}` has no streamSimple handler"
-                                    ))),
-                                );
-                                continue;
-                            };
-
-                            state.next_stream_id = state.next_stream_id.saturating_add(1);
-                            let stream_id = format!("native-stream-{}", state.next_stream_id);
-                            state.streams.insert(
-                                stream_id.clone(),
-                                stream_chunks.into_iter().collect::<VecDeque<_>>(),
-                            );
-                            tracing::debug!(
-                                event = "native_extension_runtime.provider_stream.start",
-                                provider_id = %provider_id,
-                                stream_id = %stream_id,
-                                model = %model,
-                                context = %context,
-                                options = %options,
-                                "Started native-rust streamSimple stream"
-                            );
-                            let _ = reply.send(&cx, Ok(stream_id));
-                        }
-                        NativeRustRuntimeCommand::ProviderStreamSimpleNext { stream_id, reply } => {
-                            let value = state
-                                .streams
-                                .get_mut(&stream_id)
-                                .and_then(VecDeque::pop_front);
-                            let _ = reply.send(&cx, Ok(value));
-                        }
-                        NativeRustRuntimeCommand::ProviderStreamSimpleCancel { stream_id, reply } => {
-                            state.streams.remove(&stream_id);
-                            if let Some(reply) = reply {
-                                let _ = reply.send(&cx, Ok(()));
-                            }
-                        }
-                        NativeRustRuntimeCommand::SetFlagValue {
-                            extension_id,
-                            flag_name,
-                            value,
-                            reply,
-                        } => {
-                            state.flags.insert((extension_id, flag_name), value);
-                            let _ = reply.send(&cx, Ok(()));
-                        }
-                        NativeRustRuntimeCommand::DrainRepairEvents { reply } => {
-                            let mut drained = Vec::new();
-                            std::mem::swap(&mut drained, &mut state.repair_events);
-                            let _ = reply.send(&cx, drained);
-                        }
-                        NativeRustRuntimeCommand::ResetTransientState { reply } => {
-                            state.reset_transient_state();
-                            let _ = reply.send(&cx, Ok(()));
-                        }
-                    }
-                }
-
-                let _ = exit_tx.send(&cx, ());
-                tracing::info!(
-                    event = "native_extension_runtime.exit",
-                    "Native-rust extension runtime thread exiting"
-                );
-            });
-            });
-
-            let cx = Cx::for_request();
-            init_rx
-                .recv(&cx)
-                .await
-                .map_err(|_| Error::extension("native-rust extension runtime init cancelled"))??;
-
+            tracing::info!(
+                event = "native_extension_runtime.mode",
+                mode = "single-fast-path",
+                "Native-rust extension runtime started"
+            );
             Ok(Self {
-                sender: tx,
-                exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
-                state,
+                state: Arc::new(RwLock::new(NativeRustRuntimeState::default())),
             })
         }
 
-        pub async fn shutdown(&self, budget: Duration) -> bool {
-            let cx = Cx::for_request();
-            let _ = self
-                .sender
-                .send(&cx, NativeRustRuntimeCommand::Shutdown)
-                .await;
-
-            let exit_rx = {
-                let Ok(mut guard) = self.exit_signal.lock() else {
-                    return false;
-                };
-                guard.take()
-            };
-            let Some(rx) = exit_rx else {
-                return true;
-            };
-
-            timeout(wall_now(), budget, rx.recv(&cx)).await.is_ok()
-        }
-
-        async fn send_with_timeout<T>(
-            &self,
-            timeout_ms: u64,
-            command_builder: impl FnOnce(oneshot::Sender<Result<T>>) -> NativeRustRuntimeCommand,
-            timeout_label: &str,
-        ) -> Result<T> {
-            let _ = timeout_label;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let command = command_builder(reply_tx);
-            let send_cx = Cx::for_request();
-            self.sender
-                .send(&send_cx, command)
-                .await
-                .map_err(|_| Error::extension("native-rust extension runtime channel closed"))?;
-
-            if timeout_ms == 0 {
-                reply_rx
-                    .recv(&send_cx)
-                    .await
-                    .map_err(|_| Error::extension("native-rust extension runtime task cancelled"))?
-            } else {
-                let recv_cx = cx_with_deadline(timeout_ms);
-                reply_rx
-                    .recv(&recv_cx)
-                    .await
-                    .map_err(|_| Error::extension("native-rust extension runtime task cancelled"))?
-            }
+        pub async fn shutdown(&self, _budget: Duration) -> bool {
+            true
         }
 
         async fn load_extensions_snapshots(
             &self,
             specs: Vec<NativeRustExtensionLoadSpec>,
         ) -> Result<Vec<JsExtensionSnapshot>> {
-            let timeout_ms = EXTENSION_LOAD_BUDGET_MS;
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::LoadExtensions { specs, reply },
-                &format!("native-rust extension runtime load timed out after {timeout_ms}ms"),
-            )
-            .await
+            let loaded = load_native_extensions_from_specs(&specs)?;
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            Ok(state.load_extensions(loaded))
         }
 
         pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
-            let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::GetRegisteredTools { reply },
-                &format!(
-                    "native-rust extension runtime tools query timed out after {timeout_ms}ms"
-                ),
-            )
-            .await
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            Ok(state.registered_tools.clone())
         }
 
         pub async fn pump_once(&self) -> Result<bool> {
-            let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::PumpOnce { reply },
-                &format!("native-rust extension runtime pump timed out after {timeout_ms}ms"),
-            )
-            .await
+            Ok(false)
         }
 
         pub async fn dispatch_event(
@@ -17231,39 +16943,34 @@ mod native_runtime_duplicate_scaffold {
             event_name: String,
             event_payload: Value,
             ctx_payload: Arc<Value>,
-            timeout_ms: u64,
+            _timeout_ms: u64,
         ) -> Result<Value> {
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::DispatchEvent {
-                    event_name,
-                    event_payload,
-                    ctx_payload,
-                    reply,
-                },
-                &format!("native-rust extension runtime event timed out after {timeout_ms}ms"),
-            )
-            .await
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            Ok(state.dispatch_event(&event_name, &event_payload, ctx_payload.as_ref()))
         }
 
         pub async fn dispatch_event_batch(
             &self,
             events: Vec<(String, Value)>,
             ctx_payload: Arc<Value>,
-            timeout_ms: u64,
+            _timeout_ms: u64,
         ) -> Result<Vec<Result<Value>>> {
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::DispatchEventBatch {
-                    events,
-                    ctx_payload,
-                    reply,
-                },
-                &format!(
-                    "native-rust extension runtime batch event timed out after {timeout_ms}ms"
-                ),
-            )
-            .await
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            let mut out = Vec::with_capacity(events.len());
+            for (event_name, payload) in events {
+                out.push(Ok(state.dispatch_event(
+                    &event_name,
+                    &payload,
+                    ctx_payload.as_ref(),
+                )));
+            }
+            Ok(out)
         }
 
         #[allow(clippy::option_if_let_else)]
@@ -17274,36 +16981,45 @@ mod native_runtime_duplicate_scaffold {
             input: Value,
             timeout_ms: u64,
         ) -> Result<Value> {
-            let _ = timeout_ms;
-            {
-                let state = self
-                    .state
-                    .lock()
-                    .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-                if let Some(extension) = state.find_tool_extension(&tool_name) {
-                    if let Some(value) = extension.tool_outputs.get(&tool_name) {
-                        Ok(value.clone())
-                    } else {
-                        Ok(json!({
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": format!("native-rust tool `{tool_name}` executed")
-                                }
-                            ],
-                            "details": {
-                                "runtime": "native-rust",
-                                "toolName": tool_name,
-                                "toolCallId": tool_call_id,
-                                "input": input
-                            }
-                        }))
-                    }
+            self.execute_tool_ref(&tool_name, &tool_call_id, input, timeout_ms)
+                .await
+        }
+
+        #[allow(clippy::option_if_let_else)]
+        pub async fn execute_tool_ref(
+            &self,
+            tool_name: &str,
+            tool_call_id: &str,
+            input: Value,
+            _timeout_ms: u64,
+        ) -> Result<Value> {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            if let Some(extension) = state.find_tool_extension(tool_name) {
+                if let Some(value) = extension.tool_outputs.get(tool_name) {
+                    Ok(value.clone())
                 } else {
-                    Err(Error::extension(format!(
-                        "native-rust tool `{tool_name}` is not registered"
-                    )))
+                    Ok(json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!("native-rust tool `{tool_name}` executed")
+                            }
+                        ],
+                        "details": {
+                            "runtime": "native-rust",
+                            "toolName": tool_name,
+                            "toolCallId": tool_call_id,
+                            "input": input
+                        }
+                    }))
                 }
+            } else {
+                Err(Error::extension(format!(
+                    "native-rust tool `{tool_name}` is not registered"
+                )))
             }
         }
 
@@ -17311,27 +17027,48 @@ mod native_runtime_duplicate_scaffold {
             &self,
             command_name: String,
             args: String,
-            timeout_ms: u64,
+            _timeout_ms: u64,
         ) -> Result<Value> {
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::ExecuteCommand {
-                    command_name,
-                    args,
-                    reply,
-                },
-                &format!("native-rust extension runtime command timed out after {timeout_ms}ms"),
-            )
-            .await
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            if let Some(extension) = state.find_command_extension(&command_name) {
+                if let Some(value) = extension.command_outputs.get(&command_name) {
+                    Ok(value.clone())
+                } else {
+                    Ok(json!({
+                        "runtime": "native-rust",
+                        "command": command_name,
+                        "args": args,
+                    }))
+                }
+            } else {
+                Err(Error::extension(format!(
+                    "native-rust command `{command_name}` is not registered"
+                )))
+            }
         }
 
-        pub async fn execute_shortcut(&self, key_id: String, timeout_ms: u64) -> Result<Value> {
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::ExecuteShortcut { key_id, reply },
-                &format!("native-rust extension runtime shortcut timed out after {timeout_ms}ms"),
-            )
-            .await
+        pub async fn execute_shortcut(&self, key_id: String, _timeout_ms: u64) -> Result<Value> {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            if let Some(extension) = state.find_shortcut_extension(&key_id) {
+                if let Some(value) = extension.shortcut_outputs.get(&key_id) {
+                    Ok(value.clone())
+                } else {
+                    Ok(json!({
+                        "runtime": "native-rust",
+                        "shortcut": key_id,
+                    }))
+                }
+            } else {
+                Err(Error::extension(format!(
+                    "native-rust shortcut `{key_id}` is not registered"
+                )))
+            }
         }
 
         pub async fn set_flag_value(
@@ -17340,106 +17077,115 @@ mod native_runtime_duplicate_scaffold {
             flag_name: String,
             value: Value,
         ) -> Result<()> {
-            let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::SetFlagValue {
-                    extension_id,
-                    flag_name,
-                    value,
-                    reply,
-                },
-                &format!(
-                    "native-rust extension runtime flag update timed out after {timeout_ms}ms"
-                ),
-            )
-            .await
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            state.flags.insert((extension_id, flag_name), value);
+            Ok(())
         }
 
         pub async fn drain_repair_events(&self) -> Vec<ExtensionRepairEvent> {
-            let cx = cx_with_deadline(EXTENSION_QUERY_BUDGET_MS);
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let command = NativeRustRuntimeCommand::DrainRepairEvents { reply: reply_tx };
-            let Ok(()) = self.sender.send(&cx, command).await else {
-                return Vec::new();
+            let mut state = match self.state.write() {
+                Ok(guard) => guard,
+                Err(_) => return Vec::new(),
             };
-            reply_rx.recv(&cx).await.unwrap_or_default()
+            let mut drained = Vec::new();
+            std::mem::swap(&mut drained, &mut state.repair_events);
+            drained
         }
 
         pub async fn reset_transient_state(&self) -> Result<()> {
-            let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
-            self.send_with_timeout(
-                timeout_ms,
-                |reply| NativeRustRuntimeCommand::ResetTransientState { reply },
-                &format!("native-rust extension runtime reset timed out after {timeout_ms}ms"),
-            )
-            .await
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            state.reset_transient_state();
+            Ok(())
         }
 
         pub async fn provider_stream_simple_start(
             &self,
             provider_id: String,
-            model: Value,
-            context: Value,
-            options: Value,
-            timeout_ms: u64,
+            _model: Value,
+            _context: Value,
+            _options: Value,
+            _timeout_ms: u64,
         ) -> Result<String> {
-            self.send_with_timeout(
-            timeout_ms,
-            |reply| NativeRustRuntimeCommand::ProviderStreamSimpleStart {
-                provider_id,
-                model,
-                context,
-                options,
-                reply,
-            },
-            &format!(
-                "native-rust extension runtime provider stream start timed out after {timeout_ms}ms"
-            ),
-        )
-        .await
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            let stream_chunks = state.provider_stream_chunks(&provider_id).ok_or_else(|| {
+                Error::extension(format!(
+                    "native-rust provider `{provider_id}` has no streamSimple handler"
+                ))
+            })?;
+            let chunk_count = stream_chunks.len();
+            state.next_stream_id = state.next_stream_id.saturating_add(1);
+            let stream_id = format!("native-stream-{}", state.next_stream_id);
+            state.streams.insert(
+                stream_id.clone(),
+                NativeRustProviderStreamCursor {
+                    chunks: stream_chunks,
+                    next_index: 0,
+                },
+            );
+            tracing::debug!(
+                event = "native_extension_runtime.provider_stream.start",
+                provider_id = %provider_id,
+                stream_id = %stream_id,
+                chunk_count,
+                "Started native-rust streamSimple stream"
+            );
+            Ok(stream_id)
         }
 
         pub async fn provider_stream_simple_next(
             &self,
             stream_id: String,
-            timeout_ms: u64,
+            _timeout_ms: u64,
         ) -> Result<Option<Value>> {
-            self.send_with_timeout(
-            timeout_ms,
-            |reply| NativeRustRuntimeCommand::ProviderStreamSimpleNext { stream_id, reply },
-            &format!(
-                "native-rust extension runtime provider stream next timed out after {timeout_ms}ms"
-            ),
-        )
-        .await
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            let (next_value, exhausted) = match state.streams.get_mut(&stream_id) {
+                Some(cursor) => {
+                    let next = cursor.chunks.get(cursor.next_index).cloned();
+                    let exhausted = if next.is_some() {
+                        cursor.next_index = cursor.next_index.saturating_add(1);
+                        cursor.next_index >= cursor.chunks.len()
+                    } else {
+                        true
+                    };
+                    (next, exhausted)
+                }
+                None => return Ok(None),
+            };
+            if exhausted {
+                state.streams.remove(&stream_id);
+            }
+            Ok(next_value)
         }
 
         pub async fn provider_stream_simple_cancel(
             &self,
             stream_id: String,
-            timeout_ms: u64,
+            _timeout_ms: u64,
         ) -> Result<()> {
-            self.send_with_timeout(
-            timeout_ms,
-            |reply| NativeRustRuntimeCommand::ProviderStreamSimpleCancel {
-                stream_id,
-                reply: Some(reply),
-            },
-            &format!(
-                "native-rust extension runtime provider stream cancel timed out after {timeout_ms}ms"
-            ),
-        )
-        .await
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            state.streams.remove(&stream_id);
+            Ok(())
         }
 
         pub fn provider_stream_simple_cancel_best_effort(&self, stream_id: String) {
-            let _ = self
-                .sender
-                .try_send(NativeRustRuntimeCommand::ProviderStreamSimpleCancel {
-                    stream_id,
-                    reply: None,
-                });
+            if let Ok(mut state) = self.state.write() {
+                state.streams.remove(&stream_id);
+            }
         }
     }
 
@@ -17456,19 +17202,19 @@ mod native_runtime_duplicate_scaffold {
     fn load_native_extension_from_spec(
         spec: &NativeRustExtensionLoadSpec,
     ) -> Result<NativeRustLoadedExtension> {
-        let descriptor_json = fs::read_to_string(&spec.entry_path).map_err(|err| {
+        let descriptor_bytes = fs::read(&spec.entry_path).map_err(|err| {
             Error::extension(format!(
                 "Failed to read native-rust extension descriptor {}: {err}",
                 spec.entry_path.display()
             ))
         })?;
-        let descriptor: NativeRustExtensionDescriptor = serde_json::from_str(&descriptor_json)
+        let descriptor: NativeRustExtensionDescriptor = serde_json::from_slice(&descriptor_bytes)
             .map_err(|err| {
-                Error::extension(format!(
-                    "Failed to parse native-rust extension descriptor {}: {err}",
-                    spec.entry_path.display()
-                ))
-            })?;
+            Error::extension(format!(
+                "Failed to parse native-rust extension descriptor {}: {err}",
+                spec.entry_path.display()
+            ))
+        })?;
 
         let extension_id = if descriptor.id.trim().is_empty() {
             spec.extension_id.clone()
@@ -17490,6 +17236,11 @@ mod native_runtime_duplicate_scaffold {
         } else {
             descriptor.api_version.clone()
         };
+        let provider_streams = descriptor
+            .provider_streams
+            .into_iter()
+            .map(|(provider_id, chunks)| (provider_id, Arc::<[Value]>::from(chunks)))
+            .collect::<HashMap<_, _>>();
 
         Ok(NativeRustLoadedExtension {
             snapshot: JsExtensionSnapshot {
@@ -17509,7 +17260,7 @@ mod native_runtime_duplicate_scaffold {
             tool_outputs: descriptor.tool_outputs,
             command_outputs: descriptor.command_outputs,
             shortcut_outputs: descriptor.shortcut_outputs,
-            provider_streams: descriptor.provider_streams,
+            provider_streams,
         })
     }
 
@@ -17633,16 +17384,34 @@ mod native_runtime_duplicate_scaffold {
             ctx_payload: Arc<Value>,
             timeout_ms: u64,
         ) -> Result<Value> {
+            self.execute_tool_ref(&tool_name, &tool_call_id, input, ctx_payload, timeout_ms)
+                .await
+        }
+
+        pub async fn execute_tool_ref(
+            &self,
+            tool_name: &str,
+            tool_call_id: &str,
+            input: Value,
+            ctx_payload: Arc<Value>,
+            timeout_ms: u64,
+        ) -> Result<Value> {
             match self {
                 Self::Js(runtime) => {
                     runtime
-                        .execute_tool(tool_name, tool_call_id, input, ctx_payload, timeout_ms)
+                        .execute_tool(
+                            tool_name.to_string(),
+                            tool_call_id.to_string(),
+                            input,
+                            ctx_payload,
+                            timeout_ms,
+                        )
                         .await
                 }
                 Self::NativeRust(runtime) => {
                     let _ = ctx_payload;
                     runtime
-                        .execute_tool(tool_name, tool_call_id, input, timeout_ms)
+                        .execute_tool_ref(tool_name, tool_call_id, input, timeout_ms)
                         .await
                 }
             }
@@ -19362,8 +19131,8 @@ pub async fn dispatch_host_call_shared(
         );
     }
 
-    let call_id = call.call_id.clone();
-    let method = call.method.clone();
+    let call_id = call.call_id.as_str();
+    let method = call.method.as_str();
     let opcode_hint = match resolve_hostcall_opcode(&call) {
         Ok(HostcallOpcodeResolution::FastPath { opcode, .. }) => Some(opcode),
         _ => None,
@@ -19376,7 +19145,7 @@ pub async fn dispatch_host_call_shared(
         params_hash,
         args_shape_hash,
         mut telemetry,
-    } = HostcallPayloadArena::new(&method, &call.params, opcode_hint).marshal();
+    } = HostcallPayloadArena::new(method, &call.params, opcode_hint).marshal();
     if let Some(manager) = ctx.manager.as_ref() {
         telemetry.fallback_count = manager.record_hostcall_marshalling_fallback_count(
             ctx.extension_id,
@@ -19384,16 +19153,16 @@ pub async fn dispatch_host_call_shared(
         );
     }
     let marshalling_telemetry = telemetry;
-    let resource_target_class = runtime_hostcall_resource_target_class(&method, &call.params);
+    let resource_target_class = runtime_hostcall_resource_target_class(method, &call.params);
     let policy_profile = runtime_hostcall_policy_profile(ctx.policy.mode);
     let started_at = Instant::now();
 
     log_hostcall_start(
         ctx.runtime_name,
-        &call_id,
+        call_id,
         ctx.extension_id,
         capability,
-        &method,
+        method,
         &params_hash,
         call.timeout_ms,
     );
@@ -19411,7 +19180,7 @@ pub async fn dispatch_host_call_shared(
 
     log_policy_decision(
         ctx.runtime_name,
-        &call_id,
+        call_id,
         ctx.extension_id,
         capability,
         decision,
@@ -19450,7 +19219,7 @@ pub async fn dispatch_host_call_shared(
                     category: SecurityAlertCategory::QuotaBreach,
                     severity: SecurityAlertSeverity::Warning,
                     capability: capability.to_string(),
-                    method: method.clone(),
+                    method: method.to_string(),
                     reason_codes: vec!["quota_exceeded".to_string()],
                     summary: format!("Quota exceeded: {qr}"),
                     policy_source: "quota".to_string(),
@@ -19469,17 +19238,17 @@ pub async fn dispatch_host_call_shared(
                     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
                 log_hostcall_end(
                     ctx.runtime_name,
-                    &call_id,
+                    call_id,
                     ctx.extension_id,
                     capability,
-                    &method,
+                    method,
                     &params_hash,
                     duration_ms,
                     None,
                     &marshalling_telemetry,
                     &outcome,
                 );
-                return outcome_to_host_result(&call_id, &outcome);
+                return outcome_to_host_result(call_id, &outcome);
             }
         }
     }
@@ -19493,9 +19262,9 @@ pub async fn dispatch_host_call_shared(
         if let Some(manager) = ctx.manager.as_ref() {
             runtime_risk_decision = manager.evaluate_runtime_risk(
                 ctx.extension_id,
-                &call_id,
+                call_id,
                 capability,
-                &method,
+                method,
                 &params_hash,
                 RuntimeRiskCallMetadata {
                     args_shape_hash: &args_shape_hash,
@@ -19580,7 +19349,7 @@ pub async fn dispatch_host_call_shared(
                                 category: SecurityAlertCategory::AnomalyDenial,
                                 severity: SecurityAlertSeverity::Error,
                                 capability: capability.to_string(),
-                                method: method.clone(),
+                                method: method.to_string(),
                                 reason_codes: runtime_risk_decision
                                     .as_ref()
                                     .map(|d| d.triggers.clone())
@@ -19625,7 +19394,7 @@ pub async fn dispatch_host_call_shared(
                             category: SecurityAlertCategory::AnomalyDenial,
                             severity: SecurityAlertSeverity::Error,
                             capability: capability.to_string(),
-                            method: method.clone(),
+                            method: method.to_string(),
                             reason_codes: runtime_risk_decision
                                 .as_ref()
                                 .map(|d| d.triggers.clone())
@@ -19664,7 +19433,7 @@ pub async fn dispatch_host_call_shared(
                             category: SecurityAlertCategory::Quarantine,
                             severity: SecurityAlertSeverity::Critical,
                             capability: capability.to_string(),
-                            method: method.clone(),
+                            method: method.to_string(),
                             reason_codes: runtime_risk_decision
                                 .as_ref()
                                 .map(|d| d.triggers.clone())
@@ -19711,7 +19480,7 @@ pub async fn dispatch_host_call_shared(
                 category: SecurityAlertCategory::PolicyDenial,
                 severity: SecurityAlertSeverity::Error,
                 capability: capability.to_string(),
-                method: method.clone(),
+                method: method.to_string(),
                 reason_codes: vec![reason.clone()],
                 summary: format!("Capability '{capability}' denied by policy ({reason})"),
                 policy_source: reason.clone(),
@@ -19733,10 +19502,10 @@ pub async fn dispatch_host_call_shared(
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     log_hostcall_end(
         ctx.runtime_name,
-        &call_id,
+        call_id,
         ctx.extension_id,
         capability,
-        &method,
+        method,
         &params_hash,
         duration_ms,
         lane_execution.as_ref(),
@@ -19758,7 +19527,7 @@ pub async fn dispatch_host_call_shared(
     {
         manager.record_runtime_risk_outcome(
             ctx.extension_id,
-            &call_id,
+            call_id,
             &reason,
             risk_decision,
             outcome_error_code,
@@ -19772,17 +19541,17 @@ pub async fn dispatch_host_call_shared(
     if let Some(manager) = ctx.manager.as_ref() {
         if let Some(replay_config) = manager.replay_config() {
             let ext_id = ctx.extension_id.unwrap_or("unknown");
-            let trace_id = format!("hc-{}", &call_id);
+            let trace_id = format!("hc-{call_id}");
             let mut recorder =
                 crate::extension_replay::ReplayRecorder::new(trace_id, replay_config);
 
             // Record the scheduled event.
             recorder.record_scheduled(
                 ext_id,
-                &call_id,
+                call_id,
                 std::collections::BTreeMap::from([
                     ("capability".to_string(), capability.to_string()),
-                    ("method".to_string(), method.clone()),
+                    ("method".to_string(), method.to_string()),
                 ]),
             );
             recorder.tick();
@@ -19790,7 +19559,7 @@ pub async fn dispatch_host_call_shared(
             // Record the policy decision.
             recorder.record(
                 ext_id,
-                &call_id,
+                call_id,
                 crate::extension_replay::ReplayEventKind::PolicyDecision,
                 std::collections::BTreeMap::from([
                     ("decision".to_string(), format!("{decision:?}")),
@@ -19807,7 +19576,7 @@ pub async fn dispatch_host_call_shared(
             };
             recorder.record(
                 ext_id,
-                &call_id,
+                call_id,
                 outcome_kind,
                 std::collections::BTreeMap::from([(
                     "duration_ms".to_string(),
@@ -19828,7 +19597,7 @@ pub async fn dispatch_host_call_shared(
         }
     }
 
-    outcome_to_host_result(&call_id, &outcome)
+    outcome_to_host_result(call_id, &outcome)
 }
 
 // ============================================================================
@@ -20138,16 +19907,21 @@ async fn dispatch_hostcall_session_fast_ref(
         };
     };
 
-    let op_norm = op.trim().to_ascii_lowercase();
-    let result = match op_norm.as_str() {
-        "get_state" | "getstate" => Ok(session.get_state().await),
-        "get_messages" | "getmessages" => serde_json::to_value(session.get_messages().await)
-            .map_err(|err| Error::extension(format!("Serialize messages: {err}"))),
-        "get_entries" | "getentries" => serde_json::to_value(session.get_entries().await)
-            .map_err(|err| Error::extension(format!("Serialize entries: {err}"))),
-        "get_branch" | "getbranch" => serde_json::to_value(session.get_branch().await)
-            .map_err(|err| Error::extension(format!("Serialize branch: {err}"))),
-        "get_file" | "getfile" => {
+    let result = match parse_session_opcode_atom(op) {
+        Some(CommonHostcallOpcode::SessionGetState) => Ok(session.get_state().await),
+        Some(CommonHostcallOpcode::SessionGetMessages) => {
+            serde_json::to_value(session.get_messages().await)
+                .map_err(|err| Error::extension(format!("Serialize messages: {err}")))
+        }
+        Some(CommonHostcallOpcode::SessionGetEntries) => {
+            serde_json::to_value(session.get_entries().await)
+                .map_err(|err| Error::extension(format!("Serialize entries: {err}")))
+        }
+        Some(CommonHostcallOpcode::SessionGetBranch) => {
+            serde_json::to_value(session.get_branch().await)
+                .map_err(|err| Error::extension(format!("Serialize branch: {err}")))
+        }
+        Some(CommonHostcallOpcode::SessionGetFile) => {
             let state = session.get_state().await;
             let file = state
                 .get("sessionFile")
@@ -20156,7 +19930,7 @@ async fn dispatch_hostcall_session_fast_ref(
                 .unwrap_or(Value::Null);
             Ok(file)
         }
-        "get_name" | "getname" => {
+        Some(CommonHostcallOpcode::SessionGetName) => {
             let state = session.get_state().await;
             let name = state
                 .get("sessionName")
@@ -20165,7 +19939,7 @@ async fn dispatch_hostcall_session_fast_ref(
                 .unwrap_or(Value::Null);
             Ok(name)
         }
-        "set_name" | "setname" => {
+        Some(CommonHostcallOpcode::SessionSetName) => {
             let name = params
                 .get("name")
                 .and_then(Value::as_str)
@@ -20173,7 +19947,7 @@ async fn dispatch_hostcall_session_fast_ref(
                 .to_string();
             session.set_name(name).await.map(|()| Value::Null)
         }
-        "set_model" | "setmodel" => {
+        Some(CommonHostcallOpcode::SessionSetModel) => {
             let provider = params
                 .get("provider")
                 .and_then(Value::as_str)
@@ -20196,14 +19970,14 @@ async fn dispatch_hostcall_session_fast_ref(
                 .await
                 .map(|()| Value::Bool(true))
         }
-        "get_model" | "getmodel" => {
+        Some(CommonHostcallOpcode::SessionGetModel) => {
             let (provider, model_id) = session.get_model().await;
             Ok(serde_json::json!({
                 "provider": provider,
                 "modelId": model_id,
             }))
         }
-        "set_thinking_level" | "setthinkinglevel" => {
+        Some(CommonHostcallOpcode::SessionSetThinkingLevel) => {
             let level = params
                 .get("level")
                 .and_then(Value::as_str)
@@ -20222,11 +19996,11 @@ async fn dispatch_hostcall_session_fast_ref(
                 .await
                 .map(|()| Value::Null)
         }
-        "get_thinking_level" | "getthinkinglevel" => {
+        Some(CommonHostcallOpcode::SessionGetThinkingLevel) => {
             let level = session.get_thinking_level().await;
             Ok(level.map_or(Value::Null, Value::String))
         }
-        "set_label" | "setlabel" => {
+        Some(CommonHostcallOpcode::SessionSetLabel) => {
             let target_id = params
                 .get("targetId")
                 .and_then(Value::as_str)
@@ -20251,7 +20025,7 @@ async fn dispatch_hostcall_session_fast_ref(
                 .await
                 .map(|()| Value::Null)
         }
-        _ => Err(Error::validation(format!("Unknown session op: {op}"))),
+        Some(_) | None => Err(Error::validation(format!("Unknown session op: {op}"))),
     };
 
     match result {
@@ -20356,12 +20130,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "get_active_tools",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20372,12 +20146,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "get_all_tools",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20388,12 +20162,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "set_active_tools",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20404,14 +20178,8 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
-                &call.call_id,
-                manager,
-                ctx.tools,
-                "emit",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_events_ref(&call.call_id, manager, ctx.tools, "emit", &call.params)
+                .await
         }
         CommonHostcallOpcode::EventsList => {
             let Some(ref manager) = ctx.manager else {
@@ -20420,14 +20188,8 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
-                &call.call_id,
-                manager,
-                ctx.tools,
-                "list",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_events_ref(&call.call_id, manager, ctx.tools, "list", &call.params)
+                .await
         }
         // --- New fast-lane session getters (bd-3ar8v.4.12) ---
         CommonHostcallOpcode::SessionGetState => {
@@ -20483,12 +20245,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "get_model",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20499,12 +20261,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "set_model",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20515,12 +20277,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "get_thinking_level",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20531,12 +20293,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "set_thinking_level",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20547,12 +20309,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "get_flag",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20563,12 +20325,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "list_flags",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20579,12 +20341,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "append_entry",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20595,12 +20357,12 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events(
+            dispatch_hostcall_events_ref(
                 &call.call_id,
                 manager,
                 ctx.tools,
                 "register_command",
-                params_without_key(&call.params, "op"),
+                &call.params,
             )
             .await
         }
@@ -20755,15 +20517,7 @@ async fn dispatch_shared_allowed_legacy(
                 ExecMediationResult::Allow => {}
             }
 
-            // Reconstruct exec payload: everything except "cmd".
-            let payload = if let Value::Object(map) = &call.params {
-                let mut out = map.clone();
-                out.remove("cmd");
-                Value::Object(out)
-            } else {
-                Value::Null
-            };
-            dispatch_hostcall_exec(ctx.js_runtime, &call.call_id, cmd, payload).await
+            dispatch_hostcall_exec_ref(ctx.js_runtime, &call.call_id, cmd, &call.params).await
         }
         "http" => dispatch_hostcall_http(&call.call_id, ctx.http, call.params.clone()).await,
         "session" => {
@@ -20785,15 +20539,7 @@ async fn dispatch_shared_allowed_legacy(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            // Reconstruct session payload: everything except "op".
-            let payload = if let Value::Object(map) = &call.params {
-                let mut out = map.clone();
-                out.remove("op");
-                Value::Object(out)
-            } else {
-                Value::Null
-            };
-            dispatch_hostcall_session(&call.call_id, manager, op, payload).await
+            dispatch_hostcall_session_ref(&call.call_id, manager, op, &call.params).await
         }
         "ui" => {
             let op = call
@@ -20814,15 +20560,8 @@ async fn dispatch_shared_allowed_legacy(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            // Reconstruct ui payload: everything except "op".
-            let payload = if let Value::Object(map) = &call.params {
-                let mut out = map.clone();
-                out.remove("op");
-                Value::Object(out)
-            } else {
-                Value::Null
-            };
-            dispatch_hostcall_ui(&call.call_id, manager, op, payload, ctx.extension_id).await
+            dispatch_hostcall_ui_ref(&call.call_id, manager, op, &call.params, ctx.extension_id)
+                .await
         }
         "events" => {
             let op = call
@@ -20843,15 +20582,7 @@ async fn dispatch_shared_allowed_legacy(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            // Reconstruct events payload: everything except "op".
-            let payload = if let Value::Object(map) = &call.params {
-                let mut out = map.clone();
-                out.remove("op");
-                Value::Object(out)
-            } else {
-                Value::Null
-            };
-            dispatch_hostcall_events(&call.call_id, manager, ctx.tools, op, payload).await
+            dispatch_hostcall_events_ref(&call.call_id, manager, ctx.tools, op, &call.params).await
         }
         "log" => dispatch_hostcall_log(&call.call_id, ctx.extension_id, call.params.clone()).await,
         _ => HostcallOutcome::Error {
@@ -20942,6 +20673,16 @@ async fn dispatch_hostcall_exec(
     call_id: &str,
     cmd: &str,
     payload: Value,
+) -> HostcallOutcome {
+    dispatch_hostcall_exec_ref(runtime, call_id, cmd, &payload).await
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+async fn dispatch_hostcall_exec_ref(
+    runtime: Option<&PiJsRuntime>,
+    call_id: &str,
+    cmd: &str,
+    payload: &Value,
 ) -> HostcallOutcome {
     use std::io::{BufRead as _, Read as _};
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -21344,11 +21085,23 @@ const fn hostcall_code_to_str(code: HostCallErrorCode) -> &'static str {
 #[allow(clippy::future_not_send)]
 #[allow(clippy::too_many_lines)]
 async fn dispatch_hostcall_session(
-    _call_id: &str,
+    call_id: &str,
     manager: &ExtensionManager,
     op: &str,
     payload: Value,
 ) -> HostcallOutcome {
+    dispatch_hostcall_session_ref(call_id, manager, op, &payload).await
+}
+
+#[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_lines)]
+async fn dispatch_hostcall_session_ref(
+    call_id: &str,
+    manager: &ExtensionManager,
+    op: &str,
+    payload: &Value,
+) -> HostcallOutcome {
+    let _ = call_id;
     let Some(session) = manager.session_handle() else {
         return HostcallOutcome::Error {
             code: "denied".to_string(),
@@ -21356,145 +21109,177 @@ async fn dispatch_hostcall_session(
         };
     };
 
-    let op_norm = op.trim().to_ascii_lowercase();
-    let result = match op_norm.as_str() {
-        "get_state" | "getstate" => Ok(session.get_state().await),
-        "get_messages" | "getmessages" => serde_json::to_value(session.get_messages().await)
-            .map_err(|err| Error::extension(format!("Serialize messages: {err}"))),
-        "get_entries" | "getentries" => serde_json::to_value(session.get_entries().await)
-            .map_err(|err| Error::extension(format!("Serialize entries: {err}"))),
-        "get_branch" | "getbranch" => serde_json::to_value(session.get_branch().await)
-            .map_err(|err| Error::extension(format!("Serialize branch: {err}"))),
-        "get_file" | "getfile" => {
-            let state = session.get_state().await;
-            let file = state
-                .get("sessionFile")
-                .or_else(|| state.get("session_file"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            Ok(file)
-        }
-        "get_name" | "getname" => {
-            let state = session.get_state().await;
-            let name = state
-                .get("sessionName")
-                .or_else(|| state.get("session_name"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            Ok(name)
-        }
-        "set_name" | "setname" => {
-            let name = payload
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            session.set_name(name).await.map(|()| Value::Null)
-        }
-        "set_model" | "setmodel" => {
-            let provider = payload
-                .get("provider")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let model_id = payload
-                .get("modelId")
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("model_id").and_then(Value::as_str))
-                .unwrap_or_default()
-                .to_string();
-            if provider.is_empty() || model_id.is_empty() {
-                return HostcallOutcome::Error {
-                    code: "invalid_request".to_string(),
-                    message: "setModel: provider and modelId are required".to_string(),
-                };
+    let mut invalidate_ctx_cache = false;
+    let result = if token_eq_ascii_folded(op, "appendmessage") {
+        invalidate_ctx_cache = true;
+        let message_value = if let Some(message) = payload.get("message") {
+            message.clone()
+        } else {
+            match payload {
+                Value::Object(map) => {
+                    if map.contains_key("op") {
+                        let mut without_op = map.clone();
+                        without_op.remove("op");
+                        Value::Object(without_op)
+                    } else {
+                        Value::Object(map.clone())
+                    }
+                }
+                other => other.clone(),
             }
-            session
-                .set_model(provider, model_id)
-                .await
-                .map(|()| Value::Bool(true))
+        };
+        match serde_json::from_value(message_value) {
+            Ok(message) => session.append_message(message).await.map(|()| Value::Null),
+            Err(err) => Err(Error::validation(format!("Parse message: {err}"))),
         }
-        "get_model" | "getmodel" => {
-            let (provider, model_id) = session.get_model().await;
-            Ok(serde_json::json!({
-                "provider": provider,
-                "modelId": model_id,
-            }))
-        }
-        "set_thinking_level" | "setthinkinglevel" => {
-            let level = payload
-                .get("level")
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("thinkingLevel").and_then(Value::as_str))
-                .or_else(|| payload.get("thinking_level").and_then(Value::as_str))
-                .unwrap_or_default()
-                .to_string();
-            if level.is_empty() {
-                return HostcallOutcome::Error {
-                    code: "invalid_request".to_string(),
-                    message: "setThinkingLevel: level is required".to_string(),
-                };
+    } else if token_eq_ascii_folded(op, "appendentry") {
+        invalidate_ctx_cache = true;
+        let custom_type = payload
+            .get("customType")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("custom_type").and_then(Value::as_str))
+            .or_else(|| payload.get("customtype").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        let data = payload.get("data").cloned();
+        session
+            .append_custom_entry(custom_type, data)
+            .await
+            .map(|()| Value::Null)
+    } else {
+        match parse_session_opcode_atom(op) {
+            Some(CommonHostcallOpcode::SessionGetState) => Ok(session.get_state().await),
+            Some(CommonHostcallOpcode::SessionGetMessages) => {
+                serde_json::to_value(session.get_messages().await)
+                    .map_err(|err| Error::extension(format!("Serialize messages: {err}")))
             }
-            session
-                .set_thinking_level(level)
-                .await
-                .map(|()| Value::Null)
-        }
-        "get_thinking_level" | "getthinkinglevel" => {
-            let level = session.get_thinking_level().await;
-            Ok(level.map_or(Value::Null, Value::String))
-        }
-        "append_message" | "appendmessage" => {
-            let message_value = payload.get("message").cloned().unwrap_or(payload);
-            match serde_json::from_value(message_value) {
-                Ok(message) => session.append_message(message).await.map(|()| Value::Null),
-                Err(err) => Err(Error::validation(format!("Parse message: {err}"))),
+            Some(CommonHostcallOpcode::SessionGetEntries) => {
+                serde_json::to_value(session.get_entries().await)
+                    .map_err(|err| Error::extension(format!("Serialize entries: {err}")))
             }
-        }
-        "append_entry" | "appendentry" => {
-            let custom_type = payload
-                .get("customType")
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("custom_type").and_then(Value::as_str))
-                .or_else(|| payload.get("customtype").and_then(Value::as_str))
-                .unwrap_or_default()
-                .to_string();
-            let data = payload.get("data").cloned();
-            session
-                .append_custom_entry(custom_type, data)
-                .await
-                .map(|()| Value::Null)
-        }
-        "set_label" | "setlabel" => {
-            let target_id = payload
-                .get("targetId")
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("target_id").and_then(Value::as_str))
-                .or_else(|| payload.get("entryId").and_then(Value::as_str))
-                .or_else(|| payload.get("entry_id").and_then(Value::as_str))
-                .unwrap_or_default()
-                .to_string();
-            if target_id.is_empty() {
-                return HostcallOutcome::Error {
-                    code: "invalid_request".to_string(),
-                    message: "setLabel: targetId is required".to_string(),
-                };
+            Some(CommonHostcallOpcode::SessionGetBranch) => {
+                serde_json::to_value(session.get_branch().await)
+                    .map_err(|err| Error::extension(format!("Serialize branch: {err}")))
             }
-            let label = payload
-                .get("label")
-                .and_then(Value::as_str)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            session
-                .set_label(target_id, label)
-                .await
-                .map(|()| Value::Null)
+            Some(CommonHostcallOpcode::SessionGetFile) => {
+                let state = session.get_state().await;
+                let file = state
+                    .get("sessionFile")
+                    .or_else(|| state.get("session_file"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                Ok(file)
+            }
+            Some(CommonHostcallOpcode::SessionGetName) => {
+                let state = session.get_state().await;
+                let name = state
+                    .get("sessionName")
+                    .or_else(|| state.get("session_name"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                Ok(name)
+            }
+            Some(CommonHostcallOpcode::SessionSetName) => {
+                invalidate_ctx_cache = true;
+                let name = payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                session.set_name(name).await.map(|()| Value::Null)
+            }
+            Some(CommonHostcallOpcode::SessionSetModel) => {
+                invalidate_ctx_cache = true;
+                let provider = payload
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let model_id = payload
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("model_id").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                if provider.is_empty() || model_id.is_empty() {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "setModel: provider and modelId are required".to_string(),
+                    };
+                }
+                session
+                    .set_model(provider, model_id)
+                    .await
+                    .map(|()| Value::Bool(true))
+            }
+            Some(CommonHostcallOpcode::SessionGetModel) => {
+                let (provider, model_id) = session.get_model().await;
+                Ok(serde_json::json!({
+                    "provider": provider,
+                    "modelId": model_id,
+                }))
+            }
+            Some(CommonHostcallOpcode::SessionSetThinkingLevel) => {
+                invalidate_ctx_cache = true;
+                let level = payload
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("thinkingLevel").and_then(Value::as_str))
+                    .or_else(|| payload.get("thinking_level").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                if level.is_empty() {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "setThinkingLevel: level is required".to_string(),
+                    };
+                }
+                session
+                    .set_thinking_level(level)
+                    .await
+                    .map(|()| Value::Null)
+            }
+            Some(CommonHostcallOpcode::SessionGetThinkingLevel) => {
+                let level = session.get_thinking_level().await;
+                Ok(level.map_or(Value::Null, Value::String))
+            }
+            Some(CommonHostcallOpcode::SessionSetLabel) => {
+                invalidate_ctx_cache = true;
+                let target_id = payload
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("target_id").and_then(Value::as_str))
+                    .or_else(|| payload.get("entryId").and_then(Value::as_str))
+                    .or_else(|| payload.get("entry_id").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                if target_id.is_empty() {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "setLabel: targetId is required".to_string(),
+                    };
+                }
+                let label = payload
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                session
+                    .set_label(target_id, label)
+                    .await
+                    .map(|()| Value::Null)
+            }
+            Some(_) | None => Err(Error::validation(format!("Unknown session op: {op}"))),
         }
-        _ => Err(Error::validation(format!("Unknown session op: {op}"))),
     };
 
     match result {
-        Ok(value) => HostcallOutcome::Success(value),
+        Ok(value) => {
+            if invalidate_ctx_cache {
+                manager.invalidate_ctx_cache();
+            }
+            HostcallOutcome::Success(value)
+        }
         Err(err) => {
             let code = err.hostcall_error_code().to_string();
             HostcallOutcome::Error {
@@ -21513,6 +21298,17 @@ async fn dispatch_hostcall_ui(
     payload: Value,
     extension_id: Option<&str>,
 ) -> HostcallOutcome {
+    dispatch_hostcall_ui_ref(call_id, manager, op, &payload, extension_id).await
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall_ui_ref(
+    call_id: &str,
+    manager: &ExtensionManager,
+    op: &str,
+    payload: &Value,
+    extension_id: Option<&str>,
+) -> HostcallOutcome {
     let op = op.trim();
     if op.is_empty() {
         return HostcallOutcome::Error {
@@ -21524,7 +21320,7 @@ async fn dispatch_hostcall_ui(
     let request = ExtensionUiRequest {
         id: call_id.to_string(),
         method: op.to_string(),
-        payload,
+        payload: params_without_key(payload, "op"),
         timeout_ms: None,
         extension_id: extension_id.map(ToString::to_string),
     };
@@ -21677,34 +21473,91 @@ async fn dispatch_hostcall_log(
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventsHostcallOp {
+    GetActiveTools,
+    GetAllTools,
+    SetActiveTools,
+    AppendEntry,
+    SendMessage,
+    SendUserMessage,
+    RegisterCommand,
+    RegisterProvider,
+    GetModel,
+    SetModel,
+    GetThinkingLevel,
+    SetThinkingLevel,
+    RegisterFlag,
+    GetFlag,
+    ListFlags,
+}
+
+fn parse_events_hostcall_op(op: &str) -> Option<EventsHostcallOp> {
+    with_folded_ascii_alnum_token(op, |folded| match folded {
+        b"getactivetools" => Some(EventsHostcallOp::GetActiveTools),
+        b"getalltools" => Some(EventsHostcallOp::GetAllTools),
+        b"setactivetools" => Some(EventsHostcallOp::SetActiveTools),
+        b"appendentry" => Some(EventsHostcallOp::AppendEntry),
+        b"registercommand" => Some(EventsHostcallOp::RegisterCommand),
+        b"getmodel" => Some(EventsHostcallOp::GetModel),
+        b"setmodel" => Some(EventsHostcallOp::SetModel),
+        b"getthinkinglevel" => Some(EventsHostcallOp::GetThinkingLevel),
+        b"setthinkinglevel" => Some(EventsHostcallOp::SetThinkingLevel),
+        b"getflag" => Some(EventsHostcallOp::GetFlag),
+        b"listflags" => Some(EventsHostcallOp::ListFlags),
+        b"sendmessage" => Some(EventsHostcallOp::SendMessage),
+        b"sendusermessage" => Some(EventsHostcallOp::SendUserMessage),
+        b"registerprovider" => Some(EventsHostcallOp::RegisterProvider),
+        b"registerflag" => Some(EventsHostcallOp::RegisterFlag),
+        _ => None,
+    })
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn dispatch_hostcall_events(
-    _call_id: &str,
+    call_id: &str,
     manager: &ExtensionManager,
     tools: &ToolRegistry,
     op: &str,
     payload: Value,
 ) -> HostcallOutcome {
-    let op_norm = op.trim().to_ascii_lowercase();
-    match op_norm.as_str() {
-        "getactivetools" | "get_active_tools" => {
+    dispatch_hostcall_events_ref(call_id, manager, tools, op, &payload).await
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+async fn dispatch_hostcall_events_ref(
+    call_id: &str,
+    manager: &ExtensionManager,
+    tools: &ToolRegistry,
+    op: &str,
+    payload: &Value,
+) -> HostcallOutcome {
+    let _ = call_id;
+    let Some(op_kind) = parse_events_hostcall_op(op) else {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: format!("Unknown events op: {}", op.trim()),
+        };
+    };
+
+    match op_kind {
+        EventsHostcallOp::GetActiveTools => {
             let active = manager
                 .active_tools()
                 .unwrap_or_else(|| tools.tools().iter().map(|t| t.name().to_string()).collect());
             HostcallOutcome::Success(json!({ "tools": active }))
         }
-        "getalltools" | "get_all_tools" => {
-            let mut result: Vec<Value> = tools
-                .tools()
-                .iter()
-                .map(|t| {
-                    json!({
-                        "name": t.name(),
-                        "description": t.description(),
-                    })
-                })
-                .collect();
-            for def in manager.extension_tool_defs() {
+        EventsHostcallOp::GetAllTools => {
+            let tool_defs = manager.extension_tool_defs();
+            let builtins = tools.tools();
+            let mut result = Vec::with_capacity(builtins.len() + tool_defs.len());
+            for tool in builtins {
+                result.push(json!({
+                    "name": tool.name(),
+                    "description": tool.description(),
+                }));
+            }
+            for def in tool_defs {
                 let name = def.get("name").and_then(Value::as_str).unwrap_or_default();
                 let description = def
                     .get("description")
@@ -21717,7 +21570,7 @@ async fn dispatch_hostcall_events(
             }
             HostcallOutcome::Success(json!({ "tools": result }))
         }
-        "setactivetools" | "set_active_tools" => {
+        EventsHostcallOp::SetActiveTools => {
             let tools = payload
                 .get("tools")
                 .and_then(Value::as_array)
@@ -21732,7 +21585,7 @@ async fn dispatch_hostcall_events(
             manager.set_active_tools(tools);
             HostcallOutcome::Success(Value::Null)
         }
-        "appendentry" | "append_entry" => {
+        EventsHostcallOp::AppendEntry => {
             let Some(session) = manager.session_handle() else {
                 return HostcallOutcome::Error {
                     code: "denied".to_string(),
@@ -21748,14 +21601,17 @@ async fn dispatch_hostcall_events(
                 .to_string();
             let data = payload.get("data").cloned();
             match session.append_custom_entry(custom_type, data).await {
-                Ok(()) => HostcallOutcome::Success(Value::Null),
+                Ok(()) => {
+                    manager.invalidate_ctx_cache();
+                    HostcallOutcome::Success(Value::Null)
+                }
                 Err(err) => HostcallOutcome::Error {
                     code: "io".to_string(),
                     message: err.to_string(),
                 },
             }
         }
-        "sendmessage" | "send_message" => {
+        EventsHostcallOp::SendMessage => {
             let Some(actions) = manager.host_actions() else {
                 return HostcallOutcome::Error {
                     code: "denied".to_string(),
@@ -21830,7 +21686,7 @@ async fn dispatch_hostcall_events(
                 },
             }
         }
-        "sendusermessage" | "send_user_message" => {
+        EventsHostcallOp::SendUserMessage => {
             let Some(actions) = manager.host_actions() else {
                 return HostcallOutcome::Error {
                     code: "denied".to_string(),
@@ -21876,7 +21732,7 @@ async fn dispatch_hostcall_events(
                 },
             }
         }
-        "registercommand" | "register_command" => {
+        EventsHostcallOp::RegisterCommand => {
             let name = payload
                 .get("name")
                 .and_then(Value::as_str)
@@ -21896,7 +21752,7 @@ async fn dispatch_hostcall_events(
             manager.register_command(&name, description.as_deref());
             HostcallOutcome::Success(Value::Null)
         }
-        "registerprovider" | "register_provider" => {
+        EventsHostcallOp::RegisterProvider => {
             let id = payload
                 .get("id")
                 .and_then(Value::as_str)
@@ -21938,10 +21794,10 @@ async fn dispatch_hostcall_events(
                     };
                 }
             }
-            manager.register_provider(payload);
+            manager.register_provider(params_without_key(payload, "op"));
             HostcallOutcome::Success(Value::Null)
         }
-        "getmodel" | "get_model" => {
+        EventsHostcallOp::GetModel => {
             // Prefer session-authoritative state; fall back to in-memory cache.
             let (provider, model_id) = if let Some(session) = manager.session_handle() {
                 session.get_model().await
@@ -21953,7 +21809,7 @@ async fn dispatch_hostcall_events(
                 "modelId": model_id,
             }))
         }
-        "setmodel" | "set_model" => {
+        EventsHostcallOp::SetModel => {
             let provider = payload
                 .get("provider")
                 .and_then(Value::as_str)
@@ -21982,7 +21838,7 @@ async fn dispatch_hostcall_events(
             }
             HostcallOutcome::Success(Value::Null)
         }
-        "getthinkinglevel" | "get_thinking_level" => {
+        EventsHostcallOp::GetThinkingLevel => {
             // Prefer session-authoritative state; fall back to in-memory cache.
             let level = if let Some(session) = manager.session_handle() {
                 session.get_thinking_level().await
@@ -21991,7 +21847,7 @@ async fn dispatch_hostcall_events(
             };
             HostcallOutcome::Success(json!({ "thinkingLevel": level }))
         }
-        "setthinkinglevel" | "set_thinking_level" => {
+        EventsHostcallOp::SetThinkingLevel => {
             let level = payload
                 .get("thinkingLevel")
                 .and_then(Value::as_str)
@@ -22015,7 +21871,7 @@ async fn dispatch_hostcall_events(
             }
             HostcallOutcome::Success(Value::Null)
         }
-        "registerflag" | "register_flag" => {
+        EventsHostcallOp::RegisterFlag => {
             let name = payload
                 .get("name")
                 .and_then(Value::as_str)
@@ -22028,10 +21884,10 @@ async fn dispatch_hostcall_events(
                     message: "registerFlag: name is required".to_string(),
                 };
             }
-            manager.register_flag(payload);
+            manager.register_flag(params_without_key(payload, "op"));
             HostcallOutcome::Success(Value::Null)
         }
-        "getflag" | "get_flag" => {
+        EventsHostcallOp::GetFlag => {
             let name = payload
                 .get("name")
                 .and_then(Value::as_str)
@@ -22052,14 +21908,10 @@ async fn dispatch_hostcall_events(
                 HostcallOutcome::Success(f.clone())
             })
         }
-        "listflags" | "list_flags" => {
+        EventsHostcallOp::ListFlags => {
             let flags = manager.list_flags();
             HostcallOutcome::Success(json!(flags))
         }
-        _ => HostcallOutcome::Error {
-            code: "invalid_request".to_string(),
-            message: format!("Unknown events op: {}", op.trim()),
-        },
     }
 }
 
@@ -25551,6 +25403,7 @@ impl ExtensionManager {
     pub fn set_current_thinking_level(&self, level: Option<String>) {
         let mut guard = self.inner.lock().unwrap();
         guard.current_thinking_level = level;
+        guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
         self.refresh_snapshot_with_guard_release(guard);
     }
 
@@ -26116,10 +25969,15 @@ impl ExtensionManager {
         let mut response = None;
         if let Some(runtime) = runtime {
             if has_hook {
+                #[cfg(feature = "wasm-host")]
+                let runtime_event_payload = event_payload.clone();
+                #[cfg(not(feature = "wasm-host"))]
+                let runtime_event_payload = event_payload;
+
                 let js_response = runtime
                     .dispatch_event(
                         event_name.clone(),
-                        event_payload.clone(),
+                        runtime_event_payload,
                         Arc::clone(&ctx_payload),
                         timeout_ms,
                     )
@@ -31059,6 +30917,28 @@ mod tests {
     }
 
     #[test]
+    fn events_set_thinking_level_invalidates_ctx_cache_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            let gen_before = manager.inner.lock().unwrap().ctx_generation;
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "setThinkingLevel",
+                json!({ "thinkingLevel": "high" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let gen_after = manager.inner.lock().unwrap().ctx_generation;
+            assert_eq!(gen_after, gen_before + 1);
+        });
+    }
+
+    #[test]
     fn events_set_model_snake_case_variant() {
         asupersync::test_utils::run_test(|| async {
             let manager = ExtensionManager::new();
@@ -31218,6 +31098,28 @@ mod tests {
                 }
             };
             assert_eq!(value.as_str(), Some("My Feature Work"));
+        });
+    }
+
+    #[test]
+    fn session_set_name_invalidates_ctx_cache_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let gen_before = manager.inner.lock().unwrap().ctx_generation;
+            let outcome = dispatch_hostcall_session(
+                "call-1",
+                &manager,
+                "set_name",
+                json!({ "name": "My Feature Work" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let gen_after = manager.inner.lock().unwrap().ctx_generation;
+            assert_eq!(gen_after, gen_before + 1);
         });
     }
 
@@ -31636,6 +31538,33 @@ mod tests {
             .await;
 
             assert!(matches!(outcome, HostcallOutcome::Success(_)));
+        });
+    }
+
+    #[test]
+    fn events_append_entry_invalidates_ctx_cache_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let gen_before = manager.inner.lock().unwrap().ctx_generation;
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "appendEntry",
+                json!({
+                    "customType": "annotation",
+                    "data": { "note": "ctx bump expected" }
+                }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let gen_after = manager.inner.lock().unwrap().ctx_generation;
+            assert_eq!(gen_after, gen_before + 1);
         });
     }
 
@@ -46307,6 +46236,15 @@ mod tests {
         let mgr = ExtensionManager::new();
         let gen_before = mgr.inner.lock().unwrap().ctx_generation;
         mgr.set_current_model(Some("anthropic".to_string()), Some("claude-3".to_string()));
+        let gen_after = mgr.inner.lock().unwrap().ctx_generation;
+        assert_eq!(gen_after, gen_before + 1);
+    }
+
+    #[test]
+    fn ctx_generation_increments_on_thinking_level_change() {
+        let mgr = ExtensionManager::new();
+        let gen_before = mgr.inner.lock().unwrap().ctx_generation;
+        mgr.set_current_thinking_level(Some("high".to_string()));
         let gen_after = mgr.inner.lock().unwrap().ctx_generation;
         assert_eq!(gen_after, gen_before + 1);
     }

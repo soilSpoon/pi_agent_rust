@@ -219,6 +219,23 @@ fn canonical_op_params(op: &str, payload: &serde_json::Value) -> serde_json::Val
     serde_json::Value::Object(obj)
 }
 
+fn builtin_tool_required_capability(name: &str) -> &'static str {
+    let name = name.trim();
+    if name.eq_ignore_ascii_case("read")
+        || name.eq_ignore_ascii_case("grep")
+        || name.eq_ignore_ascii_case("find")
+        || name.eq_ignore_ascii_case("ls")
+    {
+        "read"
+    } else if name.eq_ignore_ascii_case("write") || name.eq_ignore_ascii_case("edit") {
+        "write"
+    } else if name.eq_ignore_ascii_case("bash") {
+        "exec"
+    } else {
+        "tool"
+    }
+}
+
 impl HostcallRequest {
     #[must_use]
     pub const fn method(&self) -> &'static str {
@@ -234,26 +251,21 @@ impl HostcallRequest {
     }
 
     #[must_use]
-    pub fn required_capability(&self) -> String {
+    pub fn required_capability(&self) -> &'static str {
         match &self.kind {
-            HostcallKind::Tool { name } => match name.trim().to_ascii_lowercase().as_str() {
-                "read" | "grep" | "find" | "ls" => "read".to_string(),
-                "write" | "edit" => "write".to_string(),
-                "bash" => "exec".to_string(),
-                _ => "tool".to_string(),
-            },
-            HostcallKind::Exec { .. } => "exec".to_string(),
-            HostcallKind::Http => "http".to_string(),
-            HostcallKind::Session { .. } => "session".to_string(),
-            HostcallKind::Ui { .. } => "ui".to_string(),
-            HostcallKind::Events { .. } => "events".to_string(),
-            HostcallKind::Log => "log".to_string(),
+            HostcallKind::Tool { name } => builtin_tool_required_capability(name),
+            HostcallKind::Exec { .. } => "exec",
+            HostcallKind::Http => "http",
+            HostcallKind::Session { .. } => "session",
+            HostcallKind::Ui { .. } => "ui",
+            HostcallKind::Events { .. } => "events",
+            HostcallKind::Log => "log",
         }
     }
 
     #[must_use]
     pub fn io_uring_capability_class(&self) -> HostcallCapabilityClass {
-        HostcallCapabilityClass::from_capability(&self.required_capability())
+        HostcallCapabilityClass::from_capability(self.required_capability())
     }
 
     #[must_use]
@@ -261,11 +273,22 @@ impl HostcallRequest {
         match &self.kind {
             HostcallKind::Http => HostcallIoHint::IoHeavy,
             HostcallKind::Exec { .. } => HostcallIoHint::CpuBound,
-            HostcallKind::Tool { name } => match name.trim().to_ascii_lowercase().as_str() {
-                "read" | "write" | "edit" | "grep" | "find" | "ls" => HostcallIoHint::IoHeavy,
-                "bash" => HostcallIoHint::CpuBound,
-                _ => HostcallIoHint::Unknown,
-            },
+            HostcallKind::Tool { name } => {
+                let name = name.trim();
+                if name.eq_ignore_ascii_case("read")
+                    || name.eq_ignore_ascii_case("write")
+                    || name.eq_ignore_ascii_case("edit")
+                    || name.eq_ignore_ascii_case("grep")
+                    || name.eq_ignore_ascii_case("find")
+                    || name.eq_ignore_ascii_case("ls")
+                {
+                    HostcallIoHint::IoHeavy
+                } else if name.eq_ignore_ascii_case("bash") {
+                    HostcallIoHint::CpuBound
+                } else {
+                    HostcallIoHint::Unknown
+                }
+            }
             HostcallKind::Session { .. }
             | HostcallKind::Ui { .. }
             | HostcallKind::Events { .. }

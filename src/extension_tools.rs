@@ -183,9 +183,9 @@ impl Tool for ExtensionToolWrapper {
     ) -> Result<ToolOutput> {
         let result = self
             .runtime
-            .execute_tool(
-                self.def.name.clone(),
-                tool_call_id.to_string(),
+            .execute_tool_ref(
+                &self.def.name,
+                tool_call_id,
                 input,
                 Arc::clone(&self.ctx_payload),
                 self.timeout_ms,

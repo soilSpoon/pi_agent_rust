@@ -7,9 +7,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
@@ -26,12 +24,12 @@ use crate::connectors::{Connector, http::HttpConnector};
 use crate::error::Result;
 use crate::extensions::EXTENSION_EVENT_TIMEOUT_MS;
 use crate::extensions::{
-    Capability, DangerousCommandClass, ExecMediationResult, ExtensionBody, ExtensionMessage,
-    ExtensionPolicy, ExtensionSession, ExtensionUiRequest, ExtensionUiResponse, HostCallError,
-    HostCallErrorCode, HostCallPayload, HostResultPayload, HostStreamChunk, PROTOCOL_VERSION,
-    PolicyCheck, PolicyDecision, PolicyProfile, PolicySnapshot, classify_ui_hostcall_error,
+    DangerousCommandClass, ExecMediationResult, ExtensionBody, ExtensionMessage, ExtensionPolicy,
+    ExtensionSession, ExtensionUiRequest, ExtensionUiResponse, HostCallError, HostCallErrorCode,
+    HostCallPayload, HostResultPayload, HostStreamChunk, PROTOCOL_VERSION, PolicyCheck,
+    PolicyDecision, PolicyProfile, PolicySnapshot, classify_ui_hostcall_error,
     evaluate_exec_mediation, hash_canonical_json, required_capability_for_host_call_static,
-    ui_response_value_for_op,
+    ui_response_value_for_op, validate_host_call,
 };
 use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, js_to_json, json_to_js};
 use crate::hostcall_amac::{AmacBatchExecutor, AmacBatchExecutorConfig};
@@ -152,7 +150,18 @@ fn policy_snapshot_version(policy: &ExtensionPolicy) -> String {
 }
 
 fn policy_lookup_path(capability: &str) -> &'static str {
-    if Capability::parse(capability).is_some() {
+    let capability = capability.trim();
+    if capability.eq_ignore_ascii_case("read")
+        || capability.eq_ignore_ascii_case("write")
+        || capability.eq_ignore_ascii_case("exec")
+        || capability.eq_ignore_ascii_case("env")
+        || capability.eq_ignore_ascii_case("http")
+        || capability.eq_ignore_ascii_case("session")
+        || capability.eq_ignore_ascii_case("events")
+        || capability.eq_ignore_ascii_case("ui")
+        || capability.eq_ignore_ascii_case("log")
+        || capability.eq_ignore_ascii_case("tool")
+    {
         "policy_snapshot_table"
     } else {
         "policy_snapshot_fallback"
@@ -160,28 +169,36 @@ fn policy_lookup_path(capability: &str) -> &'static str {
 }
 
 fn protocol_error_code(code: &str) -> HostCallErrorCode {
-    match code.trim().to_ascii_lowercase().as_str() {
-        "timeout" => HostCallErrorCode::Timeout,
-        "denied" => HostCallErrorCode::Denied,
-        "io" | "tool_error" => HostCallErrorCode::Io,
-        "invalid_request" => HostCallErrorCode::InvalidRequest,
-        _ => HostCallErrorCode::Internal,
+    let code = code.trim();
+    if code.eq_ignore_ascii_case("timeout") {
+        HostCallErrorCode::Timeout
+    } else if code.eq_ignore_ascii_case("denied") {
+        HostCallErrorCode::Denied
+    } else if code.eq_ignore_ascii_case("io") || code.eq_ignore_ascii_case("tool_error") {
+        HostCallErrorCode::Io
+    } else if code.eq_ignore_ascii_case("invalid_request") {
+        HostCallErrorCode::InvalidRequest
+    } else {
+        HostCallErrorCode::Internal
     }
 }
 
 fn protocol_error_fallback_reason(method: &str, code: &str) -> &'static str {
-    match code.trim().to_ascii_lowercase().as_str() {
-        "denied" => "policy_denied",
-        "timeout" => "handler_timeout",
-        "io" | "tool_error" => "handler_error",
-        "invalid_request" => {
-            if parse_protocol_hostcall_method(method).is_some() {
-                "schema_validation_failed"
-            } else {
-                "unsupported_method_fallback"
-            }
+    let code = code.trim();
+    if code.eq_ignore_ascii_case("denied") {
+        "policy_denied"
+    } else if code.eq_ignore_ascii_case("timeout") {
+        "handler_timeout"
+    } else if code.eq_ignore_ascii_case("io") || code.eq_ignore_ascii_case("tool_error") {
+        "handler_error"
+    } else if code.eq_ignore_ascii_case("invalid_request") {
+        if parse_protocol_hostcall_method(method).is_some() {
+            "schema_validation_failed"
+        } else {
+            "unsupported_method_fallback"
         }
-        _ => "runtime_internal_error",
+    } else {
+        "runtime_internal_error"
     }
 }
 
@@ -597,7 +614,14 @@ fn should_sample_shadow_dual_exec(request: &HostcallRequest, sample_ppm: u32) ->
 }
 
 fn normalized_shadow_op(op: &str) -> String {
-    op.trim().to_ascii_lowercase().replace('_', "")
+    let trimmed = op.trim();
+    let mut normalized = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch != '_' {
+            normalized.push(ch.to_ascii_lowercase());
+        }
+    }
+    normalized
 }
 
 fn shadow_safe_session_op(op: &str) -> bool {
@@ -687,17 +711,26 @@ fn io_uring_force_compat_from_env() -> bool {
 fn hostcall_io_hint(kind: &HostcallKind) -> HostcallIoHint {
     match kind {
         HostcallKind::Http => HostcallIoHint::IoHeavy,
-        HostcallKind::Tool { name } => match name.trim().to_ascii_lowercase().as_str() {
-            "read" | "write" | "grep" | "find" | "ls" => HostcallIoHint::IoHeavy,
-            _ => HostcallIoHint::Unknown,
-        },
+        HostcallKind::Tool { name } => {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("read")
+                || name.eq_ignore_ascii_case("write")
+                || name.eq_ignore_ascii_case("grep")
+                || name.eq_ignore_ascii_case("find")
+                || name.eq_ignore_ascii_case("ls")
+            {
+                HostcallIoHint::IoHeavy
+            } else {
+                HostcallIoHint::Unknown
+            }
+        }
         HostcallKind::Session { op } => {
-            let normalized = normalized_shadow_op(op);
-            if normalized.contains("save")
-                || normalized.contains("append")
-                || normalized.contains("write")
-                || normalized.contains("export")
-                || normalized.contains("import")
+            let lower = op.trim().to_ascii_lowercase();
+            if lower.contains("save")
+                || lower.contains("append")
+                || lower.contains("write")
+                || lower.contains("export")
+                || lower.contains("import")
             {
                 HostcallIoHint::IoHeavy
             } else {
@@ -758,13 +791,28 @@ struct IoUringBridgeDispatch {
     fallback_reason: Option<&'static str>,
 }
 
-fn clone_payload_object_without_reserved(
+fn clone_payload_object_without_key(
     map: &serde_json::Map<String, Value>,
-    reserved_keys: &[&str],
+    reserved_key: &str,
 ) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::with_capacity(map.len());
     for (key, value) in map {
-        if reserved_keys.iter().any(|reserved| *reserved == key) {
+        if key == reserved_key {
+            continue;
+        }
+        out.insert(key.clone(), value.clone());
+    }
+    out
+}
+
+fn clone_payload_object_without_two_keys(
+    map: &serde_json::Map<String, Value>,
+    reserved_a: &str,
+    reserved_b: &str,
+) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        if key == reserved_a || key == reserved_b {
             continue;
         }
         out.insert(key.clone(), value.clone());
@@ -782,9 +830,7 @@ fn protocol_params_from_request(request: &HostcallRequest) -> Value {
         }
         HostcallKind::Exec { cmd } => {
             let mut object = match &request.payload {
-                Value::Object(map) => {
-                    clone_payload_object_without_reserved(map, &["command", "cmd"])
-                }
+                Value::Object(map) => clone_payload_object_without_two_keys(map, "command", "cmd"),
                 Value::Null => serde_json::Map::new(),
                 other => {
                     let mut out = serde_json::Map::new();
@@ -798,7 +844,7 @@ fn protocol_params_from_request(request: &HostcallRequest) -> Value {
         HostcallKind::Http | HostcallKind::Log => request.payload.clone(),
         HostcallKind::Session { op } | HostcallKind::Ui { op } | HostcallKind::Events { op } => {
             let mut object = match &request.payload {
-                Value::Object(map) => clone_payload_object_without_reserved(map, &["op"]),
+                Value::Object(map) => clone_payload_object_without_key(map, "op"),
                 Value::Null => serde_json::Map::new(),
                 other => {
                     let mut out = serde_json::Map::new();
@@ -1433,28 +1479,61 @@ fn shannon_entropy_bytes(bytes: &[u8]) -> f64 {
 }
 
 fn hostcall_opcode_entropy(kind: &HostcallKind, payload: &Value) -> f64 {
-    let mut key_material = hostcall_kind_label(kind).as_bytes().to_vec();
-    if let Some(op) = payload
+    let kind_label = hostcall_kind_label(kind);
+    let op = payload
         .get("op")
         .or_else(|| payload.get("method"))
         .or_else(|| payload.get("name"))
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        key_material.push(b':');
-        key_material.extend_from_slice(op.as_bytes());
-    }
-    if let Some(capability) = payload
+        .filter(|value| !value.is_empty());
+    let capability = payload
         .get("capability")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        key_material.push(b':');
-        key_material.extend_from_slice(capability.as_bytes());
+        .filter(|value| !value.is_empty());
+
+    // Build the byte histogram directly from segments to avoid per-call
+    // temporary Vec allocation on the hostcall fast path.
+    let mut counts = [0_u32; 256];
+    let mut total = 0_u32;
+
+    for &byte in kind_label.as_bytes() {
+        counts[usize::from(byte)] = counts[usize::from(byte)].saturating_add(1);
+        total = total.saturating_add(1);
     }
-    shannon_entropy_bytes(&key_material)
+
+    if let Some(op) = op {
+        counts[usize::from(b':')] = counts[usize::from(b':')].saturating_add(1);
+        total = total.saturating_add(1);
+        for &byte in op.as_bytes() {
+            counts[usize::from(byte)] = counts[usize::from(byte)].saturating_add(1);
+            total = total.saturating_add(1);
+        }
+    }
+
+    if let Some(capability) = capability {
+        counts[usize::from(b':')] = counts[usize::from(b':')].saturating_add(1);
+        total = total.saturating_add(1);
+        for &byte in capability.as_bytes() {
+            counts[usize::from(byte)] = counts[usize::from(byte)].saturating_add(1);
+            total = total.saturating_add(1);
+        }
+    }
+
+    if total == 0 {
+        return 0.0;
+    }
+
+    let total_f = f64::from(total);
+    counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let probability = f64::from(count) / total_f;
+            -(probability * (probability.ln() / std::f64::consts::LN_2))
+        })
+        .sum()
 }
 
 impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
@@ -1654,6 +1733,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     fn emit_io_uring_lane_telemetry(
         &self,
         request: &HostcallRequest,
+        capability: &str,
         capability_class: HostcallCapabilityClass,
         io_hint: HostcallIoHint,
         queue_depth: usize,
@@ -1669,7 +1749,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             call_id = request.call_id,
             extension_id = %request.extension_id.as_deref().unwrap_or("<none>"),
             method = request.method(),
-            capability = %request.required_capability(),
+            capability = %capability,
             capability_class = hostcall_capability_label(capability_class),
             io_hint = hostcall_io_hint_label(io_hint),
             selected_lane = selected_lane.as_str(),
@@ -1702,6 +1782,12 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             io_uring_force_compat = self.io_uring_force_compat,
             "Hostcall io_uring bridge dispatch completed"
         );
+    }
+
+    fn advanced_dispatch_enabled(&self) -> bool {
+        self.dual_exec_config.sample_ppm > 0
+            || self.io_uring_lane_config.enabled
+            || self.io_uring_force_compat
     }
 
     /// Drain pending hostcall requests from the JS runtime.
@@ -1794,7 +1880,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     async fn dispatch_hostcall_compat_shadow(&self, request: &HostcallRequest) -> HostcallOutcome {
         let payload = HostCallPayload {
             call_id: request.call_id.clone(),
-            capability: request.required_capability(),
+            capability: request.required_capability().to_string(),
             method: request.method().to_string(),
             params: protocol_params_from_request(request),
             timeout_ms: None,
@@ -1888,100 +1974,100 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
 
     /// Dispatch a hostcall and enqueue its completion into the JS scheduler.
     #[allow(clippy::future_not_send)]
-    pub fn dispatch_and_complete(
-        &self,
-        request: HostcallRequest,
-    ) -> Pin<Box<dyn Future<Output = ()> + '_>> {
-        Box::pin(async move {
-            let cap = request.required_capability();
-            let (check, lookup_path) = self.policy_lookup(&cap, request.extension_id.as_deref());
-            self.emit_policy_decision_telemetry(
-                &cap,
-                request.extension_id.as_deref(),
-                lookup_path,
-                &check,
-            );
-            if check.decision != PolicyDecision::Allow {
-                let outcome = HostcallOutcome::Error {
-                    code: "denied".to_string(),
-                    message: format!("Capability '{}' denied by policy ({})", cap, check.reason),
-                };
-                self.js_runtime()
-                    .complete_hostcall(request.call_id, outcome);
-                return;
-            }
-
-            let queue_snapshot = self.js_runtime().hostcall_queue_telemetry();
-            let queue_depth = queue_snapshot.total_depth;
-            let overflow_depth = queue_snapshot.overflow_depth;
-            let overflow_rejected_total = queue_snapshot.overflow_rejected_total;
-            let dispatch_started_at = Instant::now();
-            let opcode_entropy = hostcall_opcode_entropy(&request.kind, &request.payload);
-            let io_hint = hostcall_io_hint(&request.kind);
-            let capability_class = HostcallCapabilityClass::from_capability(&cap);
-            let lane_decision = decide_io_uring_lane(
-                self.io_uring_lane_config,
-                IoUringLaneDecisionInput {
-                    capability: capability_class,
-                    io_hint,
-                    queue_depth,
-                    force_compat_lane: self.io_uring_force_compat,
-                },
-            );
-            self.emit_io_uring_lane_telemetry(
-                &request,
-                capability_class,
-                io_hint,
-                queue_depth,
-                lane_decision.lane,
-                lane_decision.fallback_code(),
-            );
-
-            let outcome = match lane_decision.lane {
-                HostcallDispatchLane::Fast => self.dispatch_hostcall_fast(&request).await,
-                HostcallDispatchLane::IoUring => {
-                    let bridge_dispatch = self.dispatch_hostcall_io_uring(&request).await;
-                    self.emit_io_uring_bridge_telemetry(
-                        &request,
-                        bridge_dispatch.state,
-                        bridge_dispatch.fallback_reason,
-                    );
-                    bridge_dispatch.outcome
-                }
-                HostcallDispatchLane::Compat => {
-                    self.dispatch_hostcall_compat_shadow(&request).await
-                }
+    pub async fn dispatch_and_complete(&self, request: HostcallRequest) {
+        let cap = request.required_capability();
+        let (check, lookup_path) = self.policy_lookup(cap, request.extension_id.as_deref());
+        self.emit_policy_decision_telemetry(
+            cap,
+            request.extension_id.as_deref(),
+            lookup_path,
+            &check,
+        );
+        if check.decision != PolicyDecision::Allow {
+            let outcome = HostcallOutcome::Error {
+                code: "denied".to_string(),
+                message: format!("Capability '{}' denied by policy ({})", cap, check.reason),
             };
-
-            if lane_decision.lane != HostcallDispatchLane::Compat {
-                self.run_shadow_dual_exec(&request, &outcome).await;
-            }
-
-            let service_time_us = dispatch_started_at.elapsed().as_secs_f64() * 1_000_000.0;
-            let llc_miss_rate =
-                llc_miss_proxy(queue_depth, overflow_depth, overflow_rejected_total);
-            let regime_signal = RegimeSignal {
-                queue_depth: usize_to_f64(queue_depth),
-                service_time_us,
-                opcode_entropy,
-                llc_miss_rate,
-            };
-            let observation = {
-                let mut detector = self.regime_detector.borrow_mut();
-                detector.observe(regime_signal)
-            };
-            Self::emit_regime_observation_telemetry(
-                &request.call_id,
-                observation,
-                queue_depth,
-                overflow_depth,
-                overflow_rejected_total,
-                service_time_us,
-            );
-
             self.js_runtime()
                 .complete_hostcall(request.call_id, outcome);
-        })
+            return;
+        }
+
+        if !self.advanced_dispatch_enabled() {
+            let outcome = self.dispatch_hostcall_fast(&request).await;
+            self.js_runtime()
+                .complete_hostcall(request.call_id, outcome);
+            return;
+        }
+
+        let queue_snapshot = self.js_runtime().hostcall_queue_telemetry();
+        let queue_depth = queue_snapshot.total_depth;
+        let overflow_depth = queue_snapshot.overflow_depth;
+        let overflow_rejected_total = queue_snapshot.overflow_rejected_total;
+        let dispatch_started_at = Instant::now();
+        let opcode_entropy = hostcall_opcode_entropy(&request.kind, &request.payload);
+        let io_hint = hostcall_io_hint(&request.kind);
+        let capability_class = HostcallCapabilityClass::from_capability(cap);
+        let lane_decision = decide_io_uring_lane(
+            self.io_uring_lane_config,
+            IoUringLaneDecisionInput {
+                capability: capability_class,
+                io_hint,
+                queue_depth,
+                force_compat_lane: self.io_uring_force_compat,
+            },
+        );
+        self.emit_io_uring_lane_telemetry(
+            &request,
+            cap,
+            capability_class,
+            io_hint,
+            queue_depth,
+            lane_decision.lane,
+            lane_decision.fallback_code(),
+        );
+
+        let outcome = match lane_decision.lane {
+            HostcallDispatchLane::Fast => self.dispatch_hostcall_fast(&request).await,
+            HostcallDispatchLane::IoUring => {
+                let bridge_dispatch = self.dispatch_hostcall_io_uring(&request).await;
+                self.emit_io_uring_bridge_telemetry(
+                    &request,
+                    bridge_dispatch.state,
+                    bridge_dispatch.fallback_reason,
+                );
+                bridge_dispatch.outcome
+            }
+            HostcallDispatchLane::Compat => self.dispatch_hostcall_compat_shadow(&request).await,
+        };
+
+        if lane_decision.lane != HostcallDispatchLane::Compat {
+            self.run_shadow_dual_exec(&request, &outcome).await;
+        }
+
+        let service_time_us = dispatch_started_at.elapsed().as_secs_f64() * 1_000_000.0;
+        let llc_miss_rate = llc_miss_proxy(queue_depth, overflow_depth, overflow_rejected_total);
+        let regime_signal = RegimeSignal {
+            queue_depth: usize_to_f64(queue_depth),
+            service_time_us,
+            opcode_entropy,
+            llc_miss_rate,
+        };
+        let observation = {
+            let mut detector = self.regime_detector.borrow_mut();
+            detector.observe(regime_signal)
+        };
+        Self::emit_regime_observation_telemetry(
+            &request.call_id,
+            observation,
+            queue_depth,
+            overflow_depth,
+            overflow_rejected_total,
+            service_time_us,
+        );
+
+        self.js_runtime()
+            .complete_hostcall(request.call_id, outcome);
     }
 
     /// Dispatch a batch of hostcall requests using AMAC-aware grouping.
@@ -1991,140 +2077,125 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     /// sequential one-by-one dispatch when AMAC is disabled or the batch is
     /// too small.
     #[allow(clippy::future_not_send)]
-    pub fn dispatch_batch_amac(
-        &self,
-        mut requests: VecDeque<HostcallRequest>,
-    ) -> Pin<Box<dyn Future<Output = ()> + '_>> {
-        Box::pin(async move {
-            if requests.is_empty() {
-                return;
-            }
+    pub async fn dispatch_batch_amac(&self, mut requests: VecDeque<HostcallRequest>) {
+        if requests.is_empty() {
+            return;
+        }
 
-            let (rollback_active, rollback_remaining, rollback_reason) = {
-                let state = self.dual_exec_state.borrow();
-                (
-                    state.rollback_active(),
-                    state.rollback_remaining,
-                    state
-                        .rollback_reason
-                        .clone()
-                        .unwrap_or_else(|| "dual_exec_rollback_active".to_string()),
-                )
-            };
+        let (rollback_active, rollback_remaining, rollback_reason) = {
+            let state = self.dual_exec_state.borrow();
+            (
+                state.rollback_active(),
+                state.rollback_remaining,
+                state
+                    .rollback_reason
+                    .clone()
+                    .unwrap_or_else(|| "dual_exec_rollback_active".to_string()),
+            )
+        };
 
-            // Check if AMAC is enabled before consuming requests.
-            let amac_enabled = self.amac_executor.borrow().enabled();
-            let adaptation_mode = self.regime_detector.borrow().current_mode();
-            let rollout_forces_sequential =
-                adaptation_mode == RegimeAdaptationMode::SequentialFastPath;
-            if !amac_enabled || rollback_active || rollout_forces_sequential {
-                if rollback_active {
-                    tracing::warn!(
-                        target: "pi.extensions.dual_exec",
-                        rollback_remaining,
-                        rollback_reason = %rollback_reason,
-                        "Dual-exec rollback forcing sequential dispatcher mode"
-                    );
-                } else if rollout_forces_sequential && amac_enabled {
-                    tracing::debug!(
-                        target: "pi.extensions.regime_shift",
-                        adaptation_mode = adaptation_mode.as_str(),
-                        "Rollout gate forcing sequential dispatch mode"
-                    );
-                }
-                // Dispatch sequentially without AMAC overhead.
-                while let Some(req) = requests.pop_front() {
-                    self.dispatch_and_complete(req).await;
-                }
-                return;
-            }
-
-            let request_vec: Vec<HostcallRequest> = requests.into();
-            let plan = self.amac_executor.borrow_mut().plan_batch(request_vec);
-
-            for (group, decision) in plan.groups.into_iter().zip(plan.decisions.iter()) {
-                let group_key = group.key.clone();
-                let start = Instant::now();
-                // Dispatch each request in the group sequentially.
-                // AMAC decision metadata is recorded for telemetry but the
-                // actual dispatch remains sequential within a single-threaded
-                // async executor — true concurrency is achieved at the reactor
-                // mesh level (bd-3ar8v.4.20).
-                for request in group.requests {
-                    let req_start = Instant::now();
-                    self.dispatch_and_complete(request).await;
-                    let elapsed_ns =
-                        u64::try_from(req_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.amac_executor.borrow_mut().observe_call(elapsed_ns);
-                }
-
-                let group_elapsed_ns =
-                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                tracing::trace!(
-                    target: "pi.extensions.amac",
-                    group_key = ?group_key,
-                    decision = ?decision,
-                    group_elapsed_ns,
-                    "AMAC group dispatched"
+        // Check if AMAC is enabled before consuming requests.
+        let amac_enabled = self.amac_executor.borrow().enabled();
+        let adaptation_mode = self.regime_detector.borrow().current_mode();
+        let rollout_forces_sequential = adaptation_mode == RegimeAdaptationMode::SequentialFastPath;
+        if !amac_enabled || rollback_active || rollout_forces_sequential {
+            if rollback_active {
+                tracing::warn!(
+                    target: "pi.extensions.dual_exec",
+                    rollback_remaining,
+                    rollback_reason = %rollback_reason,
+                    "Dual-exec rollback forcing sequential dispatcher mode"
+                );
+            } else if rollout_forces_sequential && amac_enabled {
+                tracing::debug!(
+                    target: "pi.extensions.regime_shift",
+                    adaptation_mode = adaptation_mode.as_str(),
+                    "Rollout gate forcing sequential dispatch mode"
                 );
             }
-        })
+            // Dispatch sequentially without AMAC overhead.
+            while let Some(req) = requests.pop_front() {
+                self.dispatch_and_complete(req).await;
+            }
+            return;
+        }
+
+        let request_vec: Vec<HostcallRequest> = requests.into();
+        let plan = self.amac_executor.borrow_mut().plan_batch(request_vec);
+
+        for (group, decision) in plan.groups.into_iter().zip(plan.decisions.iter()) {
+            let group_key = group.key.clone();
+            let start = Instant::now();
+            // Dispatch each request in the group sequentially.
+            // AMAC decision metadata is recorded for telemetry but the
+            // actual dispatch remains sequential within a single-threaded
+            // async executor — true concurrency is achieved at the reactor
+            // mesh level (bd-3ar8v.4.20).
+            for request in group.requests {
+                let req_start = Instant::now();
+                self.dispatch_and_complete(request).await;
+                let elapsed_ns = u64::try_from(req_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.amac_executor.borrow_mut().observe_call(elapsed_ns);
+            }
+
+            let group_elapsed_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            tracing::trace!(
+                target: "pi.extensions.amac",
+                group_key = ?group_key,
+                decision = ?decision,
+                group_elapsed_ns,
+                "AMAC group dispatched"
+            );
+        }
     }
 
     /// Protocol adapter: convert `ExtensionMessage(type=host_call)` into
     /// `ExtensionMessage(type=host_result)` using the same dispatch paths used
     /// by runtime hostcalls.
     #[allow(clippy::future_not_send)]
-    pub fn dispatch_protocol_message(
+    pub async fn dispatch_protocol_message(
         &self,
         message: ExtensionMessage,
-    ) -> Pin<Box<dyn Future<Output = Result<ExtensionMessage>> + '_>> {
-        Box::pin(async move {
-            let ExtensionMessage { id, version, body } = message;
-            if id.trim().is_empty() {
-                return Err(crate::error::Error::validation(
-                    "Extension message id is empty",
-                ));
-            }
-            if version != PROTOCOL_VERSION {
-                return Err(crate::error::Error::validation(format!(
-                    "Unsupported extension protocol version: {version}"
-                )));
-            }
-            let ExtensionBody::HostCall(payload) = body else {
-                return Err(crate::error::Error::validation(
-                    "dispatch_protocol_message expects host_call message",
-                ));
-            };
+    ) -> Result<ExtensionMessage> {
+        let ExtensionMessage { id, version, body } = message;
+        if id.trim().is_empty() {
+            return Err(crate::error::Error::validation(
+                "Extension message id is empty",
+            ));
+        }
+        if version != PROTOCOL_VERSION {
+            return Err(crate::error::Error::validation(format!(
+                "Unsupported extension protocol version: {version}"
+            )));
+        }
+        let ExtensionBody::HostCall(payload) = body else {
+            return Err(crate::error::Error::validation(
+                "dispatch_protocol_message expects host_call message",
+            ));
+        };
 
-            let preflight = ExtensionMessage {
-                id: id.clone(),
-                version: version.clone(),
-                body: ExtensionBody::HostCall(payload.clone()),
-            };
-            let outcome = match preflight.validate() {
-                Ok(()) => self.dispatch_protocol_host_call(&payload).await,
-                Err(crate::error::Error::Validation(message)) => {
-                    if payload.call_id.trim().is_empty() {
-                        return Err(crate::error::Error::Validation(message));
-                    }
-                    HostcallOutcome::Error {
-                        code: "invalid_request".to_string(),
-                        message,
-                    }
+        let outcome = match validate_host_call(&payload) {
+            Ok(()) => self.dispatch_protocol_host_call(&payload).await,
+            Err(crate::error::Error::Validation(message)) => {
+                if payload.call_id.trim().is_empty() {
+                    return Err(crate::error::Error::Validation(message));
                 }
-                Err(err) => return Err(err),
-            };
-            let response = ExtensionMessage {
-                id,
-                version,
-                body: ExtensionBody::HostResult(hostcall_outcome_to_protocol_result_with_trace(
-                    &payload, outcome,
-                )),
-            };
-            response.validate()?;
-            Ok(response)
-        })
+                HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message,
+                }
+            }
+            Err(err) => return Err(err),
+        };
+        let response = ExtensionMessage {
+            id,
+            version,
+            body: ExtensionBody::HostResult(hostcall_outcome_to_protocol_result_with_trace(
+                &payload, outcome,
+            )),
+        };
+        response.validate()?;
+        Ok(response)
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
