@@ -1,6 +1,6 @@
 # BENCHMARK_COMPARISON_BETWEEN_RUST_VERSION_AND_ORIGINAL__GPT
 
-Generated: 2026-02-15
+Generated: 2026-02-17
 Workspace: `/data/projects/pi_agent_rust`
 
 ## 1) Lede (Do Not Bury This)
@@ -10,19 +10,26 @@ Workspace: `/data/projects/pi_agent_rust`
 3. Extension compatibility is substantial but not complete: vendored corpus is `223` extensions, with `187` pass, `29` fail, `7` pending manifest alignment.
 4. Rust has significantly expanded first-class capability surface versus legacy coding-agent CLI (commands, policy explainers, provider metadata/control, risk/quota/security instrumentation).
 5. The largest practical optimization target remains session append/save behavior at high token-volume and large histories; this is the best lever for major speed gains.
+6. Startup/readiness latency strongly favors Rust in this snapshot: `--help` is ~`3.34ms` mean vs Node `1,045.10ms` and Bun `726.28ms`, with much lower baseline RSS.
 
-## 1.1) Refresh Delta (2026-02-15)
+## 1.1) Refresh Delta (2026-02-17)
 
 Freshly re-measured in this run:
 - LOC and callable inventory (Rust + legacy scopes)
 - CLI diff (`pi --help` vs legacy `dist/cli.js --help`)
-- Extension workload microbench (`ext_workloads` and `bench_legacy_extension_workloads.mjs`)
+- provider ID diff (Rust canonical table vs legacy runtime provider registry)
+- cold startup/readiness (`hyperfine` for `--help` and `--version`)
+- one-shot startup footprint snapshots (`/usr/bin/time` RSS/user/sys)
 
 Reused (existing in-repo evidence, unchanged methodology):
 - long-session realistic latency matrix
 - matched-state 10-message append footprint matrix
 - realistic 1M/5M footprint matrix
+- extension workload microbench (`ext_workloads` and `bench_legacy_extension_workloads.mjs`)
 - 223-extension vendored conformance + failure taxonomy
+
+Build/regeneration note:
+- `cargo build --release --bin pi` currently fails in `/dp/asupersync` with `parking_lot` API/type errors (`RwLock*Guard` treated as `Result`/`.expect()` usage). Because of this, startup benchmarks used installed Rust CLI binary, and long-session/extension deep benchmarks were read from committed benchmark artifacts.
 
 ---
 
@@ -58,30 +65,30 @@ Method: `tokei` scoped by language (`Rust` for Rust repo, `TypeScript` for legac
 
 | Scope | Production LOC | Test LOC |
 |---|---:|---:|
-| Rust (`src`, Rust only) | 180,441 | 190,048 (`tests`, Rust only) |
+| Rust (`src`, Rust only) | 224,348 | 224,212 (`tests`, Rust only) |
 | Legacy coding-agent only (`src/test`, TS only) | 27,412 | 8,871 |
 | Legacy full stack (`ai+agent+coding-agent+tui`, TS only) | 55,313 | 21,779 |
 
 Ratios:
-- Rust vs legacy coding-agent: prod `6.58x`, test `21.42x`
-- Rust vs legacy full-stack: prod `3.26x`, test `8.73x`
+- Rust vs legacy coding-agent: prod `8.18x`, test `25.27x`
+- Rust vs legacy full-stack: prod `4.06x`, test `10.29x`
 
 ## 3.2 Function/Callable Inventory
 
 Method note:
-- Rust callable count here uses signature-oriented scanning (`fn` signatures + test attrs); this is approximate for Rust language forms.
-- Legacy callable count here uses regex signature/callsite inventory over TypeScript files (declarations/method-like signatures/assigned arrows), which is approximate.
+- Rust callable count here uses `fn` token signature inventory (`\\bfn\\s+...`) plus test attribute inventory; this remains approximate for macros/trait forms.
+- Legacy callable count here uses TypeScript AST traversal (function declarations, methods, constructors, accessors, variable-assigned arrow/function expressions); still an approximation of executable behavior.
 
 Rust (signature inventory):
-- `src` function signatures: `7,793`
-- `tests` function signatures: `8,151`
-- test attributes total: `9,803` (`src=4,081`, `tests=5,722`)
+- `src` function signatures: `10,417`
+- `tests` function signatures: `9,459`
+- test attributes total: `11,976` (`src=5,474`, `tests=6,502`)
 
-Legacy signature/callsite inventory (proxy):
-- coding-agent `src`: `2,515`
-- coding-agent `test`: `221`
-- full stack `src`: `4,148`
-- full stack `test`: `479`
+Legacy AST callable inventory:
+- coding-agent `src`: `1,315`
+- coding-agent `test`: `93`
+- full stack `src`: `1,907`
+- full stack `test`: `247`
 
 ## 3.3 Test Coverage Baseline (Rust)
 
@@ -100,7 +107,9 @@ This section lists **verified Rust-first-class surfaces** missing from legacy co
 
 Rust-only top-level commands:
 - `doctor`
+- `help`
 - `info`
+- `migrate`
 - `search`
 - `update-index`
 
@@ -111,17 +120,22 @@ Rust-only flags:
 - `--explain-repair-policy`
 - `--list-providers`
 - `--theme-path`
+- `--session-durability`
+- `--no-migrations`
+
+Legacy-only flags:
+- `--plan`
 
 ## 4.2 Rust-Only Major Capability Areas (with complexity hints)
 
 | Capability area | Primary Rust implementation | Approx LOC | Approx fn count |
 |---|---|---:|---:|
-| Extension runtime + policy + host integration | `src/extensions.rs` | 31,995 | 560 |
-| QuickJS bridge + hostcall plumbing + runtime adapters | `src/extensions_js.rs` | 20,341 | 111 |
-| Dispatcher for protocol/hostcall integration | `src/extension_dispatcher.rs` | 8,968 | 146 |
-| Provider canonical metadata + alias routing | `src/provider_metadata.rs` | 2,650 | 46 |
-| Extension index/search/info/update pipeline | `src/extension_index.rs` | 1,409 | 51 |
-| Environment + compatibility diagnostics (`doctor`) | `src/doctor.rs` | 1,472 | 32 |
+| Extension runtime + policy + host integration | `src/extensions.rs` | 38,379 | 1,517 |
+| QuickJS bridge + hostcall plumbing + runtime adapters | `src/extensions_js.rs` | 19,284 | 449 |
+| Dispatcher for protocol/hostcall integration | `src/extension_dispatcher.rs` | 11,745 | 404 |
+| Provider canonical metadata + alias routing | `src/provider_metadata.rs` | 2,645 | 60 |
+| Extension index/search/info/update pipeline | `src/extension_index.rs` | 1,469 | 98 |
+| Environment + compatibility diagnostics (`doctor`) | `src/doctor.rs` | 1,475 | 69 |
 | Runtime risk ledger/replay/calibration tooling | `src/extensions.rs`, `src/bin/ext_runtime_risk_ledger.rs` | large integrated surface | integrated |
 | Per-extension quota enforcement engine | `src/extensions.rs` | integrated in core runtime | integrated |
 
@@ -129,12 +143,50 @@ Rust-only flags:
 
 - Rust canonical provider IDs: `87`
 - Rust alias IDs: `34`
-- Legacy provider IDs (from generated legacy model table): `22`
+- Legacy provider IDs (runtime `@mariozechner/pi-ai` `getProviders()`): `22`
 - Exact canonical ID overlap (Rust vs legacy set): `16`
 - Rust canonical IDs not in legacy exact-ID set: `71`
 - Legacy-only exact IDs vs Rust canonical set: `6` (`azure-openai-responses`, `google-antigravity`, `google-gemini-cli`, `kimi-coding`, `openai-codex`, `vercel-ai-gateway`)
 
 Complete Rust canonical IDs absent from legacy exact-ID set appear in **Appendix B**.
+
+## 4.4 Comprehensive Rust-Only Functionality Inventory (Current Snapshot)
+
+Verified as first-class in Rust CLI/runtime and not exposed equivalently in legacy coding-agent CLI snapshot:
+
+1. Extension policy selection and explanation:
+- `--extension-policy`, `--explain-extension-policy` (`src/extensions.rs`)
+
+2. Extension auto-repair policy selection and explanation:
+- `--repair-policy`, `--explain-repair-policy` (`src/extensions.rs`)
+
+3. Provider registry introspection:
+- `--list-providers` plus canonical/alias metadata layer (`src/provider_metadata.rs`, `src/models.rs`)
+
+4. Extension index lifecycle commands:
+- `search`, `info`, `update-index` command path (`src/extension_index.rs`, CLI wiring in `src/main.rs`)
+
+5. Environment diagnostics command:
+- `doctor` (`src/doctor.rs`)
+
+6. Session durability and migration controls:
+- `--session-durability`, `--no-migrations`, `migrate` surface (`src/main.rs`, session/store modules)
+
+7. Large integrated extension runtime controls:
+- capability-gated hostcall dispatch, policy gating, quota/risk instrumentation, runtime shims (`src/extensions.rs`, `src/extensions_js.rs`, `src/extension_dispatcher.rs`)
+
+8. Runtime risk ledger and replay/calibration tooling:
+- integrated in extension runtime plus dedicated tooling entrypoints (`src/extensions.rs`, `src/bin/ext_runtime_risk_ledger.rs`)
+
+9. Expanded provider footprint:
+- 87 canonical providers + 34 aliases in Rust vs 22 provider IDs in legacy runtime (Appendix B)
+
+10. First-class benchmark and conformance executables in repo:
+- `src/bin/ext_full_validation.rs`
+- `src/bin/ext_workloads.rs`
+- `src/bin/session_workload_bench.rs`
+
+Complexity anchors for major Rust-only surfaces are listed in **Section 4.2** and **Appendix C**.
 
 ---
 
@@ -169,6 +221,30 @@ Parameters for realistic matrix:
 ---
 
 ## 6) Performance Results
+
+## 6.0 Cold Startup / Readiness (time-to-response)
+
+Command-level readiness benchmark (`hyperfine`, no network calls):
+
+| Probe | Rust mean | Legacy Node mean | Legacy Bun mean | Node/Rust | Bun/Rust |
+|---|---:|---:|---:|---:|---:|
+| `--help` | 3.34 ms | 1,045.10 ms | 726.28 ms | 313.13x | 217.61x |
+| `--version` | 20.09 ms | 1,024.75 ms | 729.70 ms | 51.01x | 36.32x |
+
+One-shot baseline footprint snapshot (`/usr/bin/time`):
+
+| Probe | Runtime | RSS KB | User s | Sys s | Elapsed |
+|---|---|---:|---:|---:|---:|
+| `--help` | rust | 6,448 | 0.00 | 0.00 | 0:00.00 |
+| `--help` | legacy_node | 156,720 | 1.11 | 0.20 | 0:01.02 |
+| `--help` | legacy_bun | 195,820 | 0.91 | 0.22 | 0:00.71 |
+| `--version` | rust | 7,556 | 0.00 | 0.01 | 0:00.01 |
+| `--version` | legacy_node | 156,560 | 1.11 | 0.21 | 0:01.03 |
+| `--version` | legacy_bun | 194,624 | 0.96 | 0.20 | 0:00.73 |
+
+Interpretation:
+- For initial CLI readiness, Rust is dramatically faster and materially lighter in baseline process footprint.
+- These probes isolate startup/path initialization; they do not include session resume or extension workload execution.
 
 ## 6.1 Realistic E2E Latency (p50, ms)
 
@@ -261,7 +337,7 @@ Design/implementation emphasis areas:
 
 ## 7.2 Real Extension Execution Benchmarks (Rust vs Legacy)
 
-Fresh run artifacts:
+Benchmark artifacts used:
 - Rust: `.tmp_windyelk/ext_workloads_rust_gpt.jsonl`
 - Legacy Node: `.tmp_windyelk/ext_workloads_legacy_node_gpt.jsonl`
 - Legacy Bun runtime: `.tmp_windyelk/ext_workloads_legacy_bun_gpt.jsonl`
@@ -358,9 +434,9 @@ third-party/w-winter-dot314	fail	harness_gap	registration_mismatch	Observed regi
 ## 8) Test Surface Comparison (Unit + E2E)
 
 Rust:
-- Rust test files: `236`
-- Rust e2e-prefixed test files: `34`
-- Rust test attributes: `9,803`
+- Rust test files: `257`
+- Rust e2e-prefixed test files: `35`
+- Rust test attributes: `11,976`
 
 Legacy proxies (regex callsite counts):
 - coding-agent test files: `49`
@@ -740,52 +816,52 @@ zhipuai-coding-plan
 
 ```tsv
 file	loc	fn_count
-src/extensions.rs	31995	560
-src/extensions_js.rs	20341	111
-src/extension_dispatcher.rs	8968	146
-src/provider_metadata.rs	2650	46
-src/extension_index.rs	1409	51
-src/doctor.rs	1472	32
-src/session.rs	5041	80
-src/session_index.rs	1388	40
-src/cli.rs	863	67
-src/main.rs	2261	19
-src/providers/mod.rs	2323	69
-src/providers/openai.rs	1948	26
-src/providers/anthropic.rs	1771	18
-src/providers/gemini.rs	1362	21
-src/providers/azure.rs	1180	13
-src/providers/cohere.rs	1738	22
-src/providers/vertex.rs	987	14
-src/providers/bedrock.rs	1146	6
-src/providers/gitlab.rs	480	9
-src/providers/copilot.rs	542	11
-src/bin/ext_full_validation.rs	1806	1
-src/bin/ext_workloads.rs	474	1
-src/bin/session_workload_bench.rs	488	5
+src/extensions.rs	38379	1517
+src/extensions_js.rs	19284	449
+src/extension_dispatcher.rs	11745	404
+src/provider_metadata.rs	2645	60
+src/extension_index.rs	1469	98
+src/doctor.rs	1475	69
+src/session.rs	7294	334
+src/session_index.rs	1648	88
+src/cli.rs	1330	107
+src/main.rs	3632	120
+src/providers/mod.rs	2127	105
+src/providers/openai.rs	1903	75
+src/providers/anthropic.rs	1792	63
+src/providers/gemini.rs	1317	59
+src/providers/azure.rs	1030	39
+src/providers/cohere.rs	1551	51
+src/providers/vertex.rs	801	39
+src/providers/bedrock.rs	1048	42
+src/providers/gitlab.rs	375	22
+src/providers/copilot.rs	424	22
+src/bin/ext_full_validation.rs	1635	28
+src/bin/ext_workloads.rs	4537	120
+src/bin/session_workload_bench.rs	435	18
 ```
 
 ### 13.2 Legacy Feature Complexity Table
 
 ```tsv
 file	loc	callables
-packages/coding-agent/src/core/extensions/index.ts	156	0
-packages/coding-agent/src/core/extensions/wrapper.ts	119	8
-packages/coding-agent/src/core/extensions/runner.ts	719	90
-packages/coding-agent/src/core/session-manager.ts	1395	90
-packages/coding-agent/src/core/model-registry.ts	600	31
-packages/coding-agent/src/cli/args.ts	304	5
-packages/coding-agent/src/main.ts	673	33
-packages/ai/src/providers/register-builtins.ts	74	2
-packages/ai/src/providers/openai-responses.ts	274	12
-packages/ai/src/providers/openai-completions.ts	848	40
-packages/ai/src/providers/anthropic.ts	732	31
-packages/ai/src/providers/google.ts	453	12
-packages/ai/src/providers/google-vertex.ts	483	14
-packages/ai/src/providers/amazon-bedrock.ts	649	22
-packages/ai/src/providers/azure-openai-responses.ts	257	10
-packages/ai/src/providers/google-gemini-cli.ts	1023	22
-packages/ai/src/providers/openai-codex-responses.ts	450	19
+packages/coding-agent/src/core/extensions/index.ts	132	0
+packages/coding-agent/src/core/extensions/wrapper.ts	85	4
+packages/coding-agent/src/core/extensions/runner.ts	615	37
+packages/coding-agent/src/core/session-manager.ts	1011	61
+packages/coding-agent/src/core/model-registry.ts	432	21
+packages/coding-agent/src/cli/args.ts	286	3
+packages/coding-agent/src/main.ts	619	16
+packages/ai/src/providers/register-builtins.ts	62	2
+packages/ai/src/providers/openai-responses.ts	222	8
+packages/ai/src/providers/openai-completions.ts	699	15
+packages/ai/src/providers/anthropic.ts	637	15
+packages/ai/src/providers/google.ts	408	9
+packages/ai/src/providers/google-vertex.ts	435	11
+packages/ai/src/providers/amazon-bedrock.ts	547	15
+packages/ai/src/providers/azure-openai-responses.ts	212	9
+packages/ai/src/providers/google-gemini-cli.ts	862	16
+packages/ai/src/providers/openai-codex-responses.ts	356	13
 ```
 
 ## 14) Appendix D — Primary Raw Artifacts
@@ -800,18 +876,25 @@ packages/ai/src/providers/openai-codex-responses.ts	450	19
   - `.tmp_windyelk/ext_workloads_rust_gpt.jsonl`
   - `.tmp_windyelk/ext_workloads_legacy_node_gpt.jsonl`
   - `.tmp_windyelk/ext_workloads_legacy_bun_gpt.jsonl`
+- Cold-start readiness and footprint probes
+  - `/tmp/startup_help_compare.json`
+  - `/tmp/startup_version_compare.json`
 - Extension conformance corpus outputs
   - `tests/ext_conformance/reports/pipeline/full_validation_report.compat2.json`
   - `tests/ext_conformance/reports/pipeline/full_validation_report.compat2.md`
 - Provider inventory/parity artifacts
   - `docs/provider-canonical-id-table.json`
   - `docs/provider-parity-reconciliation-report.json`
+  - `/tmp/provider_diff.json`
+  - `/tmp/help_diff.json`
   - `.tmp_windyelk/rust_provider_extra.txt`
   - `.tmp_windyelk/provider_overlap.txt`
   - `.tmp_windyelk/legacy_provider_extra.txt`
 - Coverage and test-surface artifacts
   - `docs/coverage-baseline-map.json`
   - `docs/TEST_COVERAGE_MATRIX.md`
+  - `/tmp/ts_counts_coding_agent.json`
+  - `/tmp/ts_counts_fullstack.json`
   - `.tmp_windyelk/pi_rust_tokei.json`
   - `.tmp_windyelk/pi_legacy_coding_agent_tokei.json`
   - `.tmp_windyelk/pi_legacy_fullstack_tokei.json`
