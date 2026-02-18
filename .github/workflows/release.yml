@@ -84,7 +84,7 @@ jobs:
         run: |
           set -euxo pipefail
           chmod +x scripts/release_gate.sh
-          ./scripts/release_gate.sh --report | tee release_gate_report.json
+          ./scripts/release_gate.sh --no-rch --report | tee release_gate_report.json
           VERDICT=$(python3 -c "import json; print(json.load(open('release_gate_report.json')).get('verdict','unknown'))")
           echo "Release gate verdict: $VERDICT"
           if [ "$VERDICT" = "fail" ]; then
