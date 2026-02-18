@@ -1572,7 +1572,7 @@ impl PackageManager {
             if !is_supported_extension_file(resolved) {
                 warn!(
                     path = %resolved.display(),
-                    "Ignoring unsupported extension source file; use extension.json, *.native.json, or *.wasm"
+                    "Ignoring unsupported extension source file; use extension.json, JS/TS entrypoints, *.native.json, or *.wasm"
                 );
                 return;
             }
@@ -2246,7 +2246,7 @@ fn collect_files_from_paths(paths: &[PathBuf], resource_type: ResourceType) -> V
             if resource_type == ResourceType::Extensions && !is_supported_extension_file(p) {
                 warn!(
                     path = %p.display(),
-                    "Ignoring unsupported extension manifest file entry; use extension.json, *.native.json, or *.wasm"
+                    "Ignoring unsupported extension file entry; use extension.json, JS/TS entrypoints, *.native.json, or *.wasm"
                 );
                 continue;
             }
@@ -2412,9 +2412,17 @@ fn is_supported_extension_file(path: &Path) -> bool {
         return true;
     }
 
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+
+    if ext.eq_ignore_ascii_case("wasm") {
+        return true;
+    }
+
+    ["ts", "tsx", "js", "mjs", "cjs", "mts", "cts"]
+        .iter()
+        .any(|candidate| ext.eq_ignore_ascii_case(candidate))
 }
 
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
@@ -2442,7 +2450,7 @@ fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
                     if resolved.is_file() && !is_supported_extension_file(&resolved) {
                         warn!(
                             path = %resolved.display(),
-                            "Ignoring unsupported package.json#pi.extensions entry; use extension.json, *.native.json, or *.wasm"
+                            "Ignoring unsupported package.json#pi.extensions entry; use extension.json, JS/TS entrypoints, *.native.json, or *.wasm"
                         );
                         continue;
                     }
@@ -2460,20 +2468,21 @@ fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
         return Some(vec![index_native]);
     }
 
-    let index_ts = dir.join("index.ts");
-    if index_ts.exists() {
-        warn!(
-            path = %index_ts.display(),
-            "Ignoring legacy JS/TS extension entrypoint; use index.native.json"
-        );
+    for index_name in [
+        "index.ts",
+        "index.tsx",
+        "index.js",
+        "index.mjs",
+        "index.cjs",
+        "index.mts",
+        "index.cts",
+    ] {
+        let candidate = dir.join(index_name);
+        if candidate.exists() {
+            return Some(vec![candidate]);
+        }
     }
-    let index_js = dir.join("index.js");
-    if index_js.exists() {
-        warn!(
-            path = %index_js.display(),
-            "Ignoring legacy JS/TS extension entrypoint; use index.native.json"
-        );
-    }
+
     None
 }
 
@@ -2504,11 +2513,7 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
             continue;
         };
         if stats.is_file() {
-            let is_native_descriptor = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".native.json"));
-            if is_native_descriptor {
+            if is_supported_extension_file(&path) {
                 out.push(path);
             }
             continue;
@@ -2519,6 +2524,8 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -4771,6 +4778,36 @@ mod tests {
         assert!(!has_md, "should not find .md files");
     }
 
+    #[test]
+    fn collect_auto_extension_entries_finds_root_js_entry_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = dir.path().join("extensions");
+        fs::create_dir_all(&ext_dir).expect("create dir");
+        fs::write(ext_dir.join("my_extension.ts"), "export default {}").expect("write");
+
+        let entries = collect_auto_extension_entries(&ext_dir);
+        assert!(
+            entries
+                .iter()
+                .any(|p| p.file_name().unwrap() == "my_extension.ts")
+        );
+    }
+
+    #[test]
+    fn collect_auto_extension_entries_deduplicates_index_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = dir.path().join("extensions");
+        fs::create_dir_all(&ext_dir).expect("create dir");
+        fs::write(ext_dir.join("index.ts"), "export default {}").expect("write");
+
+        let entries = collect_auto_extension_entries(&ext_dir);
+        let count = entries
+            .iter()
+            .filter(|p| p.file_name().unwrap() == "index.ts")
+            .count();
+        assert_eq!(count, 1, "index.ts should only be present once");
+    }
+
     // ======================================================================
     // resolve_extension_entries with index.native.json / legacy JS fallback
     // ======================================================================
@@ -4787,23 +4824,25 @@ mod tests {
     }
 
     #[test]
-    fn resolve_extension_entries_ignores_index_ts() {
+    fn resolve_extension_entries_finds_index_ts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ext_dir = dir.path().join("ext");
         fs::create_dir_all(&ext_dir).expect("create dir");
         fs::write(ext_dir.join("index.ts"), "export default {}").expect("write");
 
-        assert!(resolve_extension_entries(&ext_dir).is_none());
+        let entries = resolve_extension_entries(&ext_dir).expect("entries");
+        assert_eq!(entries, vec![ext_dir.join("index.ts")]);
     }
 
     #[test]
-    fn resolve_extension_entries_ignores_index_js() {
+    fn resolve_extension_entries_finds_index_js() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ext_dir = dir.path().join("ext");
         fs::create_dir_all(&ext_dir).expect("create dir");
         fs::write(ext_dir.join("index.js"), "export default {}").expect("write");
 
-        assert!(resolve_extension_entries(&ext_dir).is_none());
+        let entries = resolve_extension_entries(&ext_dir).expect("entries");
+        assert_eq!(entries, vec![ext_dir.join("index.js")]);
     }
 
     #[test]
