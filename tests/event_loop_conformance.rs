@@ -411,11 +411,7 @@ fn run_scheduler_under_lab(seed: u64, task_count: u64) -> Vec<String> {
                 drop(s);
             })
             .expect("create lab task");
-        runtime
-            .scheduler
-            .lock()
-            .expect("scheduler lock")
-            .schedule(task_id, 0);
+        runtime.scheduler.lock().schedule(task_id, 0);
     }
 
     runtime.run_until_quiescent();
@@ -475,11 +471,7 @@ fn lab_scheduler_invariants_hold() {
                 drop(s);
             })
             .expect("create task");
-        runtime
-            .scheduler
-            .lock()
-            .expect("scheduler lock")
-            .schedule(task_id, 0);
+        runtime.scheduler.lock().schedule(task_id, 0);
     }
 
     runtime.run_until_quiescent();
@@ -516,11 +508,7 @@ fn lab_timer_cancellation_deterministic() {
                 s.clear_timeout(t2);
             })
             .expect("create");
-        runtime
-            .scheduler
-            .lock()
-            .expect("scheduler lock")
-            .schedule(tid1, 0);
+        runtime.scheduler.lock().schedule(tid1, 0);
 
         // Task 2: add events alongside timers
         let sched2 = Arc::clone(&sched);
@@ -531,11 +519,7 @@ fn lab_timer_cancellation_deterministic() {
                 s.enqueue_event("interleaved".into(), serde_json::Value::Null);
             })
             .expect("create");
-        runtime
-            .scheduler
-            .lock()
-            .expect("scheduler lock")
-            .schedule(tid2, 0);
+        runtime.scheduler.lock().schedule(tid2, 0);
 
         runtime.run_until_quiescent();
 
@@ -587,11 +571,7 @@ fn lab_virtual_time_timer_ordering() {
                 let _t_100b = s.set_timeout(100); // Same deadline as t_100
             })
             .expect("create");
-        runtime
-            .scheduler
-            .lock()
-            .expect("scheduler lock")
-            .schedule(tid, 0);
+        runtime.scheduler.lock().schedule(tid, 0);
     }
 
     runtime.run_until_quiescent();
@@ -664,11 +644,7 @@ fn lab_event_loop_determinism() {
                     drop(loop_state);
                 })
                 .expect("create");
-            runtime
-                .scheduler
-                .lock()
-                .expect("scheduler lock")
-                .schedule(tid, 0);
+            runtime.scheduler.lock().schedule(tid, 0);
         }
 
         runtime.run_until_quiescent();
@@ -725,11 +701,7 @@ fn lab_event_loop_invariants_hold() {
                 drop(loop_state);
             })
             .expect("create");
-        runtime
-            .scheduler
-            .lock()
-            .expect("scheduler lock")
-            .schedule(tid, 0);
+        runtime.scheduler.lock().schedule(tid, 0);
     }
 
     runtime.run_until_quiescent();
@@ -772,11 +744,7 @@ fn lab_hostcall_error_outcomes_deterministic() {
                         .enqueue_hostcall_complete(format!("hc-{i}"), outcome);
                 })
                 .expect("create");
-            runtime
-                .scheduler
-                .lock()
-                .expect("scheduler lock")
-                .schedule(tid, 0);
+            runtime.scheduler.lock().schedule(tid, 0);
         }
 
         runtime.run_until_quiescent();
@@ -916,11 +884,7 @@ fn lab_time_until_next_timer() {
                 sched.set_timeout(500); // deadline = 1500
             })
             .expect("create");
-        runtime
-            .scheduler
-            .lock()
-            .expect("scheduler lock")
-            .schedule(tid, 0);
+        runtime.scheduler.lock().schedule(tid, 0);
     }
 
     runtime.run_until_quiescent();

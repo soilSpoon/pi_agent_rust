@@ -493,7 +493,23 @@ pub fn select_model_and_thinking(
                 fallback.model.provider, fallback.model.id
             ));
             selected_model = Some(fallback);
+        } else if !registry.models().is_empty() {
+            // No detected keys anywhere, but we still want to pick a stable default
+            // so startup can guide the user through the correct login flow.
+            let fallback = default_model_from_catalog(registry.models());
+            fallback_message = Some(format!(
+                "Missing credentials for {missing_provider}/{missing_model_id}. Defaulting to {}/{} for setup.",
+                fallback.model.provider, fallback.model.id
+            ));
+            selected_model = Some(fallback);
         }
+    }
+
+    // If nothing was selected yet, default to our preferred catalog entry even
+    // when no credentials are configured. This keeps first-run UX consistent
+    // and avoids the misleading "No models configured" path when built-ins exist.
+    if selected_model.is_none() && !registry.models().is_empty() {
+        selected_model = Some(default_model_from_catalog(registry.models()));
     }
 
     let Some(model_entry) = selected_model else {
@@ -638,6 +654,14 @@ fn restore_model_from_session(
 }
 
 fn default_model_from_available(available: &[ModelEntry]) -> ModelEntry {
+    default_model_from_candidates(available)
+}
+
+fn default_model_from_catalog(models: &[ModelEntry]) -> ModelEntry {
+    default_model_from_candidates(models)
+}
+
+fn default_model_from_candidates(candidates: &[ModelEntry]) -> ModelEntry {
     let defaults = [
         // Prefer Codex (ChatGPT OAuth) when available.
         ("openai-codex", "gpt-5.3-codex"),
@@ -676,7 +700,7 @@ fn default_model_from_available(available: &[ModelEntry]) -> ModelEntry {
     };
 
     for (provider, model_id) in defaults {
-        if let Some(found) = available.iter().find(|m| {
+        if let Some(found) = candidates.iter().find(|m| {
             canonical(&m.model.provider) == canonical(provider)
                 && m.model.id.eq_ignore_ascii_case(model_id)
         }) {
@@ -684,7 +708,7 @@ fn default_model_from_available(available: &[ModelEntry]) -> ModelEntry {
         }
     }
 
-    available[0].clone()
+    candidates[0].clone()
 }
 
 fn normalize_api_key_opt(api_key: Option<String>) -> Option<String> {

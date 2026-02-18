@@ -1710,6 +1710,13 @@ After approving access in the browser, press Enter in Pi to complete login.",
                     "OAuth login: {}\n\nOpen this URL:\n{}\n",
                     info.provider, info.url
                 );
+                if info.provider == "anthropic" {
+                    message.push_str(
+                        "\nWARNING: Anthropic OAuth (Claude Code consumer account) is no longer recommended.\n\
+Using consumer OAuth tokens outside the official client may violate Anthropic's consumer Terms of Service and can\n\
+result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_API_KEY) instead.\n",
+                    );
+                }
                 if let Some(instructions) = info.instructions {
                     message.push('\n');
                     message.push_str(&instructions);

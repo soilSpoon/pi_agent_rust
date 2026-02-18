@@ -2776,101 +2776,157 @@ fn list_providers() {
     println!("\n{} providers available.", rows.len());
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupCredentialKind {
+    ApiKey,
+    OAuthPkce,
+    OAuthDeviceFlow,
+}
+
 #[derive(Clone, Copy)]
 struct ProviderChoice {
-    id: &'static str,
+    provider: &'static str,
     label: &'static str,
+    kind: SetupCredentialKind,
     env: &'static str,
 }
 
-const PROVIDER_CHOICES: [ProviderChoice; 10] = [
+const PROVIDER_CHOICES: &[ProviderChoice] = &[
     ProviderChoice {
-        id: "anthropic",
-        label: "Anthropic (Claude)",
-        env: "ANTHROPIC_API_KEY",
+        provider: "openai-codex",
+        label: "OpenAI Codex (ChatGPT)",
+        kind: SetupCredentialKind::OAuthPkce,
+        env: "",
     },
     ProviderChoice {
-        id: "openai",
+        provider: "openai",
         label: "OpenAI",
+        kind: SetupCredentialKind::ApiKey,
         env: "OPENAI_API_KEY",
     },
     ProviderChoice {
-        id: "google",
+        provider: "anthropic",
+        label: "Anthropic (Claude Code)",
+        kind: SetupCredentialKind::OAuthPkce,
+        env: "",
+    },
+    ProviderChoice {
+        provider: "anthropic",
+        label: "Anthropic (Claude API key)",
+        kind: SetupCredentialKind::ApiKey,
+        env: "ANTHROPIC_API_KEY",
+    },
+    ProviderChoice {
+        provider: "kimi-for-coding",
+        label: "Kimi for Coding",
+        kind: SetupCredentialKind::OAuthDeviceFlow,
+        env: "KIMI_API_KEY",
+    },
+    ProviderChoice {
+        provider: "google-gemini-cli",
+        label: "Google Cloud Code Assist",
+        kind: SetupCredentialKind::OAuthPkce,
+        env: "",
+    },
+    ProviderChoice {
+        provider: "google",
         label: "Google Gemini",
+        kind: SetupCredentialKind::ApiKey,
         env: "GOOGLE_API_KEY",
     },
     ProviderChoice {
-        id: "azure-openai",
+        provider: "google-antigravity",
+        label: "Google Antigravity",
+        kind: SetupCredentialKind::OAuthPkce,
+        env: "",
+    },
+    ProviderChoice {
+        provider: "azure-openai",
         label: "Azure OpenAI",
+        kind: SetupCredentialKind::ApiKey,
         env: "AZURE_OPENAI_API_KEY",
     },
     ProviderChoice {
-        id: "amazon-bedrock",
-        label: "Amazon Bedrock",
-        env: "AWS_ACCESS_KEY_ID",
-    },
-    ProviderChoice {
-        id: "groq",
-        label: "Groq",
-        env: "GROQ_API_KEY",
-    },
-    ProviderChoice {
-        id: "openrouter",
+        provider: "openrouter",
         label: "OpenRouter",
+        kind: SetupCredentialKind::ApiKey,
         env: "OPENROUTER_API_KEY",
-    },
-    ProviderChoice {
-        id: "mistral",
-        label: "Mistral AI",
-        env: "MISTRAL_API_KEY",
-    },
-    ProviderChoice {
-        id: "togetherai",
-        label: "Together AI",
-        env: "TOGETHER_API_KEY",
-    },
-    ProviderChoice {
-        id: "google-vertex",
-        label: "Google Vertex AI",
-        env: "GOOGLE_APPLICATION_CREDENTIALS",
     },
 ];
 
-fn provider_from_token(token: &str) -> Option<ProviderChoice> {
-    let normalized = token.trim().to_lowercase();
+fn provider_choice_default_for_provider(provider: &str) -> Option<ProviderChoice> {
+    let canonical = provider_metadata::canonical_provider_id(provider).unwrap_or(provider);
+    PROVIDER_CHOICES
+        .iter()
+        .copied()
+        .find(|choice| choice.provider.eq_ignore_ascii_case(canonical))
+}
 
-    // Try numbered choice first (1-10)
-    if let Ok(num) = normalized.parse::<usize>() {
+fn provider_choice_from_token(token: &str) -> Option<ProviderChoice> {
+    let raw = token.trim();
+    let normalized = raw.to_ascii_lowercase();
+    let (first, rest) = normalized
+        .split_once(char::is_whitespace)
+        .map_or((normalized.as_str(), ""), |(a, b)| (a, b.trim()));
+
+    // Try numbered choice first (1-N).
+    if let Ok(num) = first.parse::<usize>() {
         if num >= 1 && num <= PROVIDER_CHOICES.len() {
             return Some(PROVIDER_CHOICES[num - 1]);
         }
         return None;
     }
 
-    // Try exact match against listed providers (including common nicknames)
-    for choice in &PROVIDER_CHOICES {
-        if normalized == choice.id || normalized == choice.label.to_lowercase() {
+    // Try exact match against listed labels.
+    for choice in PROVIDER_CHOICES {
+        if normalized == choice.label.to_ascii_lowercase()
+            || first == choice.provider
+            || first == choice.provider.to_ascii_lowercase()
+        {
             return Some(*choice);
         }
     }
 
-    // Common nicknames that map to listed providers
-    match normalized.as_str() {
-        "claude" => return Some(PROVIDER_CHOICES[0]),
-        "gpt" | "chatgpt" => return Some(PROVIDER_CHOICES[1]),
-        "gemini" => return Some(PROVIDER_CHOICES[2]),
-        "azure" => return Some(PROVIDER_CHOICES[3]),
-        "bedrock" | "aws" => return Some(PROVIDER_CHOICES[4]),
-        "together" => return Some(PROVIDER_CHOICES[8]),
-        "vertex" | "vertexai" => return Some(PROVIDER_CHOICES[9]),
+    // Common nicknames.
+    match first {
+        "codex" | "chatgpt" | "gpt" => return provider_choice_default_for_provider("openai-codex"),
+        "claude" => return provider_choice_default_for_provider("anthropic"),
+        "gemini" => return provider_choice_default_for_provider("google"),
+        "kimi" => return provider_choice_default_for_provider("kimi-for-coding"),
         _ => {}
     }
 
-    // Fall back to provider_metadata registry for any canonical ID or alias
-    let meta = provider_metadata::provider_metadata(&normalized)?;
+    // Fall back to provider_metadata registry for any canonical ID or alias.
+    let meta = provider_metadata::provider_metadata(first)?;
+    let canonical = meta.canonical_id;
+
+    // If we have an explicit method preference, honor it when multiple choices exist.
+    let wants_oauth = rest.contains("oauth");
+    let wants_key = rest.contains("key") || rest.contains("api");
+    if wants_oauth || wants_key {
+        if let Some(found) = PROVIDER_CHOICES.iter().copied().find(|choice| {
+            choice.provider.eq_ignore_ascii_case(canonical)
+                && ((wants_oauth
+                    && matches!(
+                        choice.kind,
+                        SetupCredentialKind::OAuthPkce | SetupCredentialKind::OAuthDeviceFlow
+                    ))
+                    || (wants_key && choice.kind == SetupCredentialKind::ApiKey))
+        }) {
+            return Some(found);
+        }
+    }
+
+    // Prefer known built-in flows for providers we support.
+    if let Some(found) = provider_choice_default_for_provider(canonical) {
+        return Some(found);
+    }
+
+    // Otherwise, fall back to API-key style with whatever env var hint we have.
     Some(ProviderChoice {
-        id: meta.canonical_id,
-        label: meta.canonical_id,
+        provider: canonical,
+        label: canonical,
+        kind: SetupCredentialKind::ApiKey,
         env: meta.auth_env_keys.first().copied().unwrap_or(""),
     })
 }
@@ -2887,30 +2943,44 @@ async fn run_first_time_setup(
     console.render_rule(Some("Welcome to Pi"));
     match startup_error {
         StartupError::NoModelsAvailable { .. } => {
-            console.print_markup("[bold]No models are configured yet.[/]\n");
+            console.print_markup("[bold]No authenticated models are available yet.[/]\n");
         }
         StartupError::MissingApiKey { provider } => {
             console.print_markup(&format!(
-                "[bold]Missing API key for provider:[/] {provider}\n"
+                "[bold]Missing credentials for provider:[/] {provider}\n"
             ));
         }
     }
-    console.print_markup("Let’s add your first API key.\n\n");
+    console.print_markup("Let’s authenticate.\n\n");
 
     let provider_hint = match startup_error {
-        StartupError::MissingApiKey { provider } => provider_from_token(provider),
-        StartupError::NoModelsAvailable { .. } => None,
-    };
+        StartupError::MissingApiKey { provider } => provider_choice_from_token(provider),
+        StartupError::NoModelsAvailable { .. } => {
+            provider_choice_default_for_provider("openai-codex")
+        }
+    }
+    .or_else(|| Some(PROVIDER_CHOICES[0]));
 
     console.print_markup("[bold]Choose a provider:[/]\n");
     for (idx, provider) in PROVIDER_CHOICES.iter().enumerate() {
-        let is_default = provider_hint.is_some_and(|hint| hint.id == provider.id);
+        let is_default = provider_hint
+            .is_some_and(|hint| hint.provider == provider.provider && hint.kind == provider.kind);
         let default_marker = if is_default { " [dim](default)[/]" } else { "" };
+        let method = match provider.kind {
+            SetupCredentialKind::ApiKey => "API key",
+            SetupCredentialKind::OAuthPkce => "OAuth",
+            SetupCredentialKind::OAuthDeviceFlow => "OAuth (device flow)",
+        };
+        let hint = if provider.env.trim().is_empty() {
+            method.to_string()
+        } else {
+            format!("{method}  {}", provider.env)
+        };
         console.print_markup(&format!(
             "  [cyan]{})[/] {}  [dim]{}[/]{}\n",
             idx + 1,
             provider.label,
-            provider.env,
+            hint,
             default_marker
         ));
     }
@@ -2962,39 +3032,177 @@ async fn run_first_time_setup(
             console.render_warning("Setup cancelled.");
             return Ok(false);
         }
-        if let Some(provider) = provider_from_token(&normalized) {
+        if let Some(provider) = provider_choice_from_token(&normalized) {
             break provider;
         }
         console.render_warning("Unrecognized choice. Please try again.");
     };
 
-    console.print_markup("Paste your API key (input will be visible):\n");
-    let Some(raw_key) = prompt_line("API key: ")? else {
-        console.render_warning("Setup cancelled (no input).");
-        return Ok(false);
-    };
-    let key = raw_key.trim();
-    if key.is_empty() {
-        console.render_warning("No API key entered. Setup cancelled.");
-        return Ok(false);
-    }
+    let credential = match provider.kind {
+        SetupCredentialKind::ApiKey => {
+            console.print_markup("Paste your API key (input will be visible):\n");
+            let Some(raw_key) = prompt_line("API key: ")? else {
+                console.render_warning("Setup cancelled (no input).");
+                return Ok(false);
+            };
+            let key = raw_key.trim();
+            if key.is_empty() {
+                console.render_warning("No API key entered. Setup cancelled.");
+                return Ok(false);
+            }
 
-    auth.set(
-        provider.id,
-        AuthCredential::ApiKey {
-            key: key.to_string(),
-        },
-    );
+            AuthCredential::ApiKey {
+                key: key.to_string(),
+            }
+        }
+        SetupCredentialKind::OAuthPkce => {
+            let start = match provider.provider {
+                "openai-codex" => pi::auth::start_openai_codex_oauth()?,
+                "anthropic" => pi::auth::start_anthropic_oauth()?,
+                "google-gemini-cli" => pi::auth::start_google_gemini_cli_oauth()?,
+                "google-antigravity" => pi::auth::start_google_antigravity_oauth()?,
+                _ => {
+                    console.render_warning(&format!(
+                        "OAuth login is not supported for {} in this setup flow. Start Pi and run /login {} instead.",
+                        provider.provider, provider.provider
+                    ));
+                    return Ok(false);
+                }
+            };
+
+            if start.provider == "anthropic" {
+                console.render_warning(
+                    "Anthropic OAuth (Claude Code consumer account) is no longer recommended.\n\
+Using consumer OAuth tokens outside the official client may violate Anthropic's consumer Terms of Service and can\n\
+result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_API_KEY) instead.",
+                );
+            }
+
+            console.print_markup(&format!(
+                "[bold]OAuth login:[/] {}\n\nOpen this URL:\n{}\n\n{}\n",
+                start.provider,
+                start.url,
+                start.instructions.as_deref().unwrap_or_default()
+            ));
+            let Some(code_input) = prompt_line("Paste callback URL or code: ")? else {
+                console.render_warning("Setup cancelled (no input).");
+                return Ok(false);
+            };
+            let code_input = code_input.trim();
+            if code_input.is_empty() {
+                console.render_warning("No authorization code provided. Setup cancelled.");
+                return Ok(false);
+            }
+
+            match start.provider.as_str() {
+                "openai-codex" => {
+                    pi::auth::complete_openai_codex_oauth(code_input, &start.verifier).await?
+                }
+                "anthropic" => {
+                    pi::auth::complete_anthropic_oauth(code_input, &start.verifier).await?
+                }
+                "google-gemini-cli" => {
+                    pi::auth::complete_google_gemini_cli_oauth(code_input, &start.verifier).await?
+                }
+                "google-antigravity" => {
+                    pi::auth::complete_google_antigravity_oauth(code_input, &start.verifier).await?
+                }
+                other => {
+                    console.render_warning(&format!(
+                        "OAuth completion not supported for {other}. Setup cancelled."
+                    ));
+                    return Ok(false);
+                }
+            }
+        }
+        SetupCredentialKind::OAuthDeviceFlow => {
+            if provider.provider != "kimi-for-coding" {
+                console.render_warning(&format!(
+                    "Device-flow login not supported for {} in this setup flow. Start Pi and run /login {} instead.",
+                    provider.provider, provider.provider
+                ));
+                return Ok(false);
+            }
+
+            let device = pi::auth::start_kimi_code_device_flow().await?;
+            let verification_url = device
+                .verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| device.verification_uri.clone());
+            console.print_markup(&format!(
+                "[bold]OAuth login:[/] kimi-for-coding\n\n\
+Open this URL:\n{verification_url}\n\n\
+If prompted, enter this code: {}\n\
+Code expires in {} seconds.\n",
+                device.user_code, device.expires_in
+            ));
+
+            let start = std::time::Instant::now();
+            loop {
+                let elapsed = start.elapsed().as_secs();
+                if elapsed >= device.expires_in {
+                    console.render_warning("Device code expired. Run setup again.");
+                    return Ok(false);
+                }
+
+                let Some(input) = prompt_line("Press Enter to poll (or type q to cancel): ")?
+                else {
+                    console.render_warning("Setup cancelled (no input).");
+                    return Ok(false);
+                };
+                if input.trim().eq_ignore_ascii_case("q") {
+                    console.render_warning("Setup cancelled.");
+                    return Ok(false);
+                }
+
+                match pi::auth::poll_kimi_code_device_flow(&device.device_code).await {
+                    pi::auth::DeviceFlowPollResult::Success(cred) => break cred,
+                    pi::auth::DeviceFlowPollResult::Pending => {
+                        console.render_info("Authorization still pending. Complete the browser step and poll again.");
+                    }
+                    pi::auth::DeviceFlowPollResult::SlowDown => {
+                        console.render_info("Authorization server asked to slow down. Wait a few seconds and poll again.");
+                    }
+                    pi::auth::DeviceFlowPollResult::Expired => {
+                        console.render_warning("Device code expired. Run setup again.");
+                        return Ok(false);
+                    }
+                    pi::auth::DeviceFlowPollResult::AccessDenied => {
+                        console.render_warning("Access denied. Run setup again.");
+                        return Ok(false);
+                    }
+                    pi::auth::DeviceFlowPollResult::Error(err) => {
+                        console.render_warning(&format!("OAuth polling failed: {err}"));
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    };
+
+    let _ = auth.remove_provider_aliases(provider.provider);
+    auth.set(provider.provider.to_string(), credential);
     auth.save_async().await?;
 
-    if cli.provider.as_deref() != Some(provider.id) {
-        cli.provider = Some(provider.id.to_string());
+    // Make the next startup attempt use the credential we just created.
+    if cli.provider.as_deref() != Some(provider.provider) {
+        cli.provider = Some(provider.provider.to_string());
         cli.model = None;
     }
+    if provider.provider == "openai-codex" {
+        cli.model = Some("gpt-5.3-codex".to_string());
+    }
 
+    let saved_label = match provider.kind {
+        SetupCredentialKind::ApiKey => "API key",
+        SetupCredentialKind::OAuthPkce | SetupCredentialKind::OAuthDeviceFlow => {
+            "OAuth credentials"
+        }
+    };
     console.render_success(&format!(
-        "Saved {label} API key to {path}",
-        label = provider.label,
+        "Saved {label} for {provider} to {path}",
+        label = saved_label,
+        provider = provider.provider,
         path = Config::auth_path().display()
     ));
     console.render_info("Continuing startup...");
@@ -3715,76 +3923,170 @@ mod tests {
     }
 
     #[test]
-    fn provider_from_token_numbered_choices() {
-        // Original 3 providers by number
-        assert_eq!(provider_from_token("1").unwrap().id, "anthropic");
-        assert_eq!(provider_from_token("2").unwrap().id, "openai");
-        assert_eq!(provider_from_token("3").unwrap().id, "google");
-        // New providers by number
-        assert_eq!(provider_from_token("4").unwrap().id, "azure-openai");
-        assert_eq!(provider_from_token("5").unwrap().id, "amazon-bedrock");
-        assert_eq!(provider_from_token("6").unwrap().id, "groq");
-        assert_eq!(provider_from_token("7").unwrap().id, "openrouter");
-        assert_eq!(provider_from_token("8").unwrap().id, "mistral");
-        assert_eq!(provider_from_token("9").unwrap().id, "togetherai");
-        assert_eq!(provider_from_token("10").unwrap().id, "google-vertex");
+    fn provider_choice_from_token_numbered_choices() {
+        let choice = provider_choice_from_token("1").expect("provider 1");
+        assert_eq!(choice.provider, "openai-codex");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthPkce);
+
+        let choice = provider_choice_from_token("2").expect("provider 2");
+        assert_eq!(choice.provider, "openai");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
+
+        let choice = provider_choice_from_token("3").expect("provider 3");
+        assert_eq!(choice.provider, "anthropic");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthPkce);
+
+        let choice = provider_choice_from_token("4").expect("provider 4");
+        assert_eq!(choice.provider, "anthropic");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
+
+        let choice = provider_choice_from_token("5").expect("provider 5");
+        assert_eq!(choice.provider, "kimi-for-coding");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthDeviceFlow);
+
+        let choice = provider_choice_from_token("6").expect("provider 6");
+        assert_eq!(choice.provider, "google-gemini-cli");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthPkce);
+
+        let choice = provider_choice_from_token("7").expect("provider 7");
+        assert_eq!(choice.provider, "google");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
+
+        let choice = provider_choice_from_token("8").expect("provider 8");
+        assert_eq!(choice.provider, "google-antigravity");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthPkce);
+
+        let choice = provider_choice_from_token("9").expect("provider 9");
+        assert_eq!(choice.provider, "azure-openai");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
+
+        let choice = provider_choice_from_token("10").expect("provider 10");
+        assert_eq!(choice.provider, "openrouter");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
         // Out of range
-        assert!(provider_from_token("0").is_none());
-        assert!(provider_from_token("11").is_none());
+        assert!(provider_choice_from_token("0").is_none());
+        assert!(provider_choice_from_token("11").is_none());
     }
 
     #[test]
-    fn provider_from_token_common_nicknames() {
-        assert_eq!(provider_from_token("claude").unwrap().id, "anthropic");
-        assert_eq!(provider_from_token("gpt").unwrap().id, "openai");
-        assert_eq!(provider_from_token("chatgpt").unwrap().id, "openai");
-        assert_eq!(provider_from_token("gemini").unwrap().id, "google");
-        assert_eq!(provider_from_token("azure").unwrap().id, "azure-openai");
-        assert_eq!(provider_from_token("bedrock").unwrap().id, "amazon-bedrock");
-        assert_eq!(provider_from_token("aws").unwrap().id, "amazon-bedrock");
-        assert_eq!(provider_from_token("together").unwrap().id, "togetherai");
-        assert_eq!(provider_from_token("vertex").unwrap().id, "google-vertex");
-        assert_eq!(provider_from_token("vertexai").unwrap().id, "google-vertex");
+    fn provider_choice_from_token_common_nicknames() {
+        assert_eq!(
+            provider_choice_from_token("claude").unwrap().provider,
+            "anthropic"
+        );
+        assert_eq!(
+            provider_choice_from_token("gpt").unwrap().provider,
+            "openai-codex"
+        );
+        assert_eq!(
+            provider_choice_from_token("chatgpt").unwrap().provider,
+            "openai-codex"
+        );
+        assert_eq!(
+            provider_choice_from_token("gemini").unwrap().provider,
+            "google"
+        );
+        assert_eq!(
+            provider_choice_from_token("kimi").unwrap().provider,
+            "kimi-for-coding"
+        );
     }
 
     #[test]
-    fn provider_from_token_canonical_ids() {
-        assert_eq!(provider_from_token("anthropic").unwrap().id, "anthropic");
-        assert_eq!(provider_from_token("openai").unwrap().id, "openai");
-        assert_eq!(provider_from_token("groq").unwrap().id, "groq");
-        assert_eq!(provider_from_token("openrouter").unwrap().id, "openrouter");
-        assert_eq!(provider_from_token("mistral").unwrap().id, "mistral");
+    fn provider_choice_from_token_canonical_ids() {
+        assert_eq!(
+            provider_choice_from_token("anthropic").unwrap().provider,
+            "anthropic"
+        );
+        assert_eq!(
+            provider_choice_from_token("openai").unwrap().provider,
+            "openai"
+        );
+        assert_eq!(
+            provider_choice_from_token("openai-codex").unwrap().provider,
+            "openai-codex"
+        );
+        assert_eq!(provider_choice_from_token("groq").unwrap().provider, "groq");
+        assert_eq!(
+            provider_choice_from_token("openrouter").unwrap().provider,
+            "openrouter"
+        );
+        assert_eq!(
+            provider_choice_from_token("mistral").unwrap().provider,
+            "mistral"
+        );
     }
 
     #[test]
-    fn provider_from_token_case_insensitive() {
-        assert_eq!(provider_from_token("ANTHROPIC").unwrap().id, "anthropic");
-        assert_eq!(provider_from_token("Groq").unwrap().id, "groq");
-        assert_eq!(provider_from_token("OpenRouter").unwrap().id, "openrouter");
+    fn provider_choice_from_token_case_insensitive() {
+        assert_eq!(
+            provider_choice_from_token("ANTHROPIC").unwrap().provider,
+            "anthropic"
+        );
+        assert_eq!(provider_choice_from_token("Groq").unwrap().provider, "groq");
+        assert_eq!(
+            provider_choice_from_token("OpenRouter").unwrap().provider,
+            "openrouter"
+        );
     }
 
     #[test]
-    fn provider_from_token_metadata_fallback() {
+    fn provider_choice_from_token_metadata_fallback() {
         // Providers not in the top-10 list but in provider_metadata registry
-        assert_eq!(provider_from_token("deepseek").unwrap().id, "deepseek");
-        assert_eq!(provider_from_token("cerebras").unwrap().id, "cerebras");
-        assert_eq!(provider_from_token("cohere").unwrap().id, "cohere");
-        assert_eq!(provider_from_token("perplexity").unwrap().id, "perplexity");
+        assert_eq!(
+            provider_choice_from_token("deepseek").unwrap().provider,
+            "deepseek"
+        );
+        assert_eq!(
+            provider_choice_from_token("cerebras").unwrap().provider,
+            "cerebras"
+        );
+        assert_eq!(
+            provider_choice_from_token("cohere").unwrap().provider,
+            "cohere"
+        );
+        assert_eq!(
+            provider_choice_from_token("perplexity").unwrap().provider,
+            "perplexity"
+        );
         // Aliases resolve through metadata
-        assert_eq!(provider_from_token("open-router").unwrap().id, "openrouter");
-        assert_eq!(provider_from_token("dashscope").unwrap().id, "alibaba");
+        assert_eq!(
+            provider_choice_from_token("open-router").unwrap().provider,
+            "openrouter"
+        );
+        assert_eq!(
+            provider_choice_from_token("dashscope").unwrap().provider,
+            "alibaba"
+        );
     }
 
     #[test]
-    fn provider_from_token_whitespace_handling() {
-        assert_eq!(provider_from_token("  groq  ").unwrap().id, "groq");
-        assert_eq!(provider_from_token(" 1 ").unwrap().id, "anthropic");
+    fn provider_choice_from_token_honors_method_preference() {
+        let provider = provider_choice_from_token("anthropic oauth").expect("anthropic oauth");
+        assert_eq!(provider.provider, "anthropic");
+        assert_eq!(provider.kind, SetupCredentialKind::OAuthPkce);
+
+        let provider = provider_choice_from_token("anthropic key").expect("anthropic key");
+        assert_eq!(provider.provider, "anthropic");
+        assert_eq!(provider.kind, SetupCredentialKind::ApiKey);
     }
 
     #[test]
-    fn provider_from_token_unknown_returns_none() {
-        assert!(provider_from_token("nonexistent-provider-xyz").is_none());
-        assert!(provider_from_token("").is_none());
+    fn provider_choice_from_token_whitespace_handling() {
+        assert_eq!(
+            provider_choice_from_token("  groq  ").unwrap().provider,
+            "groq"
+        );
+        assert_eq!(
+            provider_choice_from_token(" 1 ").unwrap().provider,
+            "openai-codex"
+        );
+    }
+
+    #[test]
+    fn provider_choice_from_token_unknown_returns_none() {
+        assert!(provider_choice_from_token("nonexistent-provider-xyz").is_none());
+        assert!(provider_choice_from_token("").is_none());
     }
 
     #[test]

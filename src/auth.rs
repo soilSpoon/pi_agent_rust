@@ -864,8 +864,17 @@ fn read_external_claude_access_token() -> Option<String> {
 }
 
 fn read_external_codex_auth() -> Option<serde_json::Value> {
-    let path = home_dir()?.join(".codex").join("auth.json");
-    read_external_json(&path)
+    let home = home_dir()?;
+    let candidates = [
+        home.join(".codex").join("auth.json"),
+        home.join(".config").join("codex").join("auth.json"),
+    ];
+    for path in candidates {
+        if let Some(value) = read_external_json(&path) {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn read_external_codex_access_token() -> Option<String> {
@@ -879,28 +888,64 @@ fn read_external_codex_openai_api_key() -> Option<String> {
 }
 
 fn codex_access_token_from_value(value: &serde_json::Value) -> Option<String> {
-    let token = value
-        .get("tokens")
-        .and_then(|tokens| tokens.get("access_token"))
-        .and_then(serde_json::Value::as_str)?
-        .trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
-    }
+    let candidates = [
+        // Canonical codex CLI shape.
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(serde_json::Value::as_str),
+        // CamelCase variant.
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.get("accessToken"))
+            .and_then(serde_json::Value::as_str),
+        // Flat variants.
+        value
+            .get("access_token")
+            .and_then(serde_json::Value::as_str),
+        value.get("accessToken").and_then(serde_json::Value::as_str),
+        value.get("token").and_then(serde_json::Value::as_str),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|token| !token.is_empty() && !token.starts_with("sk-"))
+        .map(std::string::ToString::to_string)
 }
 
 fn codex_openai_api_key_from_value(value: &serde_json::Value) -> Option<String> {
-    let key = value
-        .get("OPENAI_API_KEY")
-        .and_then(serde_json::Value::as_str)?
-        .trim();
-    if key.is_empty() {
-        None
-    } else {
-        Some(key.to_string())
-    }
+    let candidates = [
+        value
+            .get("OPENAI_API_KEY")
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("openai_api_key")
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("openaiApiKey")
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("env")
+            .and_then(|env| env.get("OPENAI_API_KEY"))
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("env")
+            .and_then(|env| env.get("openai_api_key"))
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("env")
+            .and_then(|env| env.get("openaiApiKey"))
+            .and_then(serde_json::Value::as_str),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|key| !key.is_empty())
+        .map(std::string::ToString::to_string)
 }
 
 fn read_external_gemini_access_payload(project_id: Option<&str>) -> Option<String> {
