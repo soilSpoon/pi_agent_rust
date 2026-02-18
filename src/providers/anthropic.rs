@@ -3,6 +3,7 @@
 //! This module implements the Provider trait for the Anthropic Messages API,
 //! supporting streaming responses, tool use, and extended thinking.
 
+use crate::auth::unmark_anthropic_oauth_bearer_token;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
@@ -95,6 +96,27 @@ where
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env_lookup("USERPROFILE")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = env_lookup("HOMEDRIVE")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())?;
+            let path = env_lookup("HOMEPATH")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())?;
+            if path.starts_with('\\') || path.starts_with('/') {
+                Some(std::path::PathBuf::from(format!("{drive}{path}")))
+            } else {
+                let mut combined = std::path::PathBuf::from(drive);
+                combined.push(path);
+                Some(combined)
+            }
+        })
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
@@ -334,7 +356,7 @@ impl Provider for AnthropicProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let auth_value = options
+        let raw_auth_value = options
             .api_key
             .clone()
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
@@ -344,9 +366,17 @@ impl Provider for AnthropicProvider {
                     "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
                 )
             })?;
+        let forced_bearer_token = if is_anthropic_provider(&self.provider) {
+            unmark_anthropic_oauth_bearer_token(&raw_auth_value).map(ToString::to_string)
+        } else {
+            None
+        };
+        let force_bearer = forced_bearer_token.is_some();
+        let auth_value = forced_bearer_token.unwrap_or(raw_auth_value);
 
         let request_body = self.build_request(context, options);
-        let anthropic_bearer_token = is_anthropic_bearer_token(&self.provider, &auth_value);
+        let anthropic_bearer_token =
+            force_bearer || is_anthropic_bearer_token(&self.provider, &auth_value);
         let kimi_oauth_token = is_kimi_oauth_token(&self.provider, &auth_value);
 
         // Build request with headers (Content-Type set by .json() below)
@@ -1088,6 +1118,27 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn home_dir_lookup_falls_back_to_userprofile() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "USERPROFILE" => Some("C:\\Users\\Ada".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(home, Some(PathBuf::from("C:\\Users\\Ada")));
+    }
+
+    #[test]
+    fn home_dir_lookup_falls_back_to_homedrive_homepath() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOMEDRIVE" => Some("D:".to_string()),
+            "HOMEPATH" => Some("\\Users\\Grace".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(home, Some(PathBuf::from("D:\\Users\\Grace")));
+    }
+
+    #[test]
     fn test_convert_user_text_message() {
         let message = Message::User(crate::model::UserMessage {
             content: UserContent::Text("Hello".to_string()),
@@ -1580,6 +1631,24 @@ mod tests {
                 .headers
                 .get("user-agent")
                 .is_some_and(|value| value.contains("pi_agent_rust/"))
+        );
+    }
+
+    #[test]
+    fn test_stream_uses_bearer_headers_for_marked_anthropic_oauth_token() {
+        let marked = "__pi_anthropic_oauth_bearer__:sk-ant-api-like-token";
+        let captured = run_stream_and_capture_headers_with_api_key(CacheRetention::None, marked)
+            .expect("captured request for marked oauth headers");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer sk-ant-api-like-token")
+        );
+        assert!(!captured.headers.contains_key("x-api-key"));
+        assert!(
+            captured
+                .headers
+                .get("anthropic-beta")
+                .is_some_and(|value| value.contains("oauth-2025-04-20"))
         );
     }
 

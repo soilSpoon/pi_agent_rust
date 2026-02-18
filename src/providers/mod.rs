@@ -855,7 +855,7 @@ pub fn create_provider(
             Ok(Arc::new(
                 anthropic::AnthropicProvider::new(entry.model.id.clone())
                     .with_provider_name(entry.model.provider.clone())
-                    .with_base_url(entry.model.base_url.clone())
+                    .with_base_url(normalize_anthropic_base(&entry.model.base_url))
                     .with_compat(entry.compat.clone())
                     .with_client(client),
             ))
@@ -961,6 +961,14 @@ pub fn create_provider(
                 .with_client(client),
         )),
     }
+}
+
+pub fn normalize_anthropic_base(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/v1/messages") {
+        return base_url.to_string();
+    }
+    format!("{base_url}/v1/messages")
 }
 
 pub fn normalize_openai_base(base_url: &str) -> String {
