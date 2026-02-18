@@ -1,10 +1,16 @@
 {
   "schema": "pi.qa.parity_certification.v1",
-  "certification_date": "2026-02-14",
-  "generated_by": "GentleIsland (claude-code, opus-4.6)",
+  "certification_date": "2026-02-18",
+  "generated_by": "Codex (gpt-5)",
   "bead_id": "bd-2pc62",
-  "verdict": "CERTIFIED",
-  "summary": "All in-scope features implemented. Zero partial or missing items. 11 items intentionally out of scope.",
+  "verdict": "NOT_CERTIFIED",
+  "summary": "Informational implementation snapshot only. Strict drop-in certification is not granted while hard-gate drop-in parity domains remain open.",
+  "release_claim_status": {
+    "strict_dropin_allowed": false,
+    "gate_contract": "docs/dropin-certification-contract.json",
+    "verdict_artifact": "docs/dropin-certification-verdict.json",
+    "blocking_reason": "Open critical/high parity gaps across CLI, JSON/RPC, SDK, config/env, session/errors, integration I/O, differential-testing, and quality-gates."
+  },
   "test_results": {
     "lib": {
       "passed": 3360,

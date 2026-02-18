@@ -34,6 +34,15 @@
     },
     {
       "aliases": [
+        "codex",
+        "chatgpt-codex"
+      ],
+      "auth_env_keys": [],
+      "canonical_id": "openai-codex",
+      "onboarding_mode": "native-adapter-required"
+    },
+    {
+      "aliases": [
         "gemini"
       ],
       "auth_env_keys": [
@@ -49,6 +58,22 @@
         "context_window": 128000,
         "max_tokens": 8192
       }
+    },
+    {
+      "aliases": [
+        "gemini-cli"
+      ],
+      "auth_env_keys": [],
+      "canonical_id": "google-gemini-cli",
+      "onboarding_mode": "native-adapter-required"
+    },
+    {
+      "aliases": [
+        "antigravity"
+      ],
+      "auth_env_keys": [],
+      "canonical_id": "google-antigravity",
+      "onboarding_mode": "native-adapter-required"
     },
     {
       "aliases": [],
@@ -808,7 +833,10 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "kimi-coding",
+        "kimi-code"
+      ],
       "auth_env_keys": [
         "KIMI_API_KEY"
       ],
@@ -1188,7 +1216,9 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "vercel-ai-gateway"
+      ],
       "auth_env_keys": [
         "AI_GATEWAY_API_KEY"
       ],
@@ -1313,7 +1343,8 @@
     {
       "aliases": [
         "azure",
-        "azure-cognitive-services"
+        "azure-cognitive-services",
+        "azure-openai-responses"
       ],
       "auth_env_keys": [
         "AZURE_OPENAI_API_KEY"
@@ -1346,6 +1377,6 @@
     }
   ],
   "schema_version": "1.0",
-  "total_aliases": 34,
-  "total_providers": 87
+  "total_aliases": 41,
+  "total_providers": 90
 }
