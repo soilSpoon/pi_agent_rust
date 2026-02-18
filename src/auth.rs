@@ -54,6 +54,10 @@ const GOOGLE_ANTIGRAVITY_PROJECT_DISCOVERY_ENDPOINTS: [&str; 2] = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
 ];
 
+/// Internal marker used to preserve OAuth-vs-API-key lane information when
+/// passing Anthropic credentials through provider-agnostic key plumbing.
+const ANTHROPIC_OAUTH_BEARER_MARKER: &str = "__pi_anthropic_oauth_bearer__:";
+
 // ── GitHub / Copilot OAuth constants ──────────────────────────────
 const GITHUB_OAUTH_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_OAUTH_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -414,11 +418,18 @@ impl AuthStorage {
         // Prefer explicit stored OAuth/Bearer credentials over ambient env vars.
         // This prevents stale shell env keys from silently overriding successful `/login` flows.
         if let Some(credential) = self.credential_for_provider(provider)
-            && matches!(
-                credential,
-                AuthCredential::OAuth { .. } | AuthCredential::BearerToken { .. }
-            )
-            && let Some(key) = api_key_from_credential(credential)
+            && let Some(key) = match credential {
+                AuthCredential::OAuth { .. }
+                    if canonical_provider_id(provider).unwrap_or(provider) == "anthropic" =>
+                {
+                    api_key_from_credential(credential)
+                        .map(|token| mark_anthropic_oauth_bearer_token(&token))
+                }
+                AuthCredential::OAuth { .. } | AuthCredential::BearerToken { .. } => {
+                    api_key_from_credential(credential)
+                }
+                _ => None,
+            }
         {
             return Some(key);
         }
@@ -744,6 +755,14 @@ fn env_key_for_provider(provider: &str) -> Option<&'static str> {
     env_keys_for_provider(provider).first().copied()
 }
 
+fn mark_anthropic_oauth_bearer_token(token: &str) -> String {
+    format!("{ANTHROPIC_OAUTH_BEARER_MARKER}{token}")
+}
+
+pub(crate) fn unmark_anthropic_oauth_bearer_token(token: &str) -> Option<&str> {
+    token.strip_prefix(ANTHROPIC_OAUTH_BEARER_MARKER)
+}
+
 fn env_keys_for_provider(provider: &str) -> &'static [&'static str] {
     provider_auth_env_keys(provider)
 }
@@ -751,13 +770,15 @@ fn env_keys_for_provider(provider: &str) -> &'static [&'static str] {
 fn resolve_external_provider_api_key(provider: &str) -> Option<String> {
     let canonical = canonical_provider_id(provider).unwrap_or(provider);
     match canonical {
-        "anthropic" => read_external_claude_access_token(),
+        "anthropic" => read_external_claude_access_token()
+            .map(|token| mark_anthropic_oauth_bearer_token(&token)),
         // Keep OpenAI API-key auth distinct from Codex OAuth token auth.
         // Codex access tokens are only valid on Codex-specific routes.
         "openai" => read_external_codex_openai_api_key(),
         "openai-codex" => read_external_codex_access_token(),
         "google-gemini-cli" => {
-            let project = google_project_id_from_env();
+            let project =
+                google_project_id_from_env().or_else(google_project_id_from_gcloud_config);
             read_external_gemini_access_payload(project.as_deref())
         }
         "google-antigravity" => {
@@ -778,11 +799,27 @@ pub fn external_setup_source(provider: &str) -> Option<&'static str> {
         "anthropic" if read_external_claude_access_token().is_some() => {
             Some("Claude Code (~/.claude/.credentials.json)")
         }
+        "openai" if read_external_codex_openai_api_key().is_some() => {
+            Some("Codex (~/.codex/auth.json)")
+        }
         "openai-codex" if read_external_codex_access_token().is_some() => {
             Some("Codex (~/.codex/auth.json)")
         }
-        "google-gemini-cli" if read_external_gemini_access_payload(None).is_some() => {
-            Some("Gemini CLI (~/.gemini/oauth_creds.json)")
+        "google-gemini-cli" => {
+            let project =
+                google_project_id_from_env().or_else(google_project_id_from_gcloud_config);
+            read_external_gemini_access_payload(project.as_deref())
+                .is_some()
+                .then_some("Gemini CLI (~/.gemini/oauth_creds.json)")
+        }
+        "google-antigravity" => {
+            let project = google_project_id_from_env()
+                .unwrap_or_else(|| GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string());
+            if read_external_gemini_access_payload(Some(project.as_str())).is_some() {
+                Some("Gemini CLI (~/.gemini/oauth_creds.json)")
+            } else {
+                None
+            }
         }
         "kimi-for-coding" if read_external_kimi_code_access_token().is_some() => Some(
             "Kimi CLI (~/.kimi/credentials/kimi-code.json or $KIMI_SHARE_DIR/credentials/kimi-code.json)",
@@ -797,8 +834,7 @@ fn read_external_json(path: &Path) -> Option<serde_json::Value> {
 }
 
 fn read_external_claude_access_token() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let path = Path::new(&home).join(".claude").join(".credentials.json");
+    let path = home_dir()?.join(".claude").join(".credentials.json");
     let value = read_external_json(&path)?;
     let token = value
         .get("claudeAiOauth")
@@ -810,8 +846,7 @@ fn read_external_claude_access_token() -> Option<String> {
 }
 
 fn read_external_codex_auth() -> Option<serde_json::Value> {
-    let home = std::env::var_os("HOME")?;
-    let path = Path::new(&home).join(".codex").join("auth.json");
+    let path = home_dir()?.join(".codex").join("auth.json");
     read_external_json(&path)
 }
 
@@ -851,13 +886,10 @@ fn codex_openai_api_key_from_value(value: &serde_json::Value) -> Option<String> 
 }
 
 fn read_external_gemini_access_payload(project_id: Option<&str>) -> Option<String> {
-    let home = std::env::var_os("HOME")?;
+    let home = home_dir()?;
     let candidates = [
-        Path::new(&home).join(".gemini").join("oauth_creds.json"),
-        Path::new(&home)
-            .join(".config")
-            .join("gemini")
-            .join("credentials.json"),
+        home.join(".gemini").join("oauth_creds.json"),
+        home.join(".config").join("gemini").join("credentials.json"),
     ];
 
     for path in candidates {
@@ -884,9 +916,13 @@ fn read_external_gemini_access_payload(project_id: Option<&str>) -> Option<Strin
                     .filter(|s| !s.is_empty())
                     .map(std::string::ToString::to_string)
             })
-            .unwrap_or_else(|| "default-project".to_string());
+            .or_else(google_project_id_from_gcloud_config)?;
+        let project = project.trim();
+        if project.is_empty() {
+            continue;
+        }
 
-        return Some(encode_project_scoped_access_token(token, &project));
+        return Some(encode_project_scoped_access_token(token, project));
     }
 
     None
@@ -928,6 +964,93 @@ fn google_project_id_from_env() -> Option<String> {
         .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn gcloud_config_dir_with_env_lookup<F>(env_lookup: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup("CLOUDSDK_CONFIG")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env_lookup("APPDATA")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| PathBuf::from(value).join("gcloud"))
+        })
+        .or_else(|| {
+            env_lookup("XDG_CONFIG_HOME")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| PathBuf::from(value).join("gcloud"))
+        })
+        .or_else(|| {
+            home_dir_with_env_lookup(env_lookup).map(|home| home.join(".config").join("gcloud"))
+        })
+}
+
+fn gcloud_active_config_name_with_env_lookup<F>(env_lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup("CLOUDSDK_ACTIVE_CONFIG_NAME")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn google_project_id_from_gcloud_config_with_env_lookup<F>(env_lookup: F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let config_dir = gcloud_config_dir_with_env_lookup(&env_lookup)?;
+    let config_name = gcloud_active_config_name_with_env_lookup(&env_lookup);
+    let config_file = config_dir
+        .join("configurations")
+        .join(format!("config_{config_name}"));
+    let Ok(content) = std::fs::read_to_string(config_file) else {
+        return None;
+    };
+
+    let mut section: Option<&str> = None;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        if let Some(rest) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            section = Some(rest.trim());
+            continue;
+        }
+
+        if section != Some("core") {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "project" {
+            continue;
+        }
+        let project = value.trim();
+        if project.is_empty() {
+            continue;
+        }
+        return Some(project.to_string());
+    }
+
+    None
+}
+
+fn google_project_id_from_gcloud_config() -> Option<String> {
+    google_project_id_from_gcloud_config_with_env_lookup(|key| std::env::var(key).ok())
 }
 
 fn encode_project_scoped_access_token(token: &str, project_id: &str) -> String {
@@ -1509,6 +1632,27 @@ where
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .or_else(|| {
+            env_lookup("USERPROFILE")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = env_lookup("HOMEDRIVE")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())?;
+            let path = env_lookup("HOMEPATH")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())?;
+            if path.starts_with('\\') || path.starts_with('/') {
+                Some(PathBuf::from(format!("{drive}{path}")))
+            } else {
+                let mut combined = PathBuf::from(drive);
+                combined.push(path);
+                Some(combined)
+            }
+        })
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1661,6 +1805,9 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
     };
 
     let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
 
     let client = crate::http::client::Client::new();
     let request = client
@@ -2430,6 +2577,9 @@ pub async fn complete_extension_oauth(
     };
 
     let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
 
     let client = crate::http::client::Client::new();
 
@@ -2631,6 +2781,9 @@ pub async fn complete_copilot_browser_oauth(
     };
 
     let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
 
     let token_url_str = if config.github_base_url == "https://github.com" {
         GITHUB_OAUTH_TOKEN_URL.to_string()
@@ -2927,6 +3080,9 @@ pub async fn complete_gitlab_oauth(
     };
 
     let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
     let base = trim_trailing_slash(&config.base_url);
     let token_url = format!("{base}{GITLAB_OAUTH_TOKEN_PATH}");
 
@@ -3228,6 +3384,26 @@ mod tests {
     }
 
     #[test]
+    fn test_google_project_id_from_gcloud_config_parses_core_project() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let gcloud_dir = dir.path().join("gcloud");
+        let configs_dir = gcloud_dir.join("configurations");
+        std::fs::create_dir_all(&configs_dir).expect("mkdir configurations");
+        std::fs::write(
+            configs_dir.join("config_default"),
+            "[core]\nproject = my-proj\n",
+        )
+        .expect("write config_default");
+
+        let project = google_project_id_from_gcloud_config_with_env_lookup(|key| match key {
+            "CLOUDSDK_CONFIG" => Some(gcloud_dir.to_string_lossy().to_string()),
+            _ => None,
+        });
+
+        assert_eq!(project.as_deref(), Some("my-proj"));
+    }
+
+    #[test]
     fn test_auth_storage_load_missing_file_starts_empty() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("missing-auth.json");
@@ -3470,7 +3646,11 @@ mod tests {
         let resolved = auth.resolve_api_key_with_env_lookup("anthropic", None, |_| {
             Some("env-api-key".to_string())
         });
-        assert_eq!(resolved.as_deref(), Some("stored-oauth-token"));
+        let token = resolved.expect("resolved anthropic oauth token");
+        assert_eq!(
+            unmark_anthropic_oauth_bearer_token(&token),
+            Some("stored-oauth-token")
+        );
     }
 
     #[test]
@@ -3580,6 +3760,17 @@ mod tests {
         assert!(state.is_none());
     }
 
+    #[test]
+    fn test_complete_anthropic_oauth_rejects_state_mismatch() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let err = complete_anthropic_oauth("abc#mismatch", "expected")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("State mismatch"));
+        });
+    }
+
     fn sample_oauth_config() -> crate::models::OAuthConfig {
         crate::models::OAuthConfig {
             auth_url: "https://auth.example.com/authorize".to_string(),
@@ -3672,6 +3863,42 @@ mod tests {
         assert!(!info.verifier.contains('/'));
         assert!(!info.verifier.contains('='));
         assert_eq!(info.verifier.len(), 43);
+    }
+
+    #[test]
+    fn test_complete_extension_oauth_rejects_state_mismatch() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let config = sample_oauth_config();
+            let err = complete_extension_oauth(&config, "abc#mismatch", "expected")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("State mismatch"));
+        });
+    }
+
+    #[test]
+    fn test_complete_copilot_browser_oauth_rejects_state_mismatch() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let config = CopilotOAuthConfig::default();
+            let err = complete_copilot_browser_oauth(&config, "abc#mismatch", "expected")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("State mismatch"));
+        });
+    }
+
+    #[test]
+    fn test_complete_gitlab_oauth_rejects_state_mismatch() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let config = GitLabOAuthConfig::default();
+            let err = complete_gitlab_oauth(&config, "abc#mismatch", "expected")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("State mismatch"));
+        });
     }
 
     #[test]
@@ -4512,6 +4739,56 @@ mod tests {
 
         let resolved = auth.resolve_api_key_with_env_lookup("openai", None, |_| Some("   ".into()));
         assert_eq!(resolved.as_deref(), Some("stored-key"));
+    }
+
+    #[test]
+    fn test_resolve_api_key_anthropic_oauth_marks_for_bearer_lane() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "anthropic",
+            AuthCredential::OAuth {
+                access_token: "sk-ant-api-like-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                expires: chrono::Utc::now().timestamp_millis() + 60_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("anthropic", None, |_| None);
+        let token = resolved.expect("resolved anthropic oauth token");
+        assert_eq!(
+            unmark_anthropic_oauth_bearer_token(&token),
+            Some("sk-ant-api-like-token")
+        );
+    }
+
+    #[test]
+    fn test_resolve_api_key_non_anthropic_oauth_is_not_marked() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "openai-codex",
+            AuthCredential::OAuth {
+                access_token: "codex-oauth-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                expires: chrono::Utc::now().timestamp_millis() + 60_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("openai-codex", None, |_| None);
+        assert_eq!(resolved.as_deref(), Some("codex-oauth-token"));
     }
 
     #[test]
@@ -5553,6 +5830,36 @@ mod tests {
             _ => None,
         });
         assert_eq!(share_dir, Some(PathBuf::from("/tmp/home/.kimi")));
+    }
+
+    #[test]
+    fn test_home_dir_env_lookup_falls_back_to_userprofile() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOME" => Some("   ".to_string()),
+            "USERPROFILE" => Some("C:\\Users\\tester".to_string()),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from("C:\\Users\\tester")));
+    }
+
+    #[test]
+    fn test_home_dir_env_lookup_falls_back_to_homedrive_homepath() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOMEDRIVE" => Some("C:".to_string()),
+            "HOMEPATH" => Some("\\Users\\tester".to_string()),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from("C:\\Users\\tester")));
+    }
+
+    #[test]
+    fn test_home_dir_env_lookup_homedrive_homepath_without_root_separator() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOMEDRIVE" => Some("C:".to_string()),
+            "HOMEPATH" => Some("Users\\tester".to_string()),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from("C:/Users\\tester")));
     }
 
     #[test]
