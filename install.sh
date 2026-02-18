@@ -1538,35 +1538,29 @@ download_release_binary() {
   if [ -n "$ARTIFACT_URL" ]; then
     candidates+=("$ASSET_NAME|$ARTIFACT_URL")
   else
-    # Prioritize versioned URLs over /latest/ since we already resolved the version.
-    # Try archive formats first (dsr default output), then bare binaries.
+    # Try candidates in priority order. dsr bare-binary names first (most common
+    # for local releases), then archive formats, then Rust target-triple names.
     local base_v="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}"
     local base_l="https://github.com/${OWNER}/${REPO}/releases/latest/download"
-    if [ -n "$ASSET_PLATFORM" ]; then
-      if [ -n "$EXE_EXT" ]; then
-        candidates+=("pi-${ASSET_PLATFORM}.zip|${base_v}/pi-${ASSET_PLATFORM}.zip")
-        candidates+=("pi-${ASSET_PLATFORM}.zip|${base_l}/pi-${ASSET_PLATFORM}.zip")
-      else
-        candidates+=("pi-${ASSET_PLATFORM}.tar.xz|${base_v}/pi-${ASSET_PLATFORM}.tar.xz")
-        candidates+=("pi-${ASSET_PLATFORM}.tar.xz|${base_l}/pi-${ASSET_PLATFORM}.tar.xz")
-        candidates+=("pi-${ASSET_PLATFORM}.tar.gz|${base_v}/pi-${ASSET_PLATFORM}.tar.gz")
-        candidates+=("pi-${ASSET_PLATFORM}.tar.gz|${base_l}/pi-${ASSET_PLATFORM}.tar.gz")
-      fi
-    fi
-    candidates+=("pi-${VERSION}-${TARGET}${EXE_EXT}|${base_v}/pi-${VERSION}-${TARGET}${EXE_EXT}")
-    candidates+=("pi-${TARGET}${EXE_EXT}|${base_v}/pi-${TARGET}${EXE_EXT}")
-    candidates+=("pi-${TARGET}${EXE_EXT}|${base_l}/pi-${TARGET}${EXE_EXT}")
-    candidates+=("pi-${OS}-${ARCH}${EXE_EXT}|${base_v}/pi-${OS}-${ARCH}${EXE_EXT}")
-    candidates+=("pi-${OS}-${ARCH}${EXE_EXT}|${base_l}/pi-${OS}-${ARCH}${EXE_EXT}")
     # dsr-style naming: pi_<os>_<arch> with underscores (e.g. pi_darwin_arm64)
     if [ -n "$ASSET_PLATFORM" ]; then
       local dsr_name="pi_${ASSET_PLATFORM//-/_}${EXE_EXT}"
       candidates+=("${dsr_name}|${base_v}/${dsr_name}")
-      candidates+=("${dsr_name}|${base_l}/${dsr_name}")
     fi
     # Bare binary name (dsr uploads Linux as just "pi")
     candidates+=("pi${EXE_EXT}|${base_v}/pi${EXE_EXT}")
-    candidates+=("pi${EXE_EXT}|${base_l}/pi${EXE_EXT}")
+    # Archive formats (GH Actions output)
+    if [ -n "$ASSET_PLATFORM" ]; then
+      if [ -n "$EXE_EXT" ]; then
+        candidates+=("pi-${ASSET_PLATFORM}.zip|${base_v}/pi-${ASSET_PLATFORM}.zip")
+      else
+        candidates+=("pi-${ASSET_PLATFORM}.tar.xz|${base_v}/pi-${ASSET_PLATFORM}.tar.xz")
+        candidates+=("pi-${ASSET_PLATFORM}.tar.gz|${base_v}/pi-${ASSET_PLATFORM}.tar.gz")
+      fi
+    fi
+    # Rust target-triple naming
+    candidates+=("pi-${TARGET}${EXE_EXT}|${base_v}/pi-${TARGET}${EXE_EXT}")
+    candidates+=("pi-${OS}-${ARCH}${EXE_EXT}|${base_v}/pi-${OS}-${ARCH}${EXE_EXT}")
   fi
 
   local entry=""
@@ -1574,7 +1568,9 @@ download_release_binary() {
     local candidate="${entry%%|*}"
     local candidate_url="${entry#*|}"
     local artifact_file="$TMP/$candidate"
-    if ! fetch_url_to_file "$candidate_url" "$artifact_file" "release artifact"; then
+    # Suppress stderr for candidate probing — 404s are expected as we try
+    # multiple naming conventions. Only show errors for explicit --artifact-url.
+    if ! fetch_url_to_file "$candidate_url" "$artifact_file" "release artifact" 2>/dev/null; then
       if [ -n "$ARTIFACT_URL" ]; then
         err "Failed to download artifact: $candidate_url"
       fi
