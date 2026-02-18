@@ -32532,7 +32532,7 @@ mod tests {
                     tx.send(&cx, "hello".to_string()).expect("send");
                 })
                 .expect("create send task");
-            runtime.scheduler.lock().unwrap().schedule(send_task, 0);
+            runtime.scheduler.lock().schedule(send_task, 0);
 
             // Receiver task: receive with infinite budget.
             let (recv_task, _) = runtime
@@ -32544,7 +32544,7 @@ mod tests {
                     }
                 })
                 .expect("create recv task");
-            runtime.scheduler.lock().unwrap().schedule(recv_task, 0);
+            runtime.scheduler.lock().schedule(recv_task, 0);
 
             runtime.run_until_quiescent();
 
@@ -32571,7 +32571,7 @@ mod tests {
                     drop(tx);
                 })
                 .expect("create drop task");
-            runtime.scheduler.lock().unwrap().schedule(drop_task, 0);
+            runtime.scheduler.lock().schedule(drop_task, 0);
 
             // Task 2: try to recv (should fail because sender was dropped).
             let (recv_task, _) = runtime
@@ -32583,7 +32583,7 @@ mod tests {
                     }
                 })
                 .expect("create recv task");
-            runtime.scheduler.lock().unwrap().schedule(recv_task, 0);
+            runtime.scheduler.lock().schedule(recv_task, 0);
 
             runtime.run_until_quiescent();
 
@@ -32616,7 +32616,7 @@ mod tests {
                             log.lock().unwrap().push(format!("task-{val}"));
                         })
                         .expect("create task");
-                    runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+                    runtime.scheduler.lock().schedule(task_id, 0);
                 }
 
                 runtime.run_until_quiescent();
@@ -32649,7 +32649,7 @@ mod tests {
                             log.lock().unwrap().push(format!("w-{i}"));
                         })
                         .expect("create task");
-                    runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+                    runtime.scheduler.lock().schedule(task_id, 0);
                 }
 
                 runtime.run_until_quiescent();
