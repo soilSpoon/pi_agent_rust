@@ -14,6 +14,18 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+    payload.downcast::<String>().map_or_else(
+        |payload| {
+            payload.downcast::<&'static str>().map_or_else(
+                |_| "unknown panic payload".to_string(),
+                |message| (*message).to_string(),
+            )
+        },
+        |message| *message,
+    )
+}
+
 // ============================================================================
 // Diagnostics
 // ============================================================================
@@ -289,7 +301,7 @@ impl ResourceLoader {
         // filesystem walks that benefit from overlapped I/O on multi-core machines.
         let agent_dir = Config::global_dir();
         let cwd_buf = cwd.to_path_buf();
-        let (skills_result, prompt_templates, themes_result) = std::thread::scope(|s| {
+        let (skills_join, prompts_join, themes_join) = std::thread::scope(|s| {
             let cwd_s = &cwd_buf;
             let agent_s = &agent_dir;
             let skills_handle = s.spawn(move || {
@@ -317,11 +329,29 @@ impl ResourceLoader {
                 })
             });
             (
-                skills_handle.join().expect("skills loader thread"),
-                prompts_handle.join().expect("prompt loader thread"),
-                themes_handle.join().expect("theme loader thread"),
+                skills_handle.join(),
+                prompts_handle.join(),
+                themes_handle.join(),
             )
         });
+        let skills_result = skills_join.map_err(|payload| {
+            Error::config(format!(
+                "Skills loader thread panicked: {}",
+                panic_payload_message(payload)
+            ))
+        })?;
+        let prompt_templates = prompts_join.map_err(|payload| {
+            Error::config(format!(
+                "Prompt loader thread panicked: {}",
+                panic_payload_message(payload)
+            ))
+        })?;
+        let themes_result = themes_join.map_err(|payload| {
+            Error::config(format!(
+                "Theme loader thread panicked: {}",
+                panic_payload_message(payload)
+            ))
+        })?;
         let (prompts, prompt_diagnostics) = dedupe_prompts(prompt_templates);
         let (themes, theme_diagnostics) = dedupe_themes(themes_result.themes);
         let mut theme_diags = themes_result.diagnostics;
@@ -1410,7 +1440,11 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
     // Positional $1, $2, ...
     result = replace_regex(&result, positional_arg_regex(), |caps| {
         let idx = caps[1].parse::<usize>().unwrap_or(0);
-        args.get(idx.saturating_sub(1)).cloned().unwrap_or_default()
+        if idx == 0 {
+            String::new()
+        } else {
+            args.get(idx.saturating_sub(1)).cloned().unwrap_or_default()
+        }
     });
 
     // ${@:start} or ${@:start:length}
@@ -2131,20 +2165,27 @@ still frontmatter",
     #[test]
     fn test_substitute_args_zero_positional() {
         let args = vec!["one".to_string(), "two".to_string()];
-        // $0 → index 0-1 = index -1 which saturates → args[0]? No, it tries idx.saturating_sub(1) = 0
-        // Actually $0 parsed as idx=0, then 0.saturating_sub(1) = 0, so args[0] = "one"
-        // Wait, 0usize.saturating_sub(1) = 0, but that's still index 0 which is "one"
-        // Hmm, actually 0_usize.saturating_sub(1) = 0, so args.get(0) = Some("one")
-        // But logically $0 shouldn't match anything... let me just test the behavior
         let result = substitute_args("$0", &args);
-        // $0 → idx=0, 0.saturating_sub(1)=0, args[0]="one"
-        assert_eq!(result, "one");
+        assert_eq!(result, "");
     }
 
     #[test]
     fn test_substitute_args_empty_args() {
         let result = substitute_args("$1 $@ $ARGUMENTS", &[]);
         assert_eq!(result, "  ");
+    }
+
+    #[test]
+    fn panic_payload_message_handles_known_payload_types() {
+        let string_payload: Box<dyn std::any::Any + Send + 'static> =
+            Box::new("loader panic".to_string());
+        assert_eq!(
+            panic_payload_message(string_payload),
+            "loader panic".to_string()
+        );
+
+        let str_payload: Box<dyn std::any::Any + Send + 'static> = Box::new("panic str");
+        assert_eq!(panic_payload_message(str_payload), "panic str".to_string());
     }
 
     // ── expand_prompt_template edge cases ──────────────────────────────
