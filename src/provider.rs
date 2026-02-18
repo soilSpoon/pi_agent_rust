@@ -235,6 +235,7 @@ pub enum Api {
     AnthropicMessages,
     OpenAICompletions,
     OpenAIResponses,
+    OpenAICodexResponses,
     AzureOpenAIResponses,
     BedrockConverseStream,
     GoogleGenerativeAI,
@@ -249,6 +250,7 @@ impl std::fmt::Display for Api {
             Self::AnthropicMessages => write!(f, "anthropic-messages"),
             Self::OpenAICompletions => write!(f, "openai-completions"),
             Self::OpenAIResponses => write!(f, "openai-responses"),
+            Self::OpenAICodexResponses => write!(f, "openai-codex-responses"),
             Self::AzureOpenAIResponses => write!(f, "azure-openai-responses"),
             Self::BedrockConverseStream => write!(f, "bedrock-converse-stream"),
             Self::GoogleGenerativeAI => write!(f, "google-generative-ai"),
@@ -267,6 +269,7 @@ impl std::str::FromStr for Api {
             "anthropic-messages" => Ok(Self::AnthropicMessages),
             "openai-completions" => Ok(Self::OpenAICompletions),
             "openai-responses" => Ok(Self::OpenAIResponses),
+            "openai-codex-responses" => Ok(Self::OpenAICodexResponses),
             "azure-openai-responses" => Ok(Self::AzureOpenAIResponses),
             "bedrock-converse-stream" => Ok(Self::BedrockConverseStream),
             "google-generative-ai" => Ok(Self::GoogleGenerativeAI),
@@ -354,6 +357,7 @@ mod tests {
             ("anthropic-messages", Api::AnthropicMessages),
             ("openai-completions", Api::OpenAICompletions),
             ("openai-responses", Api::OpenAIResponses),
+            ("openai-codex-responses", Api::OpenAICodexResponses),
             ("azure-openai-responses", Api::AzureOpenAIResponses),
             ("bedrock-converse-stream", Api::BedrockConverseStream),
             ("google-generative-ai", Api::GoogleGenerativeAI),
@@ -372,6 +376,7 @@ mod tests {
             (Api::AnthropicMessages, "anthropic-messages"),
             (Api::OpenAICompletions, "openai-completions"),
             (Api::OpenAIResponses, "openai-responses"),
+            (Api::OpenAICodexResponses, "openai-codex-responses"),
             (Api::AzureOpenAIResponses, "azure-openai-responses"),
             (Api::BedrockConverseStream, "bedrock-converse-stream"),
             (Api::GoogleGenerativeAI, "google-generative-ai"),
@@ -389,6 +394,7 @@ mod tests {
             Api::AnthropicMessages,
             Api::OpenAICompletions,
             Api::OpenAIResponses,
+            Api::OpenAICodexResponses,
             Api::AzureOpenAIResponses,
             Api::BedrockConverseStream,
             Api::GoogleGenerativeAI,
@@ -750,7 +756,7 @@ mod tests {
             #[test]
             fn api_custom_round_trip(s in "[a-z][a-z0-9-]{0,20}") {
                 let known = [
-                    "anthropic-messages", "openai-completions", "openai-responses",
+                    "anthropic-messages", "openai-completions", "openai-responses", "openai-codex-responses",
                     "azure-openai-responses", "bedrock-converse-stream",
                     "google-generative-ai", "google-gemini-cli", "google-vertex",
                 ];

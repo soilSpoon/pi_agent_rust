@@ -6,9 +6,11 @@ use crate::provider::{Api, InputType, Model, ModelCost};
 use crate::provider_metadata::{
     ProviderRoutingDefaults, canonical_provider_id, provider_routing_defaults,
 };
+use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
@@ -127,6 +129,52 @@ pub struct ModelRegistry {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelAutocompleteCandidate {
+    pub slug: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyGeneratedModel {
+    id: String,
+    name: String,
+    api: String,
+    provider: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    reasoning: bool,
+    #[serde(default)]
+    input: Vec<String>,
+    #[serde(default)]
+    cost: Option<ModelCost>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    compat: Option<CompatConfig>,
+}
+
+const LEGACY_MODELS_GENERATED_TS: &str =
+    include_str!("../legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts");
+const UPSTREAM_PROVIDER_MODEL_IDS_JSON: &str =
+    include_str!("../docs/provider-upstream-model-ids-snapshot.json");
+const CODEX_RESPONSES_API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const GOOGLE_GEMINI_CLI_API_URL: &str = "https://cloudcode-pa.googleapis.com";
+const GOOGLE_ANTIGRAVITY_API_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+
+static LEGACY_GENERATED_MODELS_CACHE: OnceLock<Vec<LegacyGeneratedModel>> = OnceLock::new();
+static UPSTREAM_PROVIDER_MODEL_IDS_CACHE: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+static MODEL_AUTOCOMPLETE_CACHE: OnceLock<Vec<ModelAutocompleteCandidate>> = OnceLock::new();
+static SATISFIES_RE: OnceLock<Regex> = OnceLock::new();
+const INPUT_TEXT_ONLY: [InputType; 1] = [InputType::Text];
+const INPUT_TEXT_AND_IMAGE: [InputType; 2] = [InputType::Text, InputType::Image];
+
 fn canonicalize_openrouter_model_id(model_id: &str) -> String {
     let trimmed = model_id.trim();
     match trimmed.to_ascii_lowercase().as_str() {
@@ -154,6 +202,152 @@ fn openrouter_model_lookup_ids(model_id: &str) -> Vec<String> {
     } else {
         vec![raw, canonical]
     }
+}
+
+fn api_fallback_base_url(api: &str) -> Option<&'static str> {
+    match api {
+        "openai-codex-responses" => Some(CODEX_RESPONSES_API_URL),
+        "google-gemini-cli" => Some(GOOGLE_GEMINI_CLI_API_URL),
+        "google-antigravity" => Some(GOOGLE_ANTIGRAVITY_API_URL),
+        _ => None,
+    }
+}
+
+fn parse_input_types(input: &[String]) -> Vec<InputType> {
+    input
+        .iter()
+        .filter_map(|value| match value.as_str() {
+            "text" => Some(InputType::Text),
+            "image" => Some(InputType::Image),
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
+    let Some(models_decl_start) = LEGACY_MODELS_GENERATED_TS.find("export const MODELS =") else {
+        tracing::warn!("Legacy model catalog missing MODELS declaration");
+        return Vec::new();
+    };
+    let Some(object_start_rel) = LEGACY_MODELS_GENERATED_TS[models_decl_start..].find('{') else {
+        tracing::warn!("Legacy model catalog missing object start after MODELS declaration");
+        return Vec::new();
+    };
+    let object_start = models_decl_start + object_start_rel;
+    let Some(end_marker) = LEGACY_MODELS_GENERATED_TS.rfind("} as const;") else {
+        tracing::warn!("Legacy model catalog missing end marker");
+        return Vec::new();
+    };
+
+    let mut object_source = LEGACY_MODELS_GENERATED_TS[object_start..=end_marker]
+        .trim_end_matches(" as const;")
+        .to_string();
+    let satisfies_re = SATISFIES_RE.get_or_init(|| {
+        Regex::new(r#"\s+satisfies\s+Model<"[^"]+">"#).expect("valid satisfies regex")
+    });
+    object_source = satisfies_re.replace_all(&object_source, "").into_owned();
+
+    let parsed: HashMap<String, HashMap<String, LegacyGeneratedModel>> =
+        match json5::from_str(&object_source) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to parse legacy model catalog");
+                return Vec::new();
+            }
+        };
+
+    let mut models = parsed
+        .into_values()
+        .flat_map(HashMap::into_values)
+        .collect::<Vec<_>>();
+    models.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.api.cmp(&b.api))
+    });
+    models
+}
+
+fn legacy_generated_models() -> &'static [LegacyGeneratedModel] {
+    LEGACY_GENERATED_MODELS_CACHE
+        .get_or_init(parse_legacy_generated_models)
+        .as_slice()
+}
+
+fn parse_upstream_provider_model_ids() -> HashMap<String, Vec<String>> {
+    let parsed: HashMap<String, Vec<String>> =
+        match serde_json::from_str(UPSTREAM_PROVIDER_MODEL_IDS_JSON) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to parse upstream provider model snapshot");
+                return HashMap::new();
+            }
+        };
+
+    let mut by_provider: HashMap<String, Vec<String>> = HashMap::new();
+    for (provider, ids) in parsed {
+        let provider = provider.trim();
+        if provider.is_empty() {
+            continue;
+        }
+        let canonical_provider = canonical_provider_id(provider)
+            .unwrap_or(provider)
+            .to_string();
+        let entry = by_provider.entry(canonical_provider.clone()).or_default();
+        for model_id in ids {
+            let normalized = canonicalize_model_id_for_provider(&canonical_provider, &model_id);
+            if !normalized.is_empty() {
+                entry.push(normalized);
+            }
+        }
+    }
+
+    for ids in by_provider.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    by_provider
+}
+
+fn upstream_provider_model_ids() -> &'static HashMap<String, Vec<String>> {
+    UPSTREAM_PROVIDER_MODEL_IDS_CACHE.get_or_init(parse_upstream_provider_model_ids)
+}
+
+pub fn model_autocomplete_candidates() -> &'static [ModelAutocompleteCandidate] {
+    MODEL_AUTOCOMPLETE_CACHE
+        .get_or_init(|| {
+            let mut candidates = legacy_generated_models()
+                .iter()
+                .map(|entry| ModelAutocompleteCandidate {
+                    slug: format!("{}/{}", entry.provider, entry.id),
+                    description: Some(entry.name.clone()).filter(|name| !name.trim().is_empty()),
+                })
+                .collect::<Vec<_>>();
+            for (provider, ids) in upstream_provider_model_ids() {
+                let provider = provider.trim();
+                if provider.is_empty() {
+                    continue;
+                }
+                for id in ids {
+                    if id.trim().is_empty() {
+                        continue;
+                    }
+                    candidates.push(ModelAutocompleteCandidate {
+                        slug: format!("{provider}/{id}"),
+                        description: None,
+                    });
+                }
+            }
+            candidates.push(ModelAutocompleteCandidate {
+                slug: "anthropic/claude-sonnet-4-6".to_string(),
+                description: Some("Claude Sonnet 4.6".to_string()),
+            });
+            candidates.sort_by(|a, b| a.slug.cmp(&b.slug));
+            candidates.dedup_by(|a, b| a.slug.eq_ignore_ascii_case(&b.slug));
+            candidates
+        })
+        .as_slice()
 }
 
 impl ModelRegistry {
@@ -244,60 +438,233 @@ impl ModelRegistry {
     }
 }
 
+fn native_adapter_seed_defaults(provider: &str) -> Option<AdHocProviderDefaults> {
+    match provider {
+        "azure-openai" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT_AND_IMAGE,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "github-copilot" | "gitlab" | "sap-ai-core" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT_ONLY,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        _ => None,
+    }
+}
+
+fn legacy_provider_ids() -> HashSet<String> {
+    legacy_generated_models()
+        .iter()
+        .map(|model| {
+            let provider = model.provider.trim();
+            canonical_provider_id(provider)
+                .unwrap_or(provider)
+                .to_ascii_lowercase()
+        })
+        .collect()
+}
+
+fn append_upstream_nonlegacy_models(
+    auth: &AuthStorage,
+    models: &mut Vec<ModelEntry>,
+    seen: &mut HashSet<String>,
+) {
+    let legacy_providers = legacy_provider_ids();
+    for (provider, ids) in upstream_provider_model_ids() {
+        let provider = provider.trim();
+        if provider.is_empty() {
+            continue;
+        }
+        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+        if legacy_providers.contains(&canonical_provider.to_ascii_lowercase()) {
+            continue;
+        }
+
+        let Some(defaults) = ad_hoc_provider_defaults(canonical_provider)
+            .or_else(|| native_adapter_seed_defaults(canonical_provider))
+        else {
+            continue;
+        };
+
+        let api_key = auth.resolve_api_key(canonical_provider, None).or_else(|| {
+            if canonical_provider.eq_ignore_ascii_case(provider) {
+                None
+            } else {
+                auth.resolve_api_key(provider, None)
+            }
+        });
+
+        for model_id in ids {
+            let normalized_model_id =
+                canonicalize_model_id_for_provider(canonical_provider, model_id);
+            if normalized_model_id.is_empty() {
+                continue;
+            }
+            let dedupe_key = format!(
+                "{}::{}",
+                canonical_provider.to_ascii_lowercase(),
+                normalized_model_id.to_ascii_lowercase()
+            );
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+
+            models.push(ModelEntry {
+                model: Model {
+                    id: normalized_model_id.clone(),
+                    name: normalized_model_id,
+                    api: defaults.api.to_string(),
+                    provider: canonical_provider.to_string(),
+                    base_url: defaults.base_url.to_string(),
+                    reasoning: defaults.reasoning,
+                    input: defaults.input.to_vec(),
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: defaults.context_window,
+                    max_tokens: defaults.max_tokens,
+                    headers: HashMap::new(),
+                },
+                api_key: api_key.clone(),
+                headers: HashMap::new(),
+                auth_header: defaults.auth_header,
+                compat: None,
+                oauth_config: None,
+            });
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
     let mut models = Vec::new();
+    let mut seen = HashSet::new();
 
-    let anthropic_key = auth.resolve_api_key("anthropic", None);
-    for (id, name, reasoning) in [
-        ("claude-sonnet-4-20250514", "Claude Sonnet 4", true),
-        ("claude-sonnet-4-5", "Claude Sonnet 4.5", true),
-        ("claude-opus-4-5", "Claude Opus 4.5", true),
-        ("claude-haiku-4-5", "Claude Haiku 4.5", false),
-        ("claude-3-5-sonnet-20241022", "Claude Sonnet 3.5", true),
-        ("claude-3-5-haiku-20241022", "Claude Haiku 3.5", false),
-        ("claude-3-opus-20240229", "Claude Opus 3", true),
-    ] {
+    for legacy in legacy_generated_models() {
+        let provider = legacy.provider.trim();
+        if provider.is_empty() {
+            continue;
+        }
+
+        let normalized_model_id = canonicalize_model_id_for_provider(provider, &legacy.id);
+        if normalized_model_id.is_empty() {
+            continue;
+        }
+
+        let dedupe_key = format!(
+            "{}::{}",
+            provider.to_ascii_lowercase(),
+            normalized_model_id.to_ascii_lowercase()
+        );
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+
+        let routing_defaults = provider_routing_defaults(provider);
+        let parsed_api: Api = legacy
+            .api
+            .parse()
+            .unwrap_or_else(|_| Api::Custom(legacy.api.clone()));
+        let api_string = parsed_api.to_string();
+
+        let base_url = if !legacy.base_url.trim().is_empty() {
+            legacy.base_url.trim().to_string()
+        } else if let Some(default_base) = routing_defaults
+            .map(|defaults| defaults.base_url)
+            .or_else(|| api_fallback_base_url(api_string.as_str()))
+        {
+            default_base.to_string()
+        } else {
+            String::new()
+        };
+
+        let input = {
+            let parsed = parse_input_types(&legacy.input);
+            if parsed.is_empty() {
+                routing_defaults
+                    .map_or_else(|| vec![InputType::Text], |defaults| defaults.input.to_vec())
+            } else {
+                parsed
+            }
+        };
+
+        let auth_header = match api_string.as_str() {
+            "openai-codex-responses" | "google-gemini-cli" => true,
+            _ => routing_defaults.is_some_and(|defaults| defaults.auth_header),
+        };
+
+        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+        let api_key = auth.resolve_api_key(canonical_provider, None).or_else(|| {
+            if canonical_provider.eq_ignore_ascii_case(provider) {
+                None
+            } else {
+                auth.resolve_api_key(provider, None)
+            }
+        });
+
         models.push(ModelEntry {
             model: Model {
-                id: id.to_string(),
-                name: name.to_string(),
+                id: normalized_model_id.clone(),
+                name: if legacy.name.trim().is_empty() {
+                    normalized_model_id
+                } else {
+                    legacy.name.clone()
+                },
+                api: api_string,
+                provider: provider.to_string(),
+                base_url,
+                reasoning: legacy.reasoning,
+                input,
+                cost: legacy.cost.clone().unwrap_or(ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                }),
+                context_window: legacy.context_window.unwrap_or_else(|| {
+                    routing_defaults.map_or(128_000, |defaults| defaults.context_window)
+                }),
+                max_tokens: legacy.max_tokens.unwrap_or_else(|| {
+                    routing_defaults.map_or(16_384, |defaults| defaults.max_tokens)
+                }),
+                headers: legacy.headers.clone(),
+            },
+            api_key,
+            headers: legacy.headers.clone(),
+            auth_header,
+            compat: legacy.compat.clone(),
+            oauth_config: None,
+        });
+    }
+
+    append_upstream_nonlegacy_models(auth, &mut models, &mut seen);
+
+    // Ensure the latest Sonnet alias is present in built-ins.
+    if !models.iter().any(|entry| {
+        entry.model.provider == "anthropic"
+            && (entry.model.id == "claude-sonnet-4-6"
+                || entry.model.id == "claude-sonnet-4-6-20260217")
+    }) {
+        models.push(ModelEntry {
+            model: Model {
+                id: "claude-sonnet-4-6".to_string(),
+                name: "Claude Sonnet 4.6".to_string(),
                 api: Api::AnthropicMessages.to_string(),
                 provider: "anthropic".to_string(),
                 base_url: "https://api.anthropic.com/v1/messages".to_string(),
-                reasoning,
-                input: vec![InputType::Text, InputType::Image],
-                cost: ModelCost {
-                    input: 0.0,
-                    output: 0.0,
-                    cache_read: 0.0,
-                    cache_write: 0.0,
-                },
-                context_window: 200_000,
-                max_tokens: 8192,
-                headers: HashMap::new(),
-            },
-            api_key: anthropic_key.clone(),
-            headers: HashMap::new(),
-            auth_header: false,
-            compat: None,
-            oauth_config: None,
-        });
-    }
-
-    let openai_key = auth.resolve_api_key("openai", None);
-    for (id, name) in [
-        ("gpt-5.1-codex", "GPT-5.1 Codex"),
-        ("gpt-4o", "GPT-4o"),
-        ("gpt-4o-mini", "GPT-4o Mini"),
-    ] {
-        models.push(ModelEntry {
-            model: Model {
-                id: id.to_string(),
-                name: name.to_string(),
-                api: Api::OpenAIResponses.to_string(),
-                provider: "openai".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
@@ -306,86 +673,13 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
                     cache_read: 0.0,
                     cache_write: 0.0,
                 },
-                context_window: 128_000,
-                max_tokens: 16384,
+                context_window: 1_000_000,
+                max_tokens: 128_000,
                 headers: HashMap::new(),
             },
-            api_key: openai_key.clone(),
-            headers: HashMap::new(),
-            auth_header: true,
-            compat: None,
-            oauth_config: None,
-        });
-    }
-
-    let google_key = auth.resolve_api_key("google", None);
-    for (id, name) in [
-        ("gemini-2.5-pro", "Gemini 2.5 Pro"),
-        ("gemini-2.5-flash", "Gemini 2.5 Flash"),
-        ("gemini-1.5-pro", "Gemini 1.5 Pro"),
-        ("gemini-1.5-flash", "Gemini 1.5 Flash"),
-    ] {
-        models.push(ModelEntry {
-            model: Model {
-                id: id.to_string(),
-                name: name.to_string(),
-                api: Api::GoogleGenerativeAI.to_string(),
-                provider: "google".to_string(),
-                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
-                reasoning: true,
-                input: vec![InputType::Text, InputType::Image],
-                cost: ModelCost {
-                    input: 0.0,
-                    output: 0.0,
-                    cache_read: 0.0,
-                    cache_write: 0.0,
-                },
-                context_window: 128_000,
-                max_tokens: 8192,
-                headers: HashMap::new(),
-            },
-            api_key: google_key.clone(),
+            api_key: auth.resolve_api_key("anthropic", None),
             headers: HashMap::new(),
             auth_header: false,
-            compat: None,
-            oauth_config: None,
-        });
-    }
-
-    let openrouter_key = auth.resolve_api_key("openrouter", None);
-    for (id, name, reasoning) in [
-        ("openrouter/auto", "OpenRouter Auto", true),
-        ("openai/gpt-4o-mini", "OpenRouter GPT-4o Mini", true),
-        ("openai/gpt-4o", "OpenRouter GPT-4o", true),
-        (
-            "anthropic/claude-3.5-sonnet",
-            "OpenRouter Claude 3.5 Sonnet",
-            true,
-        ),
-        ("google/gemini-2.5-pro", "OpenRouter Gemini 2.5 Pro", true),
-    ] {
-        models.push(ModelEntry {
-            model: Model {
-                id: id.to_string(),
-                name: name.to_string(),
-                api: Api::OpenAICompletions.to_string(),
-                provider: "openrouter".to_string(),
-                base_url: "https://openrouter.ai/api/v1".to_string(),
-                reasoning,
-                input: vec![InputType::Text],
-                cost: ModelCost {
-                    input: 0.0,
-                    output: 0.0,
-                    cache_read: 0.0,
-                    cache_write: 0.0,
-                },
-                context_window: 128_000,
-                max_tokens: 16_384,
-                headers: HashMap::new(),
-            },
-            api_key: openrouter_key.clone(),
-            headers: HashMap::new(),
-            auth_header: true,
             compat: None,
             oauth_config: None,
         });
@@ -943,6 +1237,83 @@ mod tests {
         assert_eq!(openai.api_key.as_deref(), Some("openai-auth-key"));
         assert_eq!(google.api_key.as_deref(), Some("google-auth-key"));
         assert_eq!(openrouter.api_key.as_deref(), Some("openrouter-auth-key"));
+    }
+
+    #[test]
+    fn built_in_models_include_legacy_oauth_provider_entries() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth);
+
+        assert!(models.iter().any(|m| {
+            m.model.provider == "openai-codex"
+                && m.model.api == "openai-codex-responses"
+                && m.model.id == "gpt-5.2-codex"
+        }));
+        assert!(models.iter().any(|m| {
+            m.model.provider == "google-gemini-cli"
+                && m.model.api == "google-gemini-cli"
+                && m.model.id == "gemini-2.5-pro"
+        }));
+        assert!(models.iter().any(|m| {
+            m.model.provider == "google-antigravity"
+                && m.model.api == "google-gemini-cli"
+                && m.model.id == "gemini-3-flash"
+        }));
+    }
+
+    #[test]
+    fn built_in_models_include_non_legacy_provider_model_strings_from_snapshot() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth);
+
+        assert!(
+            models
+                .iter()
+                .any(|m| { m.model.provider == "groq" && m.model.id == "llama-3.3-70b-versatile" })
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| { m.model.provider == "zhipuai" && m.model.id == "glm-4.6" })
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| { m.model.provider == "azure-openai" && m.model.id == "claude-opus-4-6" })
+        );
+        assert!(models.iter().any(|m| {
+            m.model.provider == "openrouter" && m.model.id == "anthropic/claude-sonnet-4.6"
+        }));
+    }
+
+    #[test]
+    fn autocomplete_candidates_include_legacy_and_latest_entries() {
+        let candidates = model_autocomplete_candidates();
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.slug == "openai-codex/gpt-5.2-codex")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.slug == "google-gemini-cli/gemini-2.5-pro")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.slug == "anthropic/claude-opus-4-5")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.slug == "groq/llama-3.3-70b-versatile")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.slug == "openrouter/anthropic/claude-sonnet-4.6")
+        );
     }
 
     #[test]

@@ -25,6 +25,13 @@ use std::pin::Pin;
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
+const ANTHROPIC_OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
+const ANTHROPIC_OAUTH_BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20";
+
+#[inline]
+fn is_anthropic_oauth_token(token: &str) -> bool {
+    token.contains(ANTHROPIC_OAUTH_TOKEN_PREFIX)
+}
 
 // ============================================================================
 // Anthropic Provider
@@ -154,6 +161,7 @@ impl Provider for AnthropicProvider {
         &self.model
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn stream(
         &self,
         context: &Context<'_>,
@@ -171,18 +179,40 @@ impl Provider for AnthropicProvider {
             })?;
 
         let request_body = self.build_request(context, options);
+        let oauth_token = is_anthropic_oauth_token(&auth_value);
 
         // Build request with headers (Content-Type set by .json() below)
         let mut request = self
             .client
             .post(&self.base_url)
             .header("Accept", "text/event-stream")
-            .header("X-API-Key", &auth_value)
             .header("anthropic-version", ANTHROPIC_API_VERSION);
 
-        // Add cache control header if needed
+        if oauth_token {
+            request = request
+                .header("Authorization", format!("Bearer {auth_value}"))
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .header("x-app", "cli")
+                .header(
+                    "user-agent",
+                    format!(
+                        "pi_agent_rust/{} (external, cli)",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                );
+        } else {
+            request = request.header("X-API-Key", &auth_value);
+        }
+
+        let mut beta_flags: Vec<&str> = Vec::new();
+        if oauth_token {
+            beta_flags.push(ANTHROPIC_OAUTH_BETA_FLAGS);
+        }
         if options.cache_retention != CacheRetention::None {
-            request = request.header("anthropic-beta", "prompt-caching-2024-07-31");
+            beta_flags.push("prompt-caching-2024-07-31");
+        }
+        if !beta_flags.is_empty() {
+            request = request.header("anthropic-beta", beta_flags.join(","));
         }
 
         // Apply provider-specific custom headers from compat config.
@@ -1338,6 +1368,54 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_uses_oauth_bearer_auth_headers() {
+        let captured =
+            run_stream_and_capture_headers_with_api_key(CacheRetention::None, "sk-ant-oat-test")
+                .expect("captured request for oauth headers");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer sk-ant-oat-test")
+        );
+        assert!(!captured.headers.contains_key("x-api-key"));
+        assert_eq!(
+            captured
+                .headers
+                .get("anthropic-dangerous-direct-browser-access")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            captured.headers.get("x-app").map(String::as_str),
+            Some("cli")
+        );
+        assert!(
+            captured
+                .headers
+                .get("anthropic-beta")
+                .is_some_and(|value| value.contains("oauth-2025-04-20"))
+        );
+        assert!(
+            captured
+                .headers
+                .get("user-agent")
+                .is_some_and(|value| value.contains("pi_agent_rust/"))
+        );
+    }
+
+    #[test]
+    fn test_stream_oauth_beta_header_includes_prompt_caching_when_enabled() {
+        let captured =
+            run_stream_and_capture_headers_with_api_key(CacheRetention::Short, "sk-ant-oat-test")
+                .expect("captured request for oauth + cache beta header");
+        let beta = captured
+            .headers
+            .get("anthropic-beta")
+            .expect("anthropic-beta header");
+        assert!(beta.contains("oauth-2025-04-20"));
+        assert!(beta.contains("prompt-caching-2024-07-31"));
+    }
+
+    #[test]
     fn test_stream_http_error_includes_status_and_body_message() {
         let (base_url, _rx) = spawn_test_server(
             401,
@@ -1378,6 +1456,13 @@ mod tests {
     }
 
     fn run_stream_and_capture_headers(cache_retention: CacheRetention) -> Option<CapturedRequest> {
+        run_stream_and_capture_headers_with_api_key(cache_retention, "test-key")
+    }
+
+    fn run_stream_and_capture_headers_with_api_key(
+        cache_retention: CacheRetention,
+        api_key: &str,
+    ) -> Option<CapturedRequest> {
         let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
         let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
         let context = Context {
@@ -1390,7 +1475,7 @@ mod tests {
             tools: Vec::new().into(),
         };
         let options = StreamOptions {
-            api_key: Some("test-key".to_string()),
+            api_key: Some(api_key.to_string()),
             cache_retention,
             ..Default::default()
         };

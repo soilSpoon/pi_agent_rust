@@ -79,8 +79,10 @@ enum ProviderRouteKind {
     NativeAnthropic,
     NativeOpenAICompletions,
     NativeOpenAIResponses,
+    NativeOpenAICodexResponses,
     NativeCohere,
     NativeGoogle,
+    NativeGoogleGeminiCli,
     NativeGoogleVertex,
     NativeBedrock,
     NativeAzure,
@@ -89,8 +91,10 @@ enum ProviderRouteKind {
     ApiAnthropicMessages,
     ApiOpenAICompletions,
     ApiOpenAIResponses,
+    ApiOpenAICodexResponses,
     ApiCohereChat,
     ApiGoogleGenerativeAi,
+    ApiGoogleGeminiCli,
 }
 
 impl ProviderRouteKind {
@@ -99,8 +103,10 @@ impl ProviderRouteKind {
             Self::NativeAnthropic => "native:anthropic",
             Self::NativeOpenAICompletions => "native:openai-completions",
             Self::NativeOpenAIResponses => "native:openai-responses",
+            Self::NativeOpenAICodexResponses => "native:openai-codex-responses",
             Self::NativeCohere => "native:cohere",
             Self::NativeGoogle => "native:google",
+            Self::NativeGoogleGeminiCli => "native:google-gemini-cli",
             Self::NativeGoogleVertex => "native:google-vertex",
             Self::NativeBedrock => "native:amazon-bedrock",
             Self::NativeAzure => "native:azure-openai",
@@ -109,8 +115,10 @@ impl ProviderRouteKind {
             Self::ApiAnthropicMessages => "api:anthropic-messages",
             Self::ApiOpenAICompletions => "api:openai-completions",
             Self::ApiOpenAIResponses => "api:openai-responses",
+            Self::ApiOpenAICodexResponses => "api:openai-codex-responses",
             Self::ApiCohereChat => "api:cohere-chat",
             Self::ApiGoogleGenerativeAi => "api:google-generative-ai",
+            Self::ApiGoogleGeminiCli => "api:google-gemini-cli",
         }
     }
 }
@@ -134,8 +142,10 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
                 ProviderRouteKind::NativeOpenAIResponses
             }
         }
+        "openai-codex" => ProviderRouteKind::NativeOpenAICodexResponses,
         "cohere" => ProviderRouteKind::NativeCohere,
         "google" => ProviderRouteKind::NativeGoogle,
+        "google-gemini-cli" | "google-antigravity" => ProviderRouteKind::NativeGoogleGeminiCli,
         "google-vertex" | "vertexai" => ProviderRouteKind::NativeGoogleVertex,
         "amazon-bedrock" | "bedrock" => ProviderRouteKind::NativeBedrock,
         "azure-openai" | "azure" | "azure-cognitive-services" => ProviderRouteKind::NativeAzure,
@@ -145,8 +155,10 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
             "anthropic-messages" => ProviderRouteKind::ApiAnthropicMessages,
             "openai-completions" => ProviderRouteKind::ApiOpenAICompletions,
             "openai-responses" => ProviderRouteKind::ApiOpenAIResponses,
+            "openai-codex-responses" => ProviderRouteKind::ApiOpenAICodexResponses,
             "cohere-chat" => ProviderRouteKind::ApiCohereChat,
             "google-generative-ai" => ProviderRouteKind::ApiGoogleGenerativeAi,
+            "google-gemini-cli" => ProviderRouteKind::ApiGoogleGeminiCli,
             "google-vertex" => ProviderRouteKind::NativeGoogleVertex,
             "bedrock-converse-stream" => ProviderRouteKind::NativeBedrock,
             _ => {
@@ -834,6 +846,16 @@ pub fn create_provider(
                     .with_client(client),
             ))
         }
+        ProviderRouteKind::NativeOpenAICodexResponses
+        | ProviderRouteKind::ApiOpenAICodexResponses => Ok(Arc::new(
+            openai_responses::OpenAIResponsesProvider::new(entry.model.id.clone())
+                .with_provider_name(entry.model.provider.clone())
+                .with_api_name("openai-codex-responses")
+                .with_codex_mode(true)
+                .with_base_url(normalize_openai_codex_responses_base(&entry.model.base_url))
+                .with_compat(entry.compat.clone())
+                .with_client(client),
+        )),
         ProviderRouteKind::NativeCohere | ProviderRouteKind::ApiCohereChat => Ok(Arc::new(
             cohere::CohereProvider::new(entry.model.id.clone())
                 .with_provider_name(entry.model.provider.clone())
@@ -843,10 +865,23 @@ pub fn create_provider(
         )),
         ProviderRouteKind::NativeGoogle | ProviderRouteKind::ApiGoogleGenerativeAi => Ok(Arc::new(
             gemini::GeminiProvider::new(entry.model.id.clone())
+                .with_provider_name(entry.model.provider.clone())
+                .with_api_name("google-generative-ai")
                 .with_base_url(entry.model.base_url.clone())
                 .with_compat(entry.compat.clone())
                 .with_client(client),
         )),
+        ProviderRouteKind::NativeGoogleGeminiCli | ProviderRouteKind::ApiGoogleGeminiCli => {
+            Ok(Arc::new(
+                gemini::GeminiProvider::new(entry.model.id.clone())
+                    .with_provider_name(entry.model.provider.clone())
+                    .with_api_name("google-gemini-cli")
+                    .with_google_cli_mode(true)
+                    .with_base_url(entry.model.base_url.clone())
+                    .with_compat(entry.compat.clone())
+                    .with_client(client),
+            ))
+        }
         ProviderRouteKind::NativeGoogleVertex => {
             let runtime = vertex::resolve_vertex_provider_runtime(entry)?;
             Ok(Arc::new(
@@ -916,6 +951,9 @@ pub fn normalize_openai_base(base_url: &str) -> String {
 
 pub fn normalize_openai_responses_base(base_url: &str) -> String {
     let base_url = base_url.trim_end_matches('/');
+    if base_url.is_empty() {
+        return "https://api.openai.com/v1/responses".to_string();
+    }
     if base_url.ends_with("/responses") {
         return base_url.to_string();
     }
@@ -926,6 +964,21 @@ pub fn normalize_openai_responses_base(base_url: &str) -> String {
         return format!("{base_url}/responses");
     }
     format!("{base_url}/responses")
+}
+
+pub fn normalize_openai_codex_responses_base(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return openai_responses::CODEX_RESPONSES_API_URL.to_string();
+    }
+    let base = trimmed.trim_end_matches('/');
+    if base.ends_with("/backend-api/codex/responses") {
+        return base.to_string();
+    }
+    if base.ends_with("/responses") {
+        return base.to_string();
+    }
+    format!("{base}/backend-api/codex/responses")
 }
 
 pub fn normalize_cohere_base(base_url: &str) -> String {

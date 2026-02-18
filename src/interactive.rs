@@ -88,7 +88,10 @@ use self::commands::{
     normalize_api_key_input, normalize_auth_provider_input, remove_provider_credentials,
     save_provider_credential,
 };
-use self::commands::{parse_bash_command, parse_extension_command};
+use self::commands::{
+    format_startup_oauth_hint, parse_bash_command, parse_extension_command,
+    should_show_startup_oauth_hint,
+};
 use self::conversation::conversation_from_session;
 #[cfg(test)]
 use self::conversation::{
@@ -1178,6 +1181,25 @@ fn read_git_branch(cwd: &Path) -> Option<String> {
     )
 }
 
+fn build_startup_welcome_message(config: &Config) -> String {
+    if config.quiet_startup.unwrap_or(false) {
+        return String::new();
+    }
+
+    let mut message = String::from("  Welcome to Pi!\n");
+    message.push_str("  Type a message to begin, or /help for commands.\n");
+
+    let auth_path = Config::auth_path();
+    if let Ok(auth) = crate::auth::AuthStorage::load(auth_path) {
+        if should_show_startup_oauth_hint(&auth) {
+            message.push('\n');
+            message.push_str(&format_startup_oauth_hint(&auth));
+        }
+    }
+
+    message
+}
+
 /// The main interactive TUI application model.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(bubbletea::Model)]
@@ -1300,6 +1322,8 @@ pub struct PiApp {
 
     // Current git branch name (refreshed on startup + after each agent turn)
     git_branch: Option<String>,
+    // Startup banner shown in an empty conversation.
+    startup_welcome: String,
 }
 
 impl PiApp {
@@ -1443,6 +1467,7 @@ impl PiApp {
         autocomplete.max_visible = autocomplete_max_visible;
 
         let git_branch = read_git_branch(&cwd);
+        let startup_welcome = build_startup_welcome_message(&config);
 
         let mut app = Self {
             input,
@@ -1508,6 +1533,7 @@ impl PiApp {
             message_render_cache: MessageRenderCache::new(),
             render_buffers: RenderBuffers::new(),
             git_branch,
+            startup_welcome,
         };
 
         if let Some(manager) = app.extensions.clone() {

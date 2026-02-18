@@ -13,6 +13,7 @@ use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::sse::SseStream;
 use async_trait::async_trait;
+use base64::Engine;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ use std::pin::Pin;
 // ============================================================================
 
 const OPENAI_RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
+pub(crate) const CODEX_RESPONSES_API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 
 // ============================================================================
@@ -36,6 +38,8 @@ pub struct OpenAIResponsesProvider {
     model: String,
     base_url: String,
     provider: String,
+    api: String,
+    codex_mode: bool,
     compat: Option<CompatConfig>,
 }
 
@@ -47,6 +51,8 @@ impl OpenAIResponsesProvider {
             model: model.into(),
             base_url: OPENAI_RESPONSES_API_URL.to_string(),
             provider: "openai".to_string(),
+            api: "openai-responses".to_string(),
+            codex_mode: false,
             compat: None,
         }
     }
@@ -55,6 +61,20 @@ impl OpenAIResponsesProvider {
     #[must_use]
     pub fn with_provider_name(mut self, provider: impl Into<String>) -> Self {
         self.provider = provider.into();
+        self
+    }
+
+    /// Override API identifier reported in streamed events.
+    #[must_use]
+    pub fn with_api_name(mut self, api: impl Into<String>) -> Self {
+        self.api = api.into();
+        self
+    }
+
+    /// Enable OpenAI Codex Responses mode (ChatGPT OAuth endpoint + headers).
+    #[must_use]
+    pub const fn with_codex_mode(mut self, enabled: bool) -> Self {
+        self.codex_mode = enabled;
         self
     }
 
@@ -114,8 +134,8 @@ impl Provider for OpenAIResponsesProvider {
         &self.provider
     }
 
-    fn api(&self) -> &'static str {
-        "openai-responses"
+    fn api(&self) -> &str {
+        &self.api
     }
 
     fn model_id(&self) -> &str {
@@ -141,7 +161,12 @@ impl Provider for OpenAIResponsesProvider {
                     .api_key
                     .clone()
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                    .ok_or_else(|| Error::provider("openai", "Missing API key for OpenAI. Set OPENAI_API_KEY or configure in settings."))?,
+                    .ok_or_else(|| {
+                        Error::provider(
+                            self.name(),
+                            "Missing API key for OpenAI/Codex. Set OPENAI_API_KEY or run /login.",
+                        )
+                    })?,
             )
         };
 
@@ -156,6 +181,22 @@ impl Provider for OpenAIResponsesProvider {
 
         if let Some(auth_value) = auth_value {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
+            if self.codex_mode {
+                let account_id = extract_chatgpt_account_id(&auth_value).ok_or_else(|| {
+                    Error::provider(
+                        self.name(),
+                        "Invalid OpenAI Codex OAuth token (missing chatgpt_account_id claim). Run /login openai-codex again.",
+                    )
+                })?;
+                request = request
+                    .header("chatgpt-account-id", account_id)
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("originator", "pi")
+                    .header("User-Agent", "pi_agent_rust");
+                if let Some(session_id) = &options.session_id {
+                    request = request.header("session_id", session_id);
+                }
+            }
         }
 
         // Apply provider-specific custom headers from compat config.
@@ -182,7 +223,7 @@ impl Provider for OpenAIResponsesProvider {
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::provider(
-                "openai",
+                self.name(),
                 format!("OpenAI API error (HTTP {status}): {body}"),
             ));
         }
@@ -477,6 +518,7 @@ where
                 }
             }
             OpenAIResponsesChunk::ResponseCompleted { response }
+            | OpenAIResponsesChunk::ResponseDone { response }
             | OpenAIResponsesChunk::ResponseIncomplete { response } => {
                 self.ensure_started();
                 self.partial.usage.input = response.usage.input_tokens;
@@ -487,6 +529,21 @@ where
                     .unwrap_or(response.usage.input_tokens + response.usage.output_tokens);
 
                 self.finish(response.incomplete_reason());
+            }
+            OpenAIResponsesChunk::ResponseFailed { response } => {
+                self.ensure_started();
+                self.partial.stop_reason = StopReason::Error;
+                self.partial.error_message = Some(
+                    response
+                        .error
+                        .and_then(|error| error.message)
+                        .unwrap_or_else(|| "Codex response failed".to_string()),
+                );
+                self.pending_events.push_back(StreamEvent::Error {
+                    reason: StopReason::Error,
+                    error: std::mem::take(&mut self.partial),
+                });
+                self.finished = true;
             }
             OpenAIResponsesChunk::Error { message } => {
                 self.ensure_started();
@@ -618,6 +675,29 @@ where
         });
         self.finished = true;
     }
+}
+
+fn extract_chatgpt_account_id(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let _signature = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let payload_json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    payload_json
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 // ============================================================================
@@ -849,9 +929,17 @@ enum OpenAIResponsesChunk {
     ResponseCompleted {
         response: OpenAIResponsesDonePayload,
     },
+    #[serde(rename = "response.done")]
+    ResponseDone {
+        response: OpenAIResponsesDonePayload,
+    },
     #[serde(rename = "response.incomplete")]
     ResponseIncomplete {
         response: OpenAIResponsesDonePayload,
+    },
+    #[serde(rename = "response.failed")]
+    ResponseFailed {
+        response: OpenAIResponsesFailedPayload,
     },
     #[serde(rename = "error")]
     Error { message: String },
@@ -894,6 +982,18 @@ struct OpenAIResponsesDonePayload {
     #[serde(default)]
     incomplete_details: Option<OpenAIResponsesIncompleteDetails>,
     usage: OpenAIResponsesUsage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponsesFailedPayload {
+    #[serde(default)]
+    error: Option<OpenAIResponsesFailedError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponsesFailedError {
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

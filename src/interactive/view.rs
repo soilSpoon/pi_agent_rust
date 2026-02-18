@@ -145,13 +145,7 @@ impl PiApp {
             // the reusable buffer is always returned regardless of path.
             use std::borrow::Cow;
             let viewport_content: Cow<'_, str> = if conversation_content.is_empty() {
-                Cow::Owned(if self.config.quiet_startup.unwrap_or(false) {
-                    String::new()
-                } else {
-                    self.styles
-                        .muted_italic
-                        .render("  Welcome to Pi! Type a message to begin, or /help for commands.")
-                })
+                Cow::Owned(self.styles.muted_italic.render(&self.startup_welcome))
             } else {
                 Cow::Borrowed(&conversation_content)
             };
@@ -793,6 +787,7 @@ impl PiApp {
                 AutocompleteItemKind::ExtensionCommand => "🧩",
                 AutocompleteItemKind::PromptTemplate => "📄",
                 AutocompleteItemKind::Skill => "🔧",
+                AutocompleteItemKind::Model => "🤖",
                 AutocompleteItemKind::File => "📁",
                 AutocompleteItemKind::Path => "📂",
             };

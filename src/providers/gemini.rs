@@ -24,6 +24,8 @@ use std::pin::Pin;
 // ============================================================================
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+const GOOGLE_GEMINI_CLI_BASE: &str = "https://cloudcode-pa.googleapis.com";
+const GOOGLE_ANTIGRAVITY_BASE: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 // ============================================================================
@@ -35,6 +37,9 @@ pub struct GeminiProvider {
     client: Client,
     model: String,
     base_url: String,
+    provider: String,
+    api: String,
+    google_cli_mode: bool,
     compat: Option<CompatConfig>,
 }
 
@@ -45,8 +50,32 @@ impl GeminiProvider {
             client: Client::new(),
             model: model.into(),
             base_url: GEMINI_API_BASE.to_string(),
+            provider: "google".to_string(),
+            api: "google-generative-ai".to_string(),
+            google_cli_mode: false,
             compat: None,
         }
+    }
+
+    /// Override provider name reported in streamed events.
+    #[must_use]
+    pub fn with_provider_name(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
+    }
+
+    /// Override API identifier reported in streamed events.
+    #[must_use]
+    pub fn with_api_name(mut self, api: impl Into<String>) -> Self {
+        self.api = api.into();
+        self
+    }
+
+    /// Enable Google Cloud Code Assist mode (`google-gemini-cli` / `google-antigravity`).
+    #[must_use]
+    pub const fn with_google_cli_mode(mut self, enabled: bool) -> Self {
+        self.google_cli_mode = enabled;
+        self
     }
 
     /// Create with a custom base URL.
@@ -72,10 +101,27 @@ impl GeminiProvider {
 
     /// Build the streaming URL.
     pub fn streaming_url(&self) -> String {
-        format!(
-            "{}/models/{}:streamGenerateContent?alt=sse",
-            self.base_url, self.model
-        )
+        let base = {
+            let trimmed = self.base_url.trim();
+            if trimmed.is_empty() {
+                if self.google_cli_mode {
+                    if self.provider.eq_ignore_ascii_case("google-antigravity") {
+                        GOOGLE_ANTIGRAVITY_BASE
+                    } else {
+                        GOOGLE_GEMINI_CLI_BASE
+                    }
+                } else {
+                    GEMINI_API_BASE
+                }
+            } else {
+                trimmed
+            }
+        };
+        if self.google_cli_mode {
+            format!("{base}/v1internal:streamGenerateContent?alt=sse")
+        } else {
+            format!("{base}/models/{}:streamGenerateContent?alt=sse", self.model)
+        }
     }
 
     /// Build the request body for the Gemini API.
@@ -130,25 +176,215 @@ impl GeminiProvider {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudCodeAssistRequest {
+    project: String,
+    model: String,
+    request: GeminiRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_type: Option<String>,
+    user_agent: String,
+    request_id: String,
+}
+
+fn build_google_cli_request(
+    model_id: &str,
+    project_id: &str,
+    request: GeminiRequest,
+    is_antigravity: bool,
+) -> CloudCodeAssistRequest {
+    let safe_project = project_id.trim();
+    let project = if safe_project.is_empty() {
+        "default-project".to_string()
+    } else if safe_project.starts_with("projects/") {
+        safe_project.to_string()
+    } else {
+        format!("projects/{safe_project}/locations/global")
+    };
+    CloudCodeAssistRequest {
+        project,
+        model: model_id.to_string(),
+        request,
+        request_type: is_antigravity.then(|| "agent".to_string()),
+        user_agent: if is_antigravity {
+            "antigravity".to_string()
+        } else {
+            "pi-coding-agent".to_string()
+        },
+        request_id: format!(
+            "{}-{}",
+            if is_antigravity { "agent" } else { "pi" },
+            uuid::Uuid::new_v4().simple()
+        ),
+    }
+}
+
+fn decode_project_scoped_access_payload(payload: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let token = value
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let project_id = value
+        .get("projectId")
+        .or_else(|| value.get("project_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default-project")
+        .to_string();
+    Some((token, project_id))
+}
+
 #[async_trait]
 impl Provider for GeminiProvider {
-    fn name(&self) -> &'static str {
-        "google"
+    fn name(&self) -> &str {
+        &self.provider
     }
 
-    fn api(&self) -> &'static str {
-        "google-generative-ai"
+    fn api(&self) -> &str {
+        &self.api
     }
 
     fn model_id(&self) -> &str {
         &self.model
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn stream(
         &self,
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        let request_body = self.build_request(context, options);
+        let url = self.streaming_url();
+
+        // Build request (Content-Type set by .json() below)
+        let mut request = self.client.post(&url).header("Accept", "text/event-stream");
+
+        if self.google_cli_mode {
+            let api_payload = options.api_key.clone().ok_or_else(|| {
+                Error::provider(
+                    self.name(),
+                    "Google Gemini CLI requires OAuth credentials. Run /login google-gemini-cli.",
+                )
+            })?;
+            let (access_token, project_id) = decode_project_scoped_access_payload(&api_payload)
+                .ok_or_else(|| {
+                    Error::provider(
+                        self.name(),
+                        "Invalid Google Gemini CLI OAuth payload. Run /login again.",
+                    )
+                })?;
+            let is_antigravity = self.provider.eq_ignore_ascii_case("google-antigravity");
+
+            request = request
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("Content-Type", "application/json")
+                .header("x-goog-api-client", "gl-node/22.17.0")
+                .header(
+                    "client-metadata",
+                    r#"{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}"#,
+                );
+
+            if is_antigravity {
+                request = request.header("User-Agent", "antigravity/1.15.8 darwin/arm64");
+            } else {
+                request =
+                    request.header("User-Agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+            }
+
+            // Apply provider-specific custom headers from compat config.
+            if let Some(compat) = &self.compat {
+                if let Some(custom_headers) = &compat.custom_headers {
+                    for (key, value) in custom_headers {
+                        request = request.header(key, value);
+                    }
+                }
+            }
+
+            // Per-request headers from StreamOptions (highest priority).
+            for (key, value) in &options.headers {
+                request = request.header(key, value);
+            }
+
+            let request = request.json(&build_google_cli_request(
+                &self.model,
+                &project_id,
+                request_body,
+                is_antigravity,
+            ))?;
+            let response = Box::pin(request.send()).await?;
+            let status = response.status();
+            if !(200..300).contains(&status) {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+                return Err(Error::provider(
+                    self.name(),
+                    format!("Gemini CLI API error (HTTP {status}): {body}"),
+                ));
+            }
+
+            // Create SSE stream for streaming responses.
+            let event_source = SseStream::new(response.bytes_stream());
+            let model = self.model.clone();
+            let api = self.api().to_string();
+            let provider = self.name().to_string();
+            let cloud_cli_mode = self.google_cli_mode;
+
+            let stream = stream::unfold(
+                StreamState::new(event_source, model, api, provider),
+                move |mut state| async move {
+                    if state.finished {
+                        return None;
+                    }
+                    loop {
+                        // Drain pending events before polling for more SSE data
+                        if let Some(event) = state.pending_events.pop_front() {
+                            return Some((Ok(event), state));
+                        }
+
+                        match state.event_source.next().await {
+                            Some(Ok(msg)) => {
+                                if msg.event == "ping" {
+                                    continue;
+                                }
+
+                                let processing = if cloud_cli_mode {
+                                    state.process_cloud_code_event(&msg.data)
+                                } else {
+                                    state.process_event(&msg.data)
+                                };
+                                if let Err(e) = processing {
+                                    state.finished = true;
+                                    return Some((Err(e), state));
+                                }
+                            }
+                            Some(Err(e)) => {
+                                state.finished = true;
+                                let err = Error::api(format!("SSE error: {e}"));
+                                return Some((Err(err), state));
+                            }
+                            None => {
+                                // Stream ended naturally
+                                state.finished = true;
+                                let reason = state.partial.stop_reason;
+                                let message = std::mem::take(&mut state.partial);
+                                return Some((Ok(StreamEvent::Done { reason, message }), state));
+                            }
+                        }
+                    }
+                },
+            );
+
+            return Ok(Box::pin(stream));
+        }
+
         let auth_value = options
             .api_key
             .clone()
@@ -156,20 +392,12 @@ impl Provider for GeminiProvider {
             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
             .ok_or_else(|| {
                 Error::provider(
-                    "google",
+                    self.name(),
                     "Missing API key for Google/Gemini. Set GOOGLE_API_KEY or GEMINI_API_KEY.",
                 )
             })?;
 
-        let request_body = self.build_request(context, options);
-        let url = self.streaming_url();
-
-        // Build request (Content-Type set by .json() below)
-        let mut request = self
-            .client
-            .post(&url)
-            .header("Accept", "text/event-stream")
-            .header("x-goog-api-key", &auth_value);
+        request = request.header("x-goog-api-key", &auth_value);
 
         // Apply provider-specific custom headers from compat config.
         if let Some(compat) = &self.compat {
@@ -195,7 +423,7 @@ impl Provider for GeminiProvider {
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::provider(
-                "google",
+                self.name(),
                 format!("Gemini API error (HTTP {status}): {body}"),
             ));
         }
@@ -207,10 +435,11 @@ impl Provider for GeminiProvider {
         let model = self.model.clone();
         let api = self.api().to_string();
         let provider = self.name().to_string();
+        let cloud_cli_mode = self.google_cli_mode;
 
         let stream = stream::unfold(
             StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
+            move |mut state| async move {
                 if state.finished {
                     return None;
                 }
@@ -226,7 +455,12 @@ impl Provider for GeminiProvider {
                                 continue;
                             }
 
-                            if let Err(e) = state.process_event(&msg.data) {
+                            let processing = if cloud_cli_mode {
+                                state.process_cloud_code_event(&msg.data)
+                            } else {
+                                state.process_event(&msg.data)
+                            };
+                            if let Err(e) = processing {
                                 state.finished = true;
                                 return Some((Err(e), state));
                             }
@@ -293,7 +527,10 @@ where
     fn process_event(&mut self, data: &str) -> Result<()> {
         let response: GeminiStreamResponse = serde_json::from_str(data)
             .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+        self.process_response(response)
+    }
 
+    fn process_response(&mut self, response: GeminiStreamResponse) -> Result<()> {
         // Handle usage metadata
         if let Some(metadata) = response.usage_metadata {
             self.partial.usage.input = metadata.prompt_token_count.unwrap_or(0);
@@ -309,6 +546,18 @@ where
         }
 
         Ok(())
+    }
+
+    fn process_cloud_code_event(&mut self, data: &str) -> Result<()> {
+        let wrapped: CloudCodeAssistResponseChunk = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+        let Some(response) = wrapped.response else {
+            return Ok(());
+        };
+        self.process_response(GeminiStreamResponse {
+            candidates: response.candidates,
+            usage_metadata: response.usage_metadata,
+        })
     }
 
     #[allow(clippy::unnecessary_wraps)]
@@ -543,6 +792,22 @@ pub(crate) struct GeminiStreamResponse {
     pub(crate) candidates: Option<Vec<GeminiCandidate>>,
     #[serde(default)]
     pub(crate) usage_metadata: Option<GeminiUsageMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudCodeAssistResponseChunk {
+    #[serde(default)]
+    response: Option<CloudCodeAssistResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudCodeAssistResponse {
+    #[serde(default)]
+    candidates: Option<Vec<GeminiCandidate>>,
+    #[serde(default)]
+    usage_metadata: Option<GeminiUsageMetadata>,
 }
 
 #[derive(Debug, Deserialize)]

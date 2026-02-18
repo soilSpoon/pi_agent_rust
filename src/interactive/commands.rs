@@ -220,10 +220,21 @@ pub(super) fn remove_provider_credentials(
     removed
 }
 
-const BUILTIN_LOGIN_PROVIDERS: [(&str, &str); 3] = [
+const BUILTIN_LOGIN_PROVIDERS: [(&str, &str); 8] = [
     ("anthropic", "OAuth"),
+    ("openai-codex", "OAuth"),
+    ("google-gemini-cli", "OAuth"),
+    ("google-antigravity", "OAuth"),
+    ("github-copilot", "OAuth"),
+    ("gitlab", "OAuth"),
     ("openai", "API key"),
     ("google", "API key"),
+];
+
+const STARTUP_PRIORITY_OAUTH_PROVIDERS: [(&str, &str); 3] = [
+    ("anthropic", "Claude Code"),
+    ("openai-codex", "Codex"),
+    ("google-gemini-cli", "Gemini CLI"),
 ];
 
 fn format_compact_duration(ms: i64) -> String {
@@ -259,6 +270,17 @@ fn format_credential_status(status: &crate::auth::CredentialStatus) -> String {
             )
         }
     }
+}
+
+fn format_provider_status(auth: &crate::auth::AuthStorage, provider: &str) -> String {
+    if let Some(source) = auth.external_setup_source(provider)
+        && !auth.has_stored_credential(provider)
+    {
+        return format!("Auto-detected from {source}");
+    }
+
+    let status = auth.credential_status(provider);
+    format_credential_status(&status)
 }
 
 fn collect_extension_oauth_providers(available_models: &[ModelEntry]) -> Vec<String> {
@@ -320,11 +342,10 @@ pub(super) fn format_login_provider_listing(
     let built_in_rows: Vec<(String, String, String)> = BUILTIN_LOGIN_PROVIDERS
         .iter()
         .map(|(provider, method)| {
-            let status = auth.credential_status(provider);
             (
                 (*provider).to_string(),
                 (*method).to_string(),
-                format_credential_status(&status),
+                format_provider_status(auth, provider),
             )
         })
         .collect();
@@ -335,11 +356,10 @@ pub(super) fn format_login_provider_listing(
         let extension_rows: Vec<(String, String, String)> = extension_providers
             .iter()
             .map(|provider| {
-                let status = auth.credential_status(provider);
                 (
                     provider.clone(),
                     "OAuth".to_string(),
-                    format_credential_status(&status),
+                    format_provider_status(auth, provider),
                 )
             })
             .collect();
@@ -349,6 +369,29 @@ pub(super) fn format_login_provider_listing(
 
     output.push_str("\nUsage: /login <provider>");
     output
+}
+
+pub(super) fn format_startup_oauth_hint(auth: &crate::auth::AuthStorage) -> String {
+    let mut output = String::new();
+    output.push_str("  No provider credentials were detected.\n");
+    output.push_str("  Connect one of these providers:\n");
+    for (provider, label) in STARTUP_PRIORITY_OAUTH_PROVIDERS {
+        let status = format_provider_status(auth, provider);
+        let _ = writeln!(output, "  - {provider} ({label}): {status}");
+    }
+    output.push_str("  Use /login <provider> to connect or refresh credentials.\n");
+    output.push_str("  Use /login to see all providers and auth methods.");
+    output
+}
+
+pub(super) fn should_show_startup_oauth_hint(auth: &crate::auth::AuthStorage) -> bool {
+    STARTUP_PRIORITY_OAUTH_PROVIDERS
+        .iter()
+        .all(|(provider, _)| {
+            auth.resolve_api_key(provider, None).is_none()
+                && !auth.has_stored_credential(provider)
+                && auth.external_setup_source(provider).is_none()
+        })
 }
 
 pub fn strip_thinking_level_suffix(pattern: &str) -> &str {
@@ -566,6 +609,24 @@ impl PiApp {
                 PendingLoginKind::OAuth => {
                     if provider == "anthropic" {
                         Box::pin(crate::auth::complete_anthropic_oauth(
+                            &code_input,
+                            &verifier,
+                        ))
+                        .await
+                    } else if provider == "openai-codex" {
+                        Box::pin(crate::auth::complete_openai_codex_oauth(
+                            &code_input,
+                            &verifier,
+                        ))
+                        .await
+                    } else if provider == "google-gemini-cli" {
+                        Box::pin(crate::auth::complete_google_gemini_cli_oauth(
+                            &code_input,
+                            &verifier,
+                        ))
+                        .await
+                    } else if provider == "google-antigravity" {
+                        Box::pin(crate::auth::complete_google_antigravity_oauth(
                             &code_input,
                             &verifier,
                         ))
@@ -1422,9 +1483,15 @@ impl PiApp {
             return None;
         }
 
-        // Look up OAuth config: built-in (anthropic, copilot, gitlab) or extension-registered.
+        // Look up OAuth config: built-in providers or extension-registered OAuth config.
         let oauth_result = if provider == "anthropic" {
             crate::auth::start_anthropic_oauth().map(|info| (info, None))
+        } else if provider == "openai-codex" {
+            crate::auth::start_openai_codex_oauth().map(|info| (info, None))
+        } else if provider == "google-gemini-cli" {
+            crate::auth::start_google_gemini_cli_oauth().map(|info| (info, None))
+        } else if provider == "google-antigravity" {
+            crate::auth::start_google_antigravity_oauth().map(|info| (info, None))
         } else if provider == "github-copilot" || provider == "copilot" {
             let client_id = std::env::var("GITHUB_COPILOT_CLIENT_ID").unwrap_or_default();
             let copilot_config = crate::auth::CopilotOAuthConfig {
@@ -1545,7 +1612,7 @@ impl PiApp {
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_model(&mut self, args: &str) -> Option<Cmd> {
         if args.trim().is_empty() {
-            self.status_message = Some(format!("Current model: {}", self.model));
+            self.open_model_selector_configured_only();
             return None;
         }
 
@@ -1922,7 +1989,18 @@ impl PiApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bash_command, parse_extension_command};
+    use super::{parse_bash_command, parse_extension_command, should_show_startup_oauth_hint};
+    use crate::auth::{AuthCredential, AuthStorage};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn empty_auth_storage() -> AuthStorage {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("pi_auth_storage_test_{nonce}.json"));
+        AuthStorage::load(path).expect("load empty auth storage")
+    }
 
     #[test]
     fn parse_ext_cmd_basic() {
@@ -2013,5 +2091,25 @@ mod tests {
         let (cmd, exclude) = parse_bash_command("  ! echo hi").expect("should parse");
         assert_eq!(cmd, "echo hi");
         assert!(!exclude);
+    }
+
+    #[test]
+    fn startup_hint_is_hidden_when_priority_provider_is_available() {
+        let mut auth = empty_auth_storage();
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "test-key".to_string(),
+            },
+        );
+        assert!(!should_show_startup_oauth_hint(&auth));
+    }
+
+    #[test]
+    fn startup_hint_copy_no_longer_uses_front_and_center_phrase() {
+        let auth = empty_auth_storage();
+        let hint = super::format_startup_oauth_hint(&auth);
+        assert!(hint.contains("No provider credentials were detected."));
+        assert!(!hint.contains("front and center"));
     }
 }

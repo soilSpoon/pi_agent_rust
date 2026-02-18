@@ -26,6 +26,7 @@ pub enum AutocompleteItemKind {
     ExtensionCommand,
     PromptTemplate,
     Skill,
+    Model,
     File,
     Path,
 }
@@ -138,6 +139,12 @@ impl AutocompleteProvider {
     #[must_use]
     pub fn suggest(&mut self, text: &str, cursor: usize) -> AutocompleteResponse {
         let cursor = clamp_cursor(text, cursor);
+        if let Some(token) = auth_provider_argument_token(text, cursor) {
+            return self.suggest_auth_provider_argument(&token);
+        }
+        if let Some(token) = model_argument_token(text, cursor) {
+            return self.suggest_model_argument(&token);
+        }
         let segment = token_at_cursor(text, cursor);
 
         if segment.text.starts_with('/') {
@@ -404,6 +411,96 @@ impl AutocompleteProvider {
         sort_scored_items(&mut items);
         let items = items
             .into_iter()
+            .take(self.max_items)
+            .map(|s| s.item)
+            .collect();
+
+        AutocompleteResponse {
+            replace: token.range.clone(),
+            items,
+        }
+    }
+
+    fn suggest_model_argument(&self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
+        let query = token.text.trim();
+        let mut items = crate::models::model_autocomplete_candidates()
+            .iter()
+            .filter_map(|candidate| {
+                let (is_prefix, score) = fuzzy_match_score(&candidate.slug, query)?;
+                Some(ScoredItem {
+                    is_prefix,
+                    score,
+                    kind_rank: kind_rank(AutocompleteItemKind::Model),
+                    label: candidate.slug.clone(),
+                    item: AutocompleteItem {
+                        kind: AutocompleteItemKind::Model,
+                        label: candidate.slug.clone(),
+                        insert: candidate.slug.clone(),
+                        description: candidate.description.clone(),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+
+        sort_scored_items(&mut items);
+        let items = items
+            .into_iter()
+            .take(self.max_items)
+            .map(|s| s.item)
+            .collect();
+
+        AutocompleteResponse {
+            replace: token.range.clone(),
+            items,
+        }
+    }
+
+    fn suggest_auth_provider_argument(&self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
+        let query = token.text.trim();
+        let mut items = Vec::new();
+
+        for meta in crate::provider_metadata::PROVIDER_METADATA {
+            if let Some((is_prefix, score)) = fuzzy_match_score(meta.canonical_id, query) {
+                items.push(ScoredItem {
+                    is_prefix,
+                    score,
+                    kind_rank: kind_rank(AutocompleteItemKind::SlashCommand),
+                    label: meta.canonical_id.to_string(),
+                    item: AutocompleteItem {
+                        kind: AutocompleteItemKind::SlashCommand,
+                        label: meta.canonical_id.to_string(),
+                        insert: meta.canonical_id.to_string(),
+                        description: meta
+                            .display_name
+                            .map(|name| format!("Provider: {name}"))
+                            .or_else(|| Some("Provider".to_string())),
+                    },
+                });
+            }
+
+            for alias in meta.aliases {
+                if let Some((is_prefix, score)) = fuzzy_match_score(alias, query) {
+                    items.push(ScoredItem {
+                        is_prefix,
+                        score,
+                        kind_rank: kind_rank(AutocompleteItemKind::SlashCommand),
+                        label: alias.to_string(),
+                        item: AutocompleteItem {
+                            kind: AutocompleteItemKind::SlashCommand,
+                            label: alias.to_string(),
+                            insert: alias.to_string(),
+                            description: Some(format!("Alias for {}", meta.canonical_id)),
+                        },
+                    });
+                }
+            }
+        }
+
+        sort_scored_items(&mut items);
+        let mut dedup = std::collections::HashSet::new();
+        let items = items
+            .into_iter()
+            .filter(|entry| dedup.insert(entry.item.insert.clone()))
             .take(self.max_items)
             .map(|s| s.item)
             .collect();
@@ -692,8 +789,9 @@ const fn kind_rank(kind: AutocompleteItemKind) -> u8 {
         AutocompleteItemKind::ExtensionCommand => 1,
         AutocompleteItemKind::PromptTemplate => 2,
         AutocompleteItemKind::Skill => 3,
-        AutocompleteItemKind::File => 4,
-        AutocompleteItemKind::Path => 5,
+        AutocompleteItemKind::Model => 4,
+        AutocompleteItemKind::File => 5,
+        AutocompleteItemKind::Path => 6,
     }
 }
 
@@ -848,6 +946,64 @@ fn token_at_cursor(text: &str, cursor: usize) -> TokenAtCursor<'_> {
         text: &text[start..end],
         range: start..end,
     }
+}
+
+fn model_argument_token(text: &str, cursor: usize) -> Option<TokenAtCursor<'_>> {
+    let cursor = clamp_cursor(text, cursor);
+    let line_start = text[..cursor].rfind('\n').map_or(0, |idx| idx + 1);
+    let prefix = &text[line_start..cursor];
+    let trimmed = prefix.trim_start();
+    let leading_ws = prefix.len().saturating_sub(trimmed.len());
+
+    let command = if trimmed.starts_with("/model") {
+        "/model"
+    } else if trimmed.starts_with("/m") {
+        "/m"
+    } else {
+        return None;
+    };
+
+    let command_end = line_start + leading_ws + command.len();
+    let command_boundary = text
+        .get(command_end..)
+        .and_then(|tail| tail.chars().next())
+        .is_none_or(char::is_whitespace);
+    if !command_boundary {
+        return None;
+    }
+
+    if cursor <= command_end {
+        return None;
+    }
+
+    Some(token_at_cursor(text, cursor))
+}
+
+fn auth_provider_argument_token(text: &str, cursor: usize) -> Option<TokenAtCursor<'_>> {
+    let cursor = clamp_cursor(text, cursor);
+    let line_start = text[..cursor].rfind('\n').map_or(0, |idx| idx + 1);
+    let prefix = &text[line_start..cursor];
+    let trimmed = prefix.trim_start();
+    let leading_ws = prefix.len().saturating_sub(trimmed.len());
+
+    let command = if trimmed.starts_with("/login") {
+        "/login"
+    } else if trimmed.starts_with("/logout") {
+        "/logout"
+    } else {
+        return None;
+    };
+
+    let command_end = line_start + leading_ws + command.len();
+    let command_boundary = text
+        .get(command_end..)
+        .and_then(|tail| tail.chars().next())
+        .is_none_or(char::is_whitespace);
+    if !command_boundary || cursor <= command_end {
+        return None;
+    }
+
+    Some(token_at_cursor(text, cursor))
 }
 
 fn clamp_cursor(text: &str, cursor: usize) -> usize {
@@ -1087,6 +1243,60 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == AutocompleteItemKind::ExtensionCommand)
         );
+    }
+
+    #[test]
+    fn model_command_suggests_model_catalog_candidates() {
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        let input = "/model gpt-5.2-cod";
+        let resp = provider.suggest(input, input.len());
+        assert!(
+            resp.items
+                .iter()
+                .any(|item| item.kind == AutocompleteItemKind::Model
+                    && item.insert == "openai/gpt-5.2-codex")
+        );
+    }
+
+    #[test]
+    fn model_shorthand_command_suggests_model_catalog_candidates() {
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        let input = "/m claude-sonnet-4";
+        let resp = provider.suggest(input, input.len());
+        assert!(
+            resp.items
+                .iter()
+                .any(|item| item.kind == AutocompleteItemKind::Model)
+        );
+    }
+
+    #[test]
+    fn login_command_suggests_provider_argument_candidates() {
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        let input = "/login openai-cod";
+        let resp = provider.suggest(input, input.len());
+        assert!(resp.items.iter().any(|item| item.insert == "openai-codex"));
+    }
+
+    #[test]
+    fn logout_command_suggests_provider_alias_candidates() {
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        let input = "/logout cop";
+        let resp = provider.suggest(input, input.len());
+        assert!(resp.items.iter().any(|item| item.insert == "copilot"));
+    }
+
+    #[test]
+    fn login_without_argument_keeps_slash_completion_behavior() {
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        let input = "/log";
+        let resp = provider.suggest(input, input.len());
+        assert!(resp.items.iter().any(|item| item.insert == "/login"));
     }
 
     // ── clamp_cursor / clamp_to_char_boundary ────────────────────────
@@ -1386,7 +1596,8 @@ mod tests {
             kind_rank(AutocompleteItemKind::PromptTemplate)
                 < kind_rank(AutocompleteItemKind::Skill)
         );
-        assert!(kind_rank(AutocompleteItemKind::Skill) < kind_rank(AutocompleteItemKind::File));
+        assert!(kind_rank(AutocompleteItemKind::Skill) < kind_rank(AutocompleteItemKind::Model));
+        assert!(kind_rank(AutocompleteItemKind::Model) < kind_rank(AutocompleteItemKind::File));
         assert!(kind_rank(AutocompleteItemKind::File) < kind_rank(AutocompleteItemKind::Path));
     }
 
@@ -1999,18 +2210,19 @@ mod tests {
                 assert!(!tok.text.contains(char::is_whitespace) || tok.text.is_empty());
             }
 
-            /// `kind_rank` covers all variants with distinct ranks 0..=5.
+            /// `kind_rank` covers all variants with distinct ranks 0..=6.
             #[test]
-            fn kind_rank_distinct(idx in 0..6usize) {
+            fn kind_rank_distinct(idx in 0..7usize) {
                 let kinds = [
                     AutocompleteItemKind::SlashCommand,
                     AutocompleteItemKind::ExtensionCommand,
                     AutocompleteItemKind::PromptTemplate,
                     AutocompleteItemKind::Skill,
+                    AutocompleteItemKind::Model,
                     AutocompleteItemKind::File,
                     AutocompleteItemKind::Path,
                 ];
-                let expected = [0_u8, 1, 2, 3, 4, 5][idx];
+                let expected = [0_u8, 1, 2, 3, 4, 5, 6][idx];
                 assert_eq!(kind_rank(kinds[idx]), expected);
             }
 

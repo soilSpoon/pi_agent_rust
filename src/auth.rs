@@ -23,6 +23,37 @@ const ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/
 const ANTHROPIC_OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 const ANTHROPIC_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
 
+// ── OpenAI Codex OAuth constants ─────────────────────────────────
+const OPENAI_CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_CODEX_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+const OPENAI_CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_CODEX_OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const OPENAI_CODEX_OAUTH_SCOPES: &str = "openid profile email offline_access";
+
+// ── Google Gemini CLI OAuth constants ────────────────────────────
+const GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID: &str =
+    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+const GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET: &str = "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";
+const GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI: &str = "http://localhost:8085/oauth2callback";
+const GOOGLE_GEMINI_CLI_OAUTH_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
+const GOOGLE_GEMINI_CLI_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_GEMINI_CLI_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_GEMINI_CLI_CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
+
+// ── Google Antigravity OAuth constants ───────────────────────────
+const GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID: &str =
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET: &str = "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";
+const GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
+const GOOGLE_ANTIGRAVITY_OAUTH_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+const GOOGLE_ANTIGRAVITY_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_ANTIGRAVITY_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID: &str = "rising-fact-p41fc";
+const GOOGLE_ANTIGRAVITY_PROJECT_DISCOVERY_ENDPOINTS: [&str; 2] = [
+    "https://cloudcode-pa.googleapis.com",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+];
+
 // ── GitHub / Copilot OAuth constants ──────────────────────────────
 const GITHUB_OAUTH_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_OAUTH_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -103,6 +134,7 @@ pub enum CredentialStatus {
 /// Proactive refresh: attempt refresh this many ms *before* actual expiry.
 /// This avoids using a token that's about to expire during a long-running request.
 const PROACTIVE_REFRESH_WINDOW_MS: i64 = 10 * 60 * 1000; // 10 minutes
+type OAuthRefreshRequest = (String, String, String, Option<String>, Option<String>);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthFile {
@@ -274,7 +306,11 @@ impl AuthStorage {
             .or_else(|| canonical.and_then(|id| self.entries.get(id)));
 
         let Some(cred) = cred else {
-            return CredentialStatus::Missing;
+            return if resolve_external_provider_api_key(provider).is_some() {
+                CredentialStatus::ApiKey
+            } else {
+                CredentialStatus::Missing
+            };
         };
 
         match cred {
@@ -291,6 +327,21 @@ impl AuthStorage {
             AuthCredential::AwsCredentials { .. } => CredentialStatus::AwsCredentials,
             AuthCredential::ServiceKey { .. } => CredentialStatus::ServiceKey,
         }
+    }
+
+    /// Returns true when auth.json contains a credential for `provider`
+    /// (including canonical alias fallback).
+    pub fn has_stored_credential(&self, provider: &str) -> bool {
+        self.entries.contains_key(provider)
+            || canonical_provider_id(provider)
+                .filter(|canonical| *canonical != provider)
+                .is_some_and(|canonical| self.entries.contains_key(canonical))
+    }
+
+    /// Return a human-readable source label when credentials can be auto-detected
+    /// from other locally-installed coding CLIs.
+    pub fn external_setup_source(&self, provider: &str) -> Option<&'static str> {
+        external_setup_source(provider)
     }
 
     /// Resolve API key with precedence.
@@ -328,9 +379,16 @@ impl AuthStorage {
             return Some(key);
         }
 
+        if let Some(key) = resolve_external_provider_api_key(provider) {
+            return Some(key);
+        }
+
         canonical_provider_id(provider)
             .filter(|canonical| *canonical != provider)
-            .and_then(|canonical| self.api_key(canonical))
+            .and_then(|canonical| {
+                self.api_key(canonical)
+                    .or_else(|| resolve_external_provider_api_key(canonical))
+            })
     }
 
     /// Refresh any expired OAuth tokens that this binary knows how to refresh.
@@ -352,10 +410,11 @@ impl AuthStorage {
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
         let proactive_deadline = now + PROACTIVE_REFRESH_WINDOW_MS;
-        let mut refreshes: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+        let mut refreshes: Vec<OAuthRefreshRequest> = Vec::new();
 
         for (provider, cred) in &self.entries {
             if let AuthCredential::OAuth {
+                access_token,
                 refresh_token,
                 expires,
                 token_url,
@@ -368,6 +427,7 @@ impl AuthStorage {
                 if *expires <= proactive_deadline {
                     refreshes.push((
                         provider.clone(),
+                        access_token.clone(),
                         refresh_token.clone(),
                         token_url.clone(),
                         client_id.clone(),
@@ -378,10 +438,41 @@ impl AuthStorage {
 
         let mut failed_providers = Vec::new();
 
-        for (provider, refresh_token, stored_token_url, stored_client_id) in refreshes {
+        for (provider, access_token, refresh_token, stored_token_url, stored_client_id) in refreshes
+        {
             let result = match provider.as_str() {
                 "anthropic" => {
                     Box::pin(refresh_anthropic_oauth_token(client, &refresh_token)).await
+                }
+                "google-gemini-cli" => {
+                    let (_, project_id) = decode_project_scoped_access_token(&access_token)
+                        .ok_or_else(|| {
+                            Error::auth(
+                                "google-gemini-cli OAuth credential missing projectId payload"
+                                    .to_string(),
+                            )
+                        })?;
+                    Box::pin(refresh_google_gemini_cli_oauth_token(
+                        client,
+                        &refresh_token,
+                        &project_id,
+                    ))
+                    .await
+                }
+                "google-antigravity" => {
+                    let (_, project_id) = decode_project_scoped_access_token(&access_token)
+                        .ok_or_else(|| {
+                            Error::auth(
+                                "google-antigravity OAuth credential missing projectId payload"
+                                    .to_string(),
+                            )
+                        })?;
+                    Box::pin(refresh_google_antigravity_oauth_token(
+                        client,
+                        &refresh_token,
+                        &project_id,
+                    ))
+                    .await
                 }
                 _ => {
                     if let (Some(url), Some(cid)) = (&stored_token_url, &stored_client_id) {
@@ -451,7 +542,10 @@ impl AuthStorage {
             } = cred
             {
                 // Skip built-in providers (handled by refresh_expired_oauth_tokens_with_client).
-                if provider == "anthropic" {
+                if matches!(
+                    provider.as_str(),
+                    "anthropic" | "openai-codex" | "google-gemini-cli" | "google-antigravity"
+                ) {
                     continue;
                 }
                 // Skip self-contained credentials — they are refreshed by
@@ -554,6 +648,164 @@ fn env_key_for_provider(provider: &str) -> Option<&'static str> {
 
 fn env_keys_for_provider(provider: &str) -> &'static [&'static str] {
     provider_auth_env_keys(provider)
+}
+
+fn resolve_external_provider_api_key(provider: &str) -> Option<String> {
+    let canonical = canonical_provider_id(provider).unwrap_or(provider);
+    match canonical {
+        "anthropic" => read_external_claude_access_token(),
+        "openai" => read_external_codex_openai_api_key().or_else(read_external_codex_access_token),
+        "openai-codex" => read_external_codex_access_token(),
+        "google-gemini-cli" => {
+            let project = google_project_id_from_env();
+            read_external_gemini_access_payload(project.as_deref())
+        }
+        "google-antigravity" => {
+            let project = google_project_id_from_env()
+                .unwrap_or_else(|| GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string());
+            read_external_gemini_access_payload(Some(project.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// Return a stable human-readable label when we can auto-detect local credentials
+/// from another coding agent installation.
+pub fn external_setup_source(provider: &str) -> Option<&'static str> {
+    let canonical = canonical_provider_id(provider).unwrap_or(provider);
+    match canonical {
+        "anthropic" if read_external_claude_access_token().is_some() => {
+            Some("Claude Code (~/.claude/.credentials.json)")
+        }
+        "openai-codex" if read_external_codex_access_token().is_some() => {
+            Some("Codex (~/.codex/auth.json)")
+        }
+        "google-gemini-cli" if read_external_gemini_access_payload(None).is_some() => {
+            Some("Gemini CLI (~/.gemini/oauth_creds.json)")
+        }
+        _ => None,
+    }
+}
+
+fn read_external_json(path: &Path) -> Option<serde_json::Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn read_external_claude_access_token() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let path = Path::new(&home).join(".claude").join(".credentials.json");
+    let value = read_external_json(&path)?;
+    let token = value
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("accessToken"))
+        .and_then(serde_json::Value::as_str)?
+        .trim()
+        .to_string();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+fn read_external_codex_auth() -> Option<serde_json::Value> {
+    let home = std::env::var_os("HOME")?;
+    let path = Path::new(&home).join(".codex").join("auth.json");
+    read_external_json(&path)
+}
+
+fn read_external_codex_access_token() -> Option<String> {
+    let value = read_external_codex_auth()?;
+    let token = value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(serde_json::Value::as_str)?
+        .trim()
+        .to_string();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+fn read_external_codex_openai_api_key() -> Option<String> {
+    let value = read_external_codex_auth()?;
+    let key = value
+        .get("OPENAI_API_KEY")
+        .and_then(serde_json::Value::as_str)?
+        .trim()
+        .to_string();
+    if key.is_empty() { None } else { Some(key) }
+}
+
+fn read_external_gemini_access_payload(project_id: Option<&str>) -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let candidates = [
+        Path::new(&home).join(".gemini").join("oauth_creds.json"),
+        Path::new(&home)
+            .join(".config")
+            .join("gemini")
+            .join("credentials.json"),
+    ];
+
+    for path in candidates {
+        let Some(value) = read_external_json(&path) else {
+            continue;
+        };
+        let Some(token) = value
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+
+        let project = project_id
+            .map(std::string::ToString::to_string)
+            .or_else(|| {
+                value
+                    .get("projectId")
+                    .or_else(|| value.get("project_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(std::string::ToString::to_string)
+            })
+            .unwrap_or_else(|| "default-project".to_string());
+
+        return Some(encode_project_scoped_access_token(token, &project));
+    }
+
+    None
+}
+
+fn google_project_id_from_env() -> Option<String> {
+    std::env::var("GOOGLE_CLOUD_PROJECT")
+        .ok()
+        .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn encode_project_scoped_access_token(token: &str, project_id: &str) -> String {
+    serde_json::json!({
+        "token": token,
+        "projectId": project_id,
+    })
+    .to_string()
+}
+
+fn decode_project_scoped_access_token(payload: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let token = value
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let project_id = value
+        .get("projectId")
+        .or_else(|| value.get("project_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some((token, project_id))
 }
 
 // ── AWS Credential Chain ────────────────────────────────────────
@@ -1194,6 +1446,469 @@ async fn refresh_anthropic_oauth_token(
         token_url: Some(ANTHROPIC_OAUTH_TOKEN_URL.to_string()),
         client_id: Some(ANTHROPIC_OAUTH_CLIENT_ID.to_string()),
     })
+}
+
+/// Start OpenAI Codex OAuth by generating an authorization URL and PKCE verifier.
+pub fn start_openai_codex_oauth() -> Result<OAuthStartInfo> {
+    let (verifier, challenge) = generate_pkce();
+    let url = build_url_with_query(
+        OPENAI_CODEX_OAUTH_AUTHORIZE_URL,
+        &[
+            ("response_type", "code"),
+            ("client_id", OPENAI_CODEX_OAUTH_CLIENT_ID),
+            ("redirect_uri", OPENAI_CODEX_OAUTH_REDIRECT_URI),
+            ("scope", OPENAI_CODEX_OAUTH_SCOPES),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("state", &verifier),
+            ("id_token_add_organizations", "true"),
+            ("codex_cli_simplified_flow", "true"),
+            ("originator", "pi"),
+        ],
+    );
+
+    Ok(OAuthStartInfo {
+        provider: "openai-codex".to_string(),
+        url,
+        verifier,
+        instructions: Some(
+            "Open the URL, complete login, then paste the callback URL or authorization code."
+                .to_string(),
+        ),
+    })
+}
+
+/// Complete OpenAI Codex OAuth by exchanging an authorization code for access/refresh tokens.
+pub async fn complete_openai_codex_oauth(
+    code_input: &str,
+    verifier: &str,
+) -> Result<AuthCredential> {
+    let (code, state) = parse_oauth_code_input(code_input);
+    let Some(code) = code else {
+        return Err(Error::auth("Missing authorization code".to_string()));
+    };
+    let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
+
+    let form_body = format!(
+        "grant_type=authorization_code&client_id={}&code={}&code_verifier={}&redirect_uri={}",
+        percent_encode_component(OPENAI_CODEX_OAUTH_CLIENT_ID),
+        percent_encode_component(&code),
+        percent_encode_component(verifier),
+        percent_encode_component(OPENAI_CODEX_OAUTH_REDIRECT_URI),
+    );
+
+    let client = crate::http::client::Client::new();
+    let request = client
+        .post(OPENAI_CODEX_OAUTH_TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .body(form_body.into_bytes());
+
+    let response = Box::pin(request.send())
+        .await
+        .map_err(|e| Error::auth(format!("OpenAI Codex token exchange failed: {e}")))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[code.as_str(), verifier]);
+    if !(200..300).contains(&status) {
+        return Err(Error::auth(format!(
+            "OpenAI Codex token exchange failed: {redacted_text}"
+        )));
+    }
+
+    let oauth_response: OAuthTokenResponse = serde_json::from_str(&text)
+        .map_err(|e| Error::auth(format!("Invalid OpenAI Codex token response: {e}")))?;
+
+    Ok(AuthCredential::OAuth {
+        access_token: oauth_response.access_token,
+        refresh_token: oauth_response.refresh_token,
+        expires: oauth_expires_at_ms(oauth_response.expires_in),
+        token_url: Some(OPENAI_CODEX_OAUTH_TOKEN_URL.to_string()),
+        client_id: Some(OPENAI_CODEX_OAUTH_CLIENT_ID.to_string()),
+    })
+}
+
+/// Start Google Gemini CLI OAuth by generating an authorization URL and PKCE verifier.
+pub fn start_google_gemini_cli_oauth() -> Result<OAuthStartInfo> {
+    let (verifier, challenge) = generate_pkce();
+    let url = build_url_with_query(
+        GOOGLE_GEMINI_CLI_OAUTH_AUTHORIZE_URL,
+        &[
+            ("client_id", GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID),
+            ("response_type", "code"),
+            ("redirect_uri", GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI),
+            ("scope", GOOGLE_GEMINI_CLI_OAUTH_SCOPES),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("state", &verifier),
+            ("access_type", "offline"),
+            ("prompt", "consent"),
+        ],
+    );
+
+    Ok(OAuthStartInfo {
+        provider: "google-gemini-cli".to_string(),
+        url,
+        verifier,
+        instructions: Some(
+            "Open the URL, complete login, then paste the callback URL or authorization code."
+                .to_string(),
+        ),
+    })
+}
+
+/// Start Google Antigravity OAuth by generating an authorization URL and PKCE verifier.
+pub fn start_google_antigravity_oauth() -> Result<OAuthStartInfo> {
+    let (verifier, challenge) = generate_pkce();
+    let url = build_url_with_query(
+        GOOGLE_ANTIGRAVITY_OAUTH_AUTHORIZE_URL,
+        &[
+            ("client_id", GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID),
+            ("response_type", "code"),
+            ("redirect_uri", GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI),
+            ("scope", GOOGLE_ANTIGRAVITY_OAUTH_SCOPES),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("state", &verifier),
+            ("access_type", "offline"),
+            ("prompt", "consent"),
+        ],
+    );
+
+    Ok(OAuthStartInfo {
+        provider: "google-antigravity".to_string(),
+        url,
+        verifier,
+        instructions: Some(
+            "Open the URL, complete login, then paste the callback URL or authorization code."
+                .to_string(),
+        ),
+    })
+}
+
+async fn discover_google_gemini_cli_project_id(
+    client: &crate::http::client::Client,
+    access_token: &str,
+) -> Result<String> {
+    let env_project = google_project_id_from_env();
+    let mut payload = serde_json::json!({
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        }
+    });
+    if let Some(project) = &env_project {
+        payload["cloudaicompanionProject"] = serde_json::Value::String(project.clone());
+        payload["metadata"]["duetProject"] = serde_json::Value::String(project.clone());
+    }
+
+    let request = client
+        .post(&format!(
+            "{GOOGLE_GEMINI_CLI_CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist"
+        ))
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .json(&payload)?;
+
+    let response = Box::pin(request.send())
+        .await
+        .map_err(|e| Error::auth(format!("Google Cloud project discovery failed: {e}")))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+
+    if (200..300).contains(&status) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(project_id) = parse_code_assist_project_id(&value) {
+                return Ok(project_id);
+            }
+        }
+    }
+
+    if let Some(project_id) = env_project {
+        return Ok(project_id);
+    }
+
+    Err(Error::auth(
+        "Google Cloud project discovery failed. Set GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID and retry /login google-gemini-cli.".to_string(),
+    ))
+}
+
+async fn discover_google_antigravity_project_id(
+    client: &crate::http::client::Client,
+    access_token: &str,
+) -> Result<String> {
+    let payload = serde_json::json!({
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        }
+    });
+
+    for endpoint in GOOGLE_ANTIGRAVITY_PROJECT_DISCOVERY_ENDPOINTS {
+        let request = client
+            .post(&format!("{endpoint}/v1internal:loadCodeAssist"))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("Content-Type", "application/json")
+            .json(&payload)?;
+
+        let Ok(response) = Box::pin(request.send()).await else {
+            continue;
+        };
+        let status = response.status();
+        if !(200..300).contains(&status) {
+            continue;
+        }
+        let text = response.text().await.unwrap_or_default();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(project_id) = parse_code_assist_project_id(&value) {
+                return Ok(project_id);
+            }
+        }
+    }
+
+    Ok(GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string())
+}
+
+fn parse_code_assist_project_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("cloudaicompanionProject")
+        .and_then(|project| {
+            project
+                .as_str()
+                .map(std::string::ToString::to_string)
+                .or_else(|| {
+                    project
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(std::string::ToString::to_string)
+                })
+        })
+        .map(|project| project.trim().to_string())
+        .filter(|project| !project.is_empty())
+}
+
+async fn exchange_google_authorization_code(
+    client: &crate::http::client::Client,
+    token_url: &str,
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<OAuthTokenResponse> {
+    let form_body = format!(
+        "client_id={}&client_secret={}&code={}&grant_type=authorization_code&redirect_uri={}&code_verifier={}",
+        percent_encode_component(client_id),
+        percent_encode_component(client_secret),
+        percent_encode_component(code),
+        percent_encode_component(redirect_uri),
+        percent_encode_component(verifier),
+    );
+
+    let request = client
+        .post(token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .body(form_body.into_bytes());
+
+    let response = Box::pin(request.send())
+        .await
+        .map_err(|e| Error::auth(format!("OAuth token exchange failed: {e}")))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[code, verifier, client_secret]);
+    if !(200..300).contains(&status) {
+        return Err(Error::auth(format!(
+            "OAuth token exchange failed: {redacted_text}"
+        )));
+    }
+
+    serde_json::from_str::<OAuthTokenResponse>(&text)
+        .map_err(|e| Error::auth(format!("Invalid OAuth token response: {e}")))
+}
+
+/// Complete Google Gemini CLI OAuth by exchanging an authorization code for tokens.
+pub async fn complete_google_gemini_cli_oauth(
+    code_input: &str,
+    verifier: &str,
+) -> Result<AuthCredential> {
+    let (code, state) = parse_oauth_code_input(code_input);
+    let Some(code) = code else {
+        return Err(Error::auth("Missing authorization code".to_string()));
+    };
+    let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
+
+    let client = crate::http::client::Client::new();
+    let oauth_response = exchange_google_authorization_code(
+        &client,
+        GOOGLE_GEMINI_CLI_OAUTH_TOKEN_URL,
+        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID,
+        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET,
+        &code,
+        GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI,
+        verifier,
+    )
+    .await?;
+
+    let project_id =
+        discover_google_gemini_cli_project_id(&client, &oauth_response.access_token).await?;
+
+    Ok(AuthCredential::OAuth {
+        access_token: encode_project_scoped_access_token(&oauth_response.access_token, &project_id),
+        refresh_token: oauth_response.refresh_token,
+        expires: oauth_expires_at_ms(oauth_response.expires_in),
+        token_url: None,
+        client_id: None,
+    })
+}
+
+/// Complete Google Antigravity OAuth by exchanging an authorization code for tokens.
+pub async fn complete_google_antigravity_oauth(
+    code_input: &str,
+    verifier: &str,
+) -> Result<AuthCredential> {
+    let (code, state) = parse_oauth_code_input(code_input);
+    let Some(code) = code else {
+        return Err(Error::auth("Missing authorization code".to_string()));
+    };
+    let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
+
+    let client = crate::http::client::Client::new();
+    let oauth_response = exchange_google_authorization_code(
+        &client,
+        GOOGLE_ANTIGRAVITY_OAUTH_TOKEN_URL,
+        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID,
+        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET,
+        &code,
+        GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI,
+        verifier,
+    )
+    .await?;
+
+    let project_id =
+        discover_google_antigravity_project_id(&client, &oauth_response.access_token).await?;
+
+    Ok(AuthCredential::OAuth {
+        access_token: encode_project_scoped_access_token(&oauth_response.access_token, &project_id),
+        refresh_token: oauth_response.refresh_token,
+        expires: oauth_expires_at_ms(oauth_response.expires_in),
+        token_url: None,
+        client_id: None,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthRefreshTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    expires_in: i64,
+}
+
+async fn refresh_google_oauth_token_with_project(
+    client: &crate::http::client::Client,
+    token_url: &str,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+    project_id: &str,
+    provider_name: &str,
+) -> Result<AuthCredential> {
+    let form_body = format!(
+        "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
+        percent_encode_component(client_id),
+        percent_encode_component(client_secret),
+        percent_encode_component(refresh_token),
+    );
+
+    let request = client
+        .post(token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .body(form_body.into_bytes());
+
+    let response = Box::pin(request.send())
+        .await
+        .map_err(|e| Error::auth(format!("{provider_name} token refresh failed: {e}")))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[client_secret, refresh_token]);
+    if !(200..300).contains(&status) {
+        return Err(Error::auth(format!(
+            "{provider_name} token refresh failed: {redacted_text}"
+        )));
+    }
+
+    let oauth_response: OAuthRefreshTokenResponse = serde_json::from_str(&text)
+        .map_err(|e| Error::auth(format!("Invalid {provider_name} refresh response: {e}")))?;
+
+    Ok(AuthCredential::OAuth {
+        access_token: encode_project_scoped_access_token(&oauth_response.access_token, project_id),
+        refresh_token: oauth_response
+            .refresh_token
+            .unwrap_or_else(|| refresh_token.to_string()),
+        expires: oauth_expires_at_ms(oauth_response.expires_in),
+        token_url: None,
+        client_id: None,
+    })
+}
+
+async fn refresh_google_gemini_cli_oauth_token(
+    client: &crate::http::client::Client,
+    refresh_token: &str,
+    project_id: &str,
+) -> Result<AuthCredential> {
+    refresh_google_oauth_token_with_project(
+        client,
+        GOOGLE_GEMINI_CLI_OAUTH_TOKEN_URL,
+        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID,
+        GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET,
+        refresh_token,
+        project_id,
+        "google-gemini-cli",
+    )
+    .await
+}
+
+async fn refresh_google_antigravity_oauth_token(
+    client: &crate::http::client::Client,
+    refresh_token: &str,
+    project_id: &str,
+) -> Result<AuthCredential> {
+    refresh_google_oauth_token_with_project(
+        client,
+        GOOGLE_ANTIGRAVITY_OAUTH_TOKEN_URL,
+        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID,
+        GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET,
+        refresh_token,
+        project_id,
+        "google-antigravity",
+    )
+    .await
 }
 
 /// Start OAuth for an extension-registered provider using its [`OAuthConfig`](crate::models::OAuthConfig).
