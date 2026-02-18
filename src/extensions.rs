@@ -14757,6 +14757,18 @@ mod native_runtime_experimental {
         clippy::option_if_let_else,
         clippy::significant_drop_tightening
     )]
+    #[allow(
+        clippy::manual_let_else,
+        clippy::needless_pass_by_value,
+        clippy::option_if_let_else,
+        clippy::significant_drop_tightening
+    )]
+    #[allow(
+        clippy::manual_let_else,
+        clippy::needless_pass_by_value,
+        clippy::option_if_let_else,
+        clippy::significant_drop_tightening
+    )]
     impl NativeRustExtensionRuntimeHandle {
         pub async fn start() -> Result<Self> {
             Ok(Self {
@@ -16895,7 +16907,7 @@ mod native_runtime_duplicate_scaffold {
 
     #[derive(Clone)]
     pub struct NativeRustExtensionRuntimeHandle {
-        state: Arc<Mutex<NativeRustRuntimeState>>,
+        state: Arc<RwLock<NativeRustRuntimeState>>,
     }
 
     impl NativeRustExtensionRuntimeHandle {
@@ -16958,18 +16970,21 @@ mod native_runtime_duplicate_scaffold {
             ctx_payload: Arc<Value>,
             _timeout_ms: u64,
         ) -> Result<Vec<Result<Value>>> {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            let mut out = Vec::with_capacity(events.len());
-            for (event_name, payload) in events {
-                out.push(Ok(state.dispatch_event(
-                    &event_name,
-                    &payload,
-                    ctx_payload.as_ref(),
-                )));
-            }
+            let out = {
+                let state = self
+                    .state
+                    .read()
+                    .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+                let mut out = Vec::with_capacity(events.len());
+                for (event_name, payload) in events {
+                    out.push(Ok(state.dispatch_event(
+                        &event_name,
+                        &payload,
+                        ctx_payload.as_ref(),
+                    )));
+                }
+                out
+            };
             Ok(out)
         }
 
@@ -16993,33 +17008,47 @@ mod native_runtime_duplicate_scaffold {
             input: Value,
             _timeout_ms: u64,
         ) -> Result<Value> {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            if let Some(extension) = state.find_tool_extension(tool_name) {
-                if let Some(value) = extension.tool_outputs.get(tool_name) {
-                    Ok(value.clone())
+            enum Lookup {
+                Output(Value),
+                RegisteredWithoutOutput,
+                Missing,
+            }
+
+            let lookup = {
+                let state = self
+                    .state
+                    .read()
+                    .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+                if let Some(extension) = state.find_tool_extension(tool_name) {
+                    extension
+                        .tool_outputs
+                        .get(tool_name)
+                        .cloned()
+                        .map_or(Lookup::RegisteredWithoutOutput, Lookup::Output)
                 } else {
-                    Ok(json!({
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": format!("native-rust tool `{tool_name}` executed")
-                            }
-                        ],
-                        "details": {
-                            "runtime": "native-rust",
-                            "toolName": tool_name,
-                            "toolCallId": tool_call_id,
-                            "input": input
-                        }
-                    }))
+                    Lookup::Missing
                 }
-            } else {
-                Err(Error::extension(format!(
+            };
+
+            match lookup {
+                Lookup::Output(value) => Ok(value),
+                Lookup::RegisteredWithoutOutput => Ok(json!({
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": format!("native-rust tool `{tool_name}` executed")
+                        }
+                    ],
+                    "details": {
+                        "runtime": "native-rust",
+                        "toolName": tool_name,
+                        "toolCallId": tool_call_id,
+                        "input": input
+                    }
+                })),
+                Lookup::Missing => Err(Error::extension(format!(
                     "native-rust tool `{tool_name}` is not registered"
-                )))
+                ))),
             }
         }
 
@@ -17029,45 +17058,73 @@ mod native_runtime_duplicate_scaffold {
             args: String,
             _timeout_ms: u64,
         ) -> Result<Value> {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            if let Some(extension) = state.find_command_extension(&command_name) {
-                if let Some(value) = extension.command_outputs.get(&command_name) {
-                    Ok(value.clone())
-                } else {
-                    Ok(json!({
-                        "runtime": "native-rust",
-                        "command": command_name,
-                        "args": args,
-                    }))
-                }
-            } else {
-                Err(Error::extension(format!(
+            enum Lookup {
+                Output(Value),
+                RegisteredWithoutOutput,
+                Missing,
+            }
+
+            let lookup = {
+                let state = self
+                    .state
+                    .read()
+                    .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+                state
+                    .find_command_extension(&command_name)
+                    .map_or(Lookup::Missing, |extension| {
+                        extension
+                            .command_outputs
+                            .get(&command_name)
+                            .cloned()
+                            .map_or(Lookup::RegisteredWithoutOutput, Lookup::Output)
+                    })
+            };
+
+            match lookup {
+                Lookup::Output(value) => Ok(value),
+                Lookup::RegisteredWithoutOutput => Ok(json!({
+                    "runtime": "native-rust",
+                    "command": command_name,
+                    "args": args,
+                })),
+                Lookup::Missing => Err(Error::extension(format!(
                     "native-rust command `{command_name}` is not registered"
-                )))
+                ))),
             }
         }
 
         pub async fn execute_shortcut(&self, key_id: String, _timeout_ms: u64) -> Result<Value> {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            if let Some(extension) = state.find_shortcut_extension(&key_id) {
-                if let Some(value) = extension.shortcut_outputs.get(&key_id) {
-                    Ok(value.clone())
-                } else {
-                    Ok(json!({
-                        "runtime": "native-rust",
-                        "shortcut": key_id,
-                    }))
-                }
-            } else {
-                Err(Error::extension(format!(
+            enum Lookup {
+                Output(Value),
+                RegisteredWithoutOutput,
+                Missing,
+            }
+
+            let lookup = {
+                let state = self
+                    .state
+                    .read()
+                    .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+                state
+                    .find_shortcut_extension(&key_id)
+                    .map_or(Lookup::Missing, |extension| {
+                        extension
+                            .shortcut_outputs
+                            .get(&key_id)
+                            .cloned()
+                            .map_or(Lookup::RegisteredWithoutOutput, Lookup::Output)
+                    })
+            };
+
+            match lookup {
+                Lookup::Output(value) => Ok(value),
+                Lookup::RegisteredWithoutOutput => Ok(json!({
+                    "runtime": "native-rust",
+                    "shortcut": key_id,
+                })),
+                Lookup::Missing => Err(Error::extension(format!(
                     "native-rust shortcut `{key_id}` is not registered"
-                )))
+                ))),
             }
         }
 
@@ -17077,18 +17134,17 @@ mod native_runtime_duplicate_scaffold {
             flag_name: String,
             value: Value,
         ) -> Result<()> {
-            let mut state = self
-                .state
+            self.state
                 .write()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            state.flags.insert((extension_id, flag_name), value);
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?
+                .flags
+                .insert((extension_id, flag_name), value);
             Ok(())
         }
 
         pub async fn drain_repair_events(&self) -> Vec<ExtensionRepairEvent> {
-            let mut state = match self.state.write() {
-                Ok(guard) => guard,
-                Err(_) => return Vec::new(),
+            let Ok(mut state) = self.state.write() else {
+                return Vec::new();
             };
             let mut drained = Vec::new();
             std::mem::swap(&mut drained, &mut state.repair_events);
@@ -17096,11 +17152,10 @@ mod native_runtime_duplicate_scaffold {
         }
 
         pub async fn reset_transient_state(&self) -> Result<()> {
-            let mut state = self
-                .state
+            self.state
                 .write()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            state.reset_transient_state();
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?
+                .reset_transient_state();
             Ok(())
         }
 
@@ -17112,25 +17167,30 @@ mod native_runtime_duplicate_scaffold {
             _options: Value,
             _timeout_ms: u64,
         ) -> Result<String> {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            let stream_chunks = state.provider_stream_chunks(&provider_id).ok_or_else(|| {
-                Error::extension(format!(
-                    "native-rust provider `{provider_id}` has no streamSimple handler"
-                ))
-            })?;
-            let chunk_count = stream_chunks.len();
-            state.next_stream_id = state.next_stream_id.saturating_add(1);
-            let stream_id = format!("native-stream-{}", state.next_stream_id);
-            state.streams.insert(
-                stream_id.clone(),
-                NativeRustProviderStreamCursor {
-                    chunks: stream_chunks,
-                    next_index: 0,
-                },
-            );
+            let (stream_id, chunk_count) = {
+                let mut state = self
+                    .state
+                    .write()
+                    .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+                let stream_chunks =
+                    state.provider_stream_chunks(&provider_id).ok_or_else(|| {
+                        Error::extension(format!(
+                            "native-rust provider `{provider_id}` has no streamSimple handler"
+                        ))
+                    })?;
+                let chunk_count = stream_chunks.len();
+                state.next_stream_id = state.next_stream_id.saturating_add(1);
+                let stream_id = format!("native-stream-{}", state.next_stream_id);
+                state.streams.insert(
+                    stream_id.clone(),
+                    NativeRustProviderStreamCursor {
+                        chunks: stream_chunks,
+                        next_index: 0,
+                    },
+                );
+                drop(state);
+                (stream_id, chunk_count)
+            };
             tracing::debug!(
                 event = "native_extension_runtime.provider_stream.start",
                 provider_id = %provider_id,
@@ -17146,26 +17206,26 @@ mod native_runtime_duplicate_scaffold {
             stream_id: String,
             _timeout_ms: u64,
         ) -> Result<Option<Value>> {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            let (next_value, exhausted) = match state.streams.get_mut(&stream_id) {
-                Some(cursor) => {
-                    let next = cursor.chunks.get(cursor.next_index).cloned();
-                    let exhausted = if next.is_some() {
-                        cursor.next_index = cursor.next_index.saturating_add(1);
-                        cursor.next_index >= cursor.chunks.len()
-                    } else {
-                        true
-                    };
-                    (next, exhausted)
+            let next_value = {
+                let mut state = self
+                    .state
+                    .write()
+                    .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+                let Some(cursor) = state.streams.get_mut(&stream_id) else {
+                    return Ok(None);
+                };
+                let next = cursor.chunks.get(cursor.next_index).cloned();
+                let exhausted = if next.is_some() {
+                    cursor.next_index = cursor.next_index.saturating_add(1);
+                    cursor.next_index >= cursor.chunks.len()
+                } else {
+                    true
+                };
+                if exhausted {
+                    state.streams.remove(&stream_id);
                 }
-                None => return Ok(None),
+                next
             };
-            if exhausted {
-                state.streams.remove(&stream_id);
-            }
             Ok(next_value)
         }
 
@@ -17174,14 +17234,15 @@ mod native_runtime_duplicate_scaffold {
             stream_id: String,
             _timeout_ms: u64,
         ) -> Result<()> {
-            let mut state = self
-                .state
+            self.state
                 .write()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            state.streams.remove(&stream_id);
+                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?
+                .streams
+                .remove(&stream_id);
             Ok(())
         }
 
+        #[allow(clippy::needless_pass_by_value)]
         pub fn provider_stream_simple_cancel_best_effort(&self, stream_id: String) {
             if let Ok(mut state) = self.state.write() {
                 state.streams.remove(&stream_id);
@@ -21133,6 +21194,7 @@ async fn dispatch_hostcall_session(
 
 #[allow(clippy::future_not_send)]
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::option_if_let_else)]
 async fn dispatch_hostcall_session_ref(
     call_id: &str,
     manager: &ExtensionManager,
@@ -21165,23 +21227,20 @@ async fn dispatch_hostcall_session_ref(
 
     let result = match op_kind {
         SessionHostcallOp::AppendMessage => {
-            let message_value = if let Some(message) = payload.get("message") {
-                message.clone()
-            } else {
-                match payload {
-                    Value::Object(map) => {
-                        if map.contains_key("op") {
+            let parsed: std::result::Result<SessionMessage, _> =
+                if let Some(message) = payload.get("message") {
+                    SessionMessage::deserialize(message)
+                } else {
+                    match payload {
+                        Value::Object(map) if map.contains_key("op") => {
                             let mut without_op = map.clone();
                             without_op.remove("op");
-                            Value::Object(without_op)
-                        } else {
-                            Value::Object(map.clone())
+                            serde_json::from_value(Value::Object(without_op))
                         }
+                        _ => SessionMessage::deserialize(payload),
                     }
-                    other => other.clone(),
-                }
-            };
-            match serde_json::from_value(message_value) {
+                };
+            match parsed {
                 Ok(message) => session.append_message(message).await.map(|()| Value::Null),
                 Err(err) => Err(Error::validation(format!("Parse message: {err}"))),
             }
@@ -21665,13 +21724,12 @@ async fn dispatch_hostcall_events_ref(
                 .or_else(|| payload.get("extension_id").and_then(Value::as_str))
                 .map(ToString::to_string);
 
-            let message = payload.get("message").cloned().unwrap_or(Value::Null);
-            let options = payload.get("options").cloned().unwrap_or(Value::Null);
+            let message = payload.get("message").and_then(Value::as_object);
+            let options = payload.get("options").and_then(Value::as_object);
 
             let custom_type = message
-                .get("customType")
-                .and_then(Value::as_str)
-                .or_else(|| message.get("custom_type").and_then(Value::as_str))
+                .and_then(|msg| msg.get("customType").and_then(Value::as_str))
+                .or_else(|| message.and_then(|msg| msg.get("custom_type").and_then(Value::as_str)))
                 .unwrap_or_default()
                 .trim()
                 .to_string();
@@ -21683,12 +21741,12 @@ async fn dispatch_hostcall_events_ref(
             }
 
             let display = message
-                .get("display")
+                .and_then(|msg| msg.get("display"))
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let details = message.get("details").cloned();
+            let details = message.and_then(|msg| msg.get("details")).cloned();
 
-            let content = match message.get("content") {
+            let content = match message.and_then(|msg| msg.get("content")) {
                 Some(Value::String(s)) => s.clone(),
                 Some(other) => {
                     serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string())
@@ -21698,14 +21756,18 @@ async fn dispatch_hostcall_events_ref(
 
             let deliver_as = ExtensionDeliverAs::parse(
                 options
-                    .get("deliverAs")
+                    .and_then(|opts| opts.get("deliverAs"))
                     .and_then(Value::as_str)
-                    .or_else(|| options.get("deliver_as").and_then(Value::as_str)),
+                    .or_else(|| {
+                        options.and_then(|opts| opts.get("deliver_as").and_then(Value::as_str))
+                    }),
             );
             let trigger_turn = options
-                .get("triggerTurn")
+                .and_then(|opts| opts.get("triggerTurn"))
                 .and_then(Value::as_bool)
-                .or_else(|| options.get("trigger_turn").and_then(Value::as_bool))
+                .or_else(|| {
+                    options.and_then(|opts| opts.get("trigger_turn").and_then(Value::as_bool))
+                })
                 .unwrap_or(false);
 
             let msg = ExtensionSendMessage {
@@ -21750,12 +21812,14 @@ async fn dispatch_hostcall_events_ref(
                 return HostcallOutcome::Success(Value::Null);
             }
 
-            let options = payload.get("options").cloned().unwrap_or(Value::Null);
+            let options = payload.get("options").and_then(Value::as_object);
             let deliver_as = ExtensionDeliverAs::parse(
                 options
-                    .get("deliverAs")
+                    .and_then(|opts| opts.get("deliverAs"))
                     .and_then(Value::as_str)
-                    .or_else(|| options.get("deliver_as").and_then(Value::as_str)),
+                    .or_else(|| {
+                        options.and_then(|opts| opts.get("deliver_as").and_then(Value::as_str))
+                    }),
             );
 
             let msg = ExtensionSendUserMessage {
@@ -25917,11 +25981,12 @@ impl ExtensionManager {
         let has_ui = snap.has_ui;
         let session = snap.session.clone();
         let cwd = snap.cwd.clone();
-        let registry = snap.model_registry_values.clone();
+        // Rebuild directly from the snapshot to avoid cloning the full
+        // model-registry map on cache misses.
+        let payload = Arc::new(
+            Self::build_ctx_payload(has_ui, session, cwd, &snap.model_registry_values).await,
+        );
         drop(snap);
-
-        // Rebuild.
-        let payload = Arc::new(Self::build_ctx_payload(has_ui, session, cwd, &registry).await);
 
         // Store in cache (best-effort; if another thread updated generation
         // between our snapshot and now, the cache will simply be stale and
@@ -30881,6 +30946,28 @@ mod tests {
     }
 
     #[test]
+    fn events_set_model_invalidates_ctx_cache_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            let gen_before = manager.inner.lock().unwrap().ctx_generation;
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "setModel",
+                json!({ "provider": "anthropic", "modelId": "claude-opus-4-5-20251101" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let gen_after = manager.inner.lock().unwrap().ctx_generation;
+            assert_eq!(gen_after, gen_before + 1);
+        });
+    }
+
+    #[test]
     fn events_get_thinking_level_returns_null_when_not_set() {
         asupersync::test_utils::run_test(|| async {
             let manager = ExtensionManager::new();
@@ -31186,6 +31273,129 @@ mod tests {
                 assert_eq!(labels[0].1.as_deref(), Some("important"));
                 drop(labels);
             }
+        });
+    }
+
+    #[test]
+    fn session_append_message_snake_case_alias_succeeds() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let outcome = dispatch_hostcall_session(
+                "call-append-msg",
+                &manager,
+                "append_message",
+                json!({
+                    "message": {
+                        "role": "user",
+                        "content": "hello"
+                    }
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+        });
+    }
+
+    #[test]
+    fn session_append_message_invalidates_ctx_cache_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let gen_before = manager.inner.lock().unwrap().ctx_generation;
+            let outcome = dispatch_hostcall_session(
+                "call-append-msg",
+                &manager,
+                "append_message",
+                json!({
+                    "message": {
+                        "role": "user",
+                        "content": "hello"
+                    }
+                }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let gen_after = manager.inner.lock().unwrap().ctx_generation;
+            assert_eq!(gen_after, gen_before + 1);
+        });
+    }
+
+    #[test]
+    fn session_set_model_invalidates_ctx_cache_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let gen_before = manager.inner.lock().unwrap().ctx_generation;
+            let outcome = dispatch_hostcall_session(
+                "call-set-model",
+                &manager,
+                "set_model",
+                json!({
+                    "provider": "anthropic",
+                    "modelId": "claude-opus"
+                }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let gen_after = manager.inner.lock().unwrap().ctx_generation;
+            assert_eq!(gen_after, gen_before + 1);
+        });
+    }
+
+    #[test]
+    fn session_set_thinking_level_invalidates_ctx_cache_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let gen_before = manager.inner.lock().unwrap().ctx_generation;
+            let outcome = dispatch_hostcall_session(
+                "call-set-thinking",
+                &manager,
+                "setThinkingLevel",
+                json!({ "level": "high" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let gen_after = manager.inner.lock().unwrap().ctx_generation;
+            assert_eq!(gen_after, gen_before + 1);
+        });
+    }
+
+    #[test]
+    fn session_set_label_invalidates_ctx_cache_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let gen_before = manager.inner.lock().unwrap().ctx_generation;
+            let outcome = dispatch_hostcall_session(
+                "call-set-label",
+                &manager,
+                "setLabel",
+                json!({
+                    "targetId": "entry-42",
+                    "label": "important"
+                }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let gen_after = manager.inner.lock().unwrap().ctx_generation;
+            assert_eq!(gen_after, gen_before + 1);
         });
     }
 
@@ -31509,6 +31719,36 @@ mod tests {
     }
 
     #[test]
+    fn events_send_user_message_snake_case_alias_dispatches() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+            let actions = Arc::new(MockHostActions::new());
+            manager.set_host_actions(actions.clone());
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "send_user_message",
+                json!({
+                    "text": "Please review the PR",
+                    "options": {
+                        "deliver_as": "steer"
+                    }
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+            let msgs = actions.user_messages.lock().unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].text, "Please review the PR");
+            drop(msgs);
+        });
+    }
+
+    #[test]
     fn events_send_user_message_empty_text_succeeds_noop() {
         asupersync::test_utils::run_test(|| async {
             let manager = ExtensionManager::new();
@@ -31554,6 +31794,31 @@ mod tests {
             .await;
 
             assert!(matches!(outcome, HostcallOutcome::Success(_)));
+        });
+    }
+
+    #[test]
+    fn session_append_entry_invalidates_ctx_cache_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let gen_before = manager.inner.lock().unwrap().ctx_generation;
+            let outcome = dispatch_hostcall_session(
+                "call-1",
+                &manager,
+                "append_entry",
+                json!({
+                    "customType": "bookmark",
+                    "data": { "line": 42, "file": "main.rs" }
+                }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let gen_after = manager.inner.lock().unwrap().ctx_generation;
+            assert_eq!(gen_after, gen_before + 1);
         });
     }
 
@@ -32267,7 +32532,7 @@ mod tests {
                     tx.send(&cx, "hello".to_string()).expect("send");
                 })
                 .expect("create send task");
-            runtime.scheduler.lock().schedule(send_task, 0);
+            runtime.scheduler.lock().unwrap().schedule(send_task, 0);
 
             // Receiver task: receive with infinite budget.
             let (recv_task, _) = runtime
@@ -32279,7 +32544,7 @@ mod tests {
                     }
                 })
                 .expect("create recv task");
-            runtime.scheduler.lock().schedule(recv_task, 0);
+            runtime.scheduler.lock().unwrap().schedule(recv_task, 0);
 
             runtime.run_until_quiescent();
 
@@ -32306,7 +32571,7 @@ mod tests {
                     drop(tx);
                 })
                 .expect("create drop task");
-            runtime.scheduler.lock().schedule(drop_task, 0);
+            runtime.scheduler.lock().unwrap().schedule(drop_task, 0);
 
             // Task 2: try to recv (should fail because sender was dropped).
             let (recv_task, _) = runtime
@@ -32318,7 +32583,7 @@ mod tests {
                     }
                 })
                 .expect("create recv task");
-            runtime.scheduler.lock().schedule(recv_task, 0);
+            runtime.scheduler.lock().unwrap().schedule(recv_task, 0);
 
             runtime.run_until_quiescent();
 
@@ -32351,7 +32616,7 @@ mod tests {
                             log.lock().unwrap().push(format!("task-{val}"));
                         })
                         .expect("create task");
-                    runtime.scheduler.lock().schedule(task_id, 0);
+                    runtime.scheduler.lock().unwrap().schedule(task_id, 0);
                 }
 
                 runtime.run_until_quiescent();
@@ -32384,7 +32649,7 @@ mod tests {
                             log.lock().unwrap().push(format!("w-{i}"));
                         })
                         .expect("create task");
-                    runtime.scheduler.lock().schedule(task_id, 0);
+                    runtime.scheduler.lock().unwrap().schedule(task_id, 0);
                 }
 
                 runtime.run_until_quiescent();
@@ -37230,6 +37495,82 @@ mod tests {
             assert_eq!(lane.opcode, Some(*expected_opcode));
             assert_eq!(lane.capability_class, "events");
         }
+    }
+
+    #[test]
+    fn parse_session_hostcall_op_accepts_alias_variants() {
+        let cases: &[(&str, SessionHostcallOp)] = &[
+            ("appendMessage", SessionHostcallOp::AppendMessage),
+            ("append_message", SessionHostcallOp::AppendMessage),
+            ("append-message", SessionHostcallOp::AppendMessage),
+            ("append message", SessionHostcallOp::AppendMessage),
+            ("setModel", SessionHostcallOp::SetModel),
+            ("set_model", SessionHostcallOp::SetModel),
+            ("set-model", SessionHostcallOp::SetModel),
+            ("setThinkingLevel", SessionHostcallOp::SetThinkingLevel),
+            ("set_thinking_level", SessionHostcallOp::SetThinkingLevel),
+            ("set-thinking-level", SessionHostcallOp::SetThinkingLevel),
+            ("setLabel", SessionHostcallOp::SetLabel),
+            ("set_label", SessionHostcallOp::SetLabel),
+            ("set-label", SessionHostcallOp::SetLabel),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                parse_session_hostcall_op(raw),
+                Some(*expected),
+                "session op alias should parse: {raw}"
+            );
+            assert_eq!(
+                parse_session_hostcall_op(&raw.to_ascii_uppercase()),
+                Some(*expected),
+                "uppercase session op alias should parse: {raw}"
+            );
+        }
+
+        assert_eq!(parse_session_hostcall_op("unknown"), None);
+        assert_eq!(parse_session_hostcall_op(""), None);
+    }
+
+    #[test]
+    fn parse_events_hostcall_op_accepts_alias_variants() {
+        let cases: &[(&str, EventsHostcallOp)] = &[
+            ("getActiveTools", EventsHostcallOp::GetActiveTools),
+            ("get_active_tools", EventsHostcallOp::GetActiveTools),
+            ("get-active-tools", EventsHostcallOp::GetActiveTools),
+            ("setModel", EventsHostcallOp::SetModel),
+            ("set_model", EventsHostcallOp::SetModel),
+            ("set-model", EventsHostcallOp::SetModel),
+            ("setThinkingLevel", EventsHostcallOp::SetThinkingLevel),
+            ("set_thinking_level", EventsHostcallOp::SetThinkingLevel),
+            ("set-thinking-level", EventsHostcallOp::SetThinkingLevel),
+            ("appendEntry", EventsHostcallOp::AppendEntry),
+            ("append_entry", EventsHostcallOp::AppendEntry),
+            ("append-entry", EventsHostcallOp::AppendEntry),
+            ("registerCommand", EventsHostcallOp::RegisterCommand),
+            ("register_command", EventsHostcallOp::RegisterCommand),
+            ("register-command", EventsHostcallOp::RegisterCommand),
+            ("sendMessage", EventsHostcallOp::SendMessage),
+            ("send_message", EventsHostcallOp::SendMessage),
+            ("send-message", EventsHostcallOp::SendMessage),
+            ("sendUserMessage", EventsHostcallOp::SendUserMessage),
+            ("send_user_message", EventsHostcallOp::SendUserMessage),
+            ("send-user-message", EventsHostcallOp::SendUserMessage),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                parse_events_hostcall_op(raw),
+                Some(*expected),
+                "events op alias should parse: {raw}"
+            );
+            assert_eq!(
+                parse_events_hostcall_op(&raw.to_ascii_uppercase()),
+                Some(*expected),
+                "uppercase events op alias should parse: {raw}"
+            );
+        }
+
+        assert_eq!(parse_events_hostcall_op("unknown"), None);
+        assert_eq!(parse_events_hostcall_op(""), None);
     }
 
     #[test]
