@@ -62,6 +62,17 @@ impl ExtensionSession for SessionHandle {
         let session_file = session.path.as_ref().map(|p| p.display().to_string());
         let session_id = session.header.id.clone();
         let session_name = session.get_name();
+        let model = session
+            .header
+            .provider
+            .as_ref()
+            .zip(session.header.model_id.as_ref())
+            .map_or(Value::Null, |(provider, model_id)| {
+                serde_json::json!({
+                    "provider": provider,
+                    "id": model_id,
+                })
+            });
         let thinking_level = session
             .header
             .thinking_level
@@ -75,7 +86,7 @@ impl ExtensionSession for SessionHandle {
         let pending_message_count = session.autosave_metrics().pending_mutations;
         let durability_mode = session.autosave_durability_mode().as_str();
         serde_json::json!({
-            "model": null,
+            "model": model,
             "thinkingLevel": thinking_level,
             "durabilityMode": durability_mode,
             "isStreaming": false,
@@ -4359,6 +4370,20 @@ mod tests {
             Some("throughput")
         );
         assert_eq!(state.get("messageCount").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            state
+                .get("model")
+                .and_then(|model| model.get("provider"))
+                .and_then(Value::as_str),
+            Some("prov")
+        );
+        assert_eq!(
+            state
+                .get("model")
+                .and_then(|model| model.get("id"))
+                .and_then(Value::as_str),
+            Some("model")
+        );
 
         let (provider, model_id) = run_async(async { handle.get_model().await });
         assert_eq!(provider.as_deref(), Some("prov"));
