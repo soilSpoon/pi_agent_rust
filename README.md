@@ -71,14 +71,15 @@ If you already use Pi Agent, especially through OpenClaw, this project keeps the
 
 - **Substantially faster in realistic end-to-end flows** (not synthetic microbenchmarks)
 - **Dramatically smaller memory footprint** in long-running sessions
-- **Materially stronger security model** for extension/tool execution
+- **Materially stronger security model** for extension/tool execution, including command-level blocking of dangerous extension shell patterns
 
 Security is a first-class design goal here, not a bolt-on:
 
 - Capability-gated hostcalls (`tool`/`exec`/`http`/`session`/`ui`/`events`)
+- Two-stage extension `exec` enforcement: capability gate first, then command mediation that blocks critical shell classes by default (for example recursive delete, disk/device writes, reverse shell) and can tighten to block high-tier classes in strict/safe policy
 - Policy + runtime risk + quota enforcement on the execution path
 - Structured concurrency via `asupersync` for more predictable cancellation/lifecycle behavior
-- Auditable runtime signals/ledgers for extension behavior
+- Auditable runtime signals/ledgers and redacted security alerts for extension behavior
 
 ## TL;DR (Pi/OpenClaw Users)
 
@@ -101,7 +102,15 @@ Resume/open responsiveness is also much better at scale:
 | 1M session resume | 17.59 ms | 119.76 ms | 50.83 ms | `6.81x` faster than Node, `2.89x` faster than Bun |
 | 5M session resume | 58.68 ms | 396.41 ms | 155.63 ms | `6.76x` faster than Node, `2.65x` faster than Bun |
 
-Bottom line: for real Pi/OpenClaw usage, the Rust version is now meaningfully faster, massively more memory-efficient, and substantially more secure on the execution path.
+Extension assurance is also grounded in real execution paths:
+
+| Extension assurance signal | Why you should care |
+|---|---|
+| Two-stage `exec` guard (`exec` capability policy + command-level mediation) | Even when an extension is allowed to invoke `exec`, obviously dangerous shell signatures are blocked before process spawn and recorded in audit artifacts |
+| Release-binary live-provider E2E harness (`ext_release_binary_e2e`) | Extension behavior is validated via `target/release/pi` against a real provider/model path (default `ollama` + `qwen2.5:0.5b`), not only mocked flows |
+| Vendored conformance matrix + scenario suites | Day-to-day compatibility stays measurable and regression-resistant across the extension corpus |
+
+Bottom line: for real Pi/OpenClaw usage, the Rust version is faster, far more memory-efficient, and materially stronger on extension execution safety with realistic conformance evidence.
 
 <sub>Data source: `BENCHMARK_COMPARISON_BETWEEN_RUST_VERSION_AND_ORIGINAL__GPT.md` (latest secure-path refresh, 2026-02-18).</sub>
 
@@ -318,7 +327,7 @@ Pi runs in three modes, each suited to different workflows:
 | **Print** | `pi -p "..."` | Single response to stdout, no TUI, scriptable |
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 
-**Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+P`), session branch navigator (`/tree`), and real-time token/cost tracking.
+**Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking.
 
 **Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
 
@@ -326,17 +335,27 @@ Pi runs in three modes, each suited to different workflows:
 
 ### Extensions
 
-Pi runs legacy JS/TS extensions **without Node or Bun**, using an embedded
-QuickJS runtime with capability-gated host connectors:
+Pi supports two extension runtime families with capability-gated host connectors:
+
+- JS/TS entrypoints run **without Node or Bun** in an embedded QuickJS runtime.
+- `*.native.json` descriptors run in the native-rust descriptor runtime.
 
 - Extension entrypoints are auto-detected:
   - `.js/.ts/.mjs/.cjs/.tsx/.mts/.cts` run directly in embedded QuickJS (no descriptor conversion).
-  - `*.native.json` loads the optional native-rust descriptor runtime.
-  - Mixed JS + native descriptor entries are not supported in the same session yet.
+  - `*.native.json` loads the native-rust descriptor runtime.
+  - One session currently uses one runtime family at a time (JS/TS or native descriptor).
 - Compatibility metrics are tracked in [docs/ext-compat.md](docs/ext-compat.md) and `tests/ext_conformance/reports/pipeline/`
 - **Sub-100ms cold load** (P95), **sub-1ms warm load** (P99)
 - Node API shims for `fs`, `path`, `os`, `crypto`, `child_process`, `url`, and more
 - Capability-based security: extensions call explicit connectors (`tool/exec/http/session/ui`) with audit logging
+- Command-level exec mediation: dangerous shell signatures are classified and blocked before spawn, with redacted denial alerts and mediation ledger entries
+
+### Credential-Aware Model Selection
+
+- `/model` (or `Ctrl+L`) opens a selector focused on models that are ready to run with current credentials.
+- `Ctrl+P` and `Ctrl+Shift+P` cycle through the scoped model set without opening the overlay.
+- Provider IDs and aliases are matched case-insensitively in model selection and `/login`.
+- Models that do not require configured credentials can run keyless.
 
 Extensions can register tools, slash commands, event hooks, flags, providers,
 and shortcuts. See [EXTENSIONS.md](EXTENSIONS.md) for the full architecture
@@ -345,14 +364,17 @@ and [docs/extension-catalog.json](docs/extension-catalog.json) for the
 
 ## Extension Validation Pipeline
 
-This project validates extension compatibility with a two-track pipeline:
+This project validates extension compatibility with a three-track pipeline:
 
 - **Vendored corpus (224)**: deterministic conformance, compatibility matrix, and scenario suites.
 - **Unvendored corpus (777)**: source acquisition and onboarding prioritization.
+- **Release-binary live-provider E2E**: real `target/release/pi` execution against a non-mocked provider/model path.
 
 ### Why this exists
 
 - Catch runtime/API regressions in QuickJS host shims and capability policy.
+- Catch dangerous extension shell call patterns with real command mediation on the release binary path.
+- Verify extension behavior against real provider responses, not just fixture/mocked flows.
 - Keep extension support measurable instead of anecdotal.
 - Produce a prioritized queue for onboarding unvendored candidates into vendored conformance.
 
@@ -386,7 +408,21 @@ This project validates extension compatibility with a two-track pipeline:
      - `tests/ext_conformance/reports/pipeline/full_validation_report.md`
      - Plus stage-specific reports under `tests/ext_conformance/reports/**`
 
-3. **Aggregate and triage**
+3. **Run release-binary live-provider E2E**
+   - Binary: `ext_release_binary_e2e`
+   - Typical command:
+     - `cargo build --release --bin pi`
+     - `cargo run --bin ext_release_binary_e2e -- --provider ollama --model qwen2.5:0.5b --max-cases 10 --out-json tests/ext_conformance/reports/release_binary_e2e/ollama_release_e2e_smoke.json --out-md tests/ext_conformance/reports/release_binary_e2e/ollama_release_e2e_smoke.md`
+   - Purpose:
+     - Executes `target/release/pi` directly for each selected extension case.
+     - Uses a live provider/model path (default `ollama` + `qwen2.5:0.5b`) to exercise non-mocked end-to-end behavior.
+     - Emits per-case stdout/stderr captures plus summary artifacts (`pi.ext.release_binary_e2e.v1`).
+   - Artifacts:
+     - `tests/ext_conformance/reports/release_binary_e2e/ollama_release_e2e_smoke.json`
+     - `tests/ext_conformance/reports/release_binary_e2e/ollama_release_e2e_smoke.md`
+     - `tests/ext_conformance/reports/release_binary_e2e/cases/*`
+
+4. **Aggregate and triage**
    - `full_validation_report.json` combines:
      - Stage-level pass/fail (`stageSummary`, `stageResults`)
      - Corpus counts (`corpus`)
@@ -414,17 +450,18 @@ cargo run --bin ext_unvendored_fetch_run -- run-all --workers 8 --no-probe
 cargo run --bin ext_full_validation --
 ```
 
-### Latest run snapshot (2026-02-18)
+### Latest run snapshot (2026-02-19)
 
 From:
 - `tests/ext_conformance/reports/sharded/shard_0_report.json` (generated `2026-02-18T23:43:48Z`)
 - `tests/ext_conformance/reports/scenario_conformance.json` (generated `2026-02-18T23:11:57Z`)
 - `tests/ext_conformance/reports/parity/triage.json` (generated `2026-02-18T23:12:13Z`)
+- `tests/ext_conformance/reports/release_binary_e2e/ollama_release_e2e_smoke.md` (generated `2026-02-19T00:33:00Z`)
 
 - Vendored matrix conformance: `manifest_count=224`, `tested=224`, `passed=224`, `failed=0`, `skipped=0`
 - Scenario suite conformance: `25/25` passed (`0` fail, `0` error, `0` skip)
 - Differential parity triage sample: `22` match, `0` mismatch, `3` skip (`total=25`)
-- Scope note: these figures reflect the current extension conformance harness artifacts; full release-binary end-to-end certification remains tracked as a separate release gate.
+- Release-binary live-provider smoke: `9/10` passed with `1` timeout (`bash-spawn-hook`) under `ollama` + `qwen2.5:0.5b`
 
 ---
 
@@ -567,24 +604,29 @@ Interactive file references:
 | Option | Description |
 |--------|-------------|
 | `-c, --continue` | Continue most recent session |
-| `-s, --session <PATH>` | Open specific session file |
+| `-r, --resume` | Open session picker UI |
+| `--session <PATH>` | Open specific session file |
+| `--session-dir <DIR>` | Override session storage directory for this run |
+| `--session-durability strict|balanced|throughput` | Tune persistence durability mode |
 | `--no-session` | Don't persist conversation |
 | `-p, --print` | Single response, no interaction |
+| `--mode text|json|rpc` | Output/protocol mode |
+| `--provider <NAME>` | Force provider for this run (aliases supported) |
 | `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-opus-4-5`, then `openai/gpt-5.1-codex`, then `google/gemini-2.5-pro`) |
 | `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh |
 | `--tools <TOOLS>` | Comma-separated tool list |
 | `--api-key <KEY>` | API key (or use provider-specific env vars such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) |
+| `--extension-policy safe|balanced|permissive` | Extension capability profile |
+| `--repair-policy off|suggest|auto-safe|auto-strict` | Extension auto-repair policy |
 | `--list-models [PATTERN]` | List available models (optional fuzzy filter) |
+| `--list-providers` | List canonical provider IDs, aliases, and auth env keys |
 | `--export <PATH>` | Export session file to HTML |
 
 Additional high-leverage flags:
 
-- `--provider <NAME>` to force a provider for a single run
-- `--mode text|json|rpc` to switch print output format
-- `--extension-policy safe|balanced|permissive` to tune extension permissions
-- `--repair-policy off|suggest|auto-safe|auto-strict` to control extension auto-repair behavior
-- `--session-durability strict|balanced|throughput` to pick persistence behavior
-- `--list-providers` to print provider aliases and credential env keys
+- `--no-migrations` to skip startup migration checks
+- `--explain-extension-policy` to print effective capability decisions and exit
+- `--explain-repair-policy` to print effective repair-policy resolution and exit
 
 ### Subcommands
 
@@ -729,14 +771,14 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 └────────┬──────────────────────┬──────────────────────┬──────────┘
          │                      │                      │
 ┌────────▼────────┐  ┌─────────▼──────────┐  ┌───────▼──────────┐
-│ Provider Layer  │  │  Tool Registry     │  │  Extension Mgr   │
-│ • Anthropic     │  │  • read  • bash    │  │  • QuickJS RT    │
-│ • OpenAI (Chat/ │  │  • write • grep    │  │  • Capability    │
-│   Responses)    │  │  • edit  • find    │  │    policy        │
-│ • Gemini/Cohere │  │  • ls              │  │  • Node shims    │
-│ • Azure/Bedrock │  │  • ext-registered  │  │  • Event hooks   │
-│ • Vertex/Copilot│  │                    │  │  • Runtime risk  │
-│ • GitLab/Ext    │  │                    │  │    controller    │
+│ Provider Layer  │  │  Tool Registry     │  │  Extension Mgr     │
+│ • Anthropic     │  │  • read  • bash    │  │  • QuickJS JS/TS   │
+│ • OpenAI (Chat/ │  │  • write • grep    │  │  • Native descriptor│
+│   Responses)    │  │  • edit  • find    │  │    runtime          │
+│ • Gemini/Cohere │  │  • ls              │  │  • Capability policy│
+│ • Azure/Bedrock │  │  • ext-registered  │  │  • Node shims       │
+│ • Vertex/Copilot│  │                    │  │  • Event hooks      │
+│ • GitLab/Ext    │  │                    │  │  • Runtime risk ctl │
 └────────┬────────┘  └─────────┬──────────┘  └───────┬──────────┘
          │                     │                      │
 ┌────────▼─────────────────────▼──────────────────────▼──────────┐
@@ -862,6 +904,9 @@ The sections above compare mechanics. This section calls out concrete features p
 | **Capability-gated extension policy profiles** (`safe` / `balanced` / `permissive`) with per-extension overrides | Lets operators run shared extensions with explicit capability boundaries instead of ambient full-system access |
 | **Secret-aware extension env filtering** (`pi.env()` blocklist for keys/tokens/secrets) | Reduces accidental credential exposure from extension code paths |
 | **Runtime risk controller for extension hostcalls** (configurable, fail-closed by default) | Adds another enforcement layer beyond static policy for suspicious runtime behavior in extension call flows |
+| **Argument-aware runtime risk scoring for shell paths** (`dcg_rule_hit`, `dcg_heredoc_hit`, heredoc AST inspection across Bash/Python/JS/TS/Ruby) | Detects destructive intent hidden in multiline scripts and wrapper commands before hostcall execution |
+| **Tamper-evident runtime risk ledger tooling** (`ext_runtime_risk_ledger verify|replay|calibrate`) | Security decisions are hash-chained and can be verified, replayed, and threshold-calibrated from real traces |
+| **Unified incident evidence bundle export** (risk ledger, security alerts, hostcall telemetry, exec mediation, secret-broker events) | Incident response can triage from one structured artifact set instead of stitching ad-hoc logs |
 | **Extension preflight compatibility analysis** (policy-aware extension checks) | Surfaces likely incompatibilities and security-sensitive patterns before runtime execution |
 | **Node/Bun-compatible extension runtime without Node/Bun dependency** (embedded QuickJS + shims) | Runs legacy extension workflows in a single native binary deployment model |
 | **Extension compatibility scanner + conformance harness** | Makes extension support measurable and auditable instead of anecdotal |
@@ -869,6 +914,7 @@ The sections above compare mechanics. This section calls out concrete features p
 | **Optional SQLite session storage backend** (`sqlite-sessions` feature) | Supports deployments that want database-backed session persistence in addition to JSONL |
 | **Crash-resilient session save path** (temp file + atomic persist) | Improves session-file durability during writes and reduces partial-write failure modes |
 | **Unified hostcall dispatcher with typed taxonomy mapping** (`timeout` / `denied` / `io` / `invalid_request` / `internal`) | Produces consistent extension/runtime error semantics and easier client handling |
+| **Fail-closed evidence-lineage gates** (`run_id`/`correlation_id` + cross-artifact lineage checks) | Rejects stale or cherry-picked conformance/perf artifacts at release-gate time |
 | **Structured auth diagnostics with stable machine codes** | Improves troubleshooting and operational visibility without leaking sensitive credential material |
 
 ---
@@ -1413,7 +1459,8 @@ The interactive mode uses the **Elm Architecture** (Model-Update-View) via the `
 | Command | Action |
 |---------|--------|
 | `/help` | Show available commands and keybindings |
-| `/model` or `Ctrl+P` | Open model selector with fuzzy search |
+| `/model` or `Ctrl+L` | Open model selector with fuzzy search |
+| `Ctrl+P` / `Ctrl+Shift+P` | Cycle scoped models forward/backward |
 | `/tree` | Browse and fork the conversation tree |
 | `/clear` | Clear conversation and start fresh |
 | `/compact` | Trigger manual compaction |
@@ -1519,12 +1566,12 @@ Pi also supports a v2 sidecar store next to JSONL sessions for faster resume and
 
 ### Authentication & Credential Management
 
-Beyond simple API keys, Pi supports OAuth, AWS credential chains, and service key exchange. Credentials are stored in `~/.pi/agent/auth.json` with file-locked access to prevent corruption from concurrent instances.
+Beyond simple API keys, Pi supports OAuth, AWS credential chains, service key exchange, and bearer-token auth. Credentials are stored in `~/.pi/agent/auth.json` with file-locked access to prevent corruption from concurrent instances.
 
 | Mechanism | Providers | Details |
 |-----------|-----------|---------|
-| **API Key** | Anthropic, OpenAI, Gemini, Cohere, 12+ others | Static key via env var or settings |
-| **OAuth** | Anthropic (console), GitHub Copilot, GitLab | Browser-based flow with automatic token refresh |
+| **API Key** | Anthropic, OpenAI, Gemini, Cohere, and many OpenAI-compatible providers | Static key via env var or settings |
+| **OAuth** | Anthropic, OpenAI Codex, Google Gemini CLI, Google Antigravity, Kimi for Coding, GitHub Copilot, GitLab, and extension-defined OAuth providers | PKCE/state-validated flow with automatic refresh; Kimi uses device flow |
 | **AWS Credentials** | Bedrock | Access key + secret + optional session token; region-aware |
 | **Service Key** | SAP AI Core | Client ID/secret exchange for bearer token |
 | **Bearer Token** | Custom providers | Static token in auth storage |
@@ -1536,6 +1583,8 @@ Beyond simple API keys, Pi supports OAuth, AWS credential chains, and service ke
 3. If missing: opens browser to authorization URL, user authenticates, Pi receives authorization code, exchanges it for access + refresh tokens, stores both with expiry timestamp
 4. If expired but refresh token valid: exchanges refresh token for new access token, updates `auth.json`
 5. Bearer token attached to API requests
+
+Google CLI-style OAuth providers carry project metadata with the token payload. Pi preserves and refreshes that payload and can resolve project IDs from `GOOGLE_CLOUD_PROJECT` or local `gcloud` config when needed.
 
 **Credential status reporting**: `pi config` shows the status of each configured provider's credentials: `Missing`, `ApiKey`, `OAuthValid` (with time until expiry), `OAuthExpired` (with time since expiry), `AwsCredentials`, or `BearerToken`.
 
@@ -1554,6 +1603,8 @@ Input: { "path": "src/main.rs", "offset": 10, "limit": 50 }
 ```
 
 - Supports images (jpg, png, gif, webp) with optional auto-resize
+- Streams file bytes in chunks with hard size limits to reduce peak memory usage
+- Applies defensive image decode limits to block decompression-bomb/OOM inputs
 - Truncates at 2000 lines or 50KB
 - Returns continuation hint if truncated
 
@@ -1764,6 +1815,8 @@ Pi's perf pipeline includes strict evidence checks so global speed claims cannot
 
 - `scripts/perf/orchestrate.sh` generates artifacts tied to a shared `correlation_id` for the same run.
 - `scripts/e2e/run_all.sh` validates required schemas, freshness, and `correlation_id` alignment before considering claims valid.
+- `tests/release_evidence_gate.rs` fails closed when conformance/perf artifacts are missing `run_id` or `correlation_id`, or when lineage fields disagree across linked artifacts.
+- `scripts/e2e/run_all.sh` emits an evidence-adjudication matrix and only treats evidence as canonical when freshness and lineage checks both pass.
 - Key release-facing artifacts include:
   - `pi.perf.extension_benchmark_stratification.v1`
   - `pi.perf.phase1_matrix_validation.v1`
@@ -2062,8 +2115,8 @@ A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi)
 **Q: Why rewrite in Rust?**
 A: Startup time matters when you're in a terminal all day. Rust gives us <100ms startup vs 500ms+ for Node.js. Plus, no runtime dependencies to manage.
 
-**Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab)?**
-A: Yes. Native providers include OpenAI (Chat + Responses), Gemini, Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Set provider credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see the current canonical IDs and env keys.
+**Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab/Codex)?**
+A: Yes. Native providers include Anthropic, OpenAI (Chat + Responses + Codex Responses), Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
 
 **Q: How do sessions work?**
 A: Each session is a JSONL file with message entries. Sessions are per-project (based on working directory) and support branching via parent references.
@@ -2072,7 +2125,7 @@ A: Each session is a JSONL file with message entries. Sessions are per-project (
 A: Memory safety is non-negotiable for a tool that executes arbitrary commands. The performance cost is negligible for this use case.
 
 **Q: How do I extend Pi?**
-A: Pi has a full extension system. Drop a `.ts` or `.js` extension file into your project and it runs in an embedded QuickJS runtime with capability-gated host access. Extensions can register tools, slash commands, event hooks, flags, and custom providers. See [EXTENSIONS.md](EXTENSIONS.md) for details. For built-in tool changes, implement the `Tool` trait in `src/tools.rs`.
+A: Pi has a full extension system with two runtime families: JS/TS entrypoints run in embedded QuickJS, and `*.native.json` descriptors run in the native-rust descriptor runtime. Both are capability-gated and audited through the same policy system. One session uses one runtime family at a time. Extensions can register tools, slash commands, event hooks, flags, and custom providers. See [EXTENSIONS.md](EXTENSIONS.md) for details. For built-in tool changes, implement the `Tool` trait in `src/tools.rs`.
 
 **Q: Why isn't X feature included?**
 A: Pi focuses on core coding assistance. Features like web browsing, image generation, etc. are out of scope. Use specialized tools for those.
@@ -2087,7 +2140,7 @@ A: Yes. Create a `models.json` file in `~/.pi/agent/` or `.pi/` with entries spe
 A: Pi maintains a SQLite index of all session files. When you run `pi -c`, it queries the index for the most recently modified session whose working directory matches your current project. This avoids scanning the filesystem on every resume.
 
 **Q: What happens if an extension tries to access something dangerous?**
-A: Every hostcall from an extension is checked against the active capability policy before execution. Dangerous capabilities (`exec`, `env`) are denied by default under the `safe` policy, require a user prompt under `balanced`, and are allowed under `permissive`. Denied calls return an error to the extension's Promise. Pi also blocks extensions from reading sensitive environment variables (API keys, credentials, tokens) regardless of policy.
+A: Every hostcall from an extension is checked against the active capability policy before execution. Dangerous capabilities (`exec`, `env`) are denied by default under `safe` and `balanced` unless explicitly opted in (for example via `PI_EXTENSION_ALLOW_DANGEROUS=1`), and are available under `permissive`. For `exec`, Pi then applies command mediation before spawn: it classifies command+arg signatures and blocks critical classes by default (for example recursive delete, disk/device write, reverse shell), with strict/safe policy able to block high-tier classes as well (for example shutdown, process-kill, credential-file modification). Denied calls return errors to the extension Promise path, and denial events are recorded in redacted security-alert and exec-mediation audit artifacts. Sensitive env keys (API keys/tokens/secrets) remain filtered.
 
 **Q: Does Pi work with self-hosted or proxied LLMs?**
 A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes URL paths per API type and applies compatibility overrides for field-name and feature differences. This works with vLLM, Ollama, LiteLLM, and similar OpenAI-compatible servers.
@@ -2145,6 +2198,22 @@ rch exec -- cargo test sse::tests
 # Conformance tests
 rch exec -- cargo test conformance
 ```
+
+Focused validation tools:
+
+```bash
+# Release-binary + live-provider extension smoke (non-mock path)
+rch exec -- cargo build --release --bin pi
+rch exec -- cargo run --bin ext_release_binary_e2e -- \
+  --provider ollama --model qwen2.5:0.5b --max-cases 10
+
+# Runtime risk ledger forensics (verify, replay, calibrate)
+rch exec -- cargo run --bin ext_runtime_risk_ledger -- verify --input path/to/runtime_risk_ledger.json
+rch exec -- cargo run --bin ext_runtime_risk_ledger -- replay --input path/to/runtime_risk_ledger.json
+rch exec -- cargo run --bin ext_runtime_risk_ledger -- calibrate --input path/to/runtime_risk_ledger.json --objective balanced_accuracy
+```
+
+- `ext_runtime_risk_ledger` operates on `pi.ext.runtime_risk_ledger.v1` artifacts (for example, from incident bundle exports).
 
 ### Release & Publishing
 
