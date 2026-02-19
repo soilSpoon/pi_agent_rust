@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -39,9 +39,12 @@ struct Args {
     #[arg(long, default_value = "qwen2.5:0.5b")]
     model: String,
 
-    /// API key passed to pi (required by OpenAI-compatible provider adapter).
-    #[arg(long, default_value = "ollama-no-key-needed")]
-    api_key: String,
+    /// Optional API key passed to pi.
+    ///
+    /// If omitted, the harness relies on provider-native auth (for example OAuth).
+    /// Ollama still gets a synthetic key automatically for compatibility.
+    #[arg(long)]
+    api_key: Option<String>,
 
     /// Prompt used for each extension run.
     #[arg(long, default_value = "Respond with exactly: ok")]
@@ -172,9 +175,9 @@ struct RunOutput {
     exit_code: Option<i32>,
     timed_out: bool,
     duration_ms: u64,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
 }
+
+const WRITE_ZERO_RETRY_ATTEMPTS: usize = 1;
 
 fn main() {
     if let Err(err) = run() {
@@ -479,44 +482,40 @@ fn run_one_case(
     let env_root = case_dir.join("env");
     fs::create_dir_all(&env_root)?;
 
-    let mut command = Command::new(pi_bin);
-    command
-        .current_dir(project_root)
-        .arg("--print")
-        .arg("--no-session")
-        .arg("--provider")
-        .arg(&args.provider)
-        .arg("--model")
-        .arg(&args.model)
-        .arg("--api-key")
-        .arg(&args.api_key)
-        .arg("--extension")
-        .arg(&extension_path)
-        .arg(&args.prompt)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let (run_output, stdout_text, stderr_text) = execute_case_command(
+        pi_bin,
+        project_root,
+        &extension_path,
+        args,
+        &env_root,
+        &stdout_path,
+        &stderr_path,
+    )?;
 
-    if let Some(policy) = &args.extension_policy {
-        command.arg("--extension-policy").arg(policy);
+    let mut run_output = run_output;
+    let mut stdout_text = stdout_text;
+    let mut stderr_text = stderr_text;
+    let mut attempt = 0usize;
+    while attempt < WRITE_ZERO_RETRY_ATTEMPTS
+        && !run_output.timed_out
+        && run_output.exit_code != Some(0)
+        && stderr_text.contains("write zero")
+    {
+        attempt += 1;
+        thread::sleep(Duration::from_millis(150));
+        let rerun = execute_case_command(
+            pi_bin,
+            project_root,
+            &extension_path,
+            args,
+            &env_root,
+            &stdout_path,
+            &stderr_path,
+        )?;
+        run_output = rerun.0;
+        stdout_text = rerun.1;
+        stderr_text = rerun.2;
     }
-
-    let home_dir = env_root.join("home");
-    command.env("HOME", &home_dir);
-    command.env("PI_CODING_AGENT_DIR", env_root.join("agent"));
-    command.env("PI_CONFIG_PATH", env_root.join("config.toml"));
-    command.env("PI_SESSIONS_DIR", env_root.join("sessions"));
-    command.env("PI_PACKAGE_DIR", env_root.join("packages"));
-    command.env("PI_TEST_MODE", "1");
-    if args.allow_dangerous {
-        command.env("PI_EXTENSION_ALLOW_DANGEROUS", "1");
-    }
-
-    let run_output = run_with_timeout(command, Duration::from_secs(args.timeout_secs))?;
-    fs::write(&stdout_path, &run_output.stdout)?;
-    fs::write(&stderr_path, &run_output.stderr)?;
-
-    let stdout_text = String::from_utf8_lossy(&run_output.stdout).to_string();
-    let stderr_text = String::from_utf8_lossy(&run_output.stderr).to_string();
     let status = if run_output.timed_out {
         CaseStatus::Timeout
     } else if run_output.exit_code != Some(0) {
@@ -544,6 +543,71 @@ fn run_one_case(
     })
 }
 
+fn execute_case_command(
+    pi_bin: &Path,
+    project_root: &Path,
+    extension_path: &Path,
+    args: &Args,
+    env_root: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<(RunOutput, String, String)> {
+    let mut command = Command::new(pi_bin);
+    let stdout_file = File::create(stdout_path)
+        .with_context(|| format!("creating stdout capture file {}", stdout_path.display()))?;
+    let stderr_file = File::create(stderr_path)
+        .with_context(|| format!("creating stderr capture file {}", stderr_path.display()))?;
+    command
+        .current_dir(project_root)
+        .arg("--print")
+        .arg("--no-session")
+        .arg("--provider")
+        .arg(&args.provider)
+        .arg("--model")
+        .arg(&args.model)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+
+    if let Some(api_key) = args.api_key.as_deref() {
+        command.arg("--api-key").arg(api_key);
+    } else if args.provider.eq_ignore_ascii_case("ollama") {
+        command.arg("--api-key").arg("ollama-no-key-needed");
+    }
+
+    if let Some(policy) = &args.extension_policy {
+        command.arg("--extension-policy").arg(policy);
+    }
+    command
+        .arg("--extension")
+        .arg(extension_path)
+        .arg(&args.prompt);
+
+    let home_dir = env_root.join("home");
+    fs::create_dir_all(&home_dir)
+        .with_context(|| format!("creating isolated HOME {}", home_dir.display()))?;
+    if args.api_key.is_none() {
+        seed_oauth_home(&args.provider, &home_dir)?;
+    }
+    command.env("HOME", &home_dir);
+    command.env("PI_CODING_AGENT_DIR", env_root.join("agent"));
+    command.env("PI_CONFIG_PATH", env_root.join("config.toml"));
+    command.env("PI_SESSIONS_DIR", env_root.join("sessions"));
+    command.env("PI_PACKAGE_DIR", env_root.join("packages"));
+    command.env("PI_TEST_MODE", "1");
+    if args.allow_dangerous {
+        command.env("PI_EXTENSION_ALLOW_DANGEROUS", "1");
+    }
+
+    let run_output = run_with_timeout(command, Duration::from_secs(args.timeout_secs))?;
+    let stdout_bytes = fs::read(stdout_path)
+        .with_context(|| format!("reading stdout capture file {}", stdout_path.display()))?;
+    let stderr_bytes = fs::read(stderr_path)
+        .with_context(|| format!("reading stderr capture file {}", stderr_path.display()))?;
+    let stdout_text = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes).to_string();
+    Ok((run_output, stdout_text, stderr_text))
+}
+
 fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<RunOutput> {
     let started = Instant::now();
     let mut child = command.spawn().context("spawning pi process")?;
@@ -551,36 +615,54 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<RunOutput
     loop {
         if started.elapsed() >= timeout {
             let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("capturing timed-out process output")?;
+            let status = child
+                .wait()
+                .context("waiting for timed-out process after kill")?;
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             return Ok(RunOutput {
-                exit_code: output.status.code(),
+                exit_code: status.code(),
                 timed_out: true,
                 duration_ms,
-                stdout: output.stdout,
-                stderr: output.stderr,
             });
         }
 
         match child.try_wait().context("polling process state")? {
-            Some(_) => {
-                let output = child
-                    .wait_with_output()
-                    .context("capturing process output")?;
+            Some(status) => {
                 let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 return Ok(RunOutput {
-                    exit_code: output.status.code(),
+                    exit_code: status.code(),
                     timed_out: false,
                     duration_ms,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
                 });
             }
             None => thread::sleep(Duration::from_millis(25)),
         }
     }
+}
+
+fn seed_oauth_home(provider: &str, home_dir: &Path) -> Result<()> {
+    if provider.eq_ignore_ascii_case("openai-codex") {
+        let Some(host_home) = std::env::var_os("HOME") else {
+            return Ok(());
+        };
+        let source = PathBuf::from(host_home).join(".codex/auth.json");
+        if source.exists() {
+            let target = home_dir.join(".codex/auth.json");
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("creating OAuth target directory {}", parent.display())
+                })?;
+            }
+            fs::copy(&source, &target).with_context(|| {
+                format!(
+                    "copying openai-codex auth from {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn summarize_counts(results: &[CaseResult]) -> Counts {
@@ -816,7 +898,7 @@ mod tests {
             pi_bin: PathBuf::from("c"),
             provider: "ollama".to_string(),
             model: "qwen2.5:0.5b".to_string(),
-            api_key: "x".to_string(),
+            api_key: Some("x".to_string()),
             prompt: "ok".to_string(),
             timeout_secs: 30,
             jobs: 1,
@@ -840,7 +922,7 @@ mod tests {
             pi_bin: PathBuf::from("c"),
             provider: "ollama".to_string(),
             model: "qwen2.5:0.5b".to_string(),
-            api_key: "x".to_string(),
+            api_key: Some("x".to_string()),
             prompt: "ok".to_string(),
             timeout_secs: 30,
             jobs: 0,
