@@ -24,6 +24,8 @@ use crate::permissions::{PermissionStore, PersistedDecision};
 use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
 use crate::tools::ToolRegistry;
+use ast_grep_core::{AstGrep, Pattern};
+use ast_grep_language::SupportLang;
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeBuilder;
 #[cfg(feature = "wasm-host")]
@@ -5627,6 +5629,7 @@ struct RuntimeRiskDecision {
 struct RuntimeRiskCallMetadata<'a> {
     args_shape_hash: &'a str,
     resource_target_class: &'a str,
+    params: &'a Value,
     timeout_ms: Option<u64>,
     policy_profile: &'a str,
 }
@@ -6207,24 +6210,44 @@ fn runtime_risk_is_dangerous(capability: &str) -> bool {
     matches!(capability, "exec" | "env" | "http")
 }
 
+fn runtime_risk_harden_should_block_dangerous(decision: &RuntimeRiskDecision) -> bool {
+    if !runtime_risk_is_dangerous(&decision.capability) {
+        return false;
+    }
+    if decision.risk_score >= 0.82 {
+        return true;
+    }
+    decision.triggers.iter().any(|code| {
+        matches!(
+            code.as_str(),
+            "suspicious_exec_detail"
+                | "dcg_rule_hit"
+                | "dcg_heredoc_hit"
+                | "sensitive_path_target"
+                | "public_network_target"
+                | "secret_env_access"
+        )
+    })
+}
+
 fn runtime_risk_base_score(capability: &str, method: &str, policy_reason: &str) -> f64 {
     let capability_score = match capability {
-        "exec" => 0.95,
-        "env" => 0.85,
-        "http" => 0.70,
-        "write" => 0.45,
-        "tool" => 0.50,
-        "session" => 0.35,
-        "events" => 0.30,
-        "ui" => 0.20,
-        "read" => 0.15,
-        _ => 0.25,
+        "exec" => 0.48,
+        "env" => 0.40,
+        "http" => 0.32,
+        "write" => 0.28,
+        "tool" => 0.24,
+        "session" => 0.18,
+        "events" => 0.11,
+        "ui" => 0.08,
+        "read" => 0.06,
+        _ => 0.12,
     };
 
     let method_bonus = match method {
-        "exec" => 0.20,
-        "http" => 0.12,
-        "tool" => 0.08,
+        "exec" => 0.10,
+        "http" => 0.08,
+        "tool" => 0.04,
         _ => 0.0,
     };
 
@@ -6381,6 +6404,828 @@ fn runtime_hostcall_resource_target_class(method: &str, params: &Value) -> &'sta
         "log" => "telemetry.log",
         _ => "unknown",
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeHostcallArgumentSignals {
+    risk_delta: f64,
+    flags: u8,
+}
+
+const ARG_FLAG_SUSPICIOUS_EXEC: u8 = 1 << 0;
+const ARG_FLAG_DCG_PATTERN_HIT: u8 = 1 << 1;
+const ARG_FLAG_DCG_HEREDOC_HIT: u8 = 1 << 2;
+const ARG_FLAG_SENSITIVE_PATH: u8 = 1 << 3;
+const ARG_FLAG_PUBLIC_NETWORK: u8 = 1 << 4;
+const ARG_FLAG_SECRET_ENV_ACCESS: u8 = 1 << 5;
+
+impl RuntimeHostcallArgumentSignals {
+    const fn set(&mut self, flag: u8) {
+        self.flags |= flag;
+    }
+
+    const fn has(self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+}
+
+fn runtime_hostcall_is_sensitive_path(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    let sensitive_prefixes = [
+        "/etc", "/usr", "/bin", "/sbin", "/var", "/root", "/dev", "/proc", "/sys", "/boot",
+    ];
+    sensitive_prefixes
+        .iter()
+        .any(|prefix| lower == *prefix || lower.starts_with(&format!("{prefix}/")))
+        || lower.contains("/.ssh/")
+        || lower.ends_with("/.ssh")
+}
+
+fn runtime_hostcall_is_safe_utility_command(command: &str) -> bool {
+    let cmd = command
+        .split_whitespace()
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        cmd.as_str(),
+        "ls" | "pwd" | "echo" | "cat" | "head" | "tail" | "wc" | "git"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RuntimeHeredocScriptLanguage {
+    Bash,
+    Python,
+    JavaScript,
+    TypeScript,
+    Ruby,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeHeredocAstSeverity {
+    Critical,
+    High,
+    Medium,
+}
+
+impl RuntimeHeredocAstSeverity {
+    const fn score(self) -> f64 {
+        match self {
+            Self::Critical => 0.34,
+            Self::High => 0.24,
+            Self::Medium => 0.12,
+        }
+    }
+
+    const fn is_blocking(self) -> bool {
+        matches!(self, Self::Critical | Self::High)
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeHeredocAstPattern {
+    pattern: Pattern,
+    severity: RuntimeHeredocAstSeverity,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeExtractedHeredoc {
+    body: String,
+    invocation_prefix: String,
+}
+
+fn runtime_hostcall_heredoc_ast_patterns()
+-> &'static HashMap<RuntimeHeredocScriptLanguage, Vec<RuntimeHeredocAstPattern>> {
+    static HEREDOC_AST_PATTERNS: OnceLock<
+        HashMap<RuntimeHeredocScriptLanguage, Vec<RuntimeHeredocAstPattern>>,
+    > = OnceLock::new();
+    HEREDOC_AST_PATTERNS.get_or_init(runtime_hostcall_build_heredoc_ast_patterns)
+}
+
+fn runtime_hostcall_compile_ast_patterns(
+    ast_lang: SupportLang,
+    specs: &[(&str, RuntimeHeredocAstSeverity)],
+) -> Vec<RuntimeHeredocAstPattern> {
+    let mut compiled = Vec::with_capacity(specs.len());
+    for (pattern_str, severity) in specs {
+        if let Ok(pattern) = Pattern::try_new(pattern_str, ast_lang) {
+            compiled.push(RuntimeHeredocAstPattern {
+                pattern,
+                severity: *severity,
+            });
+        }
+    }
+    compiled
+}
+
+#[allow(clippy::too_many_lines)]
+fn runtime_hostcall_build_heredoc_ast_patterns()
+-> HashMap<RuntimeHeredocScriptLanguage, Vec<RuntimeHeredocAstPattern>> {
+    let mut out: HashMap<RuntimeHeredocScriptLanguage, Vec<RuntimeHeredocAstPattern>> =
+        HashMap::new();
+
+    let bash_specs = [
+        ("rm -rf $$$", RuntimeHeredocAstSeverity::Critical),
+        ("rm -r $$$", RuntimeHeredocAstSeverity::High),
+        ("git reset --hard", RuntimeHeredocAstSeverity::Critical),
+        ("git clean -fd", RuntimeHeredocAstSeverity::High),
+        ("git clean -fdx", RuntimeHeredocAstSeverity::High),
+    ];
+    let bash = runtime_hostcall_compile_ast_patterns(SupportLang::Bash, &bash_specs);
+    if !bash.is_empty() {
+        out.insert(RuntimeHeredocScriptLanguage::Bash, bash);
+    }
+
+    let python_specs = [
+        ("shutil.rmtree($$$)", RuntimeHeredocAstSeverity::Critical),
+        ("os.remove($$$)", RuntimeHeredocAstSeverity::High),
+        ("os.rmdir($$$)", RuntimeHeredocAstSeverity::High),
+        ("os.unlink($$$)", RuntimeHeredocAstSeverity::High),
+        (
+            "pathlib.Path($$$).unlink($$$)",
+            RuntimeHeredocAstSeverity::High,
+        ),
+        ("Path($$$).unlink($$$)", RuntimeHeredocAstSeverity::High),
+        (
+            "pathlib.Path($$$).rmdir($$$)",
+            RuntimeHeredocAstSeverity::High,
+        ),
+        ("Path($$$).rmdir($$$)", RuntimeHeredocAstSeverity::High),
+        ("os.system($$$)", RuntimeHeredocAstSeverity::Medium),
+        ("subprocess.run($$$)", RuntimeHeredocAstSeverity::Medium),
+    ];
+    let python = runtime_hostcall_compile_ast_patterns(SupportLang::Python, &python_specs);
+    if !python.is_empty() {
+        out.insert(RuntimeHeredocScriptLanguage::Python, python);
+    }
+
+    let javascript_specs = [
+        ("fs.rmSync($$$)", RuntimeHeredocAstSeverity::High),
+        ("fs.rmdirSync($$$)", RuntimeHeredocAstSeverity::High),
+        ("fs.rm($$$)", RuntimeHeredocAstSeverity::Medium),
+        ("fs.rmdir($$$)", RuntimeHeredocAstSeverity::Medium),
+        (
+            "child_process.execSync($$$)",
+            RuntimeHeredocAstSeverity::Medium,
+        ),
+        (
+            "require('child_process').execSync($$$)",
+            RuntimeHeredocAstSeverity::Medium,
+        ),
+        (
+            "child_process.spawnSync($$$)",
+            RuntimeHeredocAstSeverity::Medium,
+        ),
+    ];
+    let javascript =
+        runtime_hostcall_compile_ast_patterns(SupportLang::JavaScript, &javascript_specs);
+    if !javascript.is_empty() {
+        out.insert(RuntimeHeredocScriptLanguage::JavaScript, javascript);
+    }
+
+    let typescript_specs = [
+        ("fs.rmSync($$$)", RuntimeHeredocAstSeverity::High),
+        ("fs.rmdirSync($$$)", RuntimeHeredocAstSeverity::High),
+        ("Deno.remove($$$)", RuntimeHeredocAstSeverity::High),
+        ("fs.rm($$$)", RuntimeHeredocAstSeverity::Medium),
+        ("fs.rmdir($$$)", RuntimeHeredocAstSeverity::Medium),
+        (
+            "child_process.execSync($$$)",
+            RuntimeHeredocAstSeverity::Medium,
+        ),
+        (
+            "require('child_process').execSync($$$)",
+            RuntimeHeredocAstSeverity::Medium,
+        ),
+        (
+            "child_process.spawnSync($$$)",
+            RuntimeHeredocAstSeverity::Medium,
+        ),
+    ];
+    let typescript =
+        runtime_hostcall_compile_ast_patterns(SupportLang::TypeScript, &typescript_specs);
+    if !typescript.is_empty() {
+        out.insert(RuntimeHeredocScriptLanguage::TypeScript, typescript);
+    }
+
+    let ruby_specs = [
+        ("FileUtils.rm_rf($$$)", RuntimeHeredocAstSeverity::Critical),
+        ("FileUtils.rm($$$)", RuntimeHeredocAstSeverity::High),
+        ("File.delete($$$)", RuntimeHeredocAstSeverity::High),
+        ("File.unlink($$$)", RuntimeHeredocAstSeverity::High),
+        ("Dir.rmdir($$$)", RuntimeHeredocAstSeverity::High),
+        ("system($$$)", RuntimeHeredocAstSeverity::Medium),
+        ("exec($$$)", RuntimeHeredocAstSeverity::Medium),
+    ];
+    let ruby = runtime_hostcall_compile_ast_patterns(SupportLang::Ruby, &ruby_specs);
+    if !ruby.is_empty() {
+        out.insert(RuntimeHeredocScriptLanguage::Ruby, ruby);
+    }
+
+    out
+}
+
+const fn runtime_hostcall_script_language_to_ast_lang(
+    language: RuntimeHeredocScriptLanguage,
+) -> Option<SupportLang> {
+    match language {
+        RuntimeHeredocScriptLanguage::Bash => Some(SupportLang::Bash),
+        RuntimeHeredocScriptLanguage::Python => Some(SupportLang::Python),
+        RuntimeHeredocScriptLanguage::JavaScript => Some(SupportLang::JavaScript),
+        RuntimeHeredocScriptLanguage::TypeScript => Some(SupportLang::TypeScript),
+        RuntimeHeredocScriptLanguage::Ruby => Some(SupportLang::Ruby),
+        RuntimeHeredocScriptLanguage::Unknown => None,
+    }
+}
+
+fn runtime_hostcall_matches_interpreter(base: &str, token: &str) -> bool {
+    if token == base {
+        return true;
+    }
+    token.strip_prefix(base).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && suffix.chars().next().is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+fn runtime_hostcall_script_language_from_command_token(
+    token: &str,
+) -> RuntimeHeredocScriptLanguage {
+    let basename = token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(token)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    if runtime_hostcall_matches_interpreter("python", &basename) {
+        RuntimeHeredocScriptLanguage::Python
+    } else if runtime_hostcall_matches_interpreter("node", &basename)
+        || runtime_hostcall_matches_interpreter("nodejs", &basename)
+    {
+        RuntimeHeredocScriptLanguage::JavaScript
+    } else if runtime_hostcall_matches_interpreter("deno", &basename)
+        || runtime_hostcall_matches_interpreter("bun", &basename)
+        || runtime_hostcall_matches_interpreter("tsx", &basename)
+        || runtime_hostcall_matches_interpreter("ts-node", &basename)
+    {
+        RuntimeHeredocScriptLanguage::TypeScript
+    } else if runtime_hostcall_matches_interpreter("ruby", &basename)
+        || runtime_hostcall_matches_interpreter("irb", &basename)
+    {
+        RuntimeHeredocScriptLanguage::Ruby
+    } else if runtime_hostcall_matches_interpreter("bash", &basename)
+        || runtime_hostcall_matches_interpreter("sh", &basename)
+        || runtime_hostcall_matches_interpreter("zsh", &basename)
+        || runtime_hostcall_matches_interpreter("fish", &basename)
+    {
+        RuntimeHeredocScriptLanguage::Bash
+    } else {
+        RuntimeHeredocScriptLanguage::Unknown
+    }
+}
+
+fn runtime_hostcall_script_language_from_invocation(
+    invocation_prefix: &str,
+) -> RuntimeHeredocScriptLanguage {
+    for segment in invocation_prefix.split('|').rev() {
+        let mut tokens = segment.split_whitespace().peekable();
+        while let Some(raw) = tokens.next() {
+            let token = raw.trim_matches(['\'', '"', '(', ')']);
+            if token.is_empty() {
+                continue;
+            }
+            let token_lower = token.to_ascii_lowercase();
+            if token_lower == "env" {
+                while let Some(next_raw) = tokens.peek().copied() {
+                    let next = next_raw.trim_matches(['\'', '"', '(', ')']);
+                    if next.starts_with('-') || next.contains('=') {
+                        let _ = tokens.next();
+                        continue;
+                    }
+                    return runtime_hostcall_script_language_from_command_token(next);
+                }
+                break;
+            }
+            if matches!(
+                token_lower.as_str(),
+                "sudo" | "command" | "nohup" | "time" | "builtin"
+            ) || token.contains('=')
+            {
+                continue;
+            }
+            return runtime_hostcall_script_language_from_command_token(token);
+        }
+    }
+    RuntimeHeredocScriptLanguage::Unknown
+}
+
+fn runtime_hostcall_script_language_from_shebang(content: &str) -> RuntimeHeredocScriptLanguage {
+    let Some(first_line) = content.lines().next() else {
+        return RuntimeHeredocScriptLanguage::Unknown;
+    };
+    let Some(shebang) = first_line.strip_prefix("#!") else {
+        return RuntimeHeredocScriptLanguage::Unknown;
+    };
+    let mut parts = shebang.split_whitespace();
+    let Some(first) = parts.next() else {
+        return RuntimeHeredocScriptLanguage::Unknown;
+    };
+    let basename = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    if basename.eq_ignore_ascii_case("env") {
+        for part in parts {
+            if part.starts_with('-') || part.contains('=') {
+                continue;
+            }
+            return runtime_hostcall_script_language_from_command_token(part);
+        }
+        return RuntimeHeredocScriptLanguage::Unknown;
+    }
+    runtime_hostcall_script_language_from_command_token(basename)
+}
+
+fn runtime_hostcall_script_language_from_content(content: &str) -> RuntimeHeredocScriptLanguage {
+    let window = content.lines().take(24).collect::<Vec<_>>().join("\n");
+    if window.contains("import ") && (window.contains(" os") || window.contains(" shutil")) {
+        return RuntimeHeredocScriptLanguage::Python;
+    }
+    if window.contains("require(")
+        || window.contains("module.exports")
+        || window.contains("child_process")
+    {
+        return RuntimeHeredocScriptLanguage::JavaScript;
+    }
+    if window.contains(": string")
+        || window.contains(": number")
+        || window.contains("interface ")
+        || window.contains("type ")
+    {
+        return RuntimeHeredocScriptLanguage::TypeScript;
+    }
+    if window.contains("FileUtils.")
+        || window.contains("require '")
+        || window.contains("require \"")
+        || window.contains("def ")
+    {
+        return RuntimeHeredocScriptLanguage::Ruby;
+    }
+    if window.contains("rm -rf")
+        || window.contains("git reset --hard")
+        || window.contains("set -e")
+        || window.contains("#!/bin/bash")
+    {
+        return RuntimeHeredocScriptLanguage::Bash;
+    }
+    RuntimeHeredocScriptLanguage::Unknown
+}
+
+fn runtime_hostcall_detect_heredoc_script_language(
+    heredoc: &RuntimeExtractedHeredoc,
+) -> RuntimeHeredocScriptLanguage {
+    let from_invocation =
+        runtime_hostcall_script_language_from_invocation(&heredoc.invocation_prefix);
+    if from_invocation != RuntimeHeredocScriptLanguage::Unknown {
+        return from_invocation;
+    }
+    let from_shebang = runtime_hostcall_script_language_from_shebang(&heredoc.body);
+    if from_shebang != RuntimeHeredocScriptLanguage::Unknown {
+        return from_shebang;
+    }
+    runtime_hostcall_script_language_from_content(&heredoc.body)
+}
+
+fn runtime_hostcall_dcg_command_score(command: &str) -> (f64, bool) {
+    let lower = command.to_ascii_lowercase();
+    let mut score = 0.0f64;
+    let mut matched = false;
+
+    // Adapted high-signal signatures from destructive_command_guard core git/filesystem packs.
+    let critical_git = [
+        "git reset --hard",
+        "git clean -fd",
+        "git clean -xdf",
+        "git clean -fdx",
+        "git push --force",
+        "git push -f",
+        "git stash clear",
+    ];
+    for needle in critical_git {
+        if lower.contains(needle) {
+            score += 0.36;
+            matched = true;
+        }
+    }
+    let high_git = [
+        "git checkout --",
+        "git restore --worktree",
+        "git stash drop",
+        "git branch -d",
+        "git branch -D",
+    ];
+    for needle in high_git {
+        if lower.contains(needle) {
+            score += 0.22;
+            matched = true;
+        }
+    }
+
+    if lower.contains("rm -rf /")
+        || lower.contains("rm -fr /")
+        || lower.contains("--no-preserve-root")
+    {
+        score += 0.50;
+        matched = true;
+    } else if lower.contains("rm -rf")
+        || lower.contains("rm -fr")
+        || lower.contains("rm --recursive --force")
+    {
+        score += 0.26;
+        matched = true;
+    }
+
+    if lower.contains("dd ") && lower.contains("of=/dev/") {
+        score += 0.34;
+        matched = true;
+    }
+    if lower.contains("mkfs") || lower.contains("wipefs") || lower.contains("shred ") {
+        score += 0.32;
+        matched = true;
+    }
+
+    (score.min(0.55), matched)
+}
+
+fn runtime_hostcall_extract_heredoc_blocks(command: &str) -> Vec<RuntimeExtractedHeredoc> {
+    let mut payloads = Vec::new();
+    let lines = command.lines().collect::<Vec<_>>();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let Some(op_index) = line.find("<<") else {
+            i += 1;
+            continue;
+        };
+        if line
+            .get(op_index + 2..)
+            .is_some_and(|remainder| remainder.starts_with('<'))
+        {
+            i += 1;
+            continue;
+        }
+        let invocation_prefix = line[..op_index].trim().to_string();
+        let mut delimiter = line[op_index + 2..].trim();
+        if delimiter.starts_with('-') || delimiter.starts_with('~') {
+            delimiter = delimiter[1..].trim_start();
+        }
+        let Some(raw_token) = delimiter.split_whitespace().next() else {
+            i += 1;
+            continue;
+        };
+        let token = raw_token.trim_matches('\'').trim_matches('"').to_string();
+        if token.is_empty() {
+            i += 1;
+            continue;
+        }
+        let mut body = String::new();
+        let mut j = i + 1;
+        while j < lines.len() {
+            if lines[j].trim() == token {
+                break;
+            }
+            body.push_str(lines[j]);
+            body.push('\n');
+            j += 1;
+        }
+        if !body.trim().is_empty() {
+            payloads.push(RuntimeExtractedHeredoc {
+                body,
+                invocation_prefix,
+            });
+        }
+        i = j.saturating_add(1);
+    }
+    payloads
+}
+
+fn runtime_hostcall_extract_heredoc_payloads(command: &str) -> Vec<String> {
+    runtime_hostcall_extract_heredoc_blocks(command)
+        .into_iter()
+        .map(|payload| payload.body)
+        .collect()
+}
+
+fn runtime_hostcall_dcg_heredoc_ast_score(heredoc: &RuntimeExtractedHeredoc) -> (f64, bool) {
+    let language = runtime_hostcall_detect_heredoc_script_language(heredoc);
+    let Some(ast_lang) = runtime_hostcall_script_language_to_ast_lang(language) else {
+        return (0.0, false);
+    };
+    let Some(patterns) = runtime_hostcall_heredoc_ast_patterns().get(&language) else {
+        return (0.0, false);
+    };
+    if patterns.is_empty() {
+        return (0.0, false);
+    }
+
+    let ast = AstGrep::new(heredoc.body.as_str(), ast_lang);
+    let root = ast.root();
+
+    let mut has_match = false;
+    let mut has_blocking_match = false;
+    let mut max_score = 0.0f64;
+    for pattern in patterns {
+        if root.find_all(&pattern.pattern).next().is_some() {
+            has_match = true;
+            max_score = max_score.max(pattern.severity.score());
+            if pattern.severity.is_blocking() {
+                has_blocking_match = true;
+            }
+        }
+    }
+
+    if has_match {
+        (max_score, has_blocking_match)
+    } else {
+        (0.0, false)
+    }
+}
+
+fn runtime_hostcall_dcg_heredoc_score(command: &str) -> (f64, bool) {
+    if !command.contains("<<") {
+        return (0.0, false);
+    }
+
+    let payloads = runtime_hostcall_extract_heredoc_blocks(command);
+    if payloads.is_empty() {
+        // Heredoc operator present but payload not extractable: suspicious but low-confidence.
+        return (0.05, false);
+    }
+
+    let mut matched = false;
+    let mut score = 0.0f64;
+    for payload in payloads {
+        for line in payload.body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let (line_score, line_hit) = runtime_hostcall_dcg_command_score(trimmed);
+            if line_hit {
+                matched = true;
+                score = score.max(line_score + 0.12);
+            }
+        }
+
+        let (ast_score, ast_blocking_hit) = runtime_hostcall_dcg_heredoc_ast_score(&payload);
+        if ast_score > 0.0 {
+            score = score.max(ast_score);
+        }
+        if ast_blocking_hit {
+            matched = true;
+        }
+    }
+
+    if matched {
+        (score.min(0.68), true)
+    } else if score > 0.0 {
+        (score.min(0.30), false)
+    } else {
+        (0.08, false)
+    }
+}
+
+fn runtime_hostcall_extract_exec_command(method: &str, params: &Value) -> Option<String> {
+    if method.eq_ignore_ascii_case("exec") {
+        if let Some(command) = params.get("command").and_then(Value::as_str) {
+            let command = command.trim();
+            if !command.is_empty() {
+                return Some(command.to_string());
+            }
+        }
+        if let Some(cmd) = params.get("cmd").and_then(Value::as_str) {
+            let cmd = cmd.trim();
+            if cmd.is_empty() {
+                return None;
+            }
+            let args = params
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            if args.is_empty() {
+                return Some(cmd.to_string());
+            }
+            return Some(format!("{cmd} {args}"));
+        }
+        return None;
+    }
+
+    if !method.eq_ignore_ascii_case("tool") {
+        return None;
+    }
+
+    let is_bash = params
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("bash"));
+    if !is_bash {
+        return None;
+    }
+    let input = params.get("input")?;
+    let command = input.get("command").and_then(Value::as_str)?;
+    let command = command.trim();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command.to_string())
+    }
+}
+
+fn runtime_hostcall_extract_path(method: &str, params: &Value) -> Option<String> {
+    if method.eq_ignore_ascii_case("fs") {
+        let path = params.get("path").and_then(Value::as_str)?;
+        let path = path.trim();
+        if path.is_empty() {
+            return None;
+        }
+        return Some(path.to_string());
+    }
+
+    if !method.eq_ignore_ascii_case("tool") {
+        return None;
+    }
+
+    let tool_name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(
+        tool_name.as_str(),
+        "read" | "write" | "edit" | "grep" | "find" | "ls"
+    ) {
+        return None;
+    }
+    let input = params.get("input")?;
+    for key in ["path", "file", "file_path"] {
+        if let Some(path) = input.get(key).and_then(Value::as_str) {
+            let path = path.trim();
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn runtime_hostcall_extract_env_names(method: &str, params: &Value) -> Vec<String> {
+    if !method.eq_ignore_ascii_case("env") {
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    if let Some(name) = params.get("name").and_then(Value::as_str) {
+        let value = name.trim();
+        if !value.is_empty() {
+            names.push(value.to_string());
+        }
+    }
+    if let Some(items) = params.get("names").and_then(Value::as_array) {
+        for item in items {
+            if let Some(name) = item.as_str() {
+                let value = name.trim();
+                if !value.is_empty() {
+                    names.push(value.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn runtime_hostcall_is_secret_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    let needles = [
+        "SECRET",
+        "TOKEN",
+        "PASSWORD",
+        "PASSWD",
+        "AUTH",
+        "COOKIE",
+        "SESSION",
+        "PRIVATE",
+        "KEY",
+        "AWS_",
+        "OPENAI_",
+        "ANTHROPIC_",
+    ];
+    needles.iter().any(|needle| upper.contains(needle))
+}
+
+fn runtime_hostcall_argument_signals(
+    capability: &str,
+    method: &str,
+    params: &Value,
+    resource_target_class: &str,
+) -> RuntimeHostcallArgumentSignals {
+    let mut signals = RuntimeHostcallArgumentSignals::default();
+
+    if let Some(command) = runtime_hostcall_extract_exec_command(method, params) {
+        let tokens = command
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let (cmd, args) = if let Some((first, rest)) = tokens.split_first() {
+            (first.as_str(), rest.to_vec())
+        } else {
+            ("", Vec::new())
+        };
+        let classifications = classify_dangerous_command(cmd, &args);
+        let highest = classifications.iter().map(|class| class.risk_tier()).max();
+        if let Some(tier) = highest {
+            signals.set(ARG_FLAG_SUSPICIOUS_EXEC);
+            signals.risk_delta += match tier {
+                ExecRiskTier::Critical => 0.42,
+                ExecRiskTier::High => 0.30,
+                ExecRiskTier::Medium => 0.18,
+                ExecRiskTier::Low => 0.10,
+            };
+        } else if runtime_hostcall_is_safe_utility_command(&command) {
+            signals.risk_delta -= 0.18;
+        } else {
+            signals.risk_delta += 0.04;
+        }
+
+        let (dcg_score, dcg_hit) = runtime_hostcall_dcg_command_score(&command);
+        signals.risk_delta += dcg_score;
+        if dcg_hit {
+            signals.set(ARG_FLAG_SUSPICIOUS_EXEC);
+            signals.set(ARG_FLAG_DCG_PATTERN_HIT);
+        }
+
+        let (heredoc_score, heredoc_hit) = runtime_hostcall_dcg_heredoc_score(&command);
+        signals.risk_delta += heredoc_score;
+        if heredoc_hit {
+            signals.set(ARG_FLAG_SUSPICIOUS_EXEC);
+            signals.set(ARG_FLAG_DCG_HEREDOC_HIT);
+        }
+    }
+
+    if let Some(path) = runtime_hostcall_extract_path(method, params) {
+        if runtime_hostcall_is_sensitive_path(&path) {
+            signals.set(ARG_FLAG_SENSITIVE_PATH);
+            signals.risk_delta += if capability.eq_ignore_ascii_case("write") {
+                0.30
+            } else {
+                0.20
+            };
+        } else if path.contains("../") {
+            signals.risk_delta += 0.10;
+        } else if path.starts_with('/') {
+            signals.risk_delta += 0.04;
+        } else {
+            signals.risk_delta -= 0.03;
+        }
+    }
+
+    if capability.eq_ignore_ascii_case("http") {
+        if resource_target_class == "network.public" {
+            signals.set(ARG_FLAG_PUBLIC_NETWORK);
+            signals.risk_delta += 0.14;
+        } else if matches!(
+            resource_target_class,
+            "network.private" | "network.loopback"
+        ) {
+            signals.risk_delta -= 0.06;
+        } else {
+            signals.risk_delta += 0.02;
+        }
+    }
+
+    let env_names = runtime_hostcall_extract_env_names(method, params);
+    if !env_names.is_empty() {
+        if env_names
+            .iter()
+            .any(|name| runtime_hostcall_is_secret_env_key(name))
+        {
+            signals.set(ARG_FLAG_SECRET_ENV_ACCESS);
+            signals.risk_delta += 0.22;
+        } else {
+            signals.risk_delta += 0.06;
+        }
+    }
+
+    signals.risk_delta = signals.risk_delta.clamp(-0.30, 0.55);
+    signals
 }
 
 #[allow(
@@ -7726,14 +8571,14 @@ fn runtime_risk_build_explanation(
     let mut contributors = vec![
         RuntimeRiskExplanationContributor {
             code: "feature_base_score".to_string(),
-            signed_impact: 0.65 * features.base_score,
-            magnitude: (0.65 * features.base_score).abs(),
-            rationale: "base capability/method risk contribution".to_string(),
+            signed_impact: 0.50 * features.base_score,
+            magnitude: (0.50 * features.base_score).abs(),
+            rationale: "base capability/method/detail risk contribution".to_string(),
         },
         RuntimeRiskExplanationContributor {
             code: "feature_recent_mean_score".to_string(),
-            signed_impact: 0.35 * features.recent_mean_score,
-            magnitude: (0.35 * features.recent_mean_score).abs(),
+            signed_impact: 0.30 * features.recent_mean_score,
+            magnitude: (0.30 * features.recent_mean_score).abs(),
             rationale: "recent moving-average risk contribution".to_string(),
         },
         RuntimeRiskExplanationContributor {
@@ -19334,6 +20179,7 @@ pub async fn dispatch_host_call_shared(
                 RuntimeRiskCallMetadata {
                     args_shape_hash: &args_shape_hash,
                     resource_target_class,
+                    params: &call.params,
                     timeout_ms: call.timeout_ms,
                     policy_profile,
                 },
@@ -19374,7 +20220,9 @@ pub async fn dispatch_host_call_shared(
                 .map_or(RuntimeRiskAction::Allow, |d| d.action)
             {
                 RuntimeRiskAction::Allow => true,
-                RuntimeRiskAction::Harden => !runtime_risk_is_dangerous(capability),
+                RuntimeRiskAction::Harden => runtime_risk_decision
+                    .as_ref()
+                    .is_none_or(|decision| !runtime_risk_harden_should_block_dangerous(decision)),
                 RuntimeRiskAction::Deny | RuntimeRiskAction::Terminate => false,
             }
         };
@@ -19403,7 +20251,10 @@ pub async fn dispatch_host_call_shared(
                     outcome
                 }
                 RuntimeRiskAction::Harden => {
-                    if runtime_risk_is_dangerous(capability) {
+                    let should_block = runtime_risk_decision
+                        .as_ref()
+                        .is_some_and(runtime_risk_harden_should_block_dangerous);
+                    if should_block {
                         // SEC-5.1: Alert for anomaly-based hardening denial.
                         if let Some(ref manager) = ctx.manager {
                             manager.record_security_alert(SecurityAlert {
@@ -23677,7 +24528,16 @@ impl ExtensionManager {
 
         let now_ms = runtime_risk_now_ms();
         let sequence_context = runtime_hostcall_sequence_context(state, now_ms);
-        let base = runtime_risk_base_score(capability, method, policy_reason);
+        let argument_signals = runtime_hostcall_argument_signals(
+            capability,
+            method,
+            meta.params,
+            meta.resource_target_class,
+        );
+        let base = runtime_risk_clamp01(
+            runtime_risk_base_score(capability, method, policy_reason)
+                + argument_signals.risk_delta,
+        );
         let recent_mean = if state.recent_scores.is_empty() {
             0.0
         } else {
@@ -23761,7 +24621,7 @@ impl ExtensionManager {
             });
         }
 
-        let mut risk_score = runtime_risk_clamp01((0.65 * base) + (0.35 * recent_mean));
+        let mut risk_score = runtime_risk_clamp01((0.50 * base) + (0.30 * recent_mean));
         risk_score = runtime_risk_clamp01(
             risk_score
                 + (0.12 * features.recent_error_rate)
@@ -23771,7 +24631,12 @@ impl ExtensionManager {
         if runtime_risk_is_dangerous(capability)
             && matches!(state.last_decision, Some(RuntimeRiskAction::Harden))
         {
-            risk_score = runtime_risk_clamp01(risk_score + 0.10);
+            let escalation_bonus = if argument_signals.risk_delta >= 0.18 {
+                0.10
+            } else {
+                0.02
+            };
+            risk_score = runtime_risk_clamp01(risk_score + escalation_bonus);
         }
 
         state.recent_scores.push_back(risk_score);
@@ -23860,6 +24725,24 @@ impl ExtensionManager {
         if features.prior_failure_streak_norm >= 0.25 {
             triggers.push("consecutive_failure_escalation".to_string());
         }
+        if argument_signals.has(ARG_FLAG_SUSPICIOUS_EXEC) {
+            triggers.push("suspicious_exec_detail".to_string());
+        }
+        if argument_signals.has(ARG_FLAG_DCG_PATTERN_HIT) {
+            triggers.push("dcg_rule_hit".to_string());
+        }
+        if argument_signals.has(ARG_FLAG_DCG_HEREDOC_HIT) {
+            triggers.push("dcg_heredoc_hit".to_string());
+        }
+        if argument_signals.has(ARG_FLAG_SENSITIVE_PATH) {
+            triggers.push("sensitive_path_target".to_string());
+        }
+        if argument_signals.has(ARG_FLAG_PUBLIC_NETWORK) {
+            triggers.push("public_network_target".to_string());
+        }
+        if argument_signals.has(ARG_FLAG_SECRET_ENV_ACCESS) {
+            triggers.push("secret_env_access".to_string());
+        }
         if runtime_risk_is_dangerous(capability)
             && matches!(state.last_decision, Some(RuntimeRiskAction::Harden))
         {
@@ -23873,10 +24756,11 @@ impl ExtensionManager {
                 triggers.push("unseen_capability_transition".to_string());
             }
         }
-        if matches!(
-            meta.resource_target_class,
-            "fs" | "process" | "network" | "credential"
-        ) && features.dangerous_capability > 0.5
+        if (meta.resource_target_class.starts_with("filesystem.")
+            || meta.resource_target_class.starts_with("subprocess.")
+            || meta.resource_target_class.starts_with("network.")
+            || meta.resource_target_class.starts_with("credential."))
+            && features.dangerous_capability > 0.5
         {
             triggers.push("sensitive_target_mismatch".to_string());
         }
@@ -43295,6 +44179,37 @@ mod tests {
     }
 
     #[test]
+    fn runtime_risk_dcg_layer_flags_git_reset_hard() {
+        let (score, matched) = runtime_hostcall_dcg_command_score("git reset --hard HEAD~1");
+        assert!(matched);
+        assert!(score > 0.30);
+    }
+
+    #[test]
+    fn runtime_risk_dcg_heredoc_detects_hidden_destructive_payload() {
+        let command = "bash -lc 'cat <<EOF\nrm -rf /\nEOF'";
+        let (score, matched) = runtime_hostcall_dcg_heredoc_score(command);
+        assert!(matched);
+        assert!(score > 0.20);
+    }
+
+    #[test]
+    fn runtime_risk_dcg_heredoc_ast_detects_python_delete_api() {
+        let command = "python3 <<'PY'\nimport shutil\nshutil.rmtree('/tmp/demo')\nPY";
+        let (score, matched) = runtime_hostcall_dcg_heredoc_score(command);
+        assert!(matched);
+        assert!(score > 0.20);
+    }
+
+    #[test]
+    fn runtime_risk_argument_signals_reduce_benign_exec_baseline() {
+        let params = json!({ "command": "ls -la" });
+        let signals = runtime_hostcall_argument_signals("exec", "exec", &params, "subprocess.exec");
+        assert!(signals.risk_delta < 0.0);
+        assert!(!signals.has(ARG_FLAG_SUSPICIOUS_EXEC));
+    }
+
+    #[test]
     fn explanation_allow_has_contributors() {
         let features = make_test_features(0.1, 0.05);
         let posterior = make_test_posterior(0.8, 0.15, 0.05);
@@ -43910,6 +44825,7 @@ mod tests {
         let meta = RuntimeRiskCallMetadata {
             args_shape_hash: "hash_test",
             resource_target_class: "fs",
+            params: &Value::Null,
             timeout_ms: None,
             policy_profile: "permissive",
         };
@@ -43988,37 +44904,37 @@ mod tests {
 
     #[test]
     fn golden_base_score_exec() {
-        assert!((runtime_risk_base_score("exec", "exec", "") - 1.0).abs() < 1e-10);
-        assert!((runtime_risk_base_score("exec", "run", "") - 0.95).abs() < 1e-10);
+        assert!((runtime_risk_base_score("exec", "exec", "") - 0.58).abs() < 1e-10);
+        assert!((runtime_risk_base_score("exec", "run", "") - 0.48).abs() < 1e-10);
     }
 
     #[test]
     fn golden_base_score_env() {
-        assert!((runtime_risk_base_score("env", "get", "") - 0.85).abs() < 1e-10);
+        assert!((runtime_risk_base_score("env", "get", "") - 0.40).abs() < 1e-10);
     }
 
     #[test]
     fn golden_base_score_http() {
-        assert!((runtime_risk_base_score("http", "http", "") - 0.82).abs() < 1e-10);
-        assert!((runtime_risk_base_score("http", "fetch", "") - 0.70).abs() < 1e-10);
+        assert!((runtime_risk_base_score("http", "http", "") - 0.40).abs() < 1e-10);
+        assert!((runtime_risk_base_score("http", "fetch", "") - 0.32).abs() < 1e-10);
     }
 
     #[test]
     fn golden_base_score_low_risk() {
-        assert!((runtime_risk_base_score("log", "log", "") - 0.25).abs() < 1e-10);
-        assert!((runtime_risk_base_score("read", "read", "") - 0.15).abs() < 1e-10);
-        assert!((runtime_risk_base_score("ui", "render", "") - 0.20).abs() < 1e-10);
+        assert!((runtime_risk_base_score("log", "log", "") - 0.12).abs() < 1e-10);
+        assert!((runtime_risk_base_score("read", "read", "") - 0.06).abs() < 1e-10);
+        assert!((runtime_risk_base_score("ui", "render", "") - 0.08).abs() < 1e-10);
     }
 
     #[test]
     fn golden_base_score_policy_bonus() {
         let base = runtime_risk_base_score("exec", "exec", "prompt_user_confirm");
-        // exec(0.95) + exec_method(0.20) + prompt_user(0.15) = 1.30 → clamped to 1.0
-        assert!((base - 1.0).abs() < 1e-10);
+        // exec(0.48) + exec_method(0.10) + prompt_user(0.15) = 0.73
+        assert!((base - 0.73).abs() < 1e-10);
 
         let base = runtime_risk_base_score("log", "log", "prompt_cache_hit");
-        // log(0.25) + prompt_cache(0.08) = 0.33
-        assert!((base - 0.33).abs() < 1e-10);
+        // log(0.12) + prompt_cache(0.08) = 0.20
+        assert!((base - 0.20).abs() < 1e-10);
     }
 
     #[test]
@@ -44055,6 +44971,7 @@ mod tests {
         let meta = RuntimeRiskCallMetadata {
             args_shape_hash: "golden",
             resource_target_class: "fs",
+            params: &Value::Null,
             timeout_ms: None,
             policy_profile: "default",
         };
@@ -44110,6 +45027,7 @@ mod tests {
         let meta = RuntimeRiskCallMetadata {
             args_shape_hash: "golden",
             resource_target_class: "fs",
+            params: &Value::Null,
             timeout_ms: Some(10),
             policy_profile: "default",
         };
@@ -44170,6 +45088,7 @@ mod tests {
         let meta = RuntimeRiskCallMetadata {
             args_shape_hash: "golden",
             resource_target_class: "fs",
+            params: &Value::Null,
             timeout_ms: None,
             policy_profile: "default",
         };
@@ -44233,7 +45152,8 @@ mod tests {
         };
         let meta_fs = RuntimeRiskCallMetadata {
             args_shape_hash: "golden",
-            resource_target_class: "fs",
+            resource_target_class: "subprocess.exec",
+            params: &Value::Null,
             timeout_ms: None,
             policy_profile: "default",
         };
@@ -44274,6 +45194,7 @@ mod tests {
         let meta = RuntimeRiskCallMetadata {
             args_shape_hash: "golden",
             resource_target_class: "unknown",
+            params: &Value::Null,
             timeout_ms: None,
             policy_profile: "default",
         };
@@ -44336,6 +45257,7 @@ mod tests {
         let meta = RuntimeRiskCallMetadata {
             args_shape_hash: "golden",
             resource_target_class: "unknown",
+            params: &Value::Null,
             timeout_ms: None,
             policy_profile: "default",
         };
