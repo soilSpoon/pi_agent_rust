@@ -294,10 +294,32 @@ fetch_url_to_file() {
   local url="$1"
   local output_path="$2"
   local context="${3:-resource}"
+  local connect_timeout="${PI_INSTALLER_CONNECT_TIMEOUT:-10}"
+  local max_time="${PI_INSTALLER_MAX_TIME:-180}"
+  local retries="${PI_INSTALLER_RETRIES:-2}"
+  local retry_delay="${PI_INSTALLER_RETRY_DELAY:-1}"
 
   if ! ensure_network_allowed "$url" "$context"; then
     return 1
   fi
+
+  case "$context" in
+    "agent skill")
+      connect_timeout="${PI_INSTALLER_AGENT_SKILL_CONNECT_TIMEOUT:-3}"
+      max_time="${PI_INSTALLER_AGENT_SKILL_MAX_TIME:-8}"
+      retries="${PI_INSTALLER_AGENT_SKILL_RETRIES:-0}"
+      ;;
+    "release artifact")
+      connect_timeout="${PI_INSTALLER_ARTIFACT_CONNECT_TIMEOUT:-10}"
+      max_time="${PI_INSTALLER_ARTIFACT_MAX_TIME:-240}"
+      retries="${PI_INSTALLER_ARTIFACT_RETRIES:-2}"
+      ;;
+    "release checksum manifest"|"checksum file"|"derived checksum file"|"sigstore bundle")
+      connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
+      max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
+      retries="${PI_INSTALLER_META_RETRIES:-2}"
+      ;;
+  esac
 
   if is_local_resource_ref "$url"; then
     local local_path
@@ -310,16 +332,39 @@ fetch_url_to_file() {
     return 0
   fi
 
-  curl -fsSL "${PROXY_ARGS[@]}" "$url" -o "$output_path"
+  curl -fsSL "${PROXY_ARGS[@]}" \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    --retry "$retries" \
+    --retry-delay "$retry_delay" \
+    --retry-connrefused \
+    "$url" -o "$output_path"
 }
 
 fetch_url_to_stdout() {
   local url="$1"
   local context="${2:-resource}"
+  local connect_timeout="${PI_INSTALLER_CONNECT_TIMEOUT:-10}"
+  local max_time="${PI_INSTALLER_MAX_TIME:-180}"
+  local retries="${PI_INSTALLER_RETRIES:-2}"
+  local retry_delay="${PI_INSTALLER_RETRY_DELAY:-1}"
 
   if ! ensure_network_allowed "$url" "$context"; then
     return 1
   fi
+
+  case "$context" in
+    "agent skill")
+      connect_timeout="${PI_INSTALLER_AGENT_SKILL_CONNECT_TIMEOUT:-3}"
+      max_time="${PI_INSTALLER_AGENT_SKILL_MAX_TIME:-8}"
+      retries="${PI_INSTALLER_AGENT_SKILL_RETRIES:-0}"
+      ;;
+    "release checksum manifest"|"checksum file"|"derived checksum file"|"sigstore bundle")
+      connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
+      max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
+      retries="${PI_INSTALLER_META_RETRIES:-2}"
+      ;;
+  esac
 
   if is_local_resource_ref "$url"; then
     local local_path
@@ -332,23 +377,52 @@ fetch_url_to_stdout() {
     return 0
   fi
 
-  curl -fsSL "${PROXY_ARGS[@]}" "$url"
+  curl -fsSL "${PROXY_ARGS[@]}" \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    --retry "$retries" \
+    --retry-delay "$retry_delay" \
+    --retry-connrefused \
+    "$url"
 }
 
 fetch_effective_url() {
   local url="$1"
   local context="${2:-resource}"
+  local connect_timeout="${PI_INSTALLER_CONNECT_TIMEOUT:-10}"
+  local max_time="${PI_INSTALLER_MAX_TIME:-180}"
+  local retries="${PI_INSTALLER_RETRIES:-2}"
+  local retry_delay="${PI_INSTALLER_RETRY_DELAY:-1}"
 
   if ! ensure_network_allowed "$url" "$context"; then
     return 1
   fi
+
+  case "$context" in
+    "agent skill")
+      connect_timeout="${PI_INSTALLER_AGENT_SKILL_CONNECT_TIMEOUT:-3}"
+      max_time="${PI_INSTALLER_AGENT_SKILL_MAX_TIME:-8}"
+      retries="${PI_INSTALLER_AGENT_SKILL_RETRIES:-0}"
+      ;;
+    "release checksum manifest"|"checksum file"|"derived checksum file"|"sigstore bundle")
+      connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
+      max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
+      retries="${PI_INSTALLER_META_RETRIES:-2}"
+      ;;
+  esac
 
   if is_local_resource_ref "$url"; then
     printf '%s\n' "$url"
     return 0
   fi
 
-  curl -fsSL -o /dev/null -w '%{url_effective}' "${PROXY_ARGS[@]}" "$url"
+  curl -fsSL -o /dev/null -w '%{url_effective}' "${PROXY_ARGS[@]}" \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    --retry "$retries" \
+    --retry-delay "$retry_delay" \
+    --retry-connrefused \
+    "$url"
 }
 
 probe_url_head() {
