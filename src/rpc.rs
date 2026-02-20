@@ -1590,6 +1590,15 @@ pub async fn run(
         }
     }
 
+    // Explicitly shut down extension runtimes before the session drops.
+    // Without this, ExtensionRegion::drop() runs synchronously and cannot
+    // coordinate with the QuickJS runtime thread's GC cleanup.
+    if let Ok(guard) = session.lock(&cx).await {
+        if let Some(ref ext) = guard.extensions {
+            ext.shutdown().await;
+        }
+    }
+
     Ok(())
 }
 

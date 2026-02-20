@@ -1233,7 +1233,7 @@ async fn run(
         )
         .await
     } else {
-        run_print_mode(
+        let result = run_print_mode(
             &mut agent_session,
             &mode,
             initial,
@@ -1242,7 +1242,15 @@ async fn run(
             runtime_handle.clone(),
             &config,
         )
-        .await
+        .await;
+        // Explicitly shut down extension runtimes before the session drops.
+        // Without this, ExtensionRegion::drop() runs synchronously and cannot
+        // coordinate with the QuickJS runtime thread, causing a GC assertion
+        // failure (non-empty gc_obj_list) when 2+ JS extensions are loaded.
+        if let Some(ref ext) = agent_session.extensions {
+            ext.shutdown().await;
+        }
+        result
     };
 
     // Best-effort autosave flush on shutdown.
@@ -3832,7 +3840,7 @@ async fn run_interactive_mode(
     // Extract manager for the interactive loop; the region stays alive to
     // handle shutdown when this scope exits.
     let extensions = region.as_ref().map(|r| r.manager().clone());
-    pi::interactive::run_interactive(
+    let interactive_result = pi::interactive::run_interactive(
         agent,
         session,
         config,
@@ -3847,7 +3855,15 @@ async fn run_interactive_mode(
         cwd,
         runtime_handle,
     )
-    .await?;
+    .await;
+    // Explicitly shut down extension runtimes so the QuickJS GC can
+    // collect all objects before JS_FreeRuntime asserts an empty gc_obj_list.
+    // Must run even on error — otherwise ExtensionRegion::drop() runs
+    // synchronously and the GC assertion fires.
+    if let Some(ref region) = region {
+        region.shutdown().await;
+    }
+    interactive_result?;
     Ok(())
 }
 
