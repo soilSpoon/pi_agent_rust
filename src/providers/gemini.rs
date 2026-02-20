@@ -166,7 +166,7 @@ impl GeminiProvider {
 
     /// Build the contents array from context messages.
     fn build_contents(context: &Context<'_>) -> Vec<GeminiContent> {
-        let mut contents = Vec::new();
+        let mut contents = Vec::with_capacity(context.messages.len());
 
         for message in context.messages.iter() {
             contents.extend(convert_message_to_gemini(message));

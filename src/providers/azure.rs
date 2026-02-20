@@ -720,8 +720,7 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
                     ContentBlock::Text(t) => Some(t.text.as_str()),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect::<String>();
 
             // Collect tool calls
             let tool_calls: Vec<AzureToolCallRef> = assistant

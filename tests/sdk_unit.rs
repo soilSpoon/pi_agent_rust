@@ -99,10 +99,10 @@ fn callback_ordering_session_listeners_fire_for_every_event() {
 
     // Fire multiple different events.
     listeners.notify(&AgentEvent::AgentStart {
-        session_id: "s1".to_string(),
+        session_id: "s1".into(),
     });
     listeners.notify(&AgentEvent::AgentEnd {
-        session_id: "s1".to_string(),
+        session_id: "s1".into(),
         messages: vec![],
         error: None,
     });
@@ -156,7 +156,7 @@ fn transport_session_transport_event_variants_debug() {
     let harness = TestHarness::new("transport_session_transport_event_variants_debug");
 
     let in_process_event = SessionTransportEvent::InProcess(AgentEvent::AgentStart {
-        session_id: "test".to_string(),
+        session_id: "test".into(),
     });
     let rpc_event = SessionTransportEvent::Rpc(json!({"type": "agent_start"}));
 
@@ -1046,7 +1046,7 @@ fn event_listeners_notify_with_no_subscribers_is_safe() {
     let listeners = EventListeners::default();
     // Should not panic with zero subscribers.
     listeners.notify(&AgentEvent::AgentStart {
-        session_id: "test".to_string(),
+        session_id: "test".into(),
     });
     listeners.notify_tool_start("bash", &json!({}));
     listeners.notify_tool_end(
@@ -1105,10 +1105,10 @@ fn event_listeners_clone_shares_subscribers() {
 
     // Notify on the clone — should invoke the subscriber.
     cloned.notify(&AgentEvent::AgentStart {
-        session_id: "s".to_string(),
+        session_id: "s".into(),
     });
     listeners.notify(&AgentEvent::AgentStart {
-        session_id: "s2".to_string(),
+        session_id: "s2".into(),
     });
 
     assert_eq!(
@@ -1136,7 +1136,7 @@ fn event_listeners_unsubscribe_stops_notifications() {
     }));
 
     listeners.notify(&AgentEvent::AgentStart {
-        session_id: "s".to_string(),
+        session_id: "s".into(),
     });
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
@@ -1144,7 +1144,7 @@ fn event_listeners_unsubscribe_stops_notifications() {
     assert!(removed, "unsubscribe should return true");
 
     listeners.notify(&AgentEvent::AgentStart {
-        session_id: "s2".to_string(),
+        session_id: "s2".into(),
     });
     assert_eq!(
         count.load(Ordering::SeqCst),

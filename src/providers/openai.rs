@@ -248,7 +248,7 @@ impl OpenAIProvider {
         context: &'a Context<'_>,
         system_role: &str,
     ) -> Vec<OpenAIMessage<'a>> {
-        let mut messages = Vec::new();
+        let mut messages = Vec::with_capacity(context.messages.len() + 1);
 
         // Add system prompt as first message
         if let Some(system) = &context.system_prompt {
@@ -980,8 +980,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                     ContentBlock::Text(t) => Some(t.text.as_str()),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect::<String>();
 
             // Collect tool calls
             let tool_calls: Vec<OpenAIToolCallRef<'_>> = assistant

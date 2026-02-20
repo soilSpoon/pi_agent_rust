@@ -430,17 +430,17 @@ impl ExtensionStreamSimpleProvider {
 
     fn build_js_model(model: &crate::provider::Model) -> Value {
         serde_json::json!({
-            "id": model.id.clone(),
-            "name": model.name.clone(),
-            "api": model.api.clone(),
-            "provider": model.provider.clone(),
-            "baseUrl": model.base_url.clone(),
+            "id": &model.id,
+            "name": &model.name,
+            "api": &model.api,
+            "provider": &model.provider,
+            "baseUrl": &model.base_url,
             "reasoning": model.reasoning,
-            "input": model.input.clone(),
-            "cost": model.cost.clone(),
+            "input": &model.input,
+            "cost": &model.cost,
             "contextWindow": model.context_window,
             "maxTokens": model.max_tokens,
-            "headers": model.headers.clone(),
+            "headers": &model.headers,
         })
     }
 

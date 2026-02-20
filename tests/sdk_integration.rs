@@ -958,10 +958,10 @@ fn sdk_conformance_tool_event_ordering() {
 fn sdk_conformance_agent_event_json_schema() {
     let events = vec![
         AgentEvent::AgentStart {
-            session_id: "s1".to_string(),
+            session_id: "s1".into(),
         },
         AgentEvent::TurnStart {
-            session_id: "s1".to_string(),
+            session_id: "s1".into(),
             turn_index: 0,
             timestamp: 1_234_567_890,
         },
@@ -981,7 +981,7 @@ fn sdk_conformance_agent_event_json_schema() {
             is_error: false,
         },
         AgentEvent::AgentEnd {
-            session_id: "s1".to_string(),
+            session_id: "s1".into(),
             messages: vec![],
             error: None,
         },

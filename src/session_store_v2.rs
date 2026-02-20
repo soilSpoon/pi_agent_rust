@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -32,7 +33,7 @@ const GENESIS_CHAIN_HASH: &str = "0000000000000000000000000000000000000000000000
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentFrame {
-    pub schema: String,
+    pub schema: Cow<'static, str>,
     pub segment_seq: u64,
     pub frame_seq: u64,
     pub entry_seq: u64,
@@ -58,7 +59,7 @@ impl SegmentFrame {
     ) -> Result<Self> {
         let (payload_sha256, payload_bytes) = payload_hash_and_size(&payload)?;
         Ok(Self {
-            schema: SEGMENT_FRAME_SCHEMA.to_string(),
+            schema: Cow::Borrowed(SEGMENT_FRAME_SCHEMA),
             segment_seq,
             frame_seq,
             entry_seq,
@@ -76,7 +77,7 @@ impl SegmentFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OffsetIndexEntry {
-    pub schema: String,
+    pub schema: Cow<'static, str>,
     pub entry_seq: u64,
     pub entry_id: String,
     pub segment_seq: u64,
@@ -84,7 +85,7 @@ pub struct OffsetIndexEntry {
     pub byte_offset: u64,
     pub byte_length: u64,
     pub crc32c: String,
-    pub state: String,
+    pub state: Cow<'static, str>,
 }
 
 /// Current head position of the store (last written entry).
@@ -408,11 +409,7 @@ impl SessionStoreV2 {
             .open(&segment_path)?;
 
         let pre_write_len = segment.seek(SeekFrom::End(0))?;
-        if let Err(e) = (|| -> std::io::Result<()> {
-            segment.write_all(&write_buf)?;
-            segment.flush()?;
-            Ok(())
-        })() {
+        if let Err(e) = segment.write_all(&write_buf) {
             let _ = segment.set_len(pre_write_len);
             return Err(Error::from(e));
         }
@@ -420,7 +417,7 @@ impl SessionStoreV2 {
         // Use write_buf (which includes the newline) for CRC calculation
         let crc = crc32c_upper(&write_buf);
         let index_entry = OffsetIndexEntry {
-            schema: OFFSET_INDEX_SCHEMA.to_string(),
+            schema: Cow::Borrowed(OFFSET_INDEX_SCHEMA),
             entry_seq: frame.entry_seq,
             entry_id: frame.entry_id.clone(),
             segment_seq: frame.segment_seq,
@@ -428,7 +425,7 @@ impl SessionStoreV2 {
             byte_offset,
             byte_length: line_len,
             crc32c: crc.clone(),
-            state: "active".to_string(),
+            state: Cow::Borrowed("active"),
         };
 
         if let Err(e) = append_jsonl_line(&self.index_file_path(), &index_entry) {
@@ -1075,7 +1072,7 @@ impl SessionStoreV2 {
                 let crc = crc32c_upper(&record_bytes);
 
                 let index_entry = OffsetIndexEntry {
-                    schema: OFFSET_INDEX_SCHEMA.to_string(),
+                    schema: Cow::Borrowed(OFFSET_INDEX_SCHEMA),
                     entry_seq: frame.entry_seq,
                     entry_id: frame.entry_id.clone(),
                     segment_seq: frame.segment_seq,
@@ -1083,7 +1080,7 @@ impl SessionStoreV2 {
                     byte_offset,
                     byte_length: line_len,
                     crc32c: crc.clone(),
-                    state: "active".to_string(),
+                    state: Cow::Borrowed("active"),
                 };
                 serde_json::to_writer(&mut index_writer, &index_entry)?;
                 index_writer.write_all(b"\n")?;
@@ -1417,17 +1414,15 @@ pub fn has_v2_sidecar(jsonl_path: &Path) -> bool {
 
 fn append_jsonl_line<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let mut buf = serde_json::to_vec(value)?;
-    buf.push(b'\n');
-    file.write_all(&buf)?;
-    file.flush()?;
+    // Serialize directly to file — avoids intermediate Vec<u8> allocation.
+    serde_json::to_writer(&mut file, value)?;
+    file.write_all(b"\n")?;
     Ok(())
 }
 
 fn truncate_file_to(path: &Path, len: u64) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).truncate(false).open(path)?;
+    let file = OpenOptions::new().write(true).truncate(false).open(path)?;
     file.set_len(len)?;
-    file.flush()?;
     Ok(())
 }
 

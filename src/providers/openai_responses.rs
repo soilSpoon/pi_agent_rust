@@ -873,7 +873,7 @@ fn convert_tool_to_openai_responses(tool: &ToolDef) -> OpenAIResponsesTool {
 }
 
 fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInputItem> {
-    let mut input = Vec::new();
+    let mut input = Vec::with_capacity(context.messages.len());
 
     // System prompt is sent as top-level `instructions` field, not in input array.
     // Some providers (e.g. OpenAI Codex) require `instructions` and reject system

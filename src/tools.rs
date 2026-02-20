@@ -2358,13 +2358,16 @@ fn diff_parts(old_content: &str, new_content: &str) -> Vec<DiffPart> {
 
 fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option<usize>) {
     let parts = diff_parts(old_content, new_content);
-    let mut output: Vec<String> = Vec::new();
 
-    let old_line_count = old_content.split('\n').count();
-    let new_line_count = new_content.split('\n').count();
+    // Count newlines with memchr (avoids iterator-item overhead of split().count())
+    let old_line_count = memchr::memchr_iter(b'\n', old_content.as_bytes()).count() + 1;
+    let new_line_count = memchr::memchr_iter(b'\n', new_content.as_bytes()).count() + 1;
     let max_line_num = old_line_count.max(new_line_count).max(1);
-    let line_num_width = max_line_num.to_string().len();
+    let line_num_width = max_line_num.ilog10() as usize + 1;
 
+    // Single String buffer instead of Vec<String> + join — eliminates per-line
+    // String allocations and the final join copy.
+    let mut output = String::new();
     let mut old_line_num: usize = 1;
     let mut new_line_num: usize = 1;
     let mut last_was_change = false;
@@ -2372,10 +2375,13 @@ fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option
     let context_lines: usize = 4;
 
     for (i, part) in parts.iter().enumerate() {
-        let mut raw: Vec<&str> = part.value.split('\n').collect();
-        if raw.last().is_some_and(|l| l.is_empty()) {
-            raw.pop();
-        }
+        let collected: Vec<&str> = part.value.split('\n').collect();
+        // Trim trailing empty element from split
+        let raw = if collected.last().is_some_and(|l| l.is_empty()) {
+            &collected[..collected.len() - 1]
+        } else {
+            &collected[..]
+        };
 
         match part.tag {
             DiffTag::Added | DiffTag::Removed => {
@@ -2384,15 +2390,16 @@ fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option
                 }
 
                 for line in raw {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
                     match part.tag {
                         DiffTag::Added => {
-                            let line_num = format!("{new_line_num:>line_num_width$}");
-                            output.push(format!("+{line_num} {line}"));
+                            let _ = write!(output, "+{new_line_num:>line_num_width$} {line}");
                             new_line_num = new_line_num.saturating_add(1);
                         }
                         DiffTag::Removed => {
-                            let line_num = format!("{old_line_num:>line_num_width$}");
-                            output.push(format!("-{line_num} {line}"));
+                            let _ = write!(output, "-{old_line_num:>line_num_width$} {line}");
                             old_line_num = old_line_num.saturating_add(1);
                         }
                         DiffTag::Equal => {}
@@ -2406,35 +2413,44 @@ fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option
                     && matches!(parts[i + 1].tag, DiffTag::Added | DiffTag::Removed);
 
                 if last_was_change || next_part_is_change {
-                    let mut lines_to_show: Vec<&str> = raw.clone();
-                    let mut skip_start: usize = 0;
-                    let mut skip_end: usize = 0;
-
-                    if !last_was_change {
-                        skip_start = raw.len().saturating_sub(context_lines);
-                        lines_to_show = raw[skip_start..].to_vec();
-                    }
-
-                    if !next_part_is_change && lines_to_show.len() > context_lines {
-                        skip_end = lines_to_show.len().saturating_sub(context_lines);
-                        lines_to_show = lines_to_show[..context_lines].to_vec();
-                    }
+                    // Compute slice bounds directly instead of cloning Vecs
+                    let start = if last_was_change {
+                        0
+                    } else {
+                        raw.len().saturating_sub(context_lines)
+                    };
+                    let lines_after_start = raw.len() - start;
+                    let (end, skip_end) =
+                        if !next_part_is_change && lines_after_start > context_lines {
+                            (start + context_lines, lines_after_start - context_lines)
+                        } else {
+                            (raw.len(), 0)
+                        };
+                    let skip_start = start;
 
                     if skip_start > 0 {
-                        output.push(format!(" {} ...", " ".repeat(line_num_width)));
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        let _ = write!(output, " {:>line_num_width$} ...", " ");
                         old_line_num = old_line_num.saturating_add(skip_start);
                         new_line_num = new_line_num.saturating_add(skip_start);
                     }
 
-                    for line in lines_to_show {
-                        let line_num = format!("{old_line_num:>line_num_width$}");
-                        output.push(format!(" {line_num} {line}"));
+                    for line in &raw[start..end] {
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        let _ = write!(output, " {old_line_num:>line_num_width$} {line}");
                         old_line_num = old_line_num.saturating_add(1);
                         new_line_num = new_line_num.saturating_add(1);
                     }
 
                     if skip_end > 0 {
-                        output.push(format!(" {} ...", " ".repeat(line_num_width)));
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        let _ = write!(output, " {:>line_num_width$} ...", " ");
                         old_line_num = old_line_num.saturating_add(skip_end);
                         new_line_num = new_line_num.saturating_add(skip_end);
                     }
@@ -2448,7 +2464,7 @@ fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option
         }
     }
 
-    (output.join("\n"), first_changed_line)
+    (output, first_changed_line)
 }
 
 #[async_trait]

@@ -968,10 +968,14 @@ fn is_js_like(path: &Path) -> bool {
 
 fn relative_posix(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::new();
+    for component in rel.components() {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(&component.as_os_str().to_string_lossy());
+    }
+    out
 }
 
 fn sort_evidence(evidence: &mut [CompatEvidence]) {
@@ -4367,6 +4371,9 @@ impl SecretBrokerPolicy {
 /// inline `-p password` or `--password password` style arguments.
 #[must_use]
 pub fn redact_command_for_logging(policy: &SecretBrokerPolicy, cmd: &str) -> String {
+    static PASSWORD_RE: OnceLock<Regex> = OnceLock::new();
+    static ENV_RE: OnceLock<Regex> = OnceLock::new();
+
     if !policy.enabled {
         return cmd.to_string();
     }
@@ -4374,9 +4381,10 @@ pub fn redact_command_for_logging(policy: &SecretBrokerPolicy, cmd: &str) -> Str
     // 1. Redact -p/--password arguments
     // Handles: -p password, -p 'pass word', --password=password
     let mut redacted = cmd.to_string();
-    let password_regex =
+    let password_regex = PASSWORD_RE.get_or_init(|| {
         Regex::new(r#"(?i)(--password|-p)(\s+|=)(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^\s]+)"#)
-            .expect("regex");
+            .expect("regex")
+    });
     redacted = password_regex
         .replace_all(&redacted, |caps: &regex::Captures| {
             let flag = &caps[1];
@@ -4387,9 +4395,10 @@ pub fn redact_command_for_logging(policy: &SecretBrokerPolicy, cmd: &str) -> Str
 
     // 2. Redact KEY=VALUE patterns
     // Handles: KEY=value, KEY='value with spaces', KEY="value with spaces"
-    let env_regex =
+    let env_regex = ENV_RE.get_or_init(|| {
         Regex::new(r#"([A-Za-z_][A-Za-z0-9_]*)=('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^\s]+)"#)
-            .expect("regex");
+            .expect("regex")
+    });
     redacted = env_regex
         .replace_all(&redacted, |caps: &regex::Captures| {
             let key = &caps[1];

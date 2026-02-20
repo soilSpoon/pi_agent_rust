@@ -505,11 +505,14 @@ impl ModelRegistry {
     pub fn find(&self, provider: &str, id: &str) -> Option<ModelEntry> {
         let provider = provider.trim();
         let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
-        let lookup_ids = if canonical_provider.eq_ignore_ascii_case("openrouter") {
+        let is_openrouter = canonical_provider.eq_ignore_ascii_case("openrouter");
+        // Avoid Vec + String allocation for the common (non-OpenRouter) path.
+        let openrouter_ids = if is_openrouter {
             openrouter_model_lookup_ids(id)
         } else {
-            vec![id.trim().to_string()]
+            Vec::new()
         };
+        let trimmed_id = id.trim();
 
         self.models
             .iter()
@@ -522,9 +525,13 @@ impl ModelRegistry {
                     || model_provider_canonical.eq_ignore_ascii_case(provider)
                     || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
                 provider_matches
-                    && lookup_ids
-                        .iter()
-                        .any(|lookup_id| m.model.id.eq_ignore_ascii_case(lookup_id))
+                    && if is_openrouter {
+                        openrouter_ids
+                            .iter()
+                            .any(|lookup_id| m.model.id.eq_ignore_ascii_case(lookup_id))
+                    } else {
+                        m.model.id.eq_ignore_ascii_case(trimmed_id)
+                    }
             })
             .cloned()
     }
