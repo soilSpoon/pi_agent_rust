@@ -166,12 +166,18 @@ fn kimi_device_id() -> String {
         let _ = fs::create_dir_all(parent);
     }
 
-    if fs::write(&primary, generated.as_bytes()).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&primary, fs::Permissions::from_mode(0o600));
-        }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    if let Ok(mut file) = options.open(&primary) {
+        use std::io::Write;
+        let _ = file.write_all(generated.as_bytes());
     }
 
     generated

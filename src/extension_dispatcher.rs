@@ -780,11 +780,14 @@ fn hostcall_io_hint(kind: &HostcallKind) -> HostcallIoHint {
             let name = name.trim();
             if name.eq_ignore_ascii_case("read")
                 || name.eq_ignore_ascii_case("write")
+                || name.eq_ignore_ascii_case("edit")
                 || name.eq_ignore_ascii_case("grep")
                 || name.eq_ignore_ascii_case("find")
                 || name.eq_ignore_ascii_case("ls")
             {
                 HostcallIoHint::IoHeavy
+            } else if name.eq_ignore_ascii_case("bash") {
+                HostcallIoHint::CpuBound
             } else {
                 HostcallIoHint::Unknown
             }
@@ -802,10 +805,10 @@ fn hostcall_io_hint(kind: &HostcallKind) -> HostcallIoHint {
                 HostcallIoHint::Unknown
             }
         }
-        HostcallKind::Exec { .. } => HostcallIoHint::Unknown,
-        HostcallKind::Ui { .. } | HostcallKind::Events { .. } | HostcallKind::Log => {
-            HostcallIoHint::CpuBound
-        }
+        HostcallKind::Exec { .. }
+        | HostcallKind::Ui { .. }
+        | HostcallKind::Events { .. }
+        | HostcallKind::Log => HostcallIoHint::CpuBound,
     }
 }
 
@@ -1867,6 +1870,21 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
 
     #[allow(clippy::future_not_send)]
     async fn dispatch_hostcall_fast(&self, request: &HostcallRequest) -> HostcallOutcome {
+        let cap = request.required_capability();
+        let (check, lookup_path) = self.policy_lookup(cap, request.extension_id.as_deref());
+        self.emit_policy_decision_telemetry(
+            cap,
+            request.extension_id.as_deref(),
+            lookup_path,
+            &check,
+        );
+        if check.decision != PolicyDecision::Allow {
+            return HostcallOutcome::Error {
+                code: "denied".to_string(),
+                message: format!("Capability '{}' denied by policy ({})", cap, check.reason),
+            };
+        }
+
         match &request.kind {
             HostcallKind::Tool { name } => {
                 self.dispatch_tool(&request.call_id, name, request.payload.clone())
@@ -1903,8 +1921,11 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 .await
             }
             HostcallKind::Log => {
-                // Log hostcalls are handled by the shared dispatcher path.
-                // Return success here for the legacy dispatcher fallback.
+                tracing::info!(
+                    target: "pi.extension.log",
+                    payload = ?request.payload,
+                    "Extension log"
+                );
                 HostcallOutcome::Success(serde_json::json!({ "logged": true }))
             }
         }
@@ -2407,6 +2428,11 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .await
             }
             Some(ProtocolHostcallMethod::Log) => {
+                tracing::info!(
+                    target: "pi.extension.log",
+                    payload = ?payload.params,
+                    "Extension log"
+                );
                 HostcallOutcome::Success(serde_json::json!({ "logged": true }))
             }
             None => HostcallOutcome::Error {
@@ -12640,6 +12666,31 @@ mod tests {
                 op: "get_state".to_string()
             }),
             HostcallIoHint::Unknown
+        );
+    }
+
+    #[test]
+    fn hostcall_io_hint_classifies_edit_bash_and_exec() {
+        assert_eq!(
+            hostcall_io_hint(&HostcallKind::Tool {
+                name: "edit".to_string()
+            }),
+            HostcallIoHint::IoHeavy,
+            "edit tool should be IoHeavy"
+        );
+        assert_eq!(
+            hostcall_io_hint(&HostcallKind::Tool {
+                name: "bash".to_string()
+            }),
+            HostcallIoHint::CpuBound,
+            "bash tool should be CpuBound"
+        );
+        assert_eq!(
+            hostcall_io_hint(&HostcallKind::Exec {
+                cmd: "ls".to_string()
+            }),
+            HostcallIoHint::CpuBound,
+            "exec hostcall should be CpuBound"
         );
     }
 

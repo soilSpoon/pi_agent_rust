@@ -249,12 +249,16 @@ impl AuthStorage {
             fs::create_dir_all(parent)?;
         }
 
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)?;
+        let mut options = File::options();
+        options.read(true).write(true).create(true).truncate(false);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let file = options.open(&self.path)?;
         let mut locked = lock_file(file, Duration::from_secs(30))?;
 
         let data = serde_json::to_string_pretty(&AuthFile {
@@ -267,13 +271,6 @@ impl AuthStorage {
         f.set_len(0)?; // Truncate after seeking to avoid data loss
         f.write_all(data.as_bytes())?;
         f.flush()?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&self.path, perms)?;
-        }
 
         Ok(())
     }
