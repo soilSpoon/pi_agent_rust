@@ -28,22 +28,18 @@ use std::pin::Pin;
 pub(crate) const DEFAULT_API_VERSION: &str = "2024-02-15-preview";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// Map a role string (which may come from compat config at runtime) to a `&'static str`.
-///
-/// The Azure OpenAI API uses a small, well-known set of role names.  When the
-/// value matches one of these we return the corresponding string literal (zero
-/// allocation).  For an unknown role name (extremely rare -- only possible via
-/// exotic compat overrides) we leak a heap copy so that callers can always
-/// work with `&'static str`.
-fn to_static_role(role: &str) -> &'static str {
-    match role {
-        "system" => "system",
-        "developer" => "developer",
-        "user" => "user",
-        "assistant" => "assistant",
-        "tool" => "tool",
-        "function" => "function",
-        other => Box::leak(other.to_string().into_boxed_str()),
+/// Normalize Azure role names while preserving unknown compat overrides as-is.
+fn normalize_role(role: &str) -> String {
+    let trimmed = role.trim();
+    match trimmed {
+        "system" | "developer" | "user" | "assistant" | "tool" | "function" => trimmed.to_string(),
+        _ => {
+            let lowered = trimmed.to_ascii_lowercase();
+            match lowered.as_str() {
+                "system" | "developer" | "user" | "assistant" | "tool" | "function" => lowered,
+                _ => trimmed.to_string(),
+            }
+        }
     }
 }
 
@@ -159,7 +155,7 @@ impl AzureOpenAIProvider {
         // Add system prompt as first message
         if let Some(system) = &context.system_prompt {
             messages.push(AzureMessage {
-                role: to_static_role(system_role),
+                role: normalize_role(system_role),
                 content: Some(AzureContent::Text(system.to_string())),
                 tool_calls: None,
                 tool_call_id: None,
@@ -585,7 +581,7 @@ struct AzureStreamOptions {
 
 #[derive(Debug, Serialize)]
 struct AzureMessage {
-    role: &'static str,
+    role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<AzureContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -702,13 +698,13 @@ struct AzureUsage {
 fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
     match message {
         Message::User(user) => vec![AzureMessage {
-            role: "user",
+            role: "user".to_string(),
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
         }],
         Message::Custom(custom) => vec![AzureMessage {
-            role: "user",
+            role: "user".to_string(),
             content: Some(AzureContent::Text(custom.content.clone())),
             tool_calls: None,
             tool_call_id: None,
@@ -757,7 +753,7 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
             };
 
             messages.push(AzureMessage {
-                role: "assistant",
+                role: "assistant".to_string(),
                 content,
                 tool_calls,
                 tool_call_id: None,
@@ -796,7 +792,7 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
             };
 
             vec![AzureMessage {
-                role: "tool",
+                role: "tool".to_string(),
                 content,
                 tool_calls: None,
                 tool_call_id: Some(result.tool_call_id.clone()),
@@ -987,6 +983,42 @@ mod tests {
         assert_eq!(request_json["max_tokens"], json!(DEFAULT_MAX_TOKENS));
         assert_eq!(request_json["stream"], json!(true));
         assert!(request_json.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_azure_build_request_normalizes_known_system_role_name() {
+        let provider =
+            AzureOpenAIProvider::new("contoso", "gpt-4o").with_compat(Some(CompatConfig {
+                system_role_name: Some("SYSTEM ".to_string()),
+                ..CompatConfig::default()
+            }));
+        let context = Context {
+            system_prompt: Some("You are deterministic.".to_string().into()),
+            messages: Vec::new().into(),
+            tools: Vec::new().into(),
+        };
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let request_json = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(request_json["messages"][0]["role"], json!("system"));
+    }
+
+    #[test]
+    fn test_azure_build_request_preserves_unknown_system_role_name() {
+        let provider =
+            AzureOpenAIProvider::new("contoso", "gpt-4o").with_compat(Some(CompatConfig {
+                system_role_name: Some("custom_role".to_string()),
+                ..CompatConfig::default()
+            }));
+        let context = Context {
+            system_prompt: Some("You are deterministic.".to_string().into()),
+            messages: Vec::new().into(),
+            tools: Vec::new().into(),
+        };
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let request_json = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(request_json["messages"][0]["role"], json!("custom_role"));
     }
 
     #[test]
