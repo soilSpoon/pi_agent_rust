@@ -696,8 +696,6 @@ dependencies = [
 [[package]]
 name = "charmed-bubbletea"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fbf47d60bc19491251ad01bf2e63a41432630eaa90f81c05eba3ac4cc97c1b"
 dependencies = [
  "charmed-bubbletea-macros",
  "crossterm",
@@ -709,8 +707,6 @@ dependencies = [
 [[package]]
 name = "charmed-bubbletea-macros"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ca6d26d4424b06f7b6e393de5cbbb155cb6dc633510d4a696747406f5cfb25"
 dependencies = [
  "darling",
  "proc-macro-error2",
