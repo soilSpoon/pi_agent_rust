@@ -805,12 +805,10 @@ fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
 
         // Safety check: ensure V2 manifest is not stale relative to the source JSONL.
         // If JSONL was modified after the manifest, the counters may be wrong.
-        let use_v2 = if let Ok(manifest_meta) = fs::metadata(&manifest_path) {
+        let use_v2 = fs::metadata(&manifest_path).is_ok_and(|manifest_meta| {
             let manifest_mod = manifest_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             manifest_mod >= modified
-        } else {
-            false
-        };
+        });
 
         if use_v2 {
             if let Ok(content) = fs::read_to_string(&manifest_path) {

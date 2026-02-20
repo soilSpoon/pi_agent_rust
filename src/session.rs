@@ -3551,6 +3551,8 @@ fn session_entry_stats(entries: &[SessionEntry]) -> (u64, Option<String>) {
 
 /// Minimum entry count to activate parallel deserialization (Gap E).
 const PARALLEL_THRESHOLD: usize = 512;
+/// Number of JSONL lines deserialized per batch in the blocking open path.
+const JSONL_PARSE_BATCH_SIZE: usize = 2048;
 
 /// Parse a JSONL session file on the current (blocking) thread.
 ///
@@ -3582,16 +3584,15 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
     // Gap E: parallel deserialization for large sessions.
     // Batch processing to bound memory usage while allowing parallelism.
     let num_threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-    const BATCH_SIZE: usize = 2048;
 
-    let mut line_batch: Vec<(usize, String)> = Vec::with_capacity(BATCH_SIZE);
+    let mut line_batch: Vec<(usize, String)> = Vec::with_capacity(JSONL_PARSE_BATCH_SIZE);
     let mut current_line_num = 2; // Header is line 1
 
     loop {
         line_batch.clear();
         let mut batch_eof = false;
 
-        for _ in 0..BATCH_SIZE {
+        for _ in 0..JSONL_PARSE_BATCH_SIZE {
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) => {
@@ -3622,34 +3623,34 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
 
         if line_batch.len() >= PARALLEL_THRESHOLD && num_threads > 1 {
             let chunk_size = (line_batch.len() / num_threads).max(64);
-            type ChunkResult = (Vec<SessionEntry>, Vec<SessionOpenSkippedEntry>);
 
-            let chunk_results: Vec<ChunkResult> = std::thread::scope(|s| {
-                line_batch
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        s.spawn(move || {
-                            let mut ok = Vec::with_capacity(chunk.len());
-                            let mut skip = Vec::new();
-                            for (line_num, line) in chunk {
-                                match serde_json::from_str::<SessionEntry>(line) {
-                                    Ok(entry) => ok.push(entry),
-                                    Err(e) => {
-                                        skip.push(SessionOpenSkippedEntry {
-                                            line_number: *line_num,
-                                            error: e.to_string(),
-                                        });
+            let chunk_results: Vec<(Vec<SessionEntry>, Vec<SessionOpenSkippedEntry>)> =
+                std::thread::scope(|s| {
+                    line_batch
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                let mut ok = Vec::with_capacity(chunk.len());
+                                let mut skip = Vec::new();
+                                for (line_num, line) in chunk {
+                                    match serde_json::from_str::<SessionEntry>(line) {
+                                        Ok(entry) => ok.push(entry),
+                                        Err(e) => {
+                                            skip.push(SessionOpenSkippedEntry {
+                                                line_number: *line_num,
+                                                error: e.to_string(),
+                                            });
+                                        }
                                     }
                                 }
-                            }
-                            (ok, skip)
+                                (ok, skip)
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|h| h.join().unwrap())
-                    .collect()
-            });
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().unwrap())
+                        .collect()
+                });
 
             for (chunk_entries, chunk_skipped) in chunk_results {
                 entries.extend(chunk_entries);
@@ -3657,12 +3658,12 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
             }
         } else {
             // Sequential path
-            for (line_num, line) in line_batch.drain(..) {
-                match serde_json::from_str::<SessionEntry>(&line) {
+            for (line_num, line) in &line_batch {
+                match serde_json::from_str::<SessionEntry>(line) {
                     Ok(entry) => entries.push(entry),
                     Err(e) => {
                         diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
-                            line_number: line_num,
+                            line_number: *line_num,
                             error: e.to_string(),
                         });
                     }

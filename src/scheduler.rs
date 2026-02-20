@@ -303,7 +303,11 @@ impl<C: Clock> Scheduler<C> {
     /// Check if there are pending tasks.
     #[must_use]
     pub fn has_pending(&self) -> bool {
-        !self.macrotask_queue.is_empty() || !self.timer_heap.is_empty()
+        !self.macrotask_queue.is_empty()
+            || self
+                .timer_heap
+                .iter()
+                .any(|entry| !self.cancelled_timers.contains(&entry.timer_id))
     }
 
     /// Get the number of pending macrotasks.
@@ -2335,6 +2339,14 @@ mod tests {
         assert!(sched.has_pending());
         assert_eq!(sched.macrotask_count(), 1);
         assert_eq!(sched.timer_count(), 0);
+    }
+
+    #[test]
+    fn has_pending_ignores_cancelled_timers_without_macrotasks() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        let timer = sched.set_timeout(10_000);
+        assert!(sched.clear_timeout(timer));
+        assert!(!sched.has_pending());
     }
 
     // ── WallClock ────────────────────────────────────────────────────
