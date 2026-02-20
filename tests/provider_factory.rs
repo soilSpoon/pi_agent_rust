@@ -365,6 +365,21 @@ fn normalize_openai_base_trims_trailing_slash() {
 }
 
 #[test]
+fn normalize_openai_base_empty_uses_default_endpoint() {
+    let harness = TestHarness::new("normalize_openai_base_empty_uses_default_endpoint");
+    let input = "   ";
+    let expected = "https://api.openai.com/v1/chat/completions";
+    harness
+        .log()
+        .info_ctx("normalize", "empty uses default", |ctx| {
+            ctx.push(("input".to_string(), input.to_string()));
+            ctx.push(("expected".to_string(), expected.to_string()));
+        });
+    let normalized = normalize_openai_base(input);
+    assert_eq!(normalized, expected);
+}
+
+#[test]
 fn normalize_openai_base_preserves_chat_completions() {
     let harness = TestHarness::new("normalize_openai_base_preserves_chat_completions");
     let input = "https://api.openai.com/v1/chat/completions";
@@ -418,6 +433,21 @@ fn normalize_openai_responses_base_trims_trailing_slash() {
     harness
         .log()
         .info_ctx("normalize", "responses trailing slash", |ctx| {
+            ctx.push(("input".to_string(), input.to_string()));
+            ctx.push(("expected".to_string(), expected.to_string()));
+        });
+    let normalized = normalize_openai_responses_base(input);
+    assert_eq!(normalized, expected);
+}
+
+#[test]
+fn normalize_openai_responses_base_empty_uses_default_endpoint() {
+    let harness = TestHarness::new("normalize_openai_responses_base_empty_uses_default_endpoint");
+    let input = "";
+    let expected = "https://api.openai.com/v1/responses";
+    harness
+        .log()
+        .info_ctx("normalize", "empty uses default", |ctx| {
             ctx.push(("input".to_string(), input.to_string()));
             ctx.push(("expected".to_string(), expected.to_string()));
         });

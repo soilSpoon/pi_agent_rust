@@ -498,20 +498,30 @@ where
                             tool_call,
                         });
                     }
-                    GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
-                        // Input-only parts — skip.
+                    GeminiPart::InlineData { .. }
+                    | GeminiPart::FunctionResponse { .. }
+                    | GeminiPart::Unknown(_) => {
+                        // Input-only parts are skipped.
+                        // Unknown parts are also skipped so new Gemini API part
+                        // variants don't break streaming.
                     }
                 }
             }
         }
 
-        // Emit TextEnd for all open text blocks when a finish reason is present.
+        // Emit TextEnd/ThinkingEnd for all open text/thinking blocks when a finish reason
+        // is present.
         if candidate.finish_reason.is_some() {
             for (content_index, block) in self.partial.content.iter().enumerate() {
                 if let ContentBlock::Text(t) = block {
                     self.pending_events.push_back(StreamEvent::TextEnd {
                         content_index,
                         content: t.text.clone(),
+                    });
+                } else if let ContentBlock::Thinking(t) = block {
+                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                        content_index,
+                        content: t.thinking.clone(),
                     });
                 }
             }
@@ -922,6 +932,44 @@ mod tests {
             })
             .expect("done event");
         assert_eq!(done.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn test_stream_ignores_unknown_parts() {
+        let events = vec![serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "executableCode": {
+                                "language": "python",
+                                "code": "print('x')"
+                            }
+                        },
+                        {"text": "still works"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        })];
+
+        let stream_events = collect_events(&events);
+
+        let text_deltas: Vec<&str> = stream_events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_deltas, vec!["still works"]);
+        assert!(
+            stream_events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Done { .. })),
+            "should emit Done even when unknown parts are present"
+        );
     }
 
     // ─── Test helpers ────────────────────────────────────────────────────

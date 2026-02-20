@@ -527,12 +527,17 @@ where
                 // Finalize tool call arguments
                 self.finalize_tool_call_arguments();
 
-                // Emit TextEnd for all open text blocks.
+                // Emit TextEnd/ThinkingEnd for all open text/thinking blocks.
                 for (content_index, block) in self.partial.content.iter().enumerate() {
                     if let ContentBlock::Text(t) = block {
                         self.pending_events.push_back(StreamEvent::TextEnd {
                             content_index,
                             content: t.text.clone(),
+                        });
+                    } else if let ContentBlock::Thinking(t) = block {
+                        self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                            content_index,
+                            content: t.thinking.clone(),
                         });
                     }
                 }

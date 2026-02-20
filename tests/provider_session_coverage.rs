@@ -174,6 +174,9 @@ fn known_provider_from_str_custom() {
 #[test]
 fn normalize_openai_base_appends_endpoint() {
     let cases = [
+        // Empty or whitespace uses default OpenAI endpoint
+        ("", "https://api.openai.com/v1/chat/completions"),
+        ("   ", "https://api.openai.com/v1/chat/completions"),
         // Base with /v1 gets /chat/completions appended
         (
             "https://api.openai.com/v1/",
@@ -212,6 +215,9 @@ fn normalize_openai_base_appends_endpoint() {
 #[test]
 fn normalize_openai_responses_base_appends_endpoint() {
     let cases = [
+        // Empty or whitespace uses default OpenAI endpoint
+        ("", "https://api.openai.com/v1/responses"),
+        ("  ", "https://api.openai.com/v1/responses"),
         // Already has /responses - kept as-is
         (
             "https://api.openai.com/v1/responses",
@@ -246,6 +252,9 @@ fn normalize_openai_responses_base_appends_endpoint() {
 #[test]
 fn normalize_cohere_base_appends_endpoint() {
     let cases = [
+        // Empty or whitespace uses default Cohere endpoint
+        ("", "https://api.cohere.com/v2/chat"),
+        (" \t ", "https://api.cohere.com/v2/chat"),
         // Already has /chat - kept as-is
         (
             "https://api.cohere.com/v2/chat",

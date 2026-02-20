@@ -569,6 +569,7 @@ where
             self.partial.stop_reason = match reason {
                 "MAX_TOKENS" => StopReason::Length,
                 "SAFETY" | "RECITATION" | "OTHER" => StopReason::Error,
+                "FUNCTION_CALL" => StopReason::ToolUse,
                 // STOP and any other reason treated as normal stop
                 _ => StopReason::Stop,
             };
@@ -649,21 +650,30 @@ where
                             tool_call,
                         });
                     }
-                    GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
-                        // These are for input, not output
+                    GeminiPart::InlineData { .. }
+                    | GeminiPart::FunctionResponse { .. }
+                    | GeminiPart::Unknown(_) => {
+                        // InlineData/FunctionResponse are for input, not output.
+                        // Unknown parts are silently skipped so new Gemini API
+                        // features don't break existing streams.
                     }
                 }
             }
         }
 
-        // Emit TextEnd for all open text blocks (not just the last one,
-        // since text may precede tool calls).
+        // Emit TextEnd/ThinkingEnd for all open text/thinking blocks (not just the last
+        // one, since text/thinking may precede tool calls).
         if has_finish_reason {
             for (content_index, block) in self.partial.content.iter().enumerate() {
                 if let ContentBlock::Text(t) = block {
                     self.pending_events.push_back(StreamEvent::TextEnd {
                         content_index,
                         content: t.text.clone(),
+                    });
+                } else if let ContentBlock::Thinking(t) = block {
+                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                        content_index,
+                        content: t.thinking.clone(),
                     });
                 }
             }
@@ -725,6 +735,10 @@ pub(crate) enum GeminiPart {
         #[serde(rename = "functionResponse")]
         function_response: GeminiFunctionResponse,
     },
+    /// Catch-all for unrecognized part types (e.g. `executableCode`,
+    /// `codeExecutionResult`) so that new Gemini API features don't
+    /// cause hard deserialization failures that terminate the stream.
+    Unknown(serde_json::Value),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

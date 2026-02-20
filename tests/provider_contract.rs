@@ -648,7 +648,9 @@ fn contract_anthropic_tool_schema_has_input_schema() {
 #[test]
 fn contract_openai_tool_schema_uses_function_wrapper() {
     let provider = OpenAIProvider::new("gpt-4o");
-    let req = provider.build_request(&tool_context(), &default_options());
+    let context = tool_context();
+    let options = default_options();
+    let req = provider.build_request(&context, &options);
     let v = serde_json::to_value(&req).expect("serialize");
 
     let tools = v["tools"].as_array().expect("tools array");
@@ -676,7 +678,9 @@ fn contract_openai_tool_schema_uses_function_wrapper() {
 #[test]
 fn contract_gemini_tool_schema_uses_function_declarations() {
     let provider = GeminiProvider::new("gemini-1.5-flash");
-    let req = provider.build_request(&tool_context(), &default_options());
+    let context = tool_context();
+    let options = default_options();
+    let req = provider.build_request(&context, &options);
     let v = serde_json::to_value(&req).expect("serialize");
 
     // Gemini contract: tools under `tools[0].functionDeclarations`
@@ -706,7 +710,9 @@ fn contract_gemini_tool_schema_uses_function_declarations() {
 #[test]
 fn contract_cohere_tool_schema_matches_openai_format() {
     let provider = CohereProvider::new("command-r-plus");
-    let req = provider.build_request(&tool_context(), &default_options());
+    let context = tool_context();
+    let options = default_options();
+    let req = provider.build_request(&context, &options);
     let v = serde_json::to_value(&req).expect("serialize");
 
     let tools = v["tools"].as_array().expect("tools array");
@@ -851,7 +857,9 @@ mod proptests {
         fn openai_tool_schema_round_trips_generated_defs(seeds in tool_seeds_strategy()) {
             let provider = OpenAIProvider::new("gpt-4o");
             let defs = to_tool_defs(&seeds);
-            let req = provider.build_request(&context_with_tools(defs.clone()), &default_options());
+            let context = context_with_tools(defs.clone());
+            let options = default_options();
+            let req = provider.build_request(&context, &options);
             let payload = serde_json::to_value(&req).expect("serialize OpenAI request");
             let tools = payload["tools"].as_array().expect("tools array");
 
@@ -875,7 +883,9 @@ mod proptests {
         fn cohere_tool_schema_round_trips_generated_defs(seeds in tool_seeds_strategy()) {
             let provider = CohereProvider::new("command-r-plus");
             let defs = to_tool_defs(&seeds);
-            let req = provider.build_request(&context_with_tools(defs.clone()), &default_options());
+            let context = context_with_tools(defs.clone());
+            let options = default_options();
+            let req = provider.build_request(&context, &options);
             let payload = serde_json::to_value(&req).expect("serialize Cohere request");
             let tools = payload["tools"].as_array().expect("tools array");
 
@@ -919,7 +929,9 @@ mod proptests {
         fn gemini_tool_schema_round_trips_generated_defs(seeds in tool_seeds_strategy()) {
             let provider = GeminiProvider::new("gemini-1.5-flash");
             let defs = to_tool_defs(&seeds);
-            let req = provider.build_request(&context_with_tools(defs.clone()), &default_options());
+            let context = context_with_tools(defs.clone());
+            let options = default_options();
+            let req = provider.build_request(&context, &options);
             let payload = serde_json::to_value(&req).expect("serialize Gemini request");
             let declarations = payload["tools"][0]["functionDeclarations"]
                 .as_array()

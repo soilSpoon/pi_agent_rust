@@ -6,6 +6,8 @@
 //! - Azure OpenAI
 //! - Any OpenAI-compatible API (Groq, Together, etc.)
 
+use std::borrow::Cow;
+
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
@@ -135,7 +137,11 @@ impl OpenAIProvider {
     }
 
     /// Build the request body for the OpenAI API.
-    pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> OpenAIRequest {
+    pub fn build_request<'a>(
+        &'a self,
+        context: &'a Context<'_>,
+        options: &StreamOptions,
+    ) -> OpenAIRequest<'a> {
         let system_role = self
             .compat
             .as_ref()
@@ -149,7 +155,7 @@ impl OpenAIProvider {
             .and_then(|c| c.supports_tools)
             .unwrap_or(true);
 
-        let tools: Option<Vec<OpenAITool>> = if context.tools.is_empty() || !tools_supported {
+        let tools: Option<Vec<OpenAITool<'a>>> = if context.tools.is_empty() || !tools_supported {
             None
         } else {
             Some(context.tools.iter().map(convert_tool_to_openai).collect())
@@ -175,15 +181,23 @@ impl OpenAIProvider {
             .and_then(|c| c.supports_usage_in_streaming)
             .unwrap_or(true);
 
+        let stream_options = if include_usage {
+            Some(OpenAIStreamOptions {
+                include_usage: true,
+            })
+        } else {
+            None
+        };
+
         OpenAIRequest {
-            model: self.model.clone(),
+            model: &self.model,
             messages,
             max_tokens,
             max_completion_tokens,
             temperature: options.temperature,
             tools,
             stream: true,
-            stream_options: Some(OpenAIStreamOptions { include_usage }),
+            stream_options,
         }
     }
 
@@ -230,14 +244,17 @@ impl OpenAIProvider {
     }
 
     /// Build the messages array with system prompt prepended using the given role name.
-    fn build_messages_with_role(context: &Context<'_>, system_role: &str) -> Vec<OpenAIMessage> {
+    fn build_messages_with_role<'a>(
+        context: &'a Context<'_>,
+        system_role: &str,
+    ) -> Vec<OpenAIMessage<'a>> {
         let mut messages = Vec::new();
 
         // Add system prompt as first message
         if let Some(system) = &context.system_prompt {
             messages.push(OpenAIMessage {
                 role: to_static_role(system_role),
-                content: Some(OpenAIContent::Text(system.to_string())),
+                content: Some(OpenAIContent::Text(Cow::Borrowed(system))),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -448,7 +465,6 @@ where
 {
     event_source: SseStream<S>,
     partial: AssistantMessage,
-    current_text: String,
     tool_calls: Vec<ToolCallState>,
     pending_events: VecDeque<StreamEvent>,
     started: bool,
@@ -480,7 +496,6 @@ where
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
-            current_text: String::new(),
             tool_calls: Vec::new(),
             pending_events: VecDeque::new(),
             started: false,
@@ -792,9 +807,9 @@ where
 // ============================================================================
 
 #[derive(Debug, Serialize)]
-pub struct OpenAIRequest {
-    model: String,
-    messages: Vec<OpenAIMessage>,
+pub struct OpenAIRequest<'a> {
+    model: &'a str,
+    messages: Vec<OpenAIMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     /// Some providers (e.g., o1-series) use `max_completion_tokens` instead of `max_tokens`.
@@ -803,7 +818,7 @@ pub struct OpenAIRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<OpenAITool>>,
+    tools: Option<Vec<OpenAITool<'a>>>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAIStreamOptions>,
@@ -815,59 +830,62 @@ struct OpenAIStreamOptions {
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIMessage {
+struct OpenAIMessage<'a> {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<OpenAIContent>,
+    content: Option<OpenAIContent<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OpenAIToolCallRef>>,
+    tool_calls: Option<Vec<OpenAIToolCallRef<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+    tool_call_id: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
-enum OpenAIContent {
-    Text(String),
-    Parts(Vec<OpenAIContentPart>),
+enum OpenAIContent<'a> {
+    Text(Cow<'a, str>),
+    Parts(Vec<OpenAIContentPart<'a>>),
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum OpenAIContentPart {
-    Text { text: String },
-    ImageUrl { image_url: OpenAIImageUrl },
+enum OpenAIContentPart<'a> {
+    Text { text: Cow<'a, str> },
+    ImageUrl { image_url: OpenAIImageUrl<'a> },
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIImageUrl {
+struct OpenAIImageUrl<'a> {
     url: String,
+    #[serde(skip)]
+    // Phantom data for lifetime if needed, but url is String here as constructed from format!
+    _phantom: std::marker::PhantomData<&'a ()>,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIToolCallRef {
-    id: String,
+struct OpenAIToolCallRef<'a> {
+    id: &'a str,
     r#type: &'static str,
-    function: OpenAIFunctionRef,
+    function: OpenAIFunctionRef<'a>,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIFunctionRef {
-    name: String,
+struct OpenAIFunctionRef<'a> {
+    name: &'a str,
     arguments: String,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAITool {
+struct OpenAITool<'a> {
     r#type: &'static str,
-    function: OpenAIFunction,
+    function: OpenAIFunction<'a>,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIFunction {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
+struct OpenAIFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
 }
 
 // ============================================================================
@@ -937,7 +955,7 @@ struct OpenAIChunkError {
 // Conversion Functions
 // ============================================================================
 
-fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
+fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
     match message {
         Message::User(user) => vec![OpenAIMessage {
             role: "user",
@@ -947,7 +965,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
         }],
         Message::Custom(custom) => vec![OpenAIMessage {
             role: "user",
-            content: Some(OpenAIContent::Text(custom.content.clone())),
+            content: Some(OpenAIContent::Text(Cow::Borrowed(&custom.content))),
             tool_calls: None,
             tool_call_id: None,
         }],
@@ -966,15 +984,15 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
                 .join("");
 
             // Collect tool calls
-            let tool_calls: Vec<OpenAIToolCallRef> = assistant
+            let tool_calls: Vec<OpenAIToolCallRef<'_>> = assistant
                 .content
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::ToolCall(tc) => Some(OpenAIToolCallRef {
-                        id: tc.id.clone(),
+                        id: &tc.id,
                         r#type: "function",
                         function: OpenAIFunctionRef {
-                            name: tc.name.clone(),
+                            name: &tc.name,
                             arguments: tc.arguments.to_string(),
                         },
                     }),
@@ -985,7 +1003,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
             let content = if text.is_empty() {
                 None
             } else {
-                Some(OpenAIContent::Text(text))
+                Some(OpenAIContent::Text(Cow::Owned(text)))
             };
 
             let tool_calls = if tool_calls.is_empty() {
@@ -1005,17 +1023,20 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
         }
         Message::ToolResult(result) => {
             // OpenAI expects tool results as separate messages with role "tool"
-            let parts: Vec<OpenAIContentPart> = result
+            let parts: Vec<OpenAIContentPart<'_>> = result
                 .content
                 .iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text(t) => Some(OpenAIContentPart::Text {
-                        text: t.text.clone(),
+                        text: Cow::Borrowed(&t.text),
                     }),
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
                         Some(OpenAIContentPart::ImageUrl {
-                            image_url: OpenAIImageUrl { url },
+                            image_url: OpenAIImageUrl {
+                                url,
+                                _phantom: std::marker::PhantomData,
+                            },
                         })
                     }
                     _ => None,
@@ -1039,27 +1060,30 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
                 role: "tool",
                 content,
                 tool_calls: None,
-                tool_call_id: Some(result.tool_call_id.clone()),
+                tool_call_id: Some(&result.tool_call_id),
             }]
         }
     }
 }
 
-fn convert_user_content(content: &UserContent) -> OpenAIContent {
+fn convert_user_content(content: &UserContent) -> OpenAIContent<'_> {
     match content {
-        UserContent::Text(text) => OpenAIContent::Text(text.clone()),
+        UserContent::Text(text) => OpenAIContent::Text(Cow::Borrowed(text)),
         UserContent::Blocks(blocks) => {
-            let parts: Vec<OpenAIContentPart> = blocks
+            let parts: Vec<OpenAIContentPart<'_>> = blocks
                 .iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text(t) => Some(OpenAIContentPart::Text {
-                        text: t.text.clone(),
+                        text: Cow::Borrowed(&t.text),
                     }),
                     ContentBlock::Image(img) => {
                         // Convert to data URL for OpenAI
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
                         Some(OpenAIContentPart::ImageUrl {
-                            image_url: OpenAIImageUrl { url },
+                            image_url: OpenAIImageUrl {
+                                url,
+                                _phantom: std::marker::PhantomData,
+                            },
                         })
                     }
                     _ => None,
@@ -1070,13 +1094,13 @@ fn convert_user_content(content: &UserContent) -> OpenAIContent {
     }
 }
 
-fn convert_tool_to_openai(tool: &ToolDef) -> OpenAITool {
+fn convert_tool_to_openai(tool: &ToolDef) -> OpenAITool<'_> {
     OpenAITool {
         r#type: "function",
         function: OpenAIFunction {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            parameters: tool.parameters.clone(),
+            name: &tool.name,
+            description: &tool.description,
+            parameters: &tool.parameters,
         },
     }
 }
@@ -1130,7 +1154,7 @@ mod tests {
         assert_eq!(converted.function.description, "A test tool");
         assert_eq!(
             converted.function.parameters,
-            serde_json::json!({
+            &serde_json::json!({
                 "type": "object",
                 "properties": {
                     "arg": {"type": "string"}
@@ -1888,7 +1912,9 @@ mod tests {
             system_role_name: Some("developer".to_string()),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(
             value["messages"][0]["role"], "developer",
@@ -1899,7 +1925,9 @@ mod tests {
     #[test]
     fn compat_none_uses_default_system_role() {
         let provider = OpenAIProvider::new("gpt-4o");
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(
             value["messages"][0]["role"], "system",
@@ -1913,7 +1941,9 @@ mod tests {
             supports_tools: Some(false),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert!(
             value["tools"].is_null(),
@@ -1927,7 +1957,9 @@ mod tests {
             supports_tools: Some(true),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert!(
             value["tools"].is_array(),
@@ -1941,7 +1973,9 @@ mod tests {
             max_tokens_field: Some("max_completion_tokens".to_string()),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert!(
             value["max_tokens"].is_null(),
@@ -1956,7 +1990,9 @@ mod tests {
     #[test]
     fn compat_default_routes_to_max_tokens() {
         let provider = OpenAIProvider::new("gpt-4o");
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(
             value["max_tokens"], 1024,
@@ -1974,7 +2010,9 @@ mod tests {
             supports_usage_in_streaming: Some(false),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(
             value["stream_options"]["include_usage"], false,
@@ -1991,7 +2029,9 @@ mod tests {
             supports_usage_in_streaming: Some(false),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(value["messages"][0]["role"], "developer");
         assert!(value["max_tokens"].is_null());

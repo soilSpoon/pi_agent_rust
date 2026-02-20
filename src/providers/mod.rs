@@ -964,7 +964,11 @@ pub fn create_provider(
 }
 
 pub fn normalize_anthropic_base(base_url: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return "https://api.anthropic.com/v1/messages".to_string();
+    }
+    let base_url = trimmed.trim_end_matches('/');
     if base_url.ends_with("/v1/messages") {
         return base_url.to_string();
     }
@@ -972,7 +976,11 @@ pub fn normalize_anthropic_base(base_url: &str) -> String {
 }
 
 pub fn normalize_openai_base(base_url: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return "https://api.openai.com/v1/chat/completions".to_string();
+    }
+    let base_url = trimmed.trim_end_matches('/');
     if base_url.ends_with("/chat/completions") {
         return base_url.to_string();
     }
@@ -984,10 +992,11 @@ pub fn normalize_openai_base(base_url: &str) -> String {
 }
 
 pub fn normalize_openai_responses_base(base_url: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
-    if base_url.is_empty() {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
         return "https://api.openai.com/v1/responses".to_string();
     }
+    let base_url = trimmed.trim_end_matches('/');
     if base_url.ends_with("/responses") {
         return base_url.to_string();
     }
@@ -1022,7 +1031,11 @@ pub fn normalize_openai_codex_responses_base(base_url: &str) -> String {
 }
 
 pub fn normalize_cohere_base(base_url: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return "https://api.cohere.com/v2/chat".to_string();
+    }
+    let base_url = trimmed.trim_end_matches('/');
     if base_url.ends_with("/chat") {
         return base_url.to_string();
     }
@@ -2098,6 +2111,14 @@ export default function init(pi) {
         );
     }
 
+    #[test]
+    fn normalize_anthropic_base_empty_uses_default() {
+        assert_eq!(
+            normalize_anthropic_base("   "),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
     // ── normalize_openai_base ───────────────────────────────────────
 
     #[test]
@@ -2137,6 +2158,14 @@ export default function init(pi) {
         assert_eq!(
             normalize_openai_base("https://my-llm-proxy.com"),
             "https://my-llm-proxy.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_empty_uses_default() {
+        assert_eq!(
+            normalize_openai_base(""),
+            "https://api.openai.com/v1/chat/completions"
         );
     }
 
@@ -2182,6 +2211,14 @@ export default function init(pi) {
         );
     }
 
+    #[test]
+    fn normalize_responses_base_empty_uses_default() {
+        assert_eq!(
+            normalize_openai_responses_base("  "),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
     // ── normalize_cohere_base ───────────────────────────────────────
 
     #[test]
@@ -2214,6 +2251,11 @@ export default function init(pi) {
             normalize_cohere_base("https://custom-cohere.example.com"),
             "https://custom-cohere.example.com/chat"
         );
+    }
+
+    #[test]
+    fn normalize_cohere_base_empty_uses_default() {
+        assert_eq!(normalize_cohere_base(""), "https://api.cohere.com/v2/chat");
     }
 
     mod proptests {
