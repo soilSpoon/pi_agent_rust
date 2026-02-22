@@ -1770,10 +1770,13 @@ impl PiApp {
         self.run_memory_pressure_actions();
 
         // Handle our custom Pi messages (take ownership to avoid per-token clone).
-        let msg = match msg.try_downcast::<PiMsg>() {
-            Ok(pi_msg) => return self.handle_pi_message(pi_msg),
-            Err(original) => original,
-        };
+        // NOTE: We check with `is()` first, then `downcast().unwrap()` to consume
+        // the message only when we know it will succeed. This avoids needing the
+        // `try_downcast` method that only exists in the unpublished local
+        // charmed-bubbletea (see Cargo.toml TODO for issue #5).
+        if msg.is::<PiMsg>() {
+            return self.handle_pi_message(msg.downcast::<PiMsg>().unwrap());
+        }
 
         if let Some(size) = msg.downcast_ref::<WindowSizeMsg>() {
             self.set_terminal_size(size.width as usize, size.height as usize);
