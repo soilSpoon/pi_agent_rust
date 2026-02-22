@@ -912,7 +912,8 @@ pub async fn run(
                         ));
                     }
                     Ok(None) => {
-                        let _ = out_tx.send(response_ok(id.clone(), "cycle_model", Some(Value::Null)));
+                        let _ =
+                            out_tx.send(response_ok(id.clone(), "cycle_model", Some(Value::Null)));
                     }
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(id, "cycle_model", &err));
@@ -1136,7 +1137,8 @@ pub async fn run(
                         let _ = out_tx.send(response_ok(id, "set_session_name", None));
                     }
                     Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(id, "set_session_name", &err));
+                        let _ =
+                            out_tx.send(response_error_with_hints(id, "set_session_name", &err));
                     }
                 }
             }
@@ -1325,10 +1327,11 @@ pub async fn run(
                     })?;
 
                     is_compacting.store(true, Ordering::SeqCst);
-                    let compact_res = compact(prep, provider, key, custom_instructions.as_deref()).await;
+                    let compact_res =
+                        compact(prep, provider, key, custom_instructions.as_deref()).await;
                     is_compacting.store(false, Ordering::SeqCst);
                     let result_data = compact_res?;
-                    
+
                     let details_value = compaction_details_to_value(&result_data.details)?;
 
                     let messages = {
@@ -1478,82 +1481,81 @@ pub async fn run(
                     continue;
                 };
 
-                let result: Result<String> = async {
-                    // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
-                    let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
-                        let guard = session
-                            .lock(&cx)
-                            .await
-                            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                        let inner = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        let plan = inner.plan_fork_from_user_message(entry_id)?;
-                        let parent_path = inner.path.as_ref().map(|p| p.display().to_string());
-                        let session_dir = inner.session_dir.clone();
-                        let header = inner.header.clone();
-                        (plan, parent_path, session_dir, guard.save_enabled(), header)
-                        // Both locks released here.
-                    };
+                let result: Result<String> =
+                    async {
+                        // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
+                        let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
+                            let guard = session.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("session lock failed: {err}"))
+                            })?;
+                            let inner = guard.session.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("inner session lock failed: {err}"))
+                            })?;
+                            let plan = inner.plan_fork_from_user_message(entry_id)?;
+                            let parent_path = inner.path.as_ref().map(|p| p.display().to_string());
+                            let session_dir = inner.session_dir.clone();
+                            let header = inner.header.clone();
+                            (plan, parent_path, session_dir, guard.save_enabled(), header)
+                            // Both locks released here.
+                        };
 
-                    // Phase 2: Build new session without holding any lock.
-                    let crate::session::ForkPlan {
-                        entries,
-                        leaf_id,
-                        selected_text,
-                    } = fork_plan;
+                        // Phase 2: Build new session without holding any lock.
+                        let crate::session::ForkPlan {
+                            entries,
+                            leaf_id,
+                            selected_text,
+                        } = fork_plan;
 
-                    let mut new_session = if save_enabled {
-                        crate::session::Session::create_with_dir(session_dir)
-                    } else {
-                        crate::session::Session::in_memory()
-                    };
-                    new_session.header.parent_session = parent_path;
-                    new_session
-                        .header
-                        .provider
-                        .clone_from(&header_snapshot.provider);
-                    new_session
-                        .header
-                        .model_id
-                        .clone_from(&header_snapshot.model_id);
-                    new_session
-                        .header
-                        .thinking_level
-                        .clone_from(&header_snapshot.thinking_level);
-                    new_session.entries = entries;
-                    new_session.leaf_id = leaf_id;
-                    new_session.ensure_entry_ids();
+                        let mut new_session = if save_enabled {
+                            crate::session::Session::create_with_dir(session_dir)
+                        } else {
+                            crate::session::Session::in_memory()
+                        };
+                        new_session.header.parent_session = parent_path;
+                        new_session
+                            .header
+                            .provider
+                            .clone_from(&header_snapshot.provider);
+                        new_session
+                            .header
+                            .model_id
+                            .clone_from(&header_snapshot.model_id);
+                        new_session
+                            .header
+                            .thinking_level
+                            .clone_from(&header_snapshot.thinking_level);
+                        new_session.entries = entries;
+                        new_session.leaf_id = leaf_id;
+                        new_session.ensure_entry_ids();
 
-                    let messages = new_session.to_messages_for_current_path();
-                    let session_id = new_session.header.id.clone();
+                        let messages = new_session.to_messages_for_current_path();
+                        let session_id = new_session.header.id.clone();
 
-                    // Phase 3: Swap — brief lock to install the new session.
-                    {
-                        let mut guard = session
-                            .lock(&cx)
-                            .await
-                            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                        let mut inner = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        *inner = new_session;
-                        drop(inner);
-                        guard.agent.replace_messages(messages);
-                        guard.agent.stream_options_mut().session_id = Some(session_id);
+                        // Phase 3: Swap — brief lock to install the new session.
+                        {
+                            let mut guard = session.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("session lock failed: {err}"))
+                            })?;
+                            let mut inner = guard.session.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("inner session lock failed: {err}"))
+                            })?;
+                            *inner = new_session;
+                            drop(inner);
+                            guard.agent.replace_messages(messages);
+                            guard.agent.stream_options_mut().session_id = Some(session_id);
+                        }
+
+                        {
+                            let mut state = shared_state.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("state lock failed: {err}"))
+                            })?;
+                            state.steering.clear();
+                            state.follow_up.clear();
+                        }
+
+                        Ok(selected_text)
                     }
-
-                    {
-                        let mut state = shared_state
-                            .lock(&cx)
-                            .await
-                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                        state.steering.clear();
-                        state.follow_up.clear();
-                    }
-
-                    Ok(selected_text)
-                }.await;
+                    .await;
 
                 match result {
                     Ok(selected_text) => {
@@ -3300,7 +3302,7 @@ async fn ingest_bash_rpc_chunk(
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            
+
             match options.open(&path) {
                 Ok(file) => {
                     #[cfg(unix)]
@@ -3336,7 +3338,9 @@ async fn ingest_bash_rpc_chunk(
                         match file.metadata().await {
                             Ok(meta) => {
                                 if meta.ino() != expected {
-                                    tracing::warn!("Temp file identity mismatch (possible TOCTOU attack)");
+                                    tracing::warn!(
+                                        "Temp file identity mismatch (possible TOCTOU attack)"
+                                    );
                                     identity_match = false;
                                 }
                             }
@@ -3472,9 +3476,9 @@ async fn run_bash_rpc(
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(128);
     let tx_stdout = tx.clone();
-    let stdout_handle =
+    let _stdout_handle =
         std::thread::spawn(move || pump_stream(stdout, tx_stdout, StreamKind::Stdout));
-    let stderr_handle = std::thread::spawn(move || pump_stream(stderr, tx, StreamKind::Stderr));
+    let _stderr_handle = std::thread::spawn(move || pump_stream(stderr, tx, StreamKind::Stderr));
 
     let tick = Duration::from_millis(10);
 

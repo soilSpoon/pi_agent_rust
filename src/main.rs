@@ -1472,7 +1472,7 @@ async fn handle_package_update(manager: &PackageManager, source: Option<String>)
     }
 
     if failed > 0 {
-        bail!("Failed to update {} packages", failed);
+        bail!("Failed to update {failed} packages");
     }
     println!("Updated packages");
     Ok(())

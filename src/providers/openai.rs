@@ -40,7 +40,7 @@ const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
 /// allocation).  For an unknown role name (extremely rare – only possible via
 /// exotic compat overrides) we leak a heap copy so that callers can always
 /// work with `&'static str`.
-fn to_cow_role<'a>(role: &'a str) -> Cow<'a, str> {
+fn to_cow_role(role: &str) -> Cow<'_, str> {
     match role {
         "system" => Cow::Borrowed("system"),
         "developer" => Cow::Borrowed("developer"),

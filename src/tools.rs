@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::io::{BufRead, Read};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{OnceLock, mpsc};
@@ -2696,7 +2696,6 @@ impl Tool for EditTool {
         let parent = absolute_path.parent().unwrap_or_else(|| Path::new("."));
         let mut temp_file = tempfile::NamedTempFile::new_in(parent)
             .map_err(|e| Error::tool("edit", format!("Failed to create temp file: {e}")))?;
-        use std::io::Write;
         temp_file
             .as_file_mut()
             .write_all(final_content.as_bytes())
@@ -2833,7 +2832,6 @@ impl Tool for WriteTool {
         let mut temp_file = tempfile::NamedTempFile::new_in(parent)
             .map_err(|e| Error::tool("write", format!("Failed to create temp file: {e}")))?;
 
-        use std::io::Write;
         temp_file
             .as_file_mut()
             .write_all(input.content.as_bytes())

@@ -2488,7 +2488,6 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         cmd: &str,
         payload: &serde_json::Value,
     ) -> HostcallOutcome {
-        use std::io::Read as _;
         use std::process::{Command, Stdio};
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
         use std::sync::mpsc::{self, SyncSender};
@@ -2862,6 +2861,38 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         let call_id_for_error = call_id.to_string();
 
         thread::spawn(move || {
+            #[derive(Clone, Copy)]
+            enum StreamKind {
+                Stdout,
+                Stderr,
+            }
+
+            struct StreamChunk {
+                kind: StreamKind,
+                bytes: Vec<u8>,
+            }
+
+            fn pump_stream(
+                mut reader: impl std::io::Read,
+                tx: &std::sync::mpsc::SyncSender<StreamChunk>,
+                kind: StreamKind,
+            ) {
+                let mut buf = [0u8; 8192];
+                loop {
+                    let read = match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    let chunk = StreamChunk {
+                        kind,
+                        bytes: buf[..read].to_vec(),
+                    };
+                    if tx.send(chunk).is_err() {
+                        break;
+                    }
+                }
+            }
+
             let result: std::result::Result<serde_json::Value, String> = (|| {
                 let mut command = Command::new(&cmd);
                 command
@@ -2874,47 +2905,15 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 let mut child = command.spawn().map_err(|err| err.to_string())?;
                 let pid = child.id();
 
-                let mut stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
-                let mut stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
-
-                #[derive(Clone, Copy)]
-                enum StreamKind {
-                    Stdout,
-                    Stderr,
-                }
-
-                struct StreamChunk {
-                    kind: StreamKind,
-                    bytes: Vec<u8>,
-                }
-
-                fn pump_stream(
-                    mut reader: impl std::io::Read,
-                    tx: std::sync::mpsc::SyncSender<StreamChunk>,
-                    kind: StreamKind,
-                ) {
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        let read = match reader.read(&mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(read) => read,
-                        };
-                        let chunk = StreamChunk {
-                            kind,
-                            bytes: buf[..read].to_vec(),
-                        };
-                        if tx.send(chunk).is_err() {
-                            break;
-                        }
-                    }
-                }
+                let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
+                let stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
 
                 let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(128);
                 let tx_stdout = tx.clone();
                 let _stdout_handle =
-                    thread::spawn(move || pump_stream(stdout, tx_stdout, StreamKind::Stdout));
+                    thread::spawn(move || pump_stream(stdout, &tx_stdout, StreamKind::Stdout));
                 let _stderr_handle =
-                    thread::spawn(move || pump_stream(stderr, tx, StreamKind::Stderr));
+                    thread::spawn(move || pump_stream(stderr, &tx, StreamKind::Stderr));
 
                 let start = Instant::now();
                 let mut killed = false;
@@ -2957,20 +2956,18 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 let drain_deadline = Instant::now() + Duration::from_secs(2);
                 loop {
                     match rx.try_recv() {
-                        Ok(chunk) => {
-                            match chunk.kind {
-                                StreamKind::Stdout => {
-                                    if stdout_bytes.len() < max_bytes {
-                                        stdout_bytes.extend_from_slice(&chunk.bytes);
-                                    }
-                                }
-                                StreamKind::Stderr => {
-                                    if stderr_bytes.len() < max_bytes {
-                                        stderr_bytes.extend_from_slice(&chunk.bytes);
-                                    }
+                        Ok(chunk) => match chunk.kind {
+                            StreamKind::Stdout => {
+                                if stdout_bytes.len() < max_bytes {
+                                    stdout_bytes.extend_from_slice(&chunk.bytes);
                                 }
                             }
-                        }
+                            StreamKind::Stderr => {
+                                if stderr_bytes.len() < max_bytes {
+                                    stderr_bytes.extend_from_slice(&chunk.bytes);
+                                }
+                            }
+                        },
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             if Instant::now() >= drain_deadline {
                                 break;

@@ -318,13 +318,15 @@ impl<S> SseStream<S>
 where
     S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
 {
-    fn feed_to_pending(&mut self, s: &str) {
-        let parser = &mut self.parser;
-        let pending = &mut self.pending_events;
+    fn feed_parsed_chunk(parser: &mut SseParser, pending: &mut VecDeque<SseEvent>, s: &str) {
         parser.feed_into(s, |event| pending.push_back(event));
     }
 
-    fn process_chunk_without_utf8_tail(&mut self, bytes: Vec<u8>) -> Result<(), std::io::Error> {
+    fn feed_to_pending(&mut self, s: &str) {
+        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
+    }
+
+    fn process_chunk_without_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
         let mut processed = 0;
         loop {
             match std::str::from_utf8(&bytes[processed..]) {
@@ -362,7 +364,7 @@ where
             match std::str::from_utf8(&self.utf8_buffer[processed..]) {
                 Ok(s) => {
                     if !s.is_empty() {
-                        self.feed_to_pending(s);
+                        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
                     }
                     self.utf8_buffer.clear();
                     return Ok(());
@@ -374,7 +376,7 @@ where
                             &self.utf8_buffer[processed..processed + valid_len],
                         )
                         .expect("valid utf8 prefix");
-                        self.feed_to_pending(s);
+                        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
                         processed += valid_len;
                     }
 
@@ -393,11 +395,11 @@ where
         }
     }
 
-    fn process_chunk(&mut self, bytes: Vec<u8>) -> Result<(), std::io::Error> {
+    fn process_chunk(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
         if self.utf8_buffer.is_empty() {
             self.process_chunk_without_utf8_tail(bytes)
         } else {
-            self.process_chunk_with_utf8_tail(&bytes)
+            self.process_chunk_with_utf8_tail(bytes)
         }
     }
 
@@ -436,7 +438,7 @@ where
         loop {
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if let Err(err) = self.process_chunk(bytes) {
+                    if let Err(err) = self.process_chunk(&bytes) {
                         if let Some(event) = self.pending_events.pop_front() {
                             self.pending_error = Some(err);
                             return Poll::Ready(Some(Ok(event)));

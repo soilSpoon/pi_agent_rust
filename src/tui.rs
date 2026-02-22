@@ -610,14 +610,13 @@ fn strip_markup(text: &str) -> String {
                 buffer.clear();
                 in_tag = false;
             } else if c == '[' {
+                result.push('[');
                 if buffer.is_empty() {
                     // Escaped bracket: `[[` becomes `[`
-                    result.push('[');
                     in_tag = false;
                 } else {
                     // Nested '[' means the previous '[' was literal.
                     // Flush previous '[' and buffer, start new tag candidate.
-                    result.push('[');
                     result.push_str(&buffer);
                     buffer.clear();
                     // Stay in_tag for this new '['
