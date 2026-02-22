@@ -21968,10 +21968,9 @@ async fn dispatch_hostcall_exec_ref(
                         Err(e) => {
                             let valid_len = e.valid_up_to();
                             if valid_len > 0 {
-                                let s = std::str::from_utf8(
-                                    &chunk[processed..processed + valid_len],
-                                )
-                                .expect("valid utf8 prefix");
+                                let s =
+                                    std::str::from_utf8(&chunk[processed..processed + valid_len])
+                                        .expect("valid utf8 prefix");
                                 let frame = if stdout {
                                     ExecStreamFrame::Stdout(s.to_string())
                                 } else {
@@ -22022,10 +22021,9 @@ async fn dispatch_hostcall_exec_ref(
                         Err(e) => {
                             let valid_len = e.valid_up_to();
                             if valid_len > 0 {
-                                let s = std::str::from_utf8(
-                                    &partial[processed..processed + valid_len],
-                                )
-                                .expect("valid utf8 prefix");
+                                let s =
+                                    std::str::from_utf8(&partial[processed..processed + valid_len])
+                                        .expect("valid utf8 prefix");
                                 let frame = if stdout {
                                     ExecStreamFrame::Stdout(s.to_string())
                                 } else {

@@ -1090,7 +1090,7 @@ impl Session {
         if session_store_v2::has_v2_sidecar(&path) {
             let is_stale = (|| -> Option<bool> {
                 let jsonl_meta = std::fs::metadata(&path).ok()?;
-                
+
                 let v2_root = session_store_v2::v2_sidecar_path(&path);
                 let v2_index = v2_root.join("index").join("offsets.jsonl");
                 let v2_manifest = v2_root.join("manifest.json");

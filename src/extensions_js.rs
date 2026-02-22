@@ -5548,13 +5548,13 @@ fn store_to_disk_cache(cache_dir: &Path, cache_key: &str, source: &[u8]) {
             return;
         }
     }
-    
+
     let temp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4().simple()));
     if let Err(err) = fs::write(&temp_path, source) {
         tracing::debug!(event = "pijs.module_cache.disk.write_failed", path = %temp_path.display(), %err);
         return;
     }
-    
+
     if let Err(err) = fs::rename(&temp_path, &path) {
         tracing::debug!(event = "pijs.module_cache.disk.rename_failed", from = %temp_path.display(), to = %path.display(), %err);
         let _ = fs::remove_file(&temp_path);
@@ -6064,8 +6064,7 @@ pub fn generate_monorepo_stub(names: &[String]) -> String {
 
         let export = if name == "default" {
             "export default () => {};".to_string()
-        } else if name.chars().all(|c| c.is_ascii_uppercase() || c == '_') && !name.is_empty()
-        {
+        } else if name.chars().all(|c| c.is_ascii_uppercase() || c == '_') && !name.is_empty() {
             // ALL_CAPS constant
             format!("export const {name} = [];")
         } else if name.starts_with("is") || name.starts_with("has") || name.starts_with("check") {

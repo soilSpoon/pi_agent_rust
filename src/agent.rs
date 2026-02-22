@@ -732,7 +732,7 @@ impl Agent {
                 if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
                     let abort_message = self.build_abort_message(None);
                     let message = Message::assistant(abort_message.clone());
-                    
+
                     self.messages.push(message.clone());
                     new_messages.push(message.clone());
                     on_event(AgentEvent::MessageStart {
@@ -741,7 +741,7 @@ impl Agent {
                     on_event(AgentEvent::MessageEnd {
                         message: message.clone(),
                     });
-                    
+
                     let turn_end_event = AgentEvent::TurnEnd {
                         session_id: session_id.clone(),
                         turn_index: current_turn_index,
@@ -1031,7 +1031,8 @@ impl Agent {
                             on_event(AgentEvent::MessageStart {
                                 message: Message::Assistant(Arc::clone(&abort_arc)),
                             });
-                            self.messages.push(Message::Assistant(Arc::clone(&abort_arc)));
+                            self.messages
+                                .push(Message::Assistant(Arc::clone(&abort_arc)));
                             added_partial = true;
                             // We do NOT set sent_start = true here because we are returning immediately,
                             // but setting added_partial = true prevents finalize_assistant_message from
