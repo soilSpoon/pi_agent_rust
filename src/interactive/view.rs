@@ -82,12 +82,79 @@ fn wrapped_line_segments(line: &str, max_width: usize) -> Vec<&str> {
     segments
 }
 
-fn push_wrapped_plain_line(output: &mut String, line: &str, max_width: usize) {
-    for segment in wrapped_line_segments(line, max_width) {
-        output.push_str("  ");
-        output.push_str(segment);
-        output.push('\n');
+fn parse_fence_line(line: &str) -> Option<(char, usize, &str)> {
+    let trimmed_line = line.trim_end_matches(['\r', '\n']);
+    let leading_spaces = trimmed_line.chars().take_while(|ch| *ch == ' ').count();
+    if leading_spaces > 3 {
+        return None;
     }
+
+    let trimmed = trimmed_line.get(leading_spaces..)?;
+    let marker = trimmed.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+
+    let mut marker_len = 0usize;
+    for ch in trimmed.chars() {
+        if ch == marker {
+            marker_len += 1;
+        } else {
+            break;
+        }
+    }
+
+    if marker_len >= 3 {
+        Some((
+            marker,
+            marker_len,
+            trimmed.get(marker_len..).unwrap_or_default(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn streaming_unclosed_fence(markdown: &str) -> Option<(char, usize)> {
+    let mut open_fence: Option<(char, usize)> = None;
+
+    for line in markdown.lines() {
+        let Some((marker, marker_len, tail)) = parse_fence_line(line) else {
+            continue;
+        };
+
+        if let Some((open_marker, open_len)) = open_fence {
+            if marker == open_marker && marker_len >= open_len && tail.trim().is_empty() {
+                open_fence = None;
+            }
+        } else {
+            // CommonMark: backtick fence info strings may not contain backticks.
+            if marker == '`' && tail.contains('`') {
+                continue;
+            }
+            open_fence = Some((marker, marker_len));
+        }
+    }
+
+    open_fence
+}
+
+fn stabilize_streaming_markdown(markdown: &str) -> std::borrow::Cow<'_, str> {
+    let Some((marker, marker_len)) = streaming_unclosed_fence(markdown) else {
+        return std::borrow::Cow::Borrowed(markdown);
+    };
+
+    // Close an unterminated fence in the transient streaming view so partial
+    // markdown renders predictably while tokens are still arriving.
+    let mut stabilized = String::with_capacity(markdown.len() + marker_len + 1);
+    stabilized.push_str(markdown);
+    if !stabilized.ends_with('\n') {
+        stabilized.push('\n');
+    }
+    for _ in 0..marker_len {
+        stabilized.push(marker);
+    }
+    std::borrow::Cow::Owned(stabilized)
 }
 
 fn format_persistence_footer_segment(
@@ -739,11 +806,16 @@ impl PiApp {
             }
         }
 
-        // Show response (no markdown rendering while streaming), but wrap
-        // explicitly so renderer row mapping remains stable.
+        // Render partial markdown on every stream update so headings/lists/code
+        // format as they arrive instead of showing raw markers.
         if !self.current_response.is_empty() {
-            for line in self.current_response.split('\n') {
-                push_wrapped_plain_line(output, line.trim_end_matches('\r'), content_width);
+            let stabilized_markdown = stabilize_streaming_markdown(&self.current_response);
+            let rendered = glamour::Renderer::new()
+                .with_style_config(self.markdown_style.clone())
+                .with_word_wrap(self.term_width.saturating_sub(6).max(40))
+                .render(stabilized_markdown.as_ref());
+            for line in rendered.lines() {
+                let _ = writeln!(output, "  {line}");
             }
         }
     }
@@ -1448,22 +1520,75 @@ mod tests {
 
     #[test]
     fn wrapped_plain_line_no_wrap_when_under_width() {
-        let mut out = String::new();
-        push_wrapped_plain_line(&mut out, "hello", 10);
-        assert_eq!(out, "  hello\n");
+        let segments = wrapped_line_segments("hello", 10);
+        assert_eq!(segments, vec!["hello"]);
     }
 
     #[test]
     fn wrapped_plain_line_wraps_when_over_width() {
-        let mut out = String::new();
-        push_wrapped_plain_line(&mut out, "abcdef", 4);
-        assert_eq!(out, "  abcd\n  ef\n");
+        let segments = wrapped_line_segments("abcdef", 4);
+        assert_eq!(segments, vec!["abcd", "ef"]);
     }
 
     #[test]
     fn wrapped_plain_line_preserves_empty_line() {
-        let mut out = String::new();
-        push_wrapped_plain_line(&mut out, "", 8);
-        assert_eq!(out, "  \n");
+        let segments = wrapped_line_segments("", 8);
+        assert_eq!(segments, vec![""]);
+    }
+
+    #[test]
+    fn parse_fence_line_detects_backtick_and_tilde_fences() {
+        assert_eq!(parse_fence_line("```rust"), Some(('`', 3, "rust")));
+        assert_eq!(parse_fence_line("   ~~~~~"), Some(('~', 5, "")));
+        assert_eq!(parse_fence_line("`not-a-fence"), None);
+    }
+
+    #[test]
+    fn parse_fence_line_rejects_four_space_indent() {
+        assert_eq!(parse_fence_line("    ```rust"), None);
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_none_when_balanced() {
+        let markdown = "```rust\nfn main() {}\n```\n";
+        assert_eq!(streaming_unclosed_fence(markdown), None);
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_detects_open_backtick_block() {
+        let markdown = "Heading\n\n```rust\nfn main() {\n    println!(\"hi\");";
+        assert_eq!(streaming_unclosed_fence(markdown), Some(('`', 3)));
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_does_not_close_on_trailing_text() {
+        let markdown = "```rust\nfn main() {}\n``` trailing";
+        assert_eq!(streaming_unclosed_fence(markdown), Some(('`', 3)));
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_closes_on_whitespace_only_suffix() {
+        let markdown = "```rust\nfn main() {}\n```   \n";
+        assert_eq!(streaming_unclosed_fence(markdown), None);
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_ignores_invalid_backtick_info() {
+        let markdown = "```a`b\ncontent\n";
+        assert_eq!(streaming_unclosed_fence(markdown), None);
+    }
+
+    #[test]
+    fn stabilize_streaming_markdown_closes_unterminated_fence() {
+        let markdown = "```python\nprint('hello')";
+        let stabilized = stabilize_streaming_markdown(markdown);
+        assert_eq!(stabilized.as_ref(), "```python\nprint('hello')\n```");
+    }
+
+    #[test]
+    fn stabilize_streaming_markdown_preserves_balanced_input() {
+        let markdown = "# Title\n\n- item\n";
+        let stabilized = stabilize_streaming_markdown(markdown);
+        assert_eq!(stabilized.as_ref(), markdown);
     }
 }
