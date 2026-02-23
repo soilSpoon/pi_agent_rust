@@ -3514,9 +3514,11 @@ async fn run_bash_rpc(
 
         if !cancelled && abort_rx.try_recv().is_ok() {
             cancelled = true;
-            if let Ok(Some(status)) = guard.kill() {
-                break status.code().unwrap_or(-1);
-            }
+            let status_code = match guard.kill() {
+                Ok(Some(status)) => status.code().unwrap_or(-1),
+                _ => -1,
+            };
+            break status_code;
         }
 
         match guard.try_wait_child() {
