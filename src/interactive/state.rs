@@ -117,8 +117,9 @@ pub(super) struct AutocompleteState {
     pub(super) open: bool,
     /// Current list of suggestions.
     pub(super) items: Vec<AutocompleteItem>,
-    /// Index of the currently selected item.
-    pub(super) selected: usize,
+    /// Index of the currently selected item, or `None` when the popup is open
+    /// but the user has not yet navigated with arrow keys / Tab.
+    pub(super) selected: Option<usize>,
     /// The range of text to replace when accepting a suggestion.
     pub(super) replace_range: std::ops::Range<usize>,
     /// Maximum number of items to display in the dropdown.
@@ -131,7 +132,7 @@ impl AutocompleteState {
             provider: AutocompleteProvider::new(cwd, catalog),
             open: false,
             items: Vec::new(),
-            selected: 0,
+            selected: None,
             replace_range: 0..0,
             max_visible: 10,
         }
@@ -140,7 +141,7 @@ impl AutocompleteState {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.items.clear();
-        self.selected = 0;
+        self.selected = None;
         self.replace_range = 0..0;
     }
 
@@ -151,32 +152,39 @@ impl AutocompleteState {
         }
         self.open = true;
         self.items = response.items;
-        self.selected = 0;
+        // Start with no item pre-selected so the user can browse with
+        // arrow keys before committing.
+        self.selected = None;
         self.replace_range = response.replace;
     }
 
     pub(super) fn select_next(&mut self) {
         if !self.items.is_empty() {
-            self.selected = (self.selected + 1) % self.items.len();
+            self.selected = Some(match self.selected {
+                Some(idx) => (idx + 1) % self.items.len(),
+                None => 0,
+            });
         }
     }
 
     pub(super) fn select_prev(&mut self) {
         if !self.items.is_empty() {
-            self.selected = self.selected.checked_sub(1).unwrap_or(self.items.len() - 1);
+            self.selected = Some(match self.selected {
+                Some(idx) => idx.checked_sub(1).unwrap_or(self.items.len() - 1),
+                None => self.items.len() - 1,
+            });
         }
     }
 
     pub(super) fn selected_item(&self) -> Option<&AutocompleteItem> {
-        self.items.get(self.selected)
+        self.selected.and_then(|idx| self.items.get(idx))
     }
 
     /// Returns the scroll offset for the dropdown view.
-    pub(super) const fn scroll_offset(&self) -> usize {
-        if self.selected < self.max_visible {
-            0
-        } else {
-            self.selected - self.max_visible + 1
+    pub(super) fn scroll_offset(&self) -> usize {
+        match self.selected {
+            Some(idx) if idx >= self.max_visible => idx - self.max_visible + 1,
+            _ => 0,
         }
     }
 }
