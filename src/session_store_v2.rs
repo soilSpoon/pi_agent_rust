@@ -1085,7 +1085,8 @@ impl SessionStoreV2 {
                     } else {
                         return Err(Error::session(format!(
                             "non-monotonic entry sequence in intermediate segment file: segment={} line={line_number} seq={} last_seq={last_observed_seq}",
-                            seg_path.display(), frame.entry_seq
+                            seg_path.display(),
+                            frame.entry_seq
                         )));
                     }
                 }

@@ -15,10 +15,10 @@ pub(super) async fn run_command_output(
     cwd: &Path,
     abort_signal: &crate::agent::AbortSignal,
 ) -> std::io::Result<std::process::Output> {
+    use asupersync::time::{sleep, wall_now};
     use std::process::{Command, Stdio};
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
-    use asupersync::time::{sleep, wall_now};
 
     let child = Command::new(program)
         .args(args)
@@ -29,10 +29,12 @@ pub(super) async fn run_command_output(
     let pid = child.id();
 
     let (tx, rx) = std_mpsc::channel();
-    let _handle = std::thread::Builder::new().name("share".into()).spawn(move || {
-        let result = child.wait_with_output();
-        let _ = tx.send(result);
-    });
+    let _handle = std::thread::Builder::new()
+        .name("share".into())
+        .spawn(move || {
+            let result = child.wait_with_output();
+            let _ = tx.send(result);
+        });
 
     let tick = Duration::from_millis(10);
     loop {

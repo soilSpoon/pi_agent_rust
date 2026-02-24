@@ -1641,8 +1641,7 @@ mod tests {
             ("nanogpt", "nano-gpt"),
         ];
         for &(alias, expected_canonical) in cases {
-            let meta =
-                provider_metadata(alias).unwrap_or_else(|| panic!());
+            let meta = provider_metadata(alias).unwrap_or_else(|| panic!());
             assert_eq!(
                 meta.canonical_id, expected_canonical,
                 "alias '{alias}' should resolve to '{expected_canonical}', got '{}'",
@@ -1867,8 +1866,7 @@ mod tests {
             "fastrouter",
         ];
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions", "{id} api mismatch");
             assert!(defaults.auth_header, "{id} must use auth header");
         }
@@ -1888,8 +1886,7 @@ mod tests {
         ];
         let mut urls: Vec<&str> = Vec::new();
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert!(
                 !defaults.base_url.is_empty(),
                 "{id} base_url must not be empty"
@@ -1953,8 +1950,7 @@ mod tests {
             "inference",
         ];
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions", "{id} api mismatch");
             assert!(defaults.auth_header, "{id} must use auth header");
         }
@@ -1974,8 +1970,7 @@ mod tests {
         ];
         let mut urls: Vec<&str> = Vec::new();
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert!(
                 !defaults.base_url.is_empty(),
                 "{id} base_url must not be empty"
@@ -2071,8 +2066,7 @@ mod tests {
             "nvidia",
         ];
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(
                 defaults.api, "openai-completions",
                 "{id} api should be openai-completions"
@@ -2096,8 +2090,7 @@ mod tests {
         ];
         let mut urls: Vec<&str> = Vec::new();
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert!(
                 !defaults.base_url.is_empty(),
                 "{id} base_url must not be empty"
@@ -2201,8 +2194,7 @@ mod tests {
             "xiaomi",
         ];
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(
                 defaults.api, "openai-completions",
                 "{id} api should be openai-completions"
@@ -2226,8 +2218,7 @@ mod tests {
         ];
         let mut urls: Vec<&str> = Vec::new();
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert!(
                 !defaults.base_url.is_empty(),
                 "{id} base_url must not be empty"
@@ -2316,8 +2307,7 @@ mod tests {
             "minimax-coding-plan",
             "minimax-cn-coding-plan",
         ] {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "anthropic-messages");
             assert!(!defaults.auth_header);
         }
@@ -2415,8 +2405,7 @@ mod tests {
             ),
         ];
         for (id, expected_host) in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert!(defaults.base_url.contains(expected_host));
@@ -2521,8 +2510,7 @@ mod tests {
             ("zhipuai-coding-plan", "open.bigmodel.cn"),
         ];
         for (id, expected_host) in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert!(defaults.base_url.contains(expected_host));
@@ -2597,8 +2585,7 @@ mod tests {
             ("ollama-cloud", "https://ollama.com/v1", true),
         ];
         for (id, expected_base_url, expected_auth_header) in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!());
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions");
             assert_eq!(defaults.auth_header, *expected_auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2817,7 +2804,7 @@ mod tests {
                         assert_eq!(d.api, m.api);
                     }
                     (None, None) => {}
-                    _ => assert!(false, 
+                    _ => assert!(false,
                         "mismatch for '{}': fn={:?} meta={:?}",
                         meta.canonical_id, defaults, meta.routing_defaults
                     ),

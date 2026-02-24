@@ -150,11 +150,25 @@ impl AutocompleteState {
             self.close();
             return;
         }
+
+        // Preserve the selected item across periodic refreshes when the edit
+        // target range is unchanged. This keeps arrow-key navigation stable
+        // while typing (e.g. `/model ...`) even if suggestions are recomputed.
+        let previous_selection = if response.replace == self.replace_range {
+            self.selected_item().cloned()
+        } else {
+            None
+        };
+
         self.open = true;
         self.items = response.items;
-        // Start with no item pre-selected so the user can browse with
-        // arrow keys before committing.
-        self.selected = None;
+        self.selected = previous_selection.and_then(|selected| {
+            self.items.iter().position(|candidate| {
+                candidate.kind == selected.kind
+                    && candidate.insert == selected.insert
+                    && candidate.label == selected.label
+            })
+        });
         self.replace_range = response.replace;
     }
 
@@ -937,5 +951,81 @@ pub(super) fn format_count(n: usize) -> String {
         format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_item(id: &str) -> AutocompleteItem {
+        AutocompleteItem {
+            kind: crate::autocomplete::AutocompleteItemKind::Model,
+            label: id.to_string(),
+            insert: id.to_string(),
+            description: None,
+        }
+    }
+
+    fn response(
+        replace_range: std::ops::Range<usize>,
+        items: impl IntoIterator<Item = &'static str>,
+    ) -> AutocompleteResponse {
+        AutocompleteResponse {
+            replace: replace_range,
+            items: items.into_iter().map(model_item).collect(),
+        }
+    }
+
+    #[test]
+    fn autocomplete_refresh_preserves_selected_item_when_replace_range_unchanged() {
+        let mut state = AutocompleteState::new(PathBuf::from("."), AutocompleteCatalog::default());
+        state.open_with(response(0..6, ["gpt-4o", "gpt-5.2", "claude-opus-4-5"]));
+
+        state.select_next();
+        state.select_next();
+        assert_eq!(
+            state.selected_item().map(|item| item.label.as_str()),
+            Some("gpt-5.2")
+        );
+
+        // Recompute suggestions (same replace range) in a different order.
+        state.open_with(response(0..6, ["claude-opus-4-5", "gpt-5.2", "gpt-4o"]));
+
+        assert_eq!(
+            state.selected_item().map(|item| item.label.as_str()),
+            Some("gpt-5.2")
+        );
+    }
+
+    #[test]
+    fn autocomplete_refresh_clears_selection_when_replace_range_changes() {
+        let mut state = AutocompleteState::new(PathBuf::from("."), AutocompleteCatalog::default());
+        state.open_with(response(0..6, ["gpt-4o", "gpt-5.2"]));
+        state.select_next();
+        assert_eq!(
+            state.selected_item().map(|item| item.label.as_str()),
+            Some("gpt-4o")
+        );
+
+        // Cursor/token moved: replace range changed, so selection should reset.
+        state.open_with(response(2..8, ["gpt-4o", "gpt-5.2"]));
+        assert!(state.selected_item().is_none());
+    }
+
+    #[test]
+    fn autocomplete_refresh_clears_selection_when_selected_item_disappears() {
+        let mut state = AutocompleteState::new(PathBuf::from("."), AutocompleteCatalog::default());
+        state.open_with(response(0..6, ["gpt-4o", "gpt-5.2"]));
+        state.select_next();
+        state.select_next();
+        assert_eq!(
+            state.selected_item().map(|item| item.label.as_str()),
+            Some("gpt-5.2")
+        );
+
+        // Selected suggestion no longer present after refresh.
+        state.open_with(response(0..6, ["gpt-4o"]));
+        assert!(state.selected_item().is_none());
     }
 }

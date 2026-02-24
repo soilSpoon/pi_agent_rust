@@ -1524,9 +1524,7 @@ pub async fn run(
                             .header
                             .thinking_level
                             .clone_from(&header_snapshot.thinking_level);
-                        new_session.entries = entries;
-                        new_session.leaf_id = leaf_id;
-                        new_session.ensure_entry_ids();
+                        new_session.init_from_fork_plan(fork_plan);
 
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();

@@ -3571,7 +3571,7 @@ mod tests {
 
         match parse_source("checkpoint-pi", dir.path()) {
             ParsedSource::Local { path } => assert_eq!(path, local),
-            other => panic!(),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4629,7 +4629,7 @@ mod tests {
                 assert_eq!(name, "@scope/pkg");
                 assert!(pinned);
             }
-            other => panic!(),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4640,7 +4640,7 @@ mod tests {
             ParsedSource::Npm { pinned, .. } => {
                 assert!(!pinned);
             }
-            other => panic!(),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4661,7 +4661,7 @@ mod tests {
                 assert_eq!(r#ref, Some("v2".to_string()));
                 assert!(pinned);
             }
-            other => panic!(),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 

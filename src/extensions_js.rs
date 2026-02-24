@@ -1423,7 +1423,7 @@ pub fn validate_proposal(
             if let PatchOp::ReplaceModulePath { from, .. } = op {
                 paths_to_check.push(from.clone());
             }
-            
+
             for path_str in paths_to_check {
                 let target = Path::new(&path_str);
                 let resolved = if target.is_absolute() {
@@ -5486,7 +5486,7 @@ fn compile_module_source(
     let mut raw = String::new();
     std::io::Read::read_to_string(&mut handle, &mut raw)
         .map_err(|err| rquickjs::Error::new_loading_message(name, format!("read: {err}")))?;
-    
+
     if raw.len() as u64 > MAX_MODULE_SOURCE_BYTES {
         return Err(rquickjs::Error::new_loading_message(
             name,
@@ -5863,7 +5863,7 @@ fn resolve_module_path(
 /// references compiled output that was never built.
 fn try_dist_to_src_fallback(path: &Path) -> Option<PathBuf> {
     let path_str = path.to_string_lossy();
-    
+
     // Normalize to handle both Windows backslashes and Unix forward slashes.
     let normalized = path_str.replace('\\', "/");
     let idx = normalized.find("/dist/")?;

@@ -551,8 +551,9 @@ pub struct Session {
     pub entries: Vec<SessionEntry>,
     /// Path to the session file (None for in-memory)
     pub path: Option<PathBuf>,
-    /// Current leaf entry ID
-    pub leaf_id: Option<String>,
+    /// Current leaf entry ID. Direct modification outside of `session.rs`
+    /// is forbidden because it can desynchronize the `is_linear` optimization cache.
+    pub(crate) leaf_id: Option<String>,
     /// Base directory for session storage (optional override)
     pub session_dir: Option<PathBuf>,
     store_kind: SessionStoreKind,
@@ -2257,6 +2258,27 @@ impl Session {
         } else {
             false
         }
+    }
+
+    /// Get the current leaf entry ID.
+    pub fn leaf_id(&self) -> Option<&str> {
+        self.leaf_id.as_deref()
+    }
+
+    /// Initialize the session entries and leaf from a `ForkPlan`.
+    ///
+    /// This safely applies the new entries and leaf, and rebuilds
+    /// all internal caches (including the `is_linear` optimization flag).
+    pub fn init_from_fork_plan(&mut self, plan: ForkPlan) {
+        self.entries = plan.entries;
+        self.leaf_id = plan.leaf_id;
+        self.rebuild_all_caches();
+    }
+
+    /// Set the leaf ID directly (for tests only).
+    pub fn _test_set_leaf_id(&mut self, id: Option<String>) {
+        self.leaf_id = id;
+        self.rebuild_all_caches();
     }
 
     /// Reset the leaf pointer to root (before any entries).

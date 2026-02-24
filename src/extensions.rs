@@ -3995,7 +3995,7 @@ fn normalize_command_for_classification(command: &str) -> String {
                     remaining = peek_chars.as_str();
                     continue;
                 }
-                
+
                 chars.next(); // consume the escaped character
 
                 if next.is_ascii_whitespace() {
@@ -5579,11 +5579,17 @@ impl SecurityAlert {
 
 /// Compute a short hash for context identification.
 fn sha256_short(input: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let result = hasher.finalize();
+    // Return first 16 hex chars (8 bytes) of the SHA-256 hash
+    let mut hex = String::with_capacity(16);
+    for byte in &result[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{:02x}", byte);
+    }
+    hex
 }
 
 /// Record a security alert and emit a tracing event at the appropriate
@@ -30821,9 +30827,7 @@ mod tests {
                 .get("event")
                 .is_some_and(|value| value.contains("host_call.start"))
         });
-        let start = start.unwrap_or_else(|| {
-            panic!()
-        });
+        let start = start.unwrap_or_else(|| panic!());
         assert_eq!(
             start.fields.get("runtime").map(std::string::String::as_str),
             Some("protocol")
@@ -38822,8 +38826,7 @@ mod tests {
                 cancel_token: None,
                 context: None,
             };
-            let lane = select_hostcall_lane(&payload)
-                .unwrap_or_else(|e| panic!());
+            let lane = select_hostcall_lane(&payload).unwrap_or_else(|e| panic!());
             assert_eq!(
                 lane.lane,
                 HostcallDispatchLane::Fast,
@@ -38866,8 +38869,7 @@ mod tests {
                 cancel_token: None,
                 context: None,
             };
-            let lane = select_hostcall_lane(&payload)
-                .unwrap_or_else(|e| panic!());
+            let lane = select_hostcall_lane(&payload).unwrap_or_else(|e| panic!());
             assert_eq!(
                 lane.lane,
                 HostcallDispatchLane::Fast,
@@ -41804,8 +41806,7 @@ mod tests {
                 err.code
             );
         }
-        super::validate_host_result(result)
-            .unwrap_or_else(|e| panic!());
+        super::validate_host_result(result).unwrap_or_else(|e| panic!());
     }
 
     /// Extract `HostResultPayload` from a protocol adapter response.

@@ -413,9 +413,7 @@ impl PiApp {
             if let Some(parent_path) = parent_path {
                 new_session.set_branched_from(Some(parent_path));
             }
-            new_session.entries = entries;
-            new_session.leaf_id = leaf_id;
-            new_session.ensure_entry_ids();
+            new_session.init_from_fork_plan(fork_plan);
             let new_session_id = new_session.header.id.clone();
 
             if let Err(err) = new_session.save().await {
