@@ -3995,7 +3995,7 @@ mod tests {
         let mut entry = dummy_entry("gpt-4o-mini", true);
         entry.model.provider = "openai".to_string();
         entry.auth_header = true;
-        entry.api_key  = Some("inline-model-key".to_string());
+        entry.api_key = Some("inline-model-key".to_string());
 
         let auth_path = tempfile::tempdir()
             .expect("tempdir")
@@ -4020,7 +4020,7 @@ mod tests {
         let mut entry = dummy_entry("gpt-4o-mini", true);
         entry.model.provider = "openai".to_string();
         entry.auth_header = true;
-        entry.api_key  = Some("   ".to_string());
+        entry.api_key = Some("   ".to_string());
 
         let auth_path = tempfile::tempdir()
             .expect("tempdir")

@@ -2431,7 +2431,7 @@ mod tests {
         );
 
         let mut entry = test_model_entry("openai", "gpt-4o-mini");
-        entry.api_key  = Some("inline-model-key".to_string());
+        entry.api_key = Some("inline-model-key".to_string());
 
         assert_eq!(
             super::resolve_model_key_with_auth(&auth, &entry).as_deref(),
@@ -2443,7 +2443,7 @@ mod tests {
     fn resolve_model_key_with_auth_falls_back_to_inline_key() {
         let auth = empty_auth_storage();
         let mut entry = test_model_entry("openai", "gpt-4o-mini");
-        entry.api_key  = Some("inline-model-key".to_string());
+        entry.api_key = Some("inline-model-key".to_string());
 
         assert_eq!(
             super::resolve_model_key_with_auth(&auth, &entry).as_deref(),

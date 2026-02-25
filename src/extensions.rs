@@ -6910,7 +6910,7 @@ const fn runtime_hostcall_script_language_to_ast_lang(
 }
 
 fn runtime_hostcall_matches_interpreter(base: &str, token: &str) -> bool {
-    if token  == base {
+    if token == base {
         return true;
     }
     token.strip_prefix(base).is_some_and(|suffix| {
@@ -6962,7 +6962,7 @@ fn runtime_hostcall_script_language_from_invocation(
     for segment in invocation_prefix.split('|').rev() {
         let mut tokens = segment.split_whitespace().peekable();
         while let Some(raw) = tokens.next() {
-            let token  = raw.trim_matches(['\'', '"', '(', ')']);
+            let token = raw.trim_matches(['\'', '"', '(', ')']);
             if token.is_empty() {
                 continue;
             }
@@ -7152,7 +7152,7 @@ fn runtime_hostcall_extract_heredoc_blocks(command: &str) -> Vec<RuntimeExtracte
             i += 1;
             continue;
         };
-        let token  = raw_token.trim_matches('\'').trim_matches('"').to_string();
+        let token = raw_token.trim_matches('\'').trim_matches('"').to_string();
         if token.is_empty() {
             i += 1;
             continue;

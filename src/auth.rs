@@ -851,7 +851,7 @@ fn read_external_json(path: &Path) -> Option<serde_json::Value> {
 fn read_external_claude_access_token() -> Option<String> {
     let path = home_dir()?.join(".claude").join(".credentials.json");
     let value = read_external_json(&path)?;
-    let token  = value
+    let token = value
         .get("claudeAiOauth")
         .and_then(|oauth| oauth.get("accessToken"))
         .and_then(serde_json::Value::as_str)?
@@ -999,7 +999,7 @@ fn read_external_kimi_code_access_token_from_share_dir(share_dir: &Path) -> Opti
     let path = share_dir.join("credentials").join("kimi-code.json");
     let value = read_external_json(&path)?;
 
-    let token  = value
+    let token = value
         .get("access_token")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
@@ -1123,7 +1123,7 @@ fn encode_project_scoped_access_token(token: &str, project_id: &str) -> String {
 
 fn decode_project_scoped_access_token(payload: &str) -> Option<(String, String)> {
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let token  = value
+    let token = value
         .get("token")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
@@ -1182,7 +1182,7 @@ where
 
     // 1. Bearer token from env (AWS Bedrock specific)
     if let Some(token) = env("AWS_BEARER_TOKEN_BEDROCK") {
-        let token  = token.trim().to_string();
+        let token = token.trim().to_string();
         if !token.is_empty() {
             return Some(AwsResolvedCredentials::Bearer { token, region });
         }
@@ -1195,7 +1195,7 @@ where
             if let Some(secret_key) = env("AWS_SECRET_ACCESS_KEY") {
                 let secret_key = secret_key.trim().to_string();
                 if !secret_key.is_empty() {
-                    let session_token  = env("AWS_SESSION_TOKEN")
+                    let session_token = env("AWS_SESSION_TOKEN")
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty());
                     return Some(AwsResolvedCredentials::Sigv4 {
@@ -1276,7 +1276,7 @@ where
 
     // 2. Individual env vars
     let client_id = env("SAP_AI_CORE_CLIENT_ID");
-    let client_secret  = env("SAP_AI_CORE_CLIENT_SECRET");
+    let client_secret = env("SAP_AI_CORE_CLIENT_SECRET");
     let token_url = env("SAP_AI_CORE_TOKEN_URL");
     let service_url = env("SAP_AI_CORE_SERVICE_URL");
 
@@ -1284,7 +1284,7 @@ where
         (client_id, client_secret, token_url, service_url)
     {
         let id = id.trim().to_string();
-        let secret  = secret.trim().to_string();
+        let secret = secret.trim().to_string();
         let turl = turl.trim().to_string();
         let surl = surl.trim().to_string();
         if !id.is_empty() && !secret.is_empty() && !turl.is_empty() && !surl.is_empty() {
@@ -1338,7 +1338,7 @@ fn parse_sap_service_key_json(json_str: &str) -> Option<SapResolvedCredentials> 
         .or_else(|| obj.get("client_id"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())?;
-    let client_secret  = obj
+    let client_secret = obj
         .get("clientsecret")
         .or_else(|| obj.get("client_secret"))
         .and_then(|v| v.as_str())
@@ -1377,7 +1377,7 @@ pub async fn exchange_sap_access_token(auth: &AuthStorage) -> Result<Option<Stri
     };
 
     let client = crate::http::client::Client::new();
-    let token  = exchange_sap_access_token_with_client(&client, &creds).await?;
+    let token = exchange_sap_access_token_with_client(&client, &creds).await?;
     Ok(Some(token))
 }
 
@@ -1419,7 +1419,7 @@ async fn exchange_sap_access_token_with_client(
 
     let response: SapTokenExchangeResponse = serde_json::from_str(&text)
         .map_err(|e| Error::auth(format!("SAP AI Core token response was invalid JSON: {e}")))?;
-    let access_token  = response.access_token.trim();
+    let access_token = response.access_token.trim();
     if access_token.is_empty() {
         return Err(Error::auth(
             "SAP AI Core token exchange returned an empty access_token".to_string(),
@@ -3031,14 +3031,14 @@ fn parse_github_token_response(text: &str) -> Result<AuthCredential> {
     let json: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Error::auth(format!("Invalid token JSON: {e}")))?;
 
-    let access_token  = json
+    let access_token = json
         .get("access_token")
         .and_then(|v| v.as_str())
         .ok_or_else(|| Error::auth("Missing access_token in GitHub response".to_string()))?
         .to_string();
 
     // GitHub may not return a refresh_token for all grant types.
-    let refresh_token  = json
+    let refresh_token = json
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -3706,7 +3706,7 @@ mod tests {
         let resolved = auth.resolve_api_key_with_env_lookup("anthropic", None, |_| {
             Some("env-api-key".to_string())
         });
-        let token  = resolved.expect("resolved anthropic oauth token");
+        let token = resolved.expect("resolved anthropic oauth token");
         assert_eq!(
             unmark_anthropic_oauth_bearer_token(&token),
             Some("stored-oauth-token")
@@ -4019,8 +4019,8 @@ mod tests {
                 entries: HashMap::new(),
             };
             // Insert a NOT expired credential.
-            let initial_access_token  = next_token();
-            let initial_refresh_token  = next_token();
+            let initial_access_token = next_token();
+            let initial_refresh_token = next_token();
             let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
             auth.entries.insert(
                 "my-ext".to_string(),
@@ -4065,8 +4065,8 @@ mod tests {
                 entries: HashMap::new(),
             };
             // Expired credential for a provider not in extension_configs.
-            let initial_access_token  = next_token();
-            let initial_refresh_token  = next_token();
+            let initial_access_token = next_token();
+            let initial_refresh_token = next_token();
             auth.entries.insert(
                 "unknown-ext".to_string(),
                 AuthCredential::OAuth {
@@ -4288,8 +4288,8 @@ mod tests {
     fn test_oauth_token_storage_round_trip() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("auth.json");
-        let expected_access_token  = next_token();
-        let expected_refresh_token  = next_token();
+        let expected_access_token = next_token();
+        let expected_refresh_token = next_token();
 
         // Save OAuth credential.
         {
@@ -4334,8 +4334,8 @@ mod tests {
     fn test_oauth_api_key_returns_access_token_when_unexpired() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("auth.json");
-        let expected_access_token  = next_token();
-        let expected_refresh_token  = next_token();
+        let expected_access_token = next_token();
+        let expected_refresh_token = next_token();
         let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
         let mut auth = AuthStorage {
             path: auth_path,
@@ -4362,8 +4362,8 @@ mod tests {
     fn test_oauth_api_key_returns_none_when_expired() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("auth.json");
-        let expected_access_token  = next_token();
-        let expected_refresh_token  = next_token();
+        let expected_access_token = next_token();
+        let expected_refresh_token = next_token();
         let mut auth = AuthStorage {
             path: auth_path,
             entries: HashMap::new(),
@@ -4821,7 +4821,7 @@ mod tests {
         );
 
         let resolved = auth.resolve_api_key_with_env_lookup("anthropic", None, |_| None);
-        let token  = resolved.expect("resolved anthropic oauth token");
+        let token = resolved.expect("resolved anthropic oauth token");
         assert_eq!(
             unmark_anthropic_oauth_bearer_token(&token),
             Some("sk-ant-api-like-token")
@@ -5936,7 +5936,7 @@ mod tests {
         )
         .expect("write token file");
 
-        let token  = read_external_kimi_code_access_token_from_share_dir(share_dir);
+        let token = read_external_kimi_code_access_token_from_share_dir(share_dir);
         assert_eq!(token.as_deref(), Some("kimi-token"));
     }
 
@@ -5954,7 +5954,7 @@ mod tests {
         )
         .expect("write token file");
 
-        let token  = read_external_kimi_code_access_token_from_share_dir(share_dir);
+        let token = read_external_kimi_code_access_token_from_share_dir(share_dir);
         assert!(token.is_none(), "expired Kimi token should be ignored");
     }
 
@@ -6849,7 +6849,7 @@ mod tests {
                 service_url: "https://api.ai.sap.example.com".to_string(),
             };
 
-            let token  = exchange_sap_access_token_with_client(&client, &creds)
+            let token = exchange_sap_access_token_with_client(&client, &creds)
                 .await
                 .expect("token exchange");
             assert_eq!(token, "sap-access-token");
