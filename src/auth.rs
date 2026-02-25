@@ -1386,7 +1386,7 @@ async fn exchange_sap_access_token_with_client(
     creds: &SapResolvedCredentials,
 ) -> Result<String> {
     let form_body = format!(
-        "grant_type=client_credentials&client_id={}&client_secret  ={}",
+        "grant_type=client_credentials&client_id={}&client_secret={}",
         percent_encode_component(&creds.client_id),
         percent_encode_component(&creds.client_secret),
     );
@@ -2212,7 +2212,7 @@ async fn exchange_google_authorization_code(
     verifier: &str,
 ) -> Result<OAuthTokenResponse> {
     let form_body = format!(
-        "client_id={}&client_secret  ={}&code={}&grant_type=authorization_code&redirect_uri={}&code_verifier={}",
+        "client_id={}&client_secret={}&code={}&grant_type=authorization_code&redirect_uri={}&code_verifier={}",
         percent_encode_component(client_id),
         percent_encode_component(client_secret),
         percent_encode_component(code),
@@ -2339,7 +2339,7 @@ async fn refresh_google_oauth_token_with_project(
     provider_name: &str,
 ) -> Result<AuthCredential> {
     let form_body = format!(
-        "client_id={}&client_secret  ={}&refresh_token  ={}&grant_type=refresh_token",
+        "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
         percent_encode_component(client_id),
         percent_encode_component(client_secret),
         percent_encode_component(refresh_token),
@@ -2547,7 +2547,7 @@ async fn refresh_kimi_code_oauth_token(
     refresh_token: &str,
 ) -> Result<AuthCredential> {
     let form_body = format!(
-        "client_id={}&grant_type=refresh_token&refresh_token  ={}",
+        "client_id={}&grant_type=refresh_token&refresh_token={}",
         percent_encode_component(KIMI_CODE_OAUTH_CLIENT_ID),
         percent_encode_component(refresh_token),
     );
