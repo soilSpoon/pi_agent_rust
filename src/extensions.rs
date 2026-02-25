@@ -46353,20 +46353,20 @@ mod tests {
     #[test]
     fn redact_command_env_assignment_lowercase_key() {
         let broker = SecretBrokerPolicy::default();
-        let cmd = "anthropic_api_key  =sk-ant-xxx my_script";
+        let cmd = "anthropic_api_key=sk-ant-xxx my_script";
         let result = redact_command_for_logging(&broker, cmd);
-        assert!(result.contains("anthropic_api_key  =[REDACTED]"));
+        assert!(result.contains("anthropic_api_key=[REDACTED]"));
         assert!(!result.contains("sk-ant-xxx"));
     }
 
     #[test]
     fn redact_command_password_flags() {
         let broker = SecretBrokerPolicy::default();
-        let cmd = "mysql -u root -p hunter2 --password swordfish --password  =opensesame";
+        let cmd = "mysql -u root -p hunter2 --password swordfish --password=opensesame";
         let result = redact_command_for_logging(&broker, cmd);
         assert!(result.contains("-p [REDACTED]"));
         assert!(result.contains("--password [REDACTED]"));
-        assert!(result.contains("--password  =[REDACTED]"));
+        assert!(result.contains("--password=[REDACTED]"));
         assert!(!result.contains("hunter2"));
         assert!(!result.contains("swordfish"));
         assert!(!result.contains("opensesame"));
