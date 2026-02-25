@@ -773,6 +773,23 @@ impl Agent {
                 {
                     Ok(msg) => msg,
                     Err(err) => {
+                        let error_msg = AssistantMessage {
+                            stop_reason: StopReason::Error,
+                            error_message: Some(err.to_string()),
+                            ..AssistantMessage::default()
+                        };
+                        let error_message = Message::Assistant(Arc::new(error_msg));
+
+                        let turn_end_event = AgentEvent::TurnEnd {
+                            session_id: session_id.clone(),
+                            turn_index: current_turn_index,
+                            message: error_message,
+                            tool_results: Vec::new(),
+                        };
+                        self.dispatch_extension_lifecycle_event(&turn_end_event)
+                            .await;
+                        on_event(turn_end_event);
+
                         let agent_end_event = AgentEvent::AgentEnd {
                             session_id: session_id.clone(),
                             messages: std::mem::take(&mut new_messages),
@@ -886,6 +903,16 @@ impl Agent {
                     {
                         Ok(outcome) => outcome,
                         Err(err) => {
+                            let turn_end_event = AgentEvent::TurnEnd {
+                                session_id: session_id.clone(),
+                                turn_index: current_turn_index,
+                                message: assistant_event_message.clone(),
+                                tool_results: Vec::new(),
+                            };
+                            self.dispatch_extension_lifecycle_event(&turn_end_event)
+                                .await;
+                            on_event(turn_end_event);
+
                             let agent_end_event = AgentEvent::AgentEnd {
                                 session_id: session_id.clone(),
                                 messages: std::mem::take(&mut new_messages),

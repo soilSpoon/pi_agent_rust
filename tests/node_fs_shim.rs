@@ -366,6 +366,15 @@ fn mkdtemp_sync_creates_temp_dir() {
     assert_eq!(result, "true");
 }
 
+#[test]
+fn mkdtemp_sync_denies_outside_workspace() {
+    let result = eval_fs(r#"fs.mkdtempSync("/tmp/prefix-")"#);
+    assert!(
+        result.contains("host write denied"),
+        "expected host write denied, got: {result}"
+    );
+}
+
 // ─── Callback-based async readFile ──────────────────────────────────────────
 
 #[test]

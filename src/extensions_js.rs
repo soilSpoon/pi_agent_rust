@@ -9384,6 +9384,7 @@ export function lstatSync(path) { return __pi_vfs.makeStat(path, false); }
 export function mkdtempSync(prefix, _opts) {
   const p = String(prefix ?? "/tmp/tmp-");
   const out = `${p}${Date.now().toString(36)}`;
+  __pi_vfs.checkWriteAccess(__pi_vfs.normalizePath(out));
   __pi_vfs.ensureDir(out);
   return out;
 }
