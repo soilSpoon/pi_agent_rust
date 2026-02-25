@@ -472,7 +472,14 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
     }
     if let Some(arr) = value.as_array() {
         let len = arr.len();
-        let mut result = Vec::with_capacity(len);
+        if len > 10_000_000 {
+            return Err(rquickjs::Error::new_into_js_message(
+                "json",
+                "stringify",
+                "Array length exceeds maximum allowed limit",
+            ));
+        }
+        let mut result = Vec::with_capacity(std::cmp::min(len, 1024));
         for i in 0..len {
             let v: Value<'_> = arr.get(i)?;
             result.push(js_to_json_inner(&v, depth + 1)?);
@@ -6071,7 +6078,7 @@ pub fn extract_import_names(source: &str, specifier: &str) -> Vec<String> {
 /// Parse a comma-separated list of import names, skipping `type`-only imports.
 fn parse_import_list(raw: &str, out: &mut Vec<String>) {
     for token in raw.split(',') {
-        let token /*_*/= token.trim();
+        let token  = token.trim();
         if token.is_empty() {
             continue;
         }
@@ -10287,7 +10294,7 @@ const _URL = globalThis.URL || (() => {
       const protoEnd = u.indexOf(':');
       this.protocol = protoEnd >= 0 ? u.slice(0, protoEnd + 1) : '';
       let rest = protoEnd >= 0 ? u.slice(protoEnd + 1) : u;
-      this.username = ''; this.password /*_*/= '';
+      this.username = ''; this.password  = '';
       if (rest.startsWith('//')) {
         rest = rest.slice(2);
         const pathStart = rest.indexOf('/');
@@ -10301,7 +10308,7 @@ const _URL = globalThis.URL || (() => {
           const colonIdx = userInfo.indexOf(':');
           if (colonIdx >= 0) {
             this.username = userInfo.slice(0, colonIdx);
-            this.password /*_*/= userInfo.slice(colonIdx + 1);
+            this.password  = userInfo.slice(colonIdx + 1);
           } else {
             this.username = userInfo;
           }
@@ -18908,7 +18915,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         std::fs::write(&only_json, "{\"ok\":true}\n").expect("write only_json.json");
 
         let mode = RepairMode::default();
-        let roots = vec![];
+        let roots = vec![root.to_path_buf()];
 
         let resolved_pkg =
             resolve_module_path(base.to_string_lossy().as_ref(), "./pkg", mode, &roots)
@@ -18943,7 +18950,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         std::fs::write(&base, "export {};\n").expect("write base");
 
         let outside = root.join("secret.ts");
-        std::fs::write(&outside, "export const secret /*_*/= 1;\n").expect("write outside");
+        std::fs::write(&outside, "export const secret  = 1;\n").expect("write outside");
 
         let mode = RepairMode::default();
         let roots = vec![extension_root];

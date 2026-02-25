@@ -4273,12 +4273,15 @@ impl Drop for ProcessGuard {
                 Ok(None) => {}
                 Ok(Some(_)) | Err(_) => return,
             }
-            if self.kill_tree {
-                let pid = child.id();
-                kill_process_tree(Some(pid));
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            let kill_tree = self.kill_tree;
+            std::thread::spawn(move || {
+                if kill_tree {
+                    let pid = child.id();
+                    kill_process_tree(Some(pid));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            });
         }
     }
 }
