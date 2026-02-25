@@ -5587,7 +5587,7 @@ fn sha256_short(input: &str) -> String {
     let mut hex = String::with_capacity(16);
     for byte in &result[..8] {
         use std::fmt::Write;
-        let _ = write!(&mut hex, "{:02x}", byte);
+        let _ = write!(&mut hex, "{byte:02x}");
     }
     hex
 }

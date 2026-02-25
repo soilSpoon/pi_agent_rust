@@ -997,12 +997,11 @@ impl SessionStoreV2 {
                             drop(reader);
                             truncate_file_to(seg_path, byte_offset)?;
                             break 'segments;
-                        } else {
-                            return Err(Error::session(format!(
-                                "oversized line encountered in intermediate segment file: segment={} line={line_number}",
-                                seg_path.display()
-                            )));
                         }
+                        return Err(Error::session(format!(
+                            "oversized line encountered in intermediate segment file: segment={} line={line_number}",
+                            seg_path.display()
+                        )));
                     }
                     Err(e) => return Err(Error::Io(Box::new(e))),
                 };
@@ -1037,12 +1036,11 @@ impl SessionStoreV2 {
                                 drop(reader);
                                 truncate_file_to(seg_path, byte_offset)?;
                                 break 'segments;
-                            } else {
-                                return Err(Error::session(format!(
-                                    "missing newline at EOF of intermediate segment file: segment={} line={line_number}",
-                                    seg_path.display()
-                                )));
                             }
+                            return Err(Error::session(format!(
+                                "missing newline at EOF of intermediate segment file: segment={} line={line_number}",
+                                seg_path.display()
+                            )));
                         }
                         frame
                     }
@@ -1082,13 +1080,12 @@ impl SessionStoreV2 {
                         drop(reader);
                         truncate_file_to(seg_path, byte_offset)?;
                         break 'segments;
-                    } else {
-                        return Err(Error::session(format!(
-                            "non-monotonic entry sequence in intermediate segment file: segment={} line={line_number} seq={} last_seq={last_observed_seq}",
-                            seg_path.display(),
-                            frame.entry_seq
-                        )));
                     }
+                    return Err(Error::session(format!(
+                        "non-monotonic entry sequence in intermediate segment file: segment={} line={line_number} seq={} last_seq={last_observed_seq}",
+                        seg_path.display(),
+                        frame.entry_seq
+                    )));
                 }
                 last_observed_seq = frame.entry_seq;
 

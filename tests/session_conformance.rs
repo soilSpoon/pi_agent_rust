@@ -266,7 +266,7 @@ proptest! {
             parent_session: None,
         };
         session.entries = decoded_entries;
-        session._test_set_leaf_id(leaf_id.clone());
+        session._test_set_leaf_id(leaf_id);
 
         if let Some(leaf_id) = session.leaf_id().map(String::from) {
             // Path should always end at the requested entry.
@@ -438,7 +438,7 @@ fn plan_fork_from_user_message_branches_from_parent_and_returns_selected_text() 
     } = plan;
     let mut forked = Session::create();
     forked.entries = entries;
-    forked._test_set_leaf_id(leaf_id.clone());
+    forked._test_set_leaf_id(leaf_id);
 
     let appended = forked.append_message(make_user_message("Followup"));
     let appended_entry = forked.get_entry(&appended).expect("appended entry");

@@ -195,7 +195,7 @@ impl AutocompleteState {
     }
 
     /// Returns the scroll offset for the dropdown view.
-    pub(super) fn scroll_offset(&self) -> usize {
+    pub(super) const fn scroll_offset(&self) -> usize {
         match self.selected {
             Some(idx) if idx >= self.max_visible => idx - self.max_visible + 1,
             _ => 0,
