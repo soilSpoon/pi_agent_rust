@@ -55,6 +55,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "no-skills"
         | "no-prompt-templates"
         | "no-themes"
+        | "hide-cwd-in-prompt"
         | "list-providers" => (false, false),
         "provider"
         | "model"
@@ -388,6 +389,10 @@ pub struct Cli {
     /// Disable skill discovery
     #[arg(long)]
     pub no_skills: bool,
+
+    /// Exclude current working directory from system prompt
+    #[arg(long, env = "PI_HIDE_CWD_IN_PROMPT")]
+    pub hide_cwd_in_prompt: bool,
 
     // === Prompt Templates ===
     /// Load prompt template file/directory (can use multiple times)

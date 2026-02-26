@@ -141,6 +141,7 @@ pub fn build_system_prompt(
     global_dir: &Path,
     package_dir: &Path,
     test_mode: bool,
+    include_cwd_in_prompt: bool,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -175,12 +176,15 @@ pub fn build_system_prompt(
         format_current_datetime()
     };
     let _ = write!(prompt, "\nCurrent date and time: {date_time}");
-    let cwd_display = if test_mode {
-        "<CWD>".to_string()
-    } else {
-        cwd.display().to_string()
-    };
-    let _ = write!(prompt, "\nCurrent working directory: {cwd_display}");
+
+    if include_cwd_in_prompt {
+        let cwd_display = if test_mode {
+            "<CWD>".to_string()
+        } else {
+            cwd.display().to_string()
+        };
+        let _ = write!(prompt, "\nCurrent working directory: {cwd_display}");
+    }
 
     prompt
 }
