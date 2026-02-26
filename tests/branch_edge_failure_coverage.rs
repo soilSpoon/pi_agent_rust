@@ -855,6 +855,7 @@ fn build_system_prompt_test_mode_uses_placeholders() {
         global_dir,
         package_dir,
         true, // test_mode
+        true, // include_cwd_in_prompt
     );
     assert!(prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("<CWD>"));
@@ -868,7 +869,7 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
     let global_dir = Path::new("/tmp/nonexistent_global");
     let package_dir = Path::new("/tmp/nonexistent_package");
     let prompt =
-        app::build_system_prompt(&cli, cwd, &["read"], None, global_dir, package_dir, false);
+        app::build_system_prompt(&cli, cwd, &["read"], None, global_dir, package_dir, false, true);
     assert!(!prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("/tmp/test_cwd"));
 }
@@ -886,10 +887,53 @@ fn build_system_prompt_with_skills_prompt() {
         Some("\n# Available Skills\n- /commit: Make git commits\n"),
         global_dir,
         package_dir,
-        true,
+        true, // test_mode
+        true, // include_cwd_in_prompt
     );
     assert!(prompt.contains("Available Skills"));
     assert!(prompt.contains("/commit"));
+}
+
+#[test]
+fn build_system_prompt_omits_cwd_when_include_false() {
+    let cli = Cli::parse_from(["pi"]);
+    let cwd = Path::new("/tmp/secret_cwd");
+    let global_dir = Path::new("/tmp/nonexistent_global");
+    let package_dir = Path::new("/tmp/nonexistent_package");
+    let prompt = app::build_system_prompt(
+        &cli,
+        cwd,
+        &["read"],
+        None,
+        global_dir,
+        package_dir,
+        false, // test_mode
+        false, // include_cwd_in_prompt
+    );
+    assert!(!prompt.contains("Current working directory:"));
+    assert!(!prompt.contains("/tmp/secret_cwd"));
+    assert!(prompt.contains("Current date and time:"));
+}
+
+#[test]
+fn build_system_prompt_hide_cwd_cli_flag_omits_cwd_line() {
+    let cli = Cli::parse_from(["pi", "--hide-cwd-in-prompt"]);
+    let cwd = Path::new("/tmp/secret_cwd");
+    let global_dir = Path::new("/tmp/nonexistent_global");
+    let package_dir = Path::new("/tmp/nonexistent_package");
+    let prompt = app::build_system_prompt(
+        &cli,
+        cwd,
+        &["read"],
+        None,
+        global_dir,
+        package_dir,
+        false,                   // test_mode
+        !cli.hide_cwd_in_prompt, // mirrors main.rs / pi_debug.rs logic
+    );
+    assert!(!prompt.contains("Current working directory:"));
+    assert!(!prompt.contains("/tmp/secret_cwd"));
+    assert!(prompt.contains("Current date and time:"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════

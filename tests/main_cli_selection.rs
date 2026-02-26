@@ -430,7 +430,8 @@ fn build_system_prompt_includes_custom_append_context_and_skills() {
         Some(skills_prompt),
         &global_dir,
         &package_dir,
-        false,
+        false, // test_mode
+        true,  // include_cwd_in_prompt
     );
 
     harness.log().info_ctx("prompt", "Prompt fragments", |ctx| {

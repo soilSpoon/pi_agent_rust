@@ -208,7 +208,8 @@ fn build_vcr_system_prompt_for_args(
         None,
         &global_dir,
         &package_dir,
-        true,
+        true, // test_mode
+        true, // include_cwd_in_prompt
     )
 }
 
